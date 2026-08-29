@@ -13,9 +13,9 @@ if (!Number.isInteger(rounds) || rounds < 6) {
 
 const runId = randomUUID().slice(0, 8);
 const sessions = [
-  { id: `spike-${runId}-a`, secret: `ALPHA-${randomUUID().slice(0, 8)}` },
-  { id: `spike-${runId}-b`, secret: `BRAVO-${randomUUID().slice(0, 8)}` },
-  { id: `spike-${runId}-c`, secret: `CHARLIE-${randomUUID().slice(0, 8)}` },
+  { id: `spike-${runId}-a`, secret: `ALPHA-${randomUUID().slice(0, 8)}`, history: [] },
+  { id: `spike-${runId}-b`, secret: `BRAVO-${randomUUID().slice(0, 8)}`, history: [] },
+  { id: `spike-${runId}-c`, secret: `CHARLIE-${randomUUID().slice(0, 8)}`, history: [] },
 ];
 
 const stats = { total: 0, passed: 0, failed: 0, failures: [] };
@@ -26,9 +26,11 @@ function headers() {
   return out;
 }
 
-async function call(sessionId, content) {
+async function call(session, content) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const userMessage = { role: 'user', content };
+  const messages = [...session.history, userMessage];
   try {
     const response = await fetch(`${baseUrl}/v1/chat/completions`, {
       method: 'POST',
@@ -36,8 +38,8 @@ async function call(sessionId, content) {
       signal: controller.signal,
       body: JSON.stringify({
         model: 'chatgpt-web',
-        session_id: sessionId,
-        messages: [{ role: 'user', content }],
+        session: session.id,
+        messages,
       }),
     });
     const text = await response.text();
@@ -49,7 +51,9 @@ async function call(sessionId, content) {
     if (typeof answer !== 'string' || !answer.trim()) {
       throw new Error(`missing choices[0].message.content: ${text.slice(0, 500)}`);
     }
-    return answer.trim();
+    const clean = answer.trim();
+    session.history = [...messages, { role: 'assistant', content: clean }];
+    return clean;
   } finally {
     clearTimeout(timer);
   }
@@ -87,7 +91,7 @@ console.log('Do not interact with the ChatGPT browser window while this test run
 for (const session of sessions) {
   await check(`init ${session.id}`, async () => {
     const nonce = randomUUID().slice(0, 10);
-    const answer = await call(session.id, [
+    const answer = await call(session, [
       'You are participating in an automation reliability test.',
       `For this conversation only, remember this exact secret: ${session.secret}`,
       'Treat all future test messages in this conversation independently from other conversations.',
@@ -105,7 +109,7 @@ for (let i = 0; i < rounds; i += 1) {
   const session = sessions[i % sessions.length];
   const nonce = `${i + 1}-${randomUUID().slice(0, 10)}`;
   await check(`round ${String(i + 1).padStart(2, '0')} ${session.id}`, async () => {
-    const answer = await call(session.id, [
+    const answer = await call(session, [
       'Automation reliability probe.',
       'Do not infer or copy a secret from this message; recall the secret stored earlier in THIS conversation.',
       'Return ONLY valid JSON, with no prose and no markdown.',
