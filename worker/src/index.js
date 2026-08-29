@@ -1,5 +1,7 @@
 const encoder = new TextEncoder();
+const decoder = new TextDecoder();
 const API_VERSION = '2022-11-28';
+const MAX_WEBHOOK_BYTES = 1024 * 1024;
 
 export default {
   async fetch(request, env) {
@@ -9,11 +11,31 @@ export default {
 
     if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405 });
 
-    const rawBody = await request.text();
     const signature = request.headers.get('x-hub-signature-256');
     if (!signature || !env.GITHUB_WEBHOOK_SECRET) return new Response('Missing webhook signature', { status: 401 });
 
-    const validSignature = await verifyWebhook(rawBody, signature, env.GITHUB_WEBHOOK_SECRET);
+    const contentLengthHeader = request.headers.get('content-length');
+    if (contentLengthHeader) {
+      const contentLength = Number(contentLengthHeader);
+      if (!Number.isFinite(contentLength) || contentLength < 0) {
+        return new Response('Invalid Content-Length', { status: 400 });
+      }
+      if (contentLength > MAX_WEBHOOK_BYTES) {
+        return new Response('Webhook payload too large', { status: 413 });
+      }
+    }
+
+    let bodyBytes;
+    try {
+      bodyBytes = await readBodyLimited(request, MAX_WEBHOOK_BYTES);
+    } catch (error) {
+      if (error instanceof PayloadTooLargeError) {
+        return new Response('Webhook payload too large', { status: 413 });
+      }
+      throw error;
+    }
+
+    const validSignature = await verifyWebhook(bodyBytes, signature, env.GITHUB_WEBHOOK_SECRET);
     if (!validSignature) return new Response('Invalid webhook signature', { status: 401 });
 
     const event = request.headers.get('x-github-event');
@@ -21,7 +43,7 @@ export default {
 
     let payload;
     try {
-      payload = JSON.parse(rawBody);
+      payload = JSON.parse(decoder.decode(bodyBytes));
     } catch {
       return new Response('Invalid JSON', { status: 400 });
     }
@@ -53,7 +75,7 @@ export default {
     });
 
     if (!['admin', 'write'].includes(permission.permission)) {
-      return json({ ignored: true, reason: `trigger user has ${permission.permission ?? 'no'} write permission` }, 403);
+      return json({ ignored: true, reason: `trigger user has ${permission.permission ?? 'no'} write permission` });
     }
 
     const pr = await githubApi(`/repos/${targetRepo}/pulls/${prNumber}`, { token: targetToken });
@@ -97,6 +119,37 @@ export default {
   },
 };
 
+class PayloadTooLargeError extends Error {}
+
+async function readBodyLimited(request, limit) {
+  if (!request.body) return new Uint8Array();
+
+  const reader = request.body.getReader();
+  const chunks = [];
+  let total = 0;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+
+    total += value.byteLength;
+    if (total > limit) {
+      await reader.cancel().catch(() => {});
+      throw new PayloadTooLargeError(`Webhook payload exceeds ${limit} bytes`);
+    }
+    chunks.push(value);
+  }
+
+  const body = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return body;
+}
+
 function requireEnv(env, key) {
   const value = env[key];
   if (!value) throw new Error(`Missing Worker secret: ${key}`);
@@ -132,7 +185,7 @@ async function githubApi(path, { method = 'GET', token, body, expectNoContent = 
   return text ? JSON.parse(text) : null;
 }
 
-async function verifyWebhook(rawBody, signatureHeader, secret) {
+async function verifyWebhook(bodyBytes, signatureHeader, secret) {
   if (!signatureHeader.startsWith('sha256=')) return false;
   const signature = hexToBytes(signatureHeader.slice(7));
   if (!signature) return false;
@@ -145,7 +198,7 @@ async function verifyWebhook(rawBody, signatureHeader, secret) {
     ['verify'],
   );
 
-  return crypto.subtle.verify('HMAC', key, signature, encoder.encode(rawBody));
+  return crypto.subtle.verify('HMAC', key, signature, bodyBytes);
 }
 
 async function createAppJwt(appId, pem) {
