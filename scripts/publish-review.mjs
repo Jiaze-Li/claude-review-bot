@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 
 const REVIEW_BODY_MAX_BYTES = 60_000;
-const required = ['GH_TOKEN', 'TARGET_REPO', 'PR_NUMBER', 'HEAD_SHA', 'REVIEW_PATH'];
+const required = ['GH_TOKEN', 'TARGET_REPO', 'PR_NUMBER', 'BASE_SHA', 'HEAD_SHA', 'REVIEW_PATH'];
 for (const key of required) {
   if (!process.env[key]) throw new Error(`Missing required environment variable: ${key}`);
 }
@@ -22,6 +22,9 @@ try {
 validateReview(review);
 
 const pr = await githubJson(`https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}`);
+if (pr.base?.sha !== process.env.BASE_SHA) {
+  throw new Error(`PR base moved from ${process.env.BASE_SHA} to ${pr.base?.sha ?? 'unknown'} before publish; refusing stale review`);
+}
 if (pr.head?.sha !== process.env.HEAD_SHA) {
   throw new Error(`PR head moved from ${process.env.HEAD_SHA} to ${pr.head?.sha ?? 'unknown'} before publish; refusing stale review`);
 }
