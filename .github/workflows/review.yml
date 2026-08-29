@@ -1,0 +1,156 @@
+name: Central Claude PR Review
+run-name: Claude review ${{ inputs.target_repo }}#${{ inputs.pr_number }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_repo:
+        description: owner/repo containing the pull request
+        required: true
+        type: string
+      pr_number:
+        description: Pull request number
+        required: true
+        type: string
+      base_sha:
+        description: Exact PR base SHA captured by the webhook
+        required: true
+        type: string
+      head_sha:
+        description: Exact PR head SHA captured by the webhook
+        required: true
+        type: string
+      trigger_user:
+        description: GitHub login that requested the review
+        required: true
+        type: string
+      source_comment_id:
+        description: Trigger comment ID for traceability
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: claude-review-${{ inputs.target_repo }}-${{ inputs.pr_number }}-${{ inputs.head_sha }}
+  cancel-in-progress: false
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout control repository
+        uses: actions/checkout@v6
+        with:
+          path: .control
+          persist-credentials: false
+
+      - name: Parse target repository
+        id: target
+        shell: bash
+        env:
+          TARGET_REPO: ${{ inputs.target_repo }}
+        run: |
+          set -euo pipefail
+          owner="${TARGET_REPO%%/*}"
+          repo="${TARGET_REPO#*/}"
+          if [[ -z "$owner" || -z "$repo" || "$owner" == "$repo" || "$repo" == */* ]]; then
+            echo "Invalid target_repo: $TARGET_REPO" >&2
+            exit 1
+          fi
+          echo "owner=$owner" >> "$GITHUB_OUTPUT"
+          echo "repo=$repo" >> "$GITHUB_OUTPUT"
+
+      - name: Create least-privilege GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ steps.target.outputs.owner }}
+          repositories: ${{ steps.target.outputs.repo }}
+          permission-contents: read
+          permission-pull-requests: write
+          permission-issues: read
+
+      - name: Checkout exact PR head
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.target_repo }}
+          ref: ${{ inputs.head_sha }}
+          token: ${{ steps.app-token.outputs.token }}
+          fetch-depth: 0
+          path: target
+          persist-credentials: false
+
+      - name: Build review context
+        shell: bash
+        env:
+          BASE_SHA: ${{ inputs.base_sha }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p .review-context
+
+          git -C target cat-file -e "${BASE_SHA}^{commit}"
+          git -C target cat-file -e "${HEAD_SHA}^{commit}"
+          git -C target diff --no-ext-diff --unified=80 "$BASE_SHA" "$HEAD_SHA" > .review-context/pr.diff
+          git -C target diff --name-only "$BASE_SHA" "$HEAD_SHA" > .review-context/changed-files.txt
+          git -C target diff --stat "$BASE_SHA" "$HEAD_SHA" > .review-context/diff-stat.txt
+
+          gh pr view "$PR_NUMBER" \
+            --repo "$TARGET_REPO" \
+            --json number,title,body,author,baseRefName,headRefName,baseRefOid,headRefOid \
+            > .review-context/pr.json
+
+          current_head="$(jq -r '.headRefOid' .review-context/pr.json)"
+          if [[ "$current_head" != "$HEAD_SHA" ]]; then
+            echo "PR head moved from $HEAD_SHA to $current_head before review started. Ask for @claude review again." >&2
+            exit 1
+          fi
+
+      - name: Run Claude as a read-only reviewer
+        id: claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ steps.app-token.outputs.token }}
+          prompt: |
+            You are reviewing pull request ${{ inputs.target_repo }}#${{ inputs.pr_number }}.
+
+            This is a CODE REVIEW task, not a request to answer the trigger comment.
+            The target repository is checked out at ./target at the exact PR head SHA ${{ inputs.head_sha }}.
+            Review context is available in:
+              - ./.review-context/pr.diff
+              - ./.review-context/changed-files.txt
+              - ./.review-context/diff-stat.txt
+              - ./.review-context/pr.json
+
+            Start from the PR diff, then inspect the full changed files and any related repository code needed to understand behavior. Focus on actionable correctness bugs, security issues, regressions, broken edge cases, and important missing tests. Do not report style-only preferences, compliments, or speculative issues without a concrete failure mode.
+
+            You are READ ONLY. Do not edit files, create commits, push, merge, approve, or post comments yourself.
+
+            For each finding, use a repository-relative path. If the finding can be anchored to an added/modified line in the PR diff, set line to that RIGHT-side file line number. Otherwise set line to null. Severity meanings: P0 catastrophic/release-blocking, P1 high-impact bug/security, P2 normal actionable bug/regression, P3 low-impact but concrete defect.
+
+            Return only the structured result requested by the JSON schema.
+          claude_args: >-
+            --max-turns 20
+            --allowedTools "Read,Glob,Grep,Bash(git -C target diff:*),Bash(git -C target show:*),Bash(git -C target log:*)"
+            --json-schema '{"type":"object","additionalProperties":false,"properties":{"summary":{"type":"string"},"findings":{"type":"array","maxItems":25,"items":{"type":"object","additionalProperties":false,"properties":{"severity":{"type":"string","enum":["P0","P1","P2","P3"]},"title":{"type":"string"},"body":{"type":"string"},"path":{"type":"string"},"line":{"type":["integer","null"],"minimum":1}},"required":["severity","title","body","path","line"]}}},"required":["summary","findings"]}'
+
+      - name: Publish GitHub PR Review
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          DIFF_PATH: .review-context/pr.diff
+          REVIEW_JSON: ${{ steps.claude.outputs.structured_output }}
+        run: node .control/scripts/publish-review.mjs
