@@ -45,26 +45,36 @@ export default {
     const appId = requireEnv(env, 'GITHUB_APP_ID');
     const privateKey = requireEnv(env, 'GITHUB_PRIVATE_KEY');
     const appJwt = await createAppJwt(appId, privateKey);
-    const installationToken = await createInstallationToken(installationId, appJwt);
+
+    const targetToken = await createInstallationToken(installationId, appJwt);
 
     const permission = await githubApi(`/repos/${targetRepo}/collaborators/${encodeURIComponent(triggerUser)}/permission`, {
-      token: installationToken,
+      token: targetToken,
     });
 
     if (!['admin', 'write'].includes(permission.permission)) {
       return json({ ignored: true, reason: `trigger user has ${permission.permission ?? 'no'} write permission` }, 403);
     }
 
-    const pr = await githubApi(`/repos/${targetRepo}/pulls/${prNumber}`, { token: installationToken });
+    const pr = await githubApi(`/repos/${targetRepo}/pulls/${prNumber}`, { token: targetToken });
     if (pr.state !== 'open') return json({ ignored: true, reason: 'pull request is not open' });
 
     const controlRepo = env.CONTROL_REPO || 'Jiaze-Li/claude-review-bot';
     const controlWorkflow = env.CONTROL_WORKFLOW || 'review.yml';
     const controlRef = env.CONTROL_REF || 'main';
 
+    const controlInstallation = await githubApi(`/repos/${controlRepo}/installation`, { token: appJwt });
+    if (!controlInstallation?.id) {
+      throw new Error(`GitHub App is not installed on control repository ${controlRepo}`);
+    }
+
+    const controlToken = Number(controlInstallation.id) === Number(installationId)
+      ? targetToken
+      : await createInstallationToken(controlInstallation.id, appJwt);
+
     await githubApi(`/repos/${controlRepo}/actions/workflows/${encodeURIComponent(controlWorkflow)}/dispatches`, {
       method: 'POST',
-      token: installationToken,
+      token: controlToken,
       body: {
         ref: controlRef,
         inputs: {
