@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 
+const REVIEW_BODY_MAX_BYTES = 60_000;
 const required = ['GH_TOKEN', 'TARGET_REPO', 'PR_NUMBER', 'HEAD_SHA', 'REVIEW_PATH'];
 for (const key of required) {
   if (!process.env[key]) throw new Error(`Missing required environment variable: ${key}`);
@@ -55,10 +56,27 @@ if (review.findings.length === 0) {
 
 if (unanchored.length) {
   body += '\n\n### Findings without an inline anchor\n';
+  let omitted = 0;
+
   for (const finding of unanchored) {
     const locationText = finding.line ? `${finding.path}:${finding.line}` : finding.path;
-    body += `\n- **[${finding.severity}] ${finding.title}** — <code>${escapeHtml(locationText)}</code>: ${finding.body}`;
+    const entry = `\n- **[${finding.severity}] ${finding.title}** — <code>${escapeHtml(locationText)}</code>: ${finding.body}`;
+    const reserve = '\n\n_25 additional unanchored findings omitted because the GitHub review body reached its safe size limit._';
+
+    if (Buffer.byteLength(body + entry + reserve, 'utf8') <= REVIEW_BODY_MAX_BYTES) {
+      body += entry;
+    } else {
+      omitted += 1;
+    }
   }
+
+  if (omitted) {
+    body += `\n\n_${omitted} additional unanchored finding${omitted === 1 ? '' : 's'} omitted because the GitHub review body reached its safe size limit._`;
+  }
+}
+
+if (Buffer.byteLength(body, 'utf8') > REVIEW_BODY_MAX_BYTES) {
+  throw new Error('Internal error: constructed GitHub review body exceeds safe size limit');
 }
 
 const payload = {
