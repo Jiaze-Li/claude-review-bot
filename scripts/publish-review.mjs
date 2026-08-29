@@ -1,4 +1,6 @@
-const required = ['GH_TOKEN', 'TARGET_REPO', 'PR_NUMBER', 'HEAD_SHA', 'REVIEW_JSON'];
+import fs from 'node:fs';
+
+const required = ['GH_TOKEN', 'TARGET_REPO', 'PR_NUMBER', 'HEAD_SHA', 'REVIEW_PATH'];
 for (const key of required) {
   if (!process.env[key]) throw new Error(`Missing required environment variable: ${key}`);
 }
@@ -11,7 +13,7 @@ if (!Number.isInteger(prNumber) || prNumber < 1) throw new Error('PR_NUMBER must
 
 let review;
 try {
-  review = JSON.parse(process.env.REVIEW_JSON);
+  review = JSON.parse(fs.readFileSync(process.env.REVIEW_PATH, 'utf8'));
 } catch (error) {
   throw new Error(`Claude structured output is not valid JSON: ${error.message}`);
 }
