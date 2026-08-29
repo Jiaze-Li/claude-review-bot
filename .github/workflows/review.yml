@@ -118,7 +118,12 @@ jobs:
             --json number,title,body,author,baseRefName,headRefName,baseRefOid,headRefOid \
             > .review-context/pr.json
 
+          current_base="$(jq -r '.baseRefOid' .review-context/pr.json)"
           current_head="$(jq -r '.headRefOid' .review-context/pr.json)"
+          if [[ "$current_base" != "$BASE_SHA" ]]; then
+            echo "PR base moved from $BASE_SHA to $current_base before review started. Ask for @claude review again." >&2
+            exit 1
+          fi
           if [[ "$current_head" != "$HEAD_SHA" ]]; then
             echo "PR head moved from $HEAD_SHA to $current_head before review started. Ask for @claude review again." >&2
             exit 1
@@ -154,6 +159,7 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           TARGET_REPO: ${{ inputs.target_repo }}
           PR_NUMBER: ${{ inputs.pr_number }}
+          BASE_SHA: ${{ inputs.base_sha }}
           HEAD_SHA: ${{ inputs.head_sha }}
           REVIEW_PATH: .review-context/review.json
         run: node scripts/publish-review.mjs
