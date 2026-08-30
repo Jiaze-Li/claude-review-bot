@@ -1,0 +1,226 @@
+name: Central Claude PR Review
+run-name: Claude review ${{ inputs.target_repo }}#${{ inputs.pr_number }} comment ${{ inputs.source_comment_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_repo:
+        description: owner/repo containing the pull request
+        required: true
+        type: string
+      pr_number:
+        description: Pull request number
+        required: true
+        type: string
+      base_sha:
+        description: Exact PR base SHA captured by the webhook
+        required: true
+        type: string
+      head_sha:
+        description: Exact PR head SHA captured by the webhook
+        required: true
+        type: string
+      trigger_user:
+        description: GitHub login that requested the review
+        required: true
+        type: string
+      source_comment_id:
+        description: Trigger comment ID for traceability and idempotency
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  # GitHub may redeliver the same issue_comment webhook. Serialize by the
+  # immutable source comment ID so a queued duplicate can observe the review
+  # marker written by the first successful run before doing any Claude work.
+  group: claude-review-${{ inputs.target_repo }}-${{ inputs.source_comment_id }}
+  cancel-in-progress: false
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout trusted control repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Parse target repository
+        id: target
+        shell: bash
+        env:
+          TARGET_REPO: ${{ inputs.target_repo }}
+        run: |
+          set -euo pipefail
+          owner="${TARGET_REPO%%/*}"
+          repo="${TARGET_REPO#*/}"
+          if [[ -z "$owner" || -z "$repo" || "$owner" == "$repo" || "$repo" == */* ]]; then
+            echo "Invalid target_repo: $TARGET_REPO" >&2
+            exit 1
+          fi
+          echo "owner=$owner" >> "$GITHUB_OUTPUT"
+          echo "repo=$repo" >> "$GITHUB_OUTPUT"
+
+      - name: Create least-privilege GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ steps.target.outputs.owner }}
+          repositories: ${{ steps.target.outputs.repo }}
+          permission-contents: read
+          permission-pull-requests: write
+          permission-issues: read
+
+      - name: Check source comment idempotency
+        id: dedupe
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          SOURCE_COMMENT_ID: ${{ inputs.source_comment_id }}
+          EXPECTED_REVIEW_AUTHOR: ${{ steps.app-token.outputs.app-slug }}[bot]
+        run: |
+          set -euo pipefail
+          marker="<!-- claude-review-source-comment:${SOURCE_COMMENT_ID} -->"
+
+          for page in $(seq 1 100); do
+            reviews="$(gh api "repos/${TARGET_REPO}/pulls/${PR_NUMBER}/reviews?per_page=100&page=${page}")"
+            if jq -e --arg marker "$marker" --arg author "$EXPECTED_REVIEW_AUTHOR" \
+              'any(.[]; (.user.login == $author) and (((.body // "") | contains($marker))))' \
+              <<<"$reviews" >/dev/null; then
+              echo "duplicate=true" >> "$GITHUB_OUTPUT"
+              echo "Source comment ${SOURCE_COMMENT_ID} already has a review from ${EXPECTED_REVIEW_AUTHOR}; skipping duplicate delivery."
+              exit 0
+            fi
+
+            count="$(jq 'length' <<<"$reviews")"
+            if (( count < 100 )); then
+              echo "duplicate=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+
+          echo "Pull request review pagination exceeded safety limit" >&2
+          exit 1
+
+      - name: Install trusted reviewer dependencies
+        if: steps.dedupe.outputs.duplicate != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Agent SDK 0.3.247 declares SDK/MCP/Zod peers for consumer package
+          # resolution, while its published runtime bundle is self-contained.
+          # Keep the reviewed lock graph minimal and prove the runtime import on
+          # the clean runner before any Claude credential is exposed.
+          npm ci --legacy-peer-deps --ignore-scripts --no-audit --no-fund --omit=dev
+          node --input-type=module -e "const m = await import('@anthropic-ai/claude-agent-sdk'); if (typeof m.query !== 'function') throw new Error('Claude Agent SDK query export unavailable')"
+
+      - name: Checkout exact PR head temporarily
+        if: steps.dedupe.outputs.duplicate != 'true'
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.target_repo }}
+          ref: ${{ inputs.head_sha }}
+          token: ${{ steps.app-token.outputs.token }}
+          fetch-depth: 1
+          path: target
+          persist-credentials: false
+
+      - name: Build exact PR review context
+        if: steps.dedupe.outputs.duplicate != 'true'
+        shell: bash
+        env:
+          BASE_SHA: ${{ inputs.base_sha }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p .review-context
+
+          # Revalidate the webhook snapshot before deriving any review context.
+          gh pr view "$PR_NUMBER" \
+            --repo "$TARGET_REPO" \
+            --json number,title,body,author,baseRefName,headRefName,baseRefOid,headRefOid \
+            > .review-context/pr.json
+
+          current_base="$(jq -r '.baseRefOid' .review-context/pr.json)"
+          current_head="$(jq -r '.headRefOid' .review-context/pr.json)"
+          if [[ "$current_base" != "$BASE_SHA" ]]; then
+            echo "PR base moved from $BASE_SHA to $current_base before review started. Ask for @claude review again." >&2
+            exit 1
+          fi
+          if [[ "$current_head" != "$HEAD_SHA" ]]; then
+            echo "PR head moved from $HEAD_SHA to $current_head before review started. Ask for @claude review again." >&2
+            exit 1
+          fi
+
+          # Ask GitHub for the authoritative merge base instead of downloading
+          # the repository's complete history. The compare endpoint supports
+          # SHAs across repositories in the same fork network.
+          merge_base="$(gh api "repos/${TARGET_REPO}/compare/${BASE_SHA}...${HEAD_SHA}" --jq '.merge_base_commit.sha')"
+          if [[ ! "$merge_base" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "GitHub did not return a valid merge-base SHA" >&2
+            exit 1
+          fi
+          printf '%s\n' "$merge_base" > .review-context/merge-base.txt
+
+          # The head tree is already present from the depth-1 checkout. Fetch
+          # only the merge-base commit/tree needed for the PR diff.
+          if ! git -C target cat-file -e "${merge_base}^{commit}" 2>/dev/null; then
+            git -C target fetch --no-tags --depth=1 origin "$merge_base"
+          fi
+          git -C target cat-file -e "${HEAD_SHA}^{commit}"
+          git -C target cat-file -e "${merge_base}^{commit}"
+
+          git -C target diff --no-ext-diff --no-textconv --unified=80 "$merge_base" "$HEAD_SHA" > .review-context/pr.diff
+          git -C target diff --no-ext-diff --no-textconv --name-only "$merge_base" "$HEAD_SHA" > .review-context/changed-files.txt
+          git -C target diff --no-ext-diff --no-textconv --stat "$merge_base" "$HEAD_SHA" > .review-context/diff-stat.txt
+
+      - name: Materialize safe read-only source snapshot
+        if: steps.dedupe.outputs.duplicate != 'true'
+        shell: bash
+        env:
+          HEAD_SHA: ${{ inputs.head_sha }}
+          SOURCE_REPO_DIR: target
+          OUTPUT_DIR: safe-target
+          REVIEW_CONTEXT_DIR: .review-context
+        run: |
+          set -euo pipefail
+          node scripts/materialize-safe-tree.mjs
+          rm -rf -- target
+
+      - name: Run Claude with host-enforced read-only policy
+        if: steps.dedupe.outputs.duplicate != 'true'
+        shell: bash
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          SAFE_REPO_DIR: safe-target
+          REVIEW_CONTEXT_DIR: .review-context
+          REVIEW_OUTPUT_PATH: .review-context/review.json
+        run: node scripts/run-review.mjs
+
+      - name: Publish GitHub PR Review
+        if: steps.dedupe.outputs.duplicate != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          BASE_SHA: ${{ inputs.base_sha }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          SOURCE_COMMENT_ID: ${{ inputs.source_comment_id }}
+          REVIEW_PATH: .review-context/review.json
+        run: node scripts/publish-review.mjs

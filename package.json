@@ -1,0 +1,8 @@
+{
+  "name": "claude-review-bot",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.247"
+  }
+}

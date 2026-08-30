@@ -1,0 +1,8 @@
+name = "claude-review-bot"
+main = "src/index.js"
+compatibility_date = "2026-08-29"
+
+[vars]
+CONTROL_REPO = "Jiaze-Li/claude-review-bot"
+CONTROL_WORKFLOW = "review.yml"
+CONTROL_REF = "main"
