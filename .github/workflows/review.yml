@@ -1,5 +1,5 @@
 name: Central Claude PR Review
-run-name: Claude review ${{ inputs.target_repo }}#${{ inputs.pr_number }}
+run-name: Claude review ${{ inputs.target_repo }}#${{ inputs.pr_number }} comment ${{ inputs.source_comment_id }}
 
 on:
   workflow_dispatch:
@@ -25,7 +25,7 @@ on:
         required: true
         type: string
       source_comment_id:
-        description: Trigger comment ID for traceability
+        description: Trigger comment ID for traceability and idempotency
         required: true
         type: string
 
@@ -33,7 +33,10 @@ permissions:
   contents: read
 
 concurrency:
-  group: claude-review-${{ inputs.target_repo }}-${{ inputs.pr_number }}-${{ inputs.head_sha }}
+  # GitHub may redeliver the same issue_comment webhook. Serialize by the
+  # immutable source comment ID so a queued duplicate can observe the review
+  # marker written by the first successful run before doing any Claude work.
+  group: claude-review-${{ inputs.target_repo }}-${{ inputs.source_comment_id }}
   cancel-in-progress: false
 
 jobs:
@@ -46,10 +49,6 @@ jobs:
         uses: actions/checkout@v6
         with:
           persist-credentials: false
-
-      - name: Install trusted reviewer dependencies
-        shell: bash
-        run: npm ci --legacy-peer-deps --ignore-scripts --no-audit --no-fund --omit=dev
 
       - name: Parse target repository
         id: target
@@ -79,7 +78,43 @@ jobs:
           permission-pull-requests: write
           permission-issues: read
 
+      - name: Check source comment idempotency
+        id: dedupe
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          SOURCE_COMMENT_ID: ${{ inputs.source_comment_id }}
+        run: |
+          set -euo pipefail
+          marker="<!-- claude-review-source-comment:${SOURCE_COMMENT_ID} -->"
+
+          for page in $(seq 1 100); do
+            reviews="$(gh api "repos/${TARGET_REPO}/pulls/${PR_NUMBER}/reviews?per_page=100&page=${page}")"
+            if jq -e --arg marker "$marker" 'any(.[]; ((.body // "") | contains($marker)))' <<<"$reviews" >/dev/null; then
+              echo "duplicate=true" >> "$GITHUB_OUTPUT"
+              echo "Source comment ${SOURCE_COMMENT_ID} already has a published review; skipping duplicate delivery."
+              exit 0
+            fi
+
+            count="$(jq 'length' <<<"$reviews")"
+            if (( count < 100 )); then
+              echo "duplicate=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+
+          echo "Pull request review pagination exceeded safety limit" >&2
+          exit 1
+
+      - name: Install trusted reviewer dependencies
+        if: steps.dedupe.outputs.duplicate != 'true'
+        shell: bash
+        run: npm ci --legacy-peer-deps --ignore-scripts --no-audit --no-fund --omit=dev
+
       - name: Checkout exact PR head temporarily
+        if: steps.dedupe.outputs.duplicate != 'true'
         uses: actions/checkout@v6
         with:
           repository: ${{ inputs.target_repo }}
@@ -90,6 +125,7 @@ jobs:
           persist-credentials: false
 
       - name: Build exact PR review context
+        if: steps.dedupe.outputs.duplicate != 'true'
         shell: bash
         env:
           BASE_SHA: ${{ inputs.base_sha }}
@@ -130,6 +166,7 @@ jobs:
           fi
 
       - name: Materialize safe read-only source snapshot
+        if: steps.dedupe.outputs.duplicate != 'true'
         shell: bash
         env:
           HEAD_SHA: ${{ inputs.head_sha }}
@@ -142,6 +179,7 @@ jobs:
           rm -rf -- target
 
       - name: Run Claude with host-enforced read-only policy
+        if: steps.dedupe.outputs.duplicate != 'true'
         shell: bash
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -154,6 +192,7 @@ jobs:
         run: node scripts/run-review.mjs
 
       - name: Publish GitHub PR Review
+        if: steps.dedupe.outputs.duplicate != 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
@@ -161,5 +200,6 @@ jobs:
           PR_NUMBER: ${{ inputs.pr_number }}
           BASE_SHA: ${{ inputs.base_sha }}
           HEAD_SHA: ${{ inputs.head_sha }}
+          SOURCE_COMMENT_ID: ${{ inputs.source_comment_id }}
           REVIEW_PATH: .review-context/review.json
         run: node scripts/publish-review.mjs
