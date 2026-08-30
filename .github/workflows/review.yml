@@ -111,7 +111,14 @@ jobs:
       - name: Install trusted reviewer dependencies
         if: steps.dedupe.outputs.duplicate != 'true'
         shell: bash
-        run: npm ci --legacy-peer-deps --ignore-scripts --no-audit --no-fund --omit=dev
+        run: |
+          set -euo pipefail
+          # Agent SDK 0.3.247 declares SDK/MCP/Zod peers for consumer package
+          # resolution, while its published runtime bundle is self-contained.
+          # Keep the reviewed lock graph minimal and prove the runtime import on
+          # the clean runner before any Claude credential is exposed.
+          npm ci --legacy-peer-deps --ignore-scripts --no-audit --no-fund --omit=dev
+          node --input-type=module -e "const m = await import('@anthropic-ai/claude-agent-sdk'); if (typeof m.query !== 'function') throw new Error('Claude Agent SDK query export unavailable')"
 
       - name: Checkout exact PR head temporarily
         if: steps.dedupe.outputs.duplicate != 'true'
