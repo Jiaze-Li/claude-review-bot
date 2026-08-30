@@ -67,6 +67,9 @@ export default {
     const appId = requireEnv(env, 'GITHUB_APP_ID');
     const privateKey = requireEnv(env, 'GITHUB_PRIVATE_KEY');
     const appJwt = await createAppJwt(appId, privateKey);
+    const app = await githubApi('/app', { token: appJwt });
+    if (!app?.slug) throw new Error('GitHub did not return the App slug');
+    const expectedReviewAuthor = `${app.slug}[bot]`;
 
     const targetToken = await createInstallationToken(installationId, appJwt);
 
@@ -81,11 +84,10 @@ export default {
     const pr = await githubApi(`/repos/${targetRepo}/pulls/${prNumber}`, { token: targetToken });
     if (pr.state !== 'open') return json({ ignored: true, reason: 'pull request is not open' });
 
-    // Fast path for normal GitHub redeliveries: if this source comment already
-    // produced a review, acknowledge the webhook without dispatching another run.
-    // The central workflow repeats this check under concurrency to close the race
-    // between two near-simultaneous redeliveries.
-    if (await hasPublishedReviewForComment(targetRepo, prNumber, commentId, targetToken)) {
+    // Fast path for normal GitHub redeliveries. A public marker is not enough:
+    // only a review authored by this exact GitHub App bot is trusted as proof
+    // that the source comment already completed a review.
+    if (await hasPublishedReviewForComment(targetRepo, prNumber, commentId, expectedReviewAuthor, targetToken)) {
       return json({ ignored: true, reason: 'source comment already reviewed' });
     }
 
@@ -174,12 +176,17 @@ async function createInstallationToken(installationId, appJwt) {
   return result.token;
 }
 
-async function hasPublishedReviewForComment(targetRepo, prNumber, commentId, token) {
+async function hasPublishedReviewForComment(targetRepo, prNumber, commentId, expectedReviewAuthor, token) {
   const marker = sourceCommentMarker(commentId);
   for (let page = 1; page <= 100; page += 1) {
     const reviews = await githubApi(`/repos/${targetRepo}/pulls/${prNumber}/reviews?per_page=100&page=${page}`, { token });
     if (!Array.isArray(reviews)) throw new Error('GitHub pull request reviews response was not an array');
-    if (reviews.some((review) => typeof review.body === 'string' && review.body.includes(marker))) return true;
+    if (reviews.some((review) =>
+      review?.user?.login === expectedReviewAuthor &&
+      typeof review.body === 'string' &&
+      review.body.includes(marker))) {
+      return true;
+    }
     if (reviews.length < 100) return false;
   }
   throw new Error('Pull request review pagination exceeded safety limit');
