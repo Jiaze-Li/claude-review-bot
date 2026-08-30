@@ -19,6 +19,8 @@ The comment is only a trigger. Claude reviews the actual PR diff and the checked
 - Checks out the target repository and gives Claude the real PR diff plus read access to the repository code.
 - Claude is review-only: it does not edit, push, merge, or approve code.
 - Publishes actionable findings as inline PR review comments when they can be anchored to changed lines; otherwise includes them in the review summary.
+- Uses Claude Code's moving `sonnet` alias at `medium` effort with a 10-turn ceiling to balance review quality against subscription usage.
+- Reports the resolved model, agent turns, and SDK token usage in each published review.
 
 ## Architecture
 
@@ -42,6 +44,20 @@ this repo: review.yml
         v
 GitHub PR Review
 ```
+
+## Review cost controls
+
+The reviewer intentionally uses the Claude Code `sonnet` model alias rather than a version-pinned model ID. That keeps the reviewer on the current Sonnet generation as Claude Code updates its alias.
+
+The trusted runner currently sets:
+
+```text
+model: sonnet
+effort: medium
+maxTurns: 10
+```
+
+`medium` effort reduces reasoning and tool-call token use relative to the default high effort. The turn ceiling prevents unusually large PRs from exploring indefinitely. Each successful review records the resolved model and the SDK-reported input, cache, output, and turn usage so expensive reviews can be identified from the PR itself.
 
 ## One-time setup
 

@@ -24,6 +24,7 @@ try {
 }
 
 validateReview(review);
+const runtimeSection = formatRuntimeSection(review._meta);
 
 const pr = await githubJson(`https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}`);
 if (pr.base?.sha !== process.env.BASE_SHA) {
@@ -68,7 +69,7 @@ if (unanchored.length) {
   for (const finding of unanchored) {
     const locationText = finding.line ? `${finding.path}:${finding.line}` : finding.path;
     const entry = `\n- **[${finding.severity}] ${finding.title}** — <code>${escapeHtml(locationText)}</code>: ${finding.body}`;
-    const reserve = `\n\n_25 additional unanchored findings omitted because the GitHub review body reached its safe size limit._\n\n${sourceMarker}`;
+    const reserve = `\n\n_25 additional unanchored findings omitted because the GitHub review body reached its safe size limit._${runtimeSection}\n\n${sourceMarker}`;
 
     if (Buffer.byteLength(body + entry + reserve, 'utf8') <= REVIEW_BODY_MAX_BYTES) {
       body += entry;
@@ -82,6 +83,7 @@ if (unanchored.length) {
   }
 }
 
+body += runtimeSection;
 body += `\n\n${sourceMarker}`;
 
 if (Buffer.byteLength(body, 'utf8') > REVIEW_BODY_MAX_BYTES) {
@@ -125,6 +127,66 @@ function isFinding(value) {
     typeof value.path === 'string' && Boolean(value.path.trim()) && value.path.length <= 1000 &&
     !value.path.startsWith('/') && !value.path.split('/').some((part) => part === '..') &&
     (value.line === null || (Number.isInteger(value.line) && value.line >= 1));
+}
+
+function formatRuntimeSection(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return '';
+
+  const resolvedModel = safeLabel(value.resolved_model);
+  const requestedModel = safeLabel(value.requested_model);
+  const effort = safeLabel(value.effort);
+  const numTurns = nonnegativeInteger(value.num_turns);
+  const maxTurns = nonnegativeInteger(value.max_turns);
+  const usage = value.usage && typeof value.usage === 'object' && !Array.isArray(value.usage)
+    ? value.usage
+    : null;
+  const cost = nonnegativeNumber(value.total_cost_usd);
+
+  const details = [];
+  if (resolvedModel) {
+    details.push(requestedModel && requestedModel !== resolvedModel
+      ? `model ${resolvedModel} (alias ${requestedModel})`
+      : `model ${resolvedModel}`);
+  } else if (requestedModel) {
+    details.push(`model alias ${requestedModel}`);
+  }
+  if (effort) details.push(`effort ${effort}`);
+  if (numTurns !== null) details.push(`turns ${numTurns}${maxTurns !== null ? `/${maxTurns}` : ''}`);
+
+  if (usage) {
+    const input = nonnegativeNumber(usage.input_tokens);
+    const cacheRead = nonnegativeNumber(usage.cache_read_input_tokens);
+    const cacheWrite = nonnegativeNumber(usage.cache_creation_input_tokens);
+    const output = nonnegativeNumber(usage.output_tokens);
+    const tokenParts = [];
+    if (input !== null) tokenParts.push(`input ${formatInteger(input)}`);
+    if (cacheRead !== null) tokenParts.push(`cache-read ${formatInteger(cacheRead)}`);
+    if (cacheWrite !== null) tokenParts.push(`cache-write ${formatInteger(cacheWrite)}`);
+    if (output !== null) tokenParts.push(`output ${formatInteger(output)}`);
+    if (tokenParts.length) details.push(`tokens ${tokenParts.join(', ')}`);
+  }
+
+  if (cost !== null) details.push(`SDK cost estimate $${cost.toFixed(4)}`);
+  if (!details.length) return '';
+
+  return `\n\n---\n<sub>Review runtime: ${escapeHtml(details.join(' · '))}</sub>`;
+}
+
+function safeLabel(value) {
+  if (typeof value !== 'string' || !value || value.length > 120) return null;
+  return /^[A-Za-z0-9._:/-]+$/.test(value) ? value : null;
+}
+
+function nonnegativeInteger(value) {
+  return Number.isInteger(value) && value >= 0 ? value : null;
+}
+
+function nonnegativeNumber(value) {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+function formatInteger(value) {
+  return Math.trunc(value).toLocaleString('en-US');
 }
 
 async function loadAddedLinesFromGitHub() {
