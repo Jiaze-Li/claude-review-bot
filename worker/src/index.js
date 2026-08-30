@@ -77,7 +77,7 @@ export default {
       token: targetToken,
     });
 
-    if (!['admin', 'write'].includes(permission.permission)) {
+    if (!['admin', 'maintain', 'write'].includes(permission.permission)) {
       return json({ ignored: true, reason: `trigger user has ${permission.permission ?? 'no'} write permission` });
     }
 
