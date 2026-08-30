@@ -130,7 +130,7 @@ jobs:
           repository: ${{ inputs.target_repo }}
           ref: ${{ inputs.head_sha }}
           token: ${{ steps.app-token.outputs.token }}
-          fetch-depth: 0
+          fetch-depth: 1
           path: target
           persist-credentials: false
 
@@ -147,18 +147,7 @@ jobs:
           set -euo pipefail
           mkdir -p .review-context
 
-          if ! git -C target cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
-            git -C target fetch --no-tags origin "$BASE_SHA"
-          fi
-          git -C target cat-file -e "${HEAD_SHA}^{commit}"
-
-          merge_base="$(git -C target merge-base "$BASE_SHA" "$HEAD_SHA")"
-          printf '%s\n' "$merge_base" > .review-context/merge-base.txt
-
-          git -C target diff --no-ext-diff --no-textconv --unified=80 "$merge_base" "$HEAD_SHA" > .review-context/pr.diff
-          git -C target diff --no-ext-diff --no-textconv --name-only "$merge_base" "$HEAD_SHA" > .review-context/changed-files.txt
-          git -C target diff --no-ext-diff --no-textconv --stat "$merge_base" "$HEAD_SHA" > .review-context/diff-stat.txt
-
+          # Revalidate the webhook snapshot before deriving any review context.
           gh pr view "$PR_NUMBER" \
             --repo "$TARGET_REPO" \
             --json number,title,body,author,baseRefName,headRefName,baseRefOid,headRefOid \
@@ -174,6 +163,28 @@ jobs:
             echo "PR head moved from $HEAD_SHA to $current_head before review started. Ask for @claude review again." >&2
             exit 1
           fi
+
+          # Ask GitHub for the authoritative merge base instead of downloading
+          # the repository's complete history. The compare endpoint supports
+          # SHAs across repositories in the same fork network.
+          merge_base="$(gh api "repos/${TARGET_REPO}/compare/${BASE_SHA}...${HEAD_SHA}" --jq '.merge_base_commit.sha')"
+          if [[ ! "$merge_base" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "GitHub did not return a valid merge-base SHA" >&2
+            exit 1
+          fi
+          printf '%s\n' "$merge_base" > .review-context/merge-base.txt
+
+          # The head tree is already present from the depth-1 checkout. Fetch
+          # only the merge-base commit/tree needed for the PR diff.
+          if ! git -C target cat-file -e "${merge_base}^{commit}" 2>/dev/null; then
+            git -C target fetch --no-tags --depth=1 origin "$merge_base"
+          fi
+          git -C target cat-file -e "${HEAD_SHA}^{commit}"
+          git -C target cat-file -e "${merge_base}^{commit}"
+
+          git -C target diff --no-ext-diff --no-textconv --unified=80 "$merge_base" "$HEAD_SHA" > .review-context/pr.diff
+          git -C target diff --no-ext-diff --no-textconv --name-only "$merge_base" "$HEAD_SHA" > .review-context/changed-files.txt
+          git -C target diff --no-ext-diff --no-textconv --stat "$merge_base" "$HEAD_SHA" > .review-context/diff-stat.txt
 
       - name: Materialize safe read-only source snapshot
         if: steps.dedupe.outputs.duplicate != 'true'
