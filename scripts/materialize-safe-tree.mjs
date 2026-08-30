@@ -12,22 +12,29 @@ if (!headSha) throw new Error('HEAD_SHA is required');
 const sourceRoot = path.resolve(sourceDir);
 const outputRoot = path.resolve(outputDir);
 const contextRoot = path.resolve(contextDir);
+const utf8Decoder = new TextDecoder('utf-8', { fatal: true });
 
 fs.rmSync(outputRoot, { recursive: true, force: true });
 fs.mkdirSync(outputRoot, { recursive: true, mode: 0o700 });
 fs.mkdirSync(contextRoot, { recursive: true, mode: 0o700 });
 
 const listing = gitBuffer(['ls-tree', '-r', '-z', '--full-tree', headSha]);
-const records = listing.toString('utf8').split('\0').filter(Boolean);
+const records = splitNulRecords(listing);
 const skipped = [];
 let materialized = 0;
 
-for (const record of records) {
-  const tab = record.indexOf('\t');
-  if (tab < 0) throw new Error(`Unexpected git ls-tree record: ${JSON.stringify(record)}`);
+for (const recordBytes of records) {
+  const tab = recordBytes.indexOf(0x09);
+  if (tab < 0) throw new Error('Unexpected git ls-tree record without a tab separator');
 
-  const metadata = record.slice(0, tab);
-  const repoPath = record.slice(tab + 1);
+  const metadata = recordBytes.subarray(0, tab).toString('ascii');
+  let repoPath;
+  try {
+    repoPath = utf8Decoder.decode(recordBytes.subarray(tab + 1));
+  } catch {
+    throw new Error('Repository contains a non-UTF-8 path; refusing to materialize an ambiguous filename');
+  }
+
   const [mode, type, oid] = metadata.split(' ');
 
   if (!isSafeRepositoryPath(repoPath)) {
@@ -64,6 +71,21 @@ fs.writeFileSync(
 );
 
 console.log(`Materialized ${materialized} regular file(s) into ${outputRoot}; skipped ${skipped.length}.`);
+
+function splitNulRecords(buffer) {
+  const records = [];
+  let start = 0;
+  while (start < buffer.length) {
+    const end = buffer.indexOf(0x00, start);
+    if (end < 0) {
+      if (start !== buffer.length) throw new Error('git ls-tree output was not NUL terminated');
+      break;
+    }
+    if (end > start) records.push(buffer.subarray(start, end));
+    start = end + 1;
+  }
+  return records;
+}
 
 function gitBuffer(args) {
   const result = spawnSync('git', ['-C', sourceRoot, ...args], {
