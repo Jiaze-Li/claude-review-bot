@@ -86,15 +86,18 @@ jobs:
           TARGET_REPO: ${{ inputs.target_repo }}
           PR_NUMBER: ${{ inputs.pr_number }}
           SOURCE_COMMENT_ID: ${{ inputs.source_comment_id }}
+          EXPECTED_REVIEW_AUTHOR: ${{ steps.app-token.outputs.app-slug }}[bot]
         run: |
           set -euo pipefail
           marker="<!-- claude-review-source-comment:${SOURCE_COMMENT_ID} -->"
 
           for page in $(seq 1 100); do
             reviews="$(gh api "repos/${TARGET_REPO}/pulls/${PR_NUMBER}/reviews?per_page=100&page=${page}")"
-            if jq -e --arg marker "$marker" 'any(.[]; ((.body // "") | contains($marker)))' <<<"$reviews" >/dev/null; then
+            if jq -e --arg marker "$marker" --arg author "$EXPECTED_REVIEW_AUTHOR" \
+              'any(.[]; (.user.login == $author) and (((.body // "") | contains($marker))))' \
+              <<<"$reviews" >/dev/null; then
               echo "duplicate=true" >> "$GITHUB_OUTPUT"
-              echo "Source comment ${SOURCE_COMMENT_ID} already has a published review; skipping duplicate delivery."
+              echo "Source comment ${SOURCE_COMMENT_ID} already has a review from ${EXPECTED_REVIEW_AUTHOR}; skipping duplicate delivery."
               exit 0
             fi
 
