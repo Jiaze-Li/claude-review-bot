@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 
 const REVIEW_BODY_MAX_BYTES = 60_000;
-const required = ['GH_TOKEN', 'TARGET_REPO', 'PR_NUMBER', 'BASE_SHA', 'HEAD_SHA', 'REVIEW_PATH'];
+const required = ['GH_TOKEN', 'TARGET_REPO', 'PR_NUMBER', 'BASE_SHA', 'HEAD_SHA', 'SOURCE_COMMENT_ID', 'REVIEW_PATH'];
 for (const key of required) {
   if (!process.env[key]) throw new Error(`Missing required environment variable: ${key}`);
 }
@@ -11,6 +11,10 @@ if (!owner || !repo || extra) throw new Error(`Invalid TARGET_REPO: ${process.en
 
 const prNumber = Number(process.env.PR_NUMBER);
 if (!Number.isInteger(prNumber) || prNumber < 1) throw new Error('PR_NUMBER must be a positive integer');
+
+const sourceCommentId = String(process.env.SOURCE_COMMENT_ID);
+if (!/^\d+$/.test(sourceCommentId)) throw new Error('SOURCE_COMMENT_ID must be a positive GitHub comment ID');
+const sourceMarker = sourceCommentMarker(sourceCommentId);
 
 let review;
 try {
@@ -64,7 +68,7 @@ if (unanchored.length) {
   for (const finding of unanchored) {
     const locationText = finding.line ? `${finding.path}:${finding.line}` : finding.path;
     const entry = `\n- **[${finding.severity}] ${finding.title}** — <code>${escapeHtml(locationText)}</code>: ${finding.body}`;
-    const reserve = '\n\n_25 additional unanchored findings omitted because the GitHub review body reached its safe size limit._';
+    const reserve = `\n\n_25 additional unanchored findings omitted because the GitHub review body reached its safe size limit._\n\n${sourceMarker}`;
 
     if (Buffer.byteLength(body + entry + reserve, 'utf8') <= REVIEW_BODY_MAX_BYTES) {
       body += entry;
@@ -77,6 +81,8 @@ if (unanchored.length) {
     body += `\n\n_${omitted} additional unanchored finding${omitted === 1 ? '' : 's'} omitted because the GitHub review body reached its safe size limit._`;
   }
 }
+
+body += `\n\n${sourceMarker}`;
 
 if (Buffer.byteLength(body, 'utf8') > REVIEW_BODY_MAX_BYTES) {
   throw new Error('Internal error: constructed GitHub review body exceeds safe size limit');
@@ -190,6 +196,10 @@ async function githubJson(url, init = {}) {
   }
 
   return response.json();
+}
+
+function sourceCommentMarker(commentId) {
+  return `<!-- claude-review-source-comment:${String(commentId)} -->`;
 }
 
 function escapeHtml(text) {
