@@ -50,8 +50,8 @@ export default {
 
     if (payload.action !== 'created') return json({ ignored: true, reason: 'not a created comment' });
     if (!payload.issue?.pull_request) return json({ ignored: true, reason: 'comment is not on a pull request' });
-    if (String(payload.comment?.body ?? '').trim().toLowerCase() !== '@claude review') {
-      return json({ ignored: true, reason: 'not @claude review' });
+    if (String(payload.comment?.body ?? '') !== '@claude review') {
+      return json({ ignored: true, reason: 'not exact @claude review' });
     }
 
     const installationId = payload.installation?.id;
@@ -80,6 +80,14 @@ export default {
 
     const pr = await githubApi(`/repos/${targetRepo}/pulls/${prNumber}`, { token: targetToken });
     if (pr.state !== 'open') return json({ ignored: true, reason: 'pull request is not open' });
+
+    // Fast path for normal GitHub redeliveries: if this source comment already
+    // produced a review, acknowledge the webhook without dispatching another run.
+    // The central workflow repeats this check under concurrency to close the race
+    // between two near-simultaneous redeliveries.
+    if (await hasPublishedReviewForComment(targetRepo, prNumber, commentId, targetToken)) {
+      return json({ ignored: true, reason: 'source comment already reviewed' });
+    }
 
     const controlRepo = env.CONTROL_REPO || 'Jiaze-Li/claude-review-bot';
     const controlWorkflow = env.CONTROL_WORKFLOW || 'review.yml';
@@ -164,6 +172,21 @@ async function createInstallationToken(installationId, appJwt) {
   });
   if (!result.token) throw new Error('GitHub did not return an installation token');
   return result.token;
+}
+
+async function hasPublishedReviewForComment(targetRepo, prNumber, commentId, token) {
+  const marker = sourceCommentMarker(commentId);
+  for (let page = 1; page <= 100; page += 1) {
+    const reviews = await githubApi(`/repos/${targetRepo}/pulls/${prNumber}/reviews?per_page=100&page=${page}`, { token });
+    if (!Array.isArray(reviews)) throw new Error('GitHub pull request reviews response was not an array');
+    if (reviews.some((review) => typeof review.body === 'string' && review.body.includes(marker))) return true;
+    if (reviews.length < 100) return false;
+  }
+  throw new Error('Pull request review pagination exceeded safety limit');
+}
+
+function sourceCommentMarker(commentId) {
+  return `<!-- claude-review-source-comment:${String(commentId)} -->`;
 }
 
 async function githubApi(path, { method = 'GET', token, body, expectNoContent = false } = {}) {
