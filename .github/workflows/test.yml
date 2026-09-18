@@ -1,0 +1,25 @@
+name: Deterministic trigger and status tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      # Tests use only Node built-ins and mocked GitHub calls. No Claude quota,
+      # installation tokens, npm dependency installation or Cloudflare access.
+      - run: npm test
+      - run: node --check worker/src/index.js && node --check scripts/review-status.mjs

@@ -1,3 +1,5 @@
+import { isReviewTrigger } from './review-trigger.js';
+
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 const API_VERSION = '2022-11-28';
@@ -50,8 +52,8 @@ export default {
 
     if (payload.action !== 'created') return json({ ignored: true, reason: 'not a created comment' });
     if (!payload.issue?.pull_request) return json({ ignored: true, reason: 'comment is not on a pull request' });
-    if (String(payload.comment?.body ?? '') !== '@claude review') {
-      return json({ ignored: true, reason: 'not exact @claude review' });
+    if (!isReviewTrigger(payload.comment?.body)) {
+      return json({ ignored: true, reason: 'first nonblank line is not a review command' });
     }
 
     const installationId = payload.installation?.id;

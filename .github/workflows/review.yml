@@ -187,6 +187,7 @@ jobs:
           git -C target diff --no-ext-diff --no-textconv --stat "$merge_base" "$HEAD_SHA" > .review-context/diff-stat.txt
 
       - name: Materialize safe read-only source snapshot
+        id: snapshot
         if: steps.dedupe.outputs.duplicate != 'true'
         shell: bash
         env:
@@ -198,6 +199,23 @@ jobs:
           set -euo pipefail
           node scripts/materialize-safe-tree.mjs
           rm -rf -- target
+
+      # This is a real run, not a webhook receipt or another App's reaction.
+      # PR comment writes use the existing pull-requests:write permission.
+      - name: Announce verified workflow start
+        id: review-status
+        if: steps.dedupe.outputs.duplicate != 'true' && steps.snapshot.outcome == 'success'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          SOURCE_COMMENT_ID: ${{ inputs.source_comment_id }}
+          DUPLICATE: ${{ steps.dedupe.outputs.duplicate }}
+          PREFLIGHT_OUTCOME: ${{ steps.snapshot.outcome }}
+          STATUS_STAGE: started
+        run: node scripts/review-status.mjs
 
       - name: Run Claude with host-enforced read-only policy
         if: steps.dedupe.outputs.duplicate != 'true'
@@ -213,6 +231,7 @@ jobs:
         run: node scripts/run-review.mjs
 
       - name: Publish GitHub PR Review
+        id: publish
         if: steps.dedupe.outputs.duplicate != 'true'
         shell: bash
         env:
@@ -224,3 +243,17 @@ jobs:
           SOURCE_COMMENT_ID: ${{ inputs.source_comment_id }}
           REVIEW_PATH: .review-context/review.json
         run: node scripts/publish-review.mjs
+
+      - name: Finalize workflow status
+        if: always() && steps.review-status.outputs.comment_id != ''
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          SOURCE_COMMENT_ID: ${{ inputs.source_comment_id }}
+          STATUS_STAGE: finished
+          STATUS_COMMENT_ID: ${{ steps.review-status.outputs.comment_id }}
+          PUBLISH_OUTCOME: ${{ steps.publish.outcome }}
+        run: node scripts/review-status.mjs

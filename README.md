@@ -10,6 +10,68 @@ Goal: install one GitHub App once, then use the same command in any authorized r
 
 The comment is only a trigger. Claude reviews the actual PR diff and the checked-out repository code, then the bot publishes a GitHub PR Review back to that PR.
 
+## Trigger format and trustworthy status
+
+Use the dedicated command to distinguish this App from the separate official Claude App:
+
+```text
+@jiaze-claude-review-bot review
+```
+
+`@claude review` remains a compatible alias. The first nonblank line must contain
+only the command. Matching ignores case, allows extra spaces/tabs between the
+mention and `review`, trailing spaces/tabs, surrounding blank lines, CRLF, and
+up to three leading spaces. Additional text on later lines is tolerated.
+For example:
+
+```text
+@claude   review
+
+Additional comment text can follow.
+```
+
+The comment remains only a trigger: extra text is not forwarded as reviewer
+instructions. Put binding requirements in the PR description/repository contract;
+the reviewer still inspects the actual exact-HEAD code and diff. Quoted commands,
+fenced/indented code, lists, mid-prose mentions, and edited comments do not trigger.
+Use a new comment to request another review; duplicate delivery of the same
+comment retains the existing deduplication behavior.
+
+This App never adds an eyes reaction on webhook receipt. Only after the central
+workflow has actually started, passed deduplication and exact-HEAD preflight does
+it post **Self-hosted Claude review**, with the run URL, attempt, source comment,
+and target HEAD. The same status comment is updated after publication or failure
+when workflow cleanup runs. If the runner is forcibly stopped or the status API
+fails, follow the run URL for the authoritative outcome; a start notice is not a
+completion certificate. Status is best-effort and never converts a failed review
+into success. It uses the existing Pull requests write permission, without giving
+Claude the GitHub token or requiring Issues write permission.
+
+An eyes reaction from `claude[bot]` belongs to the separate official App, not
+`jiaze-claude-review-bot[bot]`. This repository cannot prevent that other App from
+reacting. Prefer the dedicated command, or remove this repository from the
+**official Claude App's** repository access while keeping the self-hosted App
+installed. Do not use another App's reaction as proof that this workflow ran.
+
+### Deploying a trigger change
+
+A GitHub commit updates the central workflow, but does not by itself prove the
+Cloudflare webhook Worker is running new code. Redeploy the existing Worker from
+the updated checkout (preserving its existing secrets):
+
+```bash
+npm test
+cd worker
+npm ci
+npm run deploy
+```
+
+After deployment, use one fresh supported command on a PR and verify the matching
+source-comment ID in the real central run and its bot-authored status. The new
+`test.yml` workflow runs deterministic trigger/status tests without Claude calls
+or Cloudflare deployment. No deployment or App installation is changed by those
+tests.
+
 ## What V1 does
 
 - Listens for `@claude review` on pull requests through one GitHub App.
