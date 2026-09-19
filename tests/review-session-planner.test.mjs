@@ -105,3 +105,16 @@ test('planner ignores pending state from another author',async()=>{
   });
   assert.equal(plan.decision.mode,'discovery');
 });
+
+
+test('explicit reset ignores a recoverable pending review and starts fresh discovery',async()=>{
+  const pending=applyDiscoveryResult({result:{summary:'clean',findings:[]},baseSha:BASE,headSha:A,sourceCommentId:'11'});
+  const plan=await planSession({
+    env:env({REQUESTED_MODE:'reset'}),
+    fetchImpl:fetchState({reviews:[{
+      id:50,user:{login:author},body:'review body\n'+pendingSessionMarker(pending,'11'),
+    }]}),
+  });
+  assert.equal(plan.decision.mode,'discovery');
+  assert.equal(plan.decision.reason,'explicit reset');
+});
