@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHmac, generateKeyPairSync } from 'node:crypto';
-import { isReviewTrigger } from '../worker/src/review-trigger.js';
+import { isReviewTrigger, parseReviewTrigger } from '../worker/src/review-trigger.js';
 import worker from '../worker/src/index.js';
 
 for (const body of [
@@ -10,6 +10,7 @@ for (const body of [
   '\r\n @claude review \r\n\r\nInspect the actual diff.',
   '@claude review\n\nReview exact HEAD and regression tests.',
   '@jiaze-claude-review-bot review', '@JIAZE-CLAUDE-REVIEW-BOT REVIEW\nDetails.',
+  '@jiaze-claude-review-bot claude review', '@jiaze-claude-review-bot reset review',
   '   @claude review\t ',
 ]) {
   test(`accepts standalone leading command: ${JSON.stringify(body)}`, () => {
@@ -23,12 +24,20 @@ for (const body of [
   '```text\n@claude review\n```', '~~~\n@claude review\n~~~',
   '    @claude review', '\t@claude review',
   '@claude reviewer', '@claude review-all', '@claude review please',
+  '@jiaze-claude-review-bot gemini review', '@jiaze-claude-review-bot review please',
   '@claude\nreview', '@other review', '<!--\n@claude review\n-->',
 ]) {
   test(`rejects non-command or quoted command: ${JSON.stringify(body)}`, () => {
     assert.equal(isReviewTrigger(body), false);
   });
 }
+
+test('dedicated command maps to auto mode while Claude aliases remain explicit', () => {
+  assert.deepEqual(parseReviewTrigger('@jiaze-claude-review-bot review'), { requestedMode: 'auto' });
+  assert.deepEqual(parseReviewTrigger('@jiaze-claude-review-bot reset review'), { requestedMode: 'reset' });
+  assert.deepEqual(parseReviewTrigger('@jiaze-claude-review-bot claude review'), { requestedMode: 'claude' });
+  assert.deepEqual(parseReviewTrigger('@claude review'), { requestedMode: 'claude' });
+});
 
 const secret = 'synthetic-test-webhook-secret';
 const { privateKey } = generateKeyPairSync('rsa', {
@@ -90,6 +99,7 @@ for (const body of ['@claude review\n\nFocus on the runtime evidence.', '\n @jia
       ref: 'main', inputs: {
         target_repo: 'acme/project', pr_number: '7', base_sha: 'b'.repeat(40),
         head_sha: 'a'.repeat(40), trigger_user: 'maintainer', source_comment_id: '99',
+        requested_mode: body.includes('@claude review') && !body.includes('@jiaze-claude-review-bot') ? 'claude' : 'auto',
       },
     });
     assert.equal(calls.some((call) => /comments|reactions/.test(call.pathname)), false);
