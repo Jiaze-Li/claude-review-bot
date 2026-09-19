@@ -12,11 +12,11 @@ const findingSchema={
   additionalProperties:false,
   properties:{
     severity:{type:'string',enum:['P0','P1','P2','P3']},
-    title:{type:'string',maxLength:240},
-    body:{type:'string',maxLength:1600},
-    path:{type:'string',maxLength:600},
+    title:{type:'string',maxLength:200},
+    body:{type:'string',maxLength:1200},
+    path:{type:'string',maxLength:500},
     line:{type:['integer','null'],minimum:1},
-    riskClass:{type:'string',maxLength:80},
+    riskClass:{type:'string',maxLength:60},
   },
   required:['severity','title','body','path','line','riskClass'],
 };
@@ -39,15 +39,15 @@ ${prJson}
       prompt:`${common}
 This is the ONE broad discovery pass for this review session. You may discover new material issues in the PR diff.
 Do not try to exhaust every natural-language synonym or redesign intentionally documented scope limitations.
-Return at most 8 findings.
+Return at most 6 findings.
 
 PR diff with context:
 ${diff}`,
       schema:{
         type:'object',additionalProperties:false,
         properties:{
-          summary:{type:'string',maxLength:2500},
-          findings:{type:'array',maxItems:8,items:findingSchema},
+          summary:{type:'string',maxLength:1500},
+          findings:{type:'array',maxItems:6,items:findingSchema},
         },
         required:['summary','findings'],
       },
@@ -73,16 +73,16 @@ ${diff}`,
     schema:{
       type:'object',additionalProperties:false,
       properties:{
-        summary:{type:'string',maxLength:2500},
+        summary:{type:'string',maxLength:1500},
         verifications:{
           type:'array',maxItems:16,
           items:{type:'object',additionalProperties:false,properties:{
             findingId:{type:'string',maxLength:32},
             status:{type:'string',enum:['FIXED','STILL_OPEN','UNCERTAIN']},
-            reason:{type:'string',maxLength:1200},
+            reason:{type:'string',maxLength:800},
           },required:['findingId','status','reason']},
         },
-        findings:{type:'array',maxItems:5,items:findingSchema},
+        findings:{type:'array',maxItems:3,items:findingSchema},
       },
       required:['summary','verifications','findings'],
     },
