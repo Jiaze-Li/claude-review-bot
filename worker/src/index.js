@@ -1,4 +1,4 @@
-import { isReviewTrigger } from './review-trigger.js';
+import { parseReviewTrigger } from './review-trigger.js';
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -52,7 +52,8 @@ export default {
 
     if (payload.action !== 'created') return json({ ignored: true, reason: 'not a created comment' });
     if (!payload.issue?.pull_request) return json({ ignored: true, reason: 'comment is not on a pull request' });
-    if (!isReviewTrigger(payload.comment?.body)) {
+    const reviewCommand = parseReviewTrigger(payload.comment?.body);
+    if (!reviewCommand) {
       return json({ ignored: true, reason: 'first nonblank line is not a review command' });
     }
 
@@ -118,6 +119,7 @@ export default {
           head_sha: pr.head.sha,
           trigger_user: triggerUser,
           source_comment_id: String(commentId),
+          requested_mode: reviewCommand.requestedMode,
         },
       },
       expectNoContent: true,
@@ -127,6 +129,7 @@ export default {
       accepted: true,
       target: `${targetRepo}#${prNumber}`,
       head_sha: pr.head.sha,
+      requested_mode: reviewCommand.requestedMode,
     }, 202);
   },
 };
@@ -179,14 +182,14 @@ async function createInstallationToken(installationId, appJwt) {
 }
 
 async function hasPublishedReviewForComment(targetRepo, prNumber, commentId, expectedReviewAuthor, token) {
-  const marker = sourceCommentMarker(commentId);
+  const markers = sourceCommentMarkers(commentId);
   for (let page = 1; page <= 100; page += 1) {
     const reviews = await githubApi(`/repos/${targetRepo}/pulls/${prNumber}/reviews?per_page=100&page=${page}`, { token });
     if (!Array.isArray(reviews)) throw new Error('GitHub pull request reviews response was not an array');
     if (reviews.some((review) =>
       review?.user?.login === expectedReviewAuthor &&
       typeof review.body === 'string' &&
-      review.body.includes(marker))) {
+      markers.some((marker) => review.body.includes(marker)))) {
       return true;
     }
     if (reviews.length < 100) return false;
@@ -194,8 +197,12 @@ async function hasPublishedReviewForComment(targetRepo, prNumber, commentId, exp
   throw new Error('Pull request review pagination exceeded safety limit');
 }
 
-function sourceCommentMarker(commentId) {
-  return `<!-- claude-review-source-comment:${String(commentId)} -->`;
+function sourceCommentMarkers(commentId) {
+  const id = String(commentId);
+  return [
+    `<!-- jiaze-review-source-comment:${id} -->`,
+    `<!-- claude-review-source-comment:${id} -->`,
+  ];
 }
 
 async function githubApi(path, { method = 'GET', token, body, expectNoContent = false } = {}) {
