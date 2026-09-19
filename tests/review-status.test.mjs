@@ -115,6 +115,7 @@ test('bounded no-op final status explicitly says zero model quota', async () => 
     fetchImpl: fake.fetchImpl,
   });
   assert.match(fake.calls[0].body, /No model quota was spent/);
+  assert.match(fake.calls[0].body, /jiaze-review-source-comment:99/);
 });
 
 test('failed status write cannot invent a comment id or echo sensitive response content', async () => {
