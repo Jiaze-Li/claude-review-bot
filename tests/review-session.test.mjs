@@ -94,3 +94,50 @@ test('verification cannot invent finding IDs outside the open durable registry',
     findings:[],
   }}),/unknown or non-open finding id/);
 });
+
+
+test('target base-tip movement alone never spends another discovery call',()=>{
+  const NEW_BASE='e'.repeat(40);
+  const ready=applyDiscoveryResult({result:{summary:'clean',findings:[]},baseSha:BASE,headSha:A,sourceCommentId:'9'});
+  assert.equal(planReviewSession({session:ready,baseSha:NEW_BASE,headSha:A}).mode,'noop_ready');
+
+  const rework=applyDiscoveryResult({result:{summary:'bug',findings:[finding('P1')]},baseSha:BASE,headSha:A,sourceCommentId:'10'});
+  assert.equal(planReviewSession({session:rework,baseSha:NEW_BASE,headSha:A}).mode,'noop_waiting');
+  assert.equal(planReviewSession({session:rework,baseSha:NEW_BASE,headSha:B}).mode,'verification');
+});
+
+test('maximum accepted bounded session remains renderable through two verification rounds',()=>{
+  const text=(ch,n)=>ch.repeat(n);
+  const maxFinding=(i)=>({
+    severity:'P1',
+    title:text(String(i%10),200),
+    body:text('b',1200),
+    path:'src/'+text('p',480)+i+'.js',
+    line:i+1,
+    riskClass:text('r',60),
+  });
+  let s=applyDiscoveryResult({
+    result:{summary:text('s',1500),findings:Array.from({length:6},(_,i)=>maxFinding(i))},
+    baseSha:BASE,headSha:A,sourceCommentId:'9',
+  });
+
+  const verify=(head,offset)=>({
+    session:s,
+    headSha:head,
+    result:{
+      summary:text('v',1500),
+      verifications:s.findings.filter(f=>f.status==='OPEN').map(f=>({
+        findingId:f.id,status:'STILL_OPEN',reason:text('q',800),
+      })),
+      findings:Array.from({length:3},(_,i)=>maxFinding(offset+i)),
+    },
+  });
+  s=applyVerificationResult(verify(B,10));
+  s=applyVerificationResult(verify(C,20));
+  assert.equal(s.status,'HUMAN_REQUIRED');
+  assert.equal(s.findings.length,12);
+  const body=renderSessionComment(s,{sourceCommentIds:['1','2']});
+  assert.ok(Buffer.byteLength(body,'utf8')<65536);
+  assert.match(body,/jiaze-review-source-comment:1/);
+  assert.match(body,/jiaze-review-source-comment:2/);
+});
