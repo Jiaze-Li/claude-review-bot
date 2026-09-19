@@ -62,7 +62,9 @@ function request(payload = basePayload, overrides = {}) {
     },
   });
 }
-function fakeGithub(t, { permission = 'write', state = 'open', duplicate = false, dispatchFails = false } = {}) {
+function fakeGithub(t, {
+  permission = 'write', state = 'open', duplicate = false, processedNoop = false, dispatchFails = false,
+} = {}) {
   const calls = [];
   t.mock.method(globalThis, 'fetch', async (url, options) => {
     const pathname = new URL(url).pathname;
@@ -79,6 +81,9 @@ function fakeGithub(t, { permission = 'write', state = 'open', duplicate = false
     else if (pathname === '/repos/acme/project/pulls/7') out = { state, head: { sha: 'a'.repeat(40) }, base: { sha: 'b'.repeat(40) } };
     else if (pathname.endsWith('/reviews')) out = duplicate
       ? [{ user: { login: 'jiaze-claude-review-bot[bot]' }, body: '<!-- claude-review-source-comment:99 -->' }]
+      : [];
+    else if (pathname === '/repos/acme/project/issues/7/comments') out = processedNoop
+      ? [{ user: { login: 'jiaze-claude-review-bot[bot]' }, body: '<!-- jiaze-review-source-comment:99 -->' }]
       : [];
     else if (pathname === '/repos/Jiaze-Li/claude-review-bot/installation') out = { id: 11 };
     else assert.fail(`Unexpected GitHub endpoint: ${method} ${pathname}`);
@@ -102,7 +107,7 @@ for (const body of ['@claude review\n\nFocus on the runtime evidence.', '\n @jia
         requested_mode: body.includes('@claude review') && !body.includes('@jiaze-claude-review-bot') ? 'claude' : 'auto',
       },
     });
-    assert.equal(calls.some((call) => /comments|reactions/.test(call.pathname)), false);
+    assert.equal(calls.some((call) => /comments|reactions/.test(call.pathname) && call.method !== 'GET'), false);
   });
 }
 for (const [name, payload, headers] of [
@@ -119,17 +124,19 @@ for (const [name, payload, headers] of [
     assert.equal(calls.length, 0);
   });
 }
-for (const options of [{ permission: 'read' }, { state: 'closed' }, { duplicate: true }]) {
+for (const options of [{ permission: 'read' }, { state: 'closed' }, { duplicate: true }, { processedNoop: true }]) {
   test(`ignored authorized-path trigger: ${JSON.stringify(options)}`, async (t) => {
     const calls = fakeGithub(t, options);
     const response = await worker.fetch(request(), env);
     assert.equal((await response.json()).ignored, true);
-    assert.equal(calls.some((call) => /dispatches|comments|reactions/.test(call.pathname)), false);
+    assert.equal(calls.some((call) =>
+      call.pathname.endsWith('/dispatches') ||
+      (/comments|reactions/.test(call.pathname) && call.method !== 'GET')), false);
   });
 }
 test('failed dispatch never returns accepted or posts a reaction/status', async (t) => {
   const calls = fakeGithub(t, { dispatchFails: true });
   await assert.rejects(worker.fetch(request(), env), /503/);
   assert.equal(calls.filter((call) => call.pathname.endsWith('/dispatches')).length, 1);
-  assert.equal(calls.some((call) => /comments|reactions/.test(call.pathname)), false);
+  assert.equal(calls.some((call) => /comments|reactions/.test(call.pathname) && call.method !== 'GET'), false);
 });
