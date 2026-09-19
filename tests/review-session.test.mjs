@@ -141,3 +141,33 @@ test('maximum accepted bounded session remains renderable through two verificati
   assert.match(body,/jiaze-review-source-comment:1/);
   assert.match(body,/jiaze-review-source-comment:2/);
 });
+
+
+test('Gemini may return a detailed finding while durable session stores a compact copy',()=>{
+  const detailed={
+    severity:'P1',
+    title:'Detailed bug',
+    body:'x'.repeat(2500),
+    path:'src/a.js',
+    line:10,
+    riskClass:'state-invariant',
+  };
+  const s=applyDiscoveryResult({
+    result:{summary:'s'.repeat(2500),findings:[detailed]},
+    baseSha:BASE,headSha:A,sourceCommentId:'9',
+  });
+  assert.equal(s.status,'REWORK');
+  assert.equal(s.findings[0].body.length,450);
+  assert.equal(s.lastSummary.length,500);
+});
+
+test('verification reason may be detailed while durable resolution is compacted',()=>{
+  let s=applyDiscoveryResult({result:{summary:'bug',findings:[finding('P1')]},baseSha:BASE,headSha:A,sourceCommentId:'9'});
+  s=applyVerificationResult({session:s,headSha:B,result:{
+    summary:'verification',
+    verifications:[{findingId:'F001',status:'STILL_OPEN',reason:'r'.repeat(1500)}],
+    findings:[],
+  }});
+  assert.equal(s.status,'REWORK');
+  assert.equal(s.findings[0].resolutionReason.length,600);
+});
