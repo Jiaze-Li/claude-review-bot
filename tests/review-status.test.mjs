@@ -106,6 +106,21 @@ for (const outcome of ['success', 'failure', 'cancelled', 'skipped', undefined])
   });
 }
 
+test('skipped final audit does not mask a successful Gemini publication', async () => {
+  const fake = fakeFetch();
+  await publishRunStatus({
+    env: {
+      ...baseEnv,
+      STATUS_STAGE: 'finished',
+      STATUS_COMMENT_ID: '5678',
+      GEMINI_PUBLISH_OUTCOME: 'success',
+      FINAL_AUDIT_PUBLISH_OUTCOME: 'skipped',
+    },
+    fetchImpl: fake.fetchImpl,
+  });
+  assert.match(fake.calls[0].body, /publication completed/);
+});
+
 test('bounded no-op final status explicitly says zero model quota', async () => {
   const fake = fakeFetch();
   await publishRunStatus({
