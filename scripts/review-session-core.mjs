@@ -149,7 +149,10 @@ export function renderSessionComment(session) {
       ? 'Push a repair, then comment `@jiaze-claude-review-bot review` again.'
       : 'Automatic review budget is exhausted. Use human judgment or a targeted Codex/Claude review; do not restart full discovery automatically.';
   const findingLines = open.length
-    ? open.slice(0, 8).map((finding) => `- ${finding.id} **${finding.severity}** — ${cleanInline(finding.title)}`)
+    ? open.slice(0, 8).flatMap((finding) => [
+      `- ${finding.id} **${finding.severity}** — ${cleanInline(finding.title)}`,
+      `  - ${cleanInline(finding.path)}${finding.line ? `:${finding.line}` : ''} — ${cleanInline(finding.body).slice(0, 800)}`,
+    ])
     : ['- none'];
   const state = encodeState(session);
   return [
@@ -260,6 +263,6 @@ function cleanInline(value) {
 
 function encodeState(session) {
   const json = JSON.stringify(session);
-  if (Buffer.byteLength(json, 'utf8') > 48_000) throw new Error('review session state exceeds 48KB');
+  if (Buffer.byteLength(json, 'utf8') > 32_000) throw new Error('review session state exceeds 32KB');
   return Buffer.from(json, 'utf8').toString('base64url');
 }
