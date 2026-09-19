@@ -102,7 +102,7 @@ const result = await githubJson(`https://api.github.com/repos/${owner}/${repo}/p
   body: JSON.stringify(payload),
 });
 
-console.log(`Published Claude review ${result.html_url ?? result.id} with ${inlineComments.length} inline comment(s).`);
+console.log(`Published explicit Claude review ${result.html_url ?? result.id} with ${inlineComments.length} inline comment(s).`);
 
 function validateReview(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -261,7 +261,7 @@ async function githubJson(url, init = {}) {
 }
 
 function sourceCommentMarker(commentId) {
-  return `<!-- claude-review-source-comment:${String(commentId)} -->`;
+  return `<!-- jiaze-review-source-comment:${String(commentId)} -->`;
 }
 
 function escapeHtml(text) {
