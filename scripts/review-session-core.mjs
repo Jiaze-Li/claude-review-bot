@@ -43,7 +43,7 @@ export function applyDiscoveryResult({
   let nextFindingNumber = 1;
   const findings = normalized.findings.map((finding) => ({
     id: findingId(nextFindingNumber++),
-    ...finding,
+    ...compactFinding(finding),
     status: MATERIAL_SEVERITIES.has(finding.severity) ? 'OPEN' : 'DEFERRED',
     origin: 'DISCOVERY',
     introducedHead: headSha,
@@ -63,7 +63,7 @@ export function applyDiscoveryResult({
     nextFindingNumber,
     findings,
     acceptedRiskClasses: [],
-    lastSummary: normalized.summary,
+    lastSummary: compactText(normalized.summary, 800),
     updatedAt: now,
   };
 }
@@ -96,13 +96,13 @@ export function applyVerificationResult({
         ...finding,
         status: 'FIXED',
         lastCheckedHead: headSha,
-        resolutionReason: verdict.reason,
+        resolutionReason: compactText(verdict.reason, 600),
       };
     }
     return {
       ...finding,
       lastCheckedHead: headSha,
-      resolutionReason: verdict.reason,
+      resolutionReason: compactText(verdict.reason, 600),
     };
   });
 
@@ -110,7 +110,7 @@ export function applyVerificationResult({
   for (const finding of normalized.findings) {
     findings.push({
       id: findingId(nextFindingNumber++),
-      ...finding,
+      ...compactFinding(finding),
       status: MATERIAL_SEVERITIES.has(finding.severity) ? 'OPEN' : 'DEFERRED',
       origin: 'REPAIR_REGRESSION',
       introducedHead: headSha,
@@ -135,7 +135,7 @@ export function applyVerificationResult({
     maxVerificationRounds: MAX_VERIFICATION_ROUNDS,
     nextFindingNumber,
     findings,
-    lastSummary: normalized.summary,
+    lastSummary: compactText(normalized.summary, 800),
     updatedAt: now,
   };
 }
@@ -193,16 +193,16 @@ export function parseSessionComment(body) {
 
 export function normalizeReviewResult(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('review result must be an object');
-  const summary = checkedText(value.summary, 2500, 'summary');
-  if (!Array.isArray(value.findings) || value.findings.length > 8) throw new Error('findings must be an array with at most 8 entries');
+  const summary = checkedText(value.summary, 1500, 'summary');
+  if (!Array.isArray(value.findings) || value.findings.length > 6) throw new Error('findings must be an array with at most 6 entries');
   return { summary, findings: value.findings.map(normalizeFinding) };
 }
 
 export function normalizeVerificationResult(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('verification result must be an object');
-  const summary = checkedText(value.summary, 2500, 'summary');
+  const summary = checkedText(value.summary, 1500, 'summary');
   if (!Array.isArray(value.verifications) || value.verifications.length > 16) throw new Error('verifications must be an array with at most 16 entries');
-  if (!Array.isArray(value.findings) || value.findings.length > 5) throw new Error('repair findings must be an array with at most 5 entries');
+  if (!Array.isArray(value.findings) || value.findings.length > 3) throw new Error('repair findings must be an array with at most 3 entries');
   const seen = new Set();
   const verifications = value.verifications.map((entry) => {
     if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw new Error('verification entry must be an object');
@@ -214,7 +214,7 @@ export function normalizeVerificationResult(value) {
     return {
       findingId: findingIdValue,
       status,
-      reason: checkedText(entry.reason, 1200, 'verification reason'),
+      reason: checkedText(entry.reason, 800, 'verification reason'),
     };
   });
   return { summary, verifications, findings: value.findings.map(normalizeFinding) };
@@ -224,17 +224,17 @@ function normalizeFinding(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('finding must be an object');
   const severity = String(value.severity ?? '').trim().toUpperCase();
   if (!['P0', 'P1', 'P2', 'P3'].includes(severity)) throw new Error('invalid finding severity');
-  const path = checkedText(value.path, 600, 'finding path');
+  const path = checkedText(value.path, 500, 'finding path');
   if (path.startsWith('/') || path.split('/').includes('..')) throw new Error('finding path must be repository-relative');
   const line = value.line == null ? null : value.line;
   if (line !== null && (!Number.isInteger(line) || line < 1)) throw new Error('finding line must be null or a positive integer');
   return {
     severity,
-    title: checkedText(value.title, 240, 'finding title'),
-    body: checkedText(value.body, 1600, 'finding body'),
+    title: checkedText(value.title, 200, 'finding title'),
+    body: checkedText(value.body, 1200, 'finding body'),
     path,
     line,
-    riskClass: checkedText(value.riskClass ?? 'uncategorized', 80, 'riskClass'),
+    riskClass: checkedText(value.riskClass ?? 'uncategorized', 60, 'riskClass'),
   };
 }
 
@@ -246,6 +246,20 @@ function validateSession(session) {
   checkedSha(session.lastReviewedHead, 'session.lastReviewedHead');
   if (!['READY', 'REWORK', 'HUMAN_REQUIRED'].includes(session.status)) throw new Error('invalid review session status');
   if (!Array.isArray(session.findings) || session.findings.length > 64) throw new Error('invalid review session findings');
+}
+
+function compactFinding(finding) {
+  return {
+    ...finding,
+    title: compactText(finding.title, 180),
+    body: compactText(finding.body, 600),
+    path: compactText(finding.path, 400),
+    riskClass: compactText(finding.riskClass, 60),
+  };
+}
+
+function compactText(value, max) {
+  return String(value ?? '').replace(/[\r\n]+/g, ' ').trim().slice(0, max);
 }
 
 function findingId(number) {
@@ -269,6 +283,6 @@ function cleanInline(value) {
 
 function encodeState(session) {
   const json = JSON.stringify(session);
-  if (Buffer.byteLength(json, 'utf8') > 32_000) throw new Error('review session state exceeds 32KB');
+  if (Buffer.byteLength(json, 'utf8') > 24_000) throw new Error('review session state exceeds 24KB');
   return Buffer.from(json, 'utf8').toString('base64url');
 }
