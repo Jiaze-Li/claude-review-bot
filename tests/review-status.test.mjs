@@ -146,11 +146,12 @@ test('v2 workflow isolates provider credentials and serializes durable PR sessio
   const started = yml.indexOf('- name: Announce verified workflow start');
   const recover = yml.indexOf('- name: Recover published session without model spend');
   const gemini = yml.indexOf('- name: Run Gemini bounded review');
+  const validator = yml.indexOf('- name: Validate Gemini material findings');
   const publishGemini = yml.indexOf('- name: Publish Gemini review and durable session');
   const claude = yml.indexOf('- name: Run Claude explicit deep review');
   const finished = yml.indexOf('- name: Finalize workflow status');
 
-  assert.ok(context < plan && plan < started && started < recover && recover < gemini && gemini < publishGemini && publishGemini < claude && claude < finished);
+  assert.ok(context < plan && plan < started && started < recover && recover < gemini && gemini < validator && validator < publishGemini && publishGemini < claude && claude < finished);
   assert.match(yml, /group: independent-review-\$\{\{ inputs\.target_repo \}\}-\$\{\{ inputs\.pr_number \}\}/);
   assert.match(yml, /GEMINI_API_KEY: \$\{\{ secrets\.GEMINI_API_KEY \}\}/);
   const recoverBlock = yml.slice(recover, gemini);
@@ -158,6 +159,9 @@ test('v2 workflow isolates provider credentials and serializes durable PR sessio
   assert.match(yml, /CLAUDE_CODE_OAUTH_TOKEN: \$\{\{ secrets\.CLAUDE_CODE_OAUTH_TOKEN \}\}/);
   const geminiBlock = yml.slice(gemini, publishGemini);
   assert.doesNotMatch(geminiBlock, /GH_TOKEN|app-token\.outputs\.token/);
+  const validatorBlock = yml.slice(validator, publishGemini);
+  assert.match(validatorBlock, /thinkingLevel|validate-gemini-findings|TARGET_REPO_DIR: target/);
+  assert.doesNotMatch(validatorBlock, /GH_TOKEN|app-token\.outputs\.token/);
   const publishClaude = yml.indexOf('- name: Publish Claude explicit deep review');
   const claudeBlock = yml.slice(claude, publishClaude);
   assert.doesNotMatch(claudeBlock, /GH_TOKEN|app-token\.outputs\.token/);
