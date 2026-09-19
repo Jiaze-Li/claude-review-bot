@@ -84,3 +84,13 @@ test('session comment round-trips durable hidden state',()=>{
   assert.deepEqual(parseSessionComment(body),s);
   assert.equal(parseSessionComment('ordinary comment'),null);
 });
+
+
+test('verification cannot invent finding IDs outside the open durable registry', () => {
+  const s=applyDiscoveryResult({result:{summary:'bug',findings:[finding('P1')]},baseSha:BASE,headSha:A,sourceCommentId:'9'});
+  assert.throws(()=>applyVerificationResult({session:s,headSha:B,result:{
+    summary:'bad id',
+    verifications:[{findingId:'F999',status:'FIXED',reason:'invented'}],
+    findings:[],
+  }}),/unknown or non-open finding id/);
+});
