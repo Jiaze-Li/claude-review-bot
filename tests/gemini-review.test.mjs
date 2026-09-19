@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildGeminiRequest, runGeminiReview } from '../scripts/run-gemini-review.mjs';
+import { buildGeminiRequest, runGeminiReview, toGeminiJsonSchema } from '../scripts/run-gemini-review.mjs';
 import { applyDiscoveryResult } from '../scripts/review-session-core.mjs';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -43,10 +43,31 @@ test('Gemini runner sends low thinking and structured schema',async()=>{
   });
   assert.match(request.url,/gemini-3\.8-flash:generateContent$/);
   assert.equal(request.body.generationConfig.thinkingConfig.thinkingLevel,'low');
-  assert.equal(request.body.generationConfig.responseMimeType,'application/json');
-  assert.ok(request.body.generationConfig.responseSchema);
+  assert.equal(request.body.generationConfig.responseFormat.text.mimeType,'APPLICATION_JSON');
+  assert.ok(request.body.generationConfig.responseFormat.text.schema);
+  assert.equal('maxLength' in request.body.generationConfig.responseFormat.text.schema.properties.summary,false);
   assert.equal(request.body.generationConfig.maxOutputTokens,16384);
   assert.equal(result._meta.effort,'low');
   assert.equal(result._meta.usage.total_tokens,130);
   assert.equal(request.headers['x-goog-api-key'],'secret');
+});
+
+
+test('Gemini JSON-schema adapter strips unsupported length keywords but preserves object constraints',()=>{
+  const out=toGeminiJsonSchema({
+    type:'object',additionalProperties:false,maxLength:99,
+    properties:{
+      name:{type:'string',maxLength:20},
+      line:{type:['integer','null'],minimum:1},
+    },
+    required:['name','line'],
+  });
+  assert.deepEqual(out,{
+    type:'object',additionalProperties:false,
+    properties:{
+      name:{type:'string'},
+      line:{type:['integer','null'],minimum:1},
+    },
+    required:['name','line'],
+  });
 });
