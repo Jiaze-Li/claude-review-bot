@@ -125,31 +125,52 @@ tests.
 ## Architecture
 
 ```text
-PR comment: @claude review
+PR comment: @jiaze-claude-review-bot review
         |
         v
-GitHub App webhook
+GitHub App webhook / Cloudflare Worker
         |
         v
-Cloudflare Worker (small router)
+review-v2.yml (serialized per PR)
+        |
+        +--> exact-HEAD preflight + PR diff
+        +--> restore durable review session
+        +--> choose automatically:
+        |      Gemini discovery
+        |      Gemini verification
+        |      no-op / HUMAN_REQUIRED
+        |
+        +--> exact-HEAD publisher
+        +--> update durable session comment
         |
         v
-this repo: review.yml
-        |
-        +--> checkout exact target PR SHA
-        +--> build diff/context
-        +--> Claude Code review
-        +--> deterministic publisher
-        |
-        v
-GitHub PR Review
+READY / REWORK / HUMAN_REQUIRED
 ```
+
+The provider is an implementation detail. The session policy, stable finding IDs,
+round budget, and GitHub publication are separate from the Gemini/Claude adapters.
+A future ReviewLoop integration should call this service through one thin review
+interface rather than embedding provider-specific logic in ReviewLoop core.
 
 ## Review cost controls
 
-The reviewer intentionally uses the Claude Code `sonnet` model alias rather than a version-pinned model ID. That keeps the reviewer on the current Sonnet generation as Claude Code updates its alias.
+Default automatic review:
 
-The trusted runner currently sets:
+```text
+model: gemini-3.8-flash
+thinking: low
+discovery passes: 1
+verification passes: max 2
+P3: non-blocking
+same HEAD: no model call
+```
+
+Gemini receives bounded textual context rather than repository tools. Discovery
+uses the exact PR diff; verification uses only the repair diff plus durable open
+findings. The request has a hard output/thinking-token ceiling and the publisher
+fails closed on malformed output or a moved PR HEAD.
+
+Claude remains an explicit deep-review escape hatch:
 
 ```text
 model: sonnet
@@ -157,7 +178,9 @@ effort: medium
 maxTurns: 24
 ```
 
-`medium` effort reduces reasoning and tool-call token use relative to the default high effort. The turn ceiling prevents unusually large PRs from exploring indefinitely. Each successful review records the resolved model and the SDK-reported input, cache, output, and turn usage so expensive reviews can be identified from the PR itself.
+It is not part of the normal automatic loop, preserving Claude quota for Worker
+tasks. Codex is also not called automatically; use targeted escalation only after
+the bounded session reaches HUMAN_REQUIRED.
 
 ## One-time setup
 
@@ -223,7 +246,10 @@ On a PR in any repository covered by the GitHub App, add:
 @jiaze-claude-review-bot review
 ```
 
-Expected behavior: a central workflow starts in this repository and a Claude PR Review appears on the original PR.
+Expected behavior: the first call runs a Gemini discovery review and creates an
+**Independent Review Session** comment. If material findings exist, push a repair
+and use the same command again; it automatically runs targeted verification.
+The session eventually reaches READY or HUMAN_REQUIRED and does not loop forever.
 
 ## Security model
 
