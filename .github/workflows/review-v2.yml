@@ -95,19 +95,40 @@ jobs:
           set -euo pipefail
           marker_new="<!-- jiaze-review-source-comment:${SOURCE_COMMENT_ID} -->"
           marker_old="<!-- claude-review-source-comment:${SOURCE_COMMENT_ID} -->"
+
           for page in $(seq 1 100); do
             reviews="$(gh api "repos/${TARGET_REPO}/pulls/${PR_NUMBER}/reviews?per_page=100&page=${page}")"
-            if jq -e --arg m1 "$marker_new" --arg m2 "$marker_old" --arg author "$EXPECTED_REVIEW_AUTHOR"               'any(.[]; (.user.login == $author) and (((.body // "") | contains($m1)) or ((.body // "") | contains($m2))))'               <<<"$reviews" >/dev/null; then
+            if jq -e --arg m1 "$marker_new" --arg m2 "$marker_old" --arg author "$EXPECTED_REVIEW_AUTHOR" \
+              'any(.[]; (.user.login == $author) and (((.body // "") | contains($m1)) or ((.body // "") | contains($m2))))' \
+              <<<"$reviews" >/dev/null; then
               echo "duplicate=true" >> "$GITHUB_OUTPUT"
               exit 0
             fi
             count="$(jq 'length' <<<"$reviews")"
             if (( count < 100 )); then
+              break
+            fi
+            if (( page == 100 )); then
+              echo "Pull request review pagination exceeded safety limit" >&2
+              exit 1
+            fi
+          done
+
+          for page in $(seq 1 100); do
+            comments="$(gh api "repos/${TARGET_REPO}/issues/${PR_NUMBER}/comments?per_page=100&page=${page}")"
+            if jq -e --arg m1 "$marker_new" --arg m2 "$marker_old" --arg author "$EXPECTED_REVIEW_AUTHOR" \
+              'any(.[]; (.user.login == $author) and (((.body // "") | contains($m1)) or ((.body // "") | contains($m2))))' \
+              <<<"$comments" >/dev/null; then
+              echo "duplicate=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            count="$(jq 'length' <<<"$comments")"
+            if (( count < 100 )); then
               echo "duplicate=false" >> "$GITHUB_OUTPUT"
               exit 0
             fi
           done
-          echo "Pull request review pagination exceeded safety limit" >&2
+          echo "Pull request comment pagination exceeded safety limit" >&2
           exit 1
 
       - name: Checkout exact PR head temporarily
