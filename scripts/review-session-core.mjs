@@ -6,7 +6,10 @@ export function planReviewSession({ session = null, baseSha, headSha, reset = fa
   checkedSha(baseSha, 'baseSha');
   checkedSha(headSha, 'headSha');
 
-  if (reset || !session || session.version !== SESSION_VERSION || session.baseSha !== baseSha) {
+  // A moving target-branch tip is not new PR evidence by itself. The exact PR
+  // HEAD and repair delta drive review progress; baseSha is retained as audit
+  // metadata from discovery, not as a reason to spend another discovery call.
+  if (reset || !session || session.version !== SESSION_VERSION) {
     return { mode: 'discovery', previousHead: null, reason: reset ? 'explicit reset' : 'new review session' };
   }
 
@@ -145,7 +148,7 @@ export function openMaterialFindings(session) {
   return session.findings.filter((finding) => finding.status === 'OPEN' && MATERIAL_SEVERITIES.has(finding.severity));
 }
 
-export function renderSessionComment(session) {
+export function renderSessionComment(session, { sourceCommentIds = [] } = {}) {
   validateSession(session);
   const open = openMaterialFindings(session);
   const verification = `${session.verificationRound ?? 0}/${session.maxVerificationRounds ?? MAX_VERIFICATION_ROUNDS}`;
@@ -160,9 +163,13 @@ export function renderSessionComment(session) {
       `  - ${cleanInline(finding.path)}${finding.line ? `:${finding.line}` : ''} — ${cleanInline(finding.body).slice(0, 800)}`,
     ])
     : ['- none'];
-  const state = encodeState(session);
+  const state = encodeSessionState(session);
+  const processedMarkers = [...new Set(sourceCommentIds.map(String).filter((id) => /^[1-9]\d*$/.test(id)))]
+    .slice(-8)
+    .map((id) => `<!-- jiaze-review-source-comment:${id} -->`);
   return [
     '<!-- jiaze-review-session:v1 -->',
+    ...processedMarkers,
     '### Independent Review Session',
     `Status: **${session.status}**`,
     `Default reviewer: **Gemini Flash / low thinking**`,
@@ -281,8 +288,28 @@ function cleanInline(value) {
   return String(value).replace(/[\r\n]+/g, ' ').replace(/<!--|-->/g, '').slice(0, 300);
 }
 
-function encodeState(session) {
+export function encodeSessionState(session) {
+  validateSession(session);
   const json = JSON.stringify(session);
   if (Buffer.byteLength(json, 'utf8') > 24_000) throw new Error('review session state exceeds 24KB');
   return Buffer.from(json, 'utf8').toString('base64url');
+}
+
+export function pendingSessionMarker(session, sourceCommentId) {
+  const id = String(sourceCommentId ?? '');
+  if (!/^[1-9]\d*$/.test(id)) throw new Error('invalid pending source comment id');
+  return `<!-- jiaze-review-pending-session:v1:${id}:${encodeSessionState(session)} -->`;
+}
+
+export function parsePendingSessionReview(body) {
+  if (typeof body !== 'string') return null;
+  const match = body.match(/<!-- jiaze-review-pending-session:v1:([1-9]\d*):([A-Za-z0-9_-]+) -->/);
+  if (!match) return null;
+  try {
+    const session = JSON.parse(Buffer.from(match[2], 'base64url').toString('utf8'));
+    validateSession(session);
+    return { sourceCommentId: match[1], session };
+  } catch {
+    return null;
+  }
 }
