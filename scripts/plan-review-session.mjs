@@ -42,7 +42,7 @@ export async function planSession({ env=process.env, fetchImpl=fetch }={}) {
     .filter(r=>r.pending && r.pending.session.lastReviewedHead===headSha)
     .sort((a,b)=>Number(b.reviewId)-Number(a.reviewId));
   const pending=pendingCandidates[0]??null;
-  if(pending && isPendingNewer(session,pending.pending.session)){
+  if(requested!=='reset' && pending && isPendingNewer(session,pending.pending.session)){
     return {
       requestedMode:requested,
       decision:{mode:'recover',previousHead:null,reason:'recover published review session without another model call'},
