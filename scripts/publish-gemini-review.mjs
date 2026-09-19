@@ -7,6 +7,7 @@ import {
   normalizeReviewResult,
   normalizeVerificationResult,
   openMaterialFindings,
+  pendingSessionMarker,
   renderSessionComment,
 } from './review-session-core.mjs';
 
@@ -43,7 +44,8 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
     session = applyVerificationResult({ session: plan.session, result: normalized, headSha });
   }
 
-  const sessionBody = renderSessionComment(session);
+  const sessionBody = renderSessionComment(session, { sourceCommentIds: [sourceCommentId] });
+  const pendingMarker = pendingSessionMarker(session, sourceCommentId);
   const addedLines = await loadAddedLines({ owner, repo, prNumber, token: env.GH_TOKEN, fetchImpl });
   const newFindings = mode === 'discovery'
     ? session.findings
@@ -83,7 +85,10 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
     body += '\n\nAutomatic review has stopped. Use human judgment or a targeted Codex/Claude review; do not start another full discovery automatically.';
   }
   body += formatRuntime(raw._meta);
-  body += '\n\n<!-- jiaze-review-source-comment:' + sourceCommentId + ' -->';
+  // This is intentionally NOT the processed-source marker. If durable session
+  // persistence fails after the review POST, a retry remains eligible and can
+  // recover this exact already-paid result without another Gemini call.
+  body += '\n\n' + pendingMarker;
   if (Buffer.byteLength(body, 'utf8') > REVIEW_BODY_MAX_BYTES) throw new Error('Constructed review body exceeds safe size limit');
 
   const review = await githubJson('https://api.github.com/repos/' + owner + '/' + repo + '/pulls/' + prNumber + '/reviews',
