@@ -1,0 +1,283 @@
+name: Central Independent PR Review
+run-name: Independent review ${{ inputs.target_repo }}#${{ inputs.pr_number }} comment ${{ inputs.source_comment_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_repo:
+        description: owner/repo containing the pull request
+        required: true
+        type: string
+      pr_number:
+        description: Pull request number
+        required: true
+        type: string
+      base_sha:
+        description: Exact PR base SHA captured by the webhook
+        required: true
+        type: string
+      head_sha:
+        description: Exact PR head SHA captured by the webhook
+        required: true
+        type: string
+      trigger_user:
+        description: GitHub login that requested the review
+        required: true
+        type: string
+      source_comment_id:
+        description: Trigger comment ID for traceability and idempotency
+        required: true
+        type: string
+      requested_mode:
+        description: auto, claude, or reset
+        required: true
+        default: auto
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  # Serialize one PR's durable review session. A second trigger waits for the
+  # first to publish state, then plans from that updated state.
+  group: independent-review-${{ inputs.target_repo }}-${{ inputs.pr_number }}
+  cancel-in-progress: false
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout trusted control repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Parse target repository
+        id: target
+        shell: bash
+        env:
+          TARGET_REPO: ${{ inputs.target_repo }}
+        run: |
+          set -euo pipefail
+          owner="${TARGET_REPO%%/*}"
+          repo="${TARGET_REPO#*/}"
+          if [[ -z "$owner" || -z "$repo" || "$owner" == "$repo" || "$repo" == */* ]]; then
+            echo "Invalid target_repo: $TARGET_REPO" >&2
+            exit 1
+          fi
+          echo "owner=$owner" >> "$GITHUB_OUTPUT"
+          echo "repo=$repo" >> "$GITHUB_OUTPUT"
+
+      - name: Create least-privilege GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ steps.target.outputs.owner }}
+          repositories: ${{ steps.target.outputs.repo }}
+          permission-contents: read
+          permission-pull-requests: write
+          permission-issues: read
+
+      - name: Check source comment idempotency
+        id: dedupe
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          SOURCE_COMMENT_ID: ${{ inputs.source_comment_id }}
+          EXPECTED_REVIEW_AUTHOR: ${{ steps.app-token.outputs.app-slug }}[bot]
+        run: |
+          set -euo pipefail
+          marker_new="<!-- jiaze-review-source-comment:${SOURCE_COMMENT_ID} -->"
+          marker_old="<!-- claude-review-source-comment:${SOURCE_COMMENT_ID} -->"
+          for page in $(seq 1 100); do
+            reviews="$(gh api "repos/${TARGET_REPO}/pulls/${PR_NUMBER}/reviews?per_page=100&page=${page}")"
+            if jq -e --arg m1 "$marker_new" --arg m2 "$marker_old" --arg author "$EXPECTED_REVIEW_AUTHOR"               'any(.[]; (.user.login == $author) and (((.body // "") | contains($m1)) or ((.body // "") | contains($m2))))'               <<<"$reviews" >/dev/null; then
+              echo "duplicate=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            count="$(jq 'length' <<<"$reviews")"
+            if (( count < 100 )); then
+              echo "duplicate=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+          echo "Pull request review pagination exceeded safety limit" >&2
+          exit 1
+
+      - name: Checkout exact PR head temporarily
+        if: steps.dedupe.outputs.duplicate != 'true'
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.target_repo }}
+          ref: ${{ inputs.head_sha }}
+          token: ${{ steps.app-token.outputs.token }}
+          fetch-depth: 1
+          path: target
+          persist-credentials: false
+
+      - name: Build exact PR review context
+        if: steps.dedupe.outputs.duplicate != 'true'
+        shell: bash
+        env:
+          BASE_SHA: ${{ inputs.base_sha }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p .review-context
+          gh pr view "$PR_NUMBER" --repo "$TARGET_REPO"             --json number,title,body,author,baseRefName,headRefName,baseRefOid,headRefOid             > .review-context/pr.json
+          current_base="$(jq -r '.baseRefOid' .review-context/pr.json)"
+          current_head="$(jq -r '.headRefOid' .review-context/pr.json)"
+          [[ "$current_base" == "$BASE_SHA" ]] || { echo "PR base moved before review started" >&2; exit 1; }
+          [[ "$current_head" == "$HEAD_SHA" ]] || { echo "PR head moved before review started" >&2; exit 1; }
+
+          merge_base="$(gh api "repos/${TARGET_REPO}/compare/${BASE_SHA}...${HEAD_SHA}" --jq '.merge_base_commit.sha')"
+          [[ "$merge_base" =~ ^[0-9a-f]{40}$ ]] || { echo "GitHub did not return a valid merge-base SHA" >&2; exit 1; }
+          printf '%s\n' "$merge_base" > .review-context/merge-base.txt
+          if ! git -C target cat-file -e "${merge_base}^{commit}" 2>/dev/null; then
+            git -C target fetch --no-tags --depth=1 origin "$merge_base"
+          fi
+          git -C target diff --no-ext-diff --no-textconv --unified=80 "$merge_base" "$HEAD_SHA" > .review-context/pr.diff
+          git -C target diff --no-ext-diff --no-textconv --name-only "$merge_base" "$HEAD_SHA" > .review-context/changed-files.txt
+          git -C target diff --no-ext-diff --no-textconv --stat "$merge_base" "$HEAD_SHA" > .review-context/diff-stat.txt
+
+      - name: Plan durable review session
+        id: plan
+        if: steps.dedupe.outputs.duplicate != 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          BASE_SHA: ${{ inputs.base_sha }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          SOURCE_COMMENT_ID: ${{ inputs.source_comment_id }}
+          REQUESTED_MODE: ${{ inputs.requested_mode }}
+          EXPECTED_REVIEW_AUTHOR: ${{ steps.app-token.outputs.app-slug }}[bot]
+          REVIEW_CONTEXT_DIR: .review-context
+        run: node scripts/plan-review-session.mjs
+
+      - name: Build repair-only verification diff
+        if: steps.dedupe.outputs.duplicate != 'true' && steps.plan.outputs.mode == 'verification'
+        shell: bash
+        env:
+          PREVIOUS_HEAD: ${{ steps.plan.outputs.previous_head }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$PREVIOUS_HEAD" =~ ^[0-9a-f]{40}$ ]] || { echo "Invalid prior reviewed HEAD" >&2; exit 1; }
+          if ! git -C target cat-file -e "${PREVIOUS_HEAD}^{commit}" 2>/dev/null; then
+            git -C target fetch --no-tags --depth=1 origin "$PREVIOUS_HEAD"
+          fi
+          git -C target diff --no-ext-diff --no-textconv --unified=80 "$PREVIOUS_HEAD" "$HEAD_SHA" > .review-context/repair.diff
+
+      - name: Install Claude dependencies only for explicit deep review
+        if: steps.dedupe.outputs.duplicate != 'true' && steps.plan.outputs.mode == 'claude'
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci --legacy-peer-deps --ignore-scripts --no-audit --no-fund --omit=dev
+          node --input-type=module -e "const m = await import('@anthropic-ai/claude-agent-sdk'); if (typeof m.query !== 'function') throw new Error('Claude Agent SDK query export unavailable')"
+
+      - name: Materialize safe source snapshot only for Claude deep review
+        id: snapshot
+        if: steps.dedupe.outputs.duplicate != 'true' && steps.plan.outputs.mode == 'claude'
+        env:
+          HEAD_SHA: ${{ inputs.head_sha }}
+          SOURCE_REPO_DIR: target
+          OUTPUT_DIR: safe-target
+          REVIEW_CONTEXT_DIR: .review-context
+        run: |
+          set -euo pipefail
+          node scripts/materialize-safe-tree.mjs
+
+      - name: Announce verified workflow start
+        id: review-status
+        if: steps.dedupe.outputs.duplicate != 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          SOURCE_COMMENT_ID: ${{ inputs.source_comment_id }}
+          DUPLICATE: ${{ steps.dedupe.outputs.duplicate }}
+          PREFLIGHT_OUTCOME: success
+          STATUS_STAGE: started
+          REVIEW_MODE: ${{ steps.plan.outputs.mode }}
+          REVIEW_REASON: ${{ steps.plan.outputs.reason }}
+        run: node scripts/review-status.mjs
+
+      - name: Run Gemini bounded review
+        if: steps.dedupe.outputs.duplicate != 'true' && (steps.plan.outputs.mode == 'discovery' || steps.plan.outputs.mode == 'verification')
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          REVIEW_CONTEXT_DIR: .review-context
+          REVIEW_OUTPUT_PATH: .review-context/review.json
+        run: node scripts/run-gemini-review.mjs
+
+      - name: Publish Gemini review and durable session
+        id: publish-gemini
+        if: steps.dedupe.outputs.duplicate != 'true' && (steps.plan.outputs.mode == 'discovery' || steps.plan.outputs.mode == 'verification')
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          BASE_SHA: ${{ inputs.base_sha }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          SOURCE_COMMENT_ID: ${{ inputs.source_comment_id }}
+          REVIEW_CONTEXT_DIR: .review-context
+          REVIEW_PATH: .review-context/review.json
+        run: node scripts/publish-gemini-review.mjs
+
+      - name: Run Claude explicit deep review
+        if: steps.dedupe.outputs.duplicate != 'true' && steps.plan.outputs.mode == 'claude'
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          SAFE_REPO_DIR: safe-target
+          REVIEW_CONTEXT_DIR: .review-context
+          REVIEW_OUTPUT_PATH: .review-context/review.json
+        run: node scripts/run-review.mjs
+
+      - name: Publish Claude explicit deep review
+        id: publish-claude
+        if: steps.dedupe.outputs.duplicate != 'true' && steps.plan.outputs.mode == 'claude'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          BASE_SHA: ${{ inputs.base_sha }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          SOURCE_COMMENT_ID: ${{ inputs.source_comment_id }}
+          REVIEW_PATH: .review-context/review.json
+        run: node scripts/publish-review.mjs
+
+      - name: Finalize workflow status
+        if: always() && steps.review-status.outputs.comment_id != ''
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          SOURCE_COMMENT_ID: ${{ inputs.source_comment_id }}
+          STATUS_STAGE: finished
+          STATUS_COMMENT_ID: ${{ steps.review-status.outputs.comment_id }}
+          REVIEW_MODE: ${{ steps.plan.outputs.mode }}
+          REVIEW_REASON: ${{ steps.plan.outputs.reason }}
+          GEMINI_PUBLISH_OUTCOME: ${{ steps.publish-gemini.outcome }}
+          CLAUDE_PUBLISH_OUTCOME: ${{ steps.publish-claude.outcome }}
+        run: node scripts/review-status.mjs
