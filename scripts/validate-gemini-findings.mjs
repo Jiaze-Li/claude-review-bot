@@ -139,19 +139,23 @@ export async function validateMaterialFindings({ env = process.env, fetchImpl = 
   const returned = normalizeValidationResult(parsed, includedIds);
   const byId = new Map(returned.validations.map((entry) => [entry.candidateId, entry]));
   const validations = candidates.map((candidate) => {
-    if (!includedIds.has(candidate.candidateId)) {
-      return {
+    const verdict = !includedIds.has(candidate.candidateId)
+      ? {
         candidateId: candidate.candidateId,
         verdict: 'UNCERTAIN',
         reason: 'Candidate exceeded the bounded validator context budget and was not validated.',
         evidence: [],
+      }
+      : byId.get(candidate.candidateId) || {
+        candidateId: candidate.candidateId,
+        verdict: 'UNCERTAIN',
+        reason: 'Validator omitted this candidate; treated as uncertain rather than blocking.',
+        evidence: [],
       };
-    }
-    return byId.get(candidate.candidateId) || {
-      candidateId: candidate.candidateId,
-      verdict: 'UNCERTAIN',
-      reason: 'Validator omitted this candidate; treated as uncertain rather than blocking.',
-      evidence: [],
+    return {
+      ...verdict,
+      severity: String(candidate.finding?.severity || '').toUpperCase(),
+      title: cleanText(candidate.finding?.title, 300),
     };
   });
   const verdictById = new Map(validations.map((entry) => [entry.candidateId, entry.verdict]));
