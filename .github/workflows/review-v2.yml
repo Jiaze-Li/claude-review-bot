@@ -421,6 +421,7 @@ jobs:
           STATUS_COMMENT_ID: ${{ steps.review-status.outputs.comment_id }}
           REVIEW_MODE: ${{ steps.plan.outputs.mode }}
           REVIEW_REASON: ${{ steps.plan.outputs.reason }}
-          GEMINI_PUBLISH_OUTCOME: ${{ steps.publish-final-audit.outcome || steps.publish-gemini.outcome }}
+          GEMINI_PUBLISH_OUTCOME: ${{ steps.publish-gemini.outcome }}
+          FINAL_AUDIT_PUBLISH_OUTCOME: ${{ steps.publish-final-audit.outcome }}
           CLAUDE_PUBLISH_OUTCOME: ${{ steps.publish-claude.outcome }}
         run: node scripts/review-status.mjs
