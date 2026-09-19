@@ -113,8 +113,12 @@ export async function runGeminiReview({env=process.env,fetchImpl=fetch}={}){
       contents:[{role:'user',parts:[{text:built.prompt}]}],
       generationConfig:{
         thinkingConfig:{thinkingLevel:GEMINI_THINKING},
-        responseMimeType:'application/json',
-        responseSchema:built.schema,
+        responseFormat:{
+          text:{
+            mimeType:'APPLICATION_JSON',
+            schema:toGeminiJsonSchema(built.schema),
+          },
+        },
         maxOutputTokens:16384,
       },
     }),
@@ -140,6 +144,27 @@ export async function runGeminiReview({env=process.env,fetchImpl=fetch}={}){
     },
   };
   return result;
+}
+
+const GEMINI_JSON_SCHEMA_KEYS=new Set([
+  '$id','$defs','$ref','$anchor','type','format','title','description','enum',
+  'items','prefixItems','minItems','maxItems','minimum','maximum','anyOf','oneOf',
+  'properties','additionalProperties','required','propertyOrdering',
+]);
+
+export function toGeminiJsonSchema(value,key=null){
+  if(Array.isArray(value)) return value.map((item)=>toGeminiJsonSchema(item));
+  if(!value||typeof value!=='object') return value;
+  const out={};
+  for(const [childKey,childValue] of Object.entries(value)){
+    if(key==='properties'||key==='$defs'){
+      out[childKey]=toGeminiJsonSchema(childValue,childKey);
+      continue;
+    }
+    if(!GEMINI_JSON_SCHEMA_KEYS.has(childKey)) continue;
+    out[childKey]=toGeminiJsonSchema(childValue,childKey);
+  }
+  return out;
 }
 
 function nonnegative(v){return typeof v==='number'&&Number.isFinite(v)&&v>=0?v:null;}
