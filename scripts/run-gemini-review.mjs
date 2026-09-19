@@ -4,7 +4,7 @@ import { pathToFileURL } from 'node:url';
 import { openMaterialFindings } from './review-session-core.mjs';
 
 export const GEMINI_MODEL='gemini-3.8-flash';
-export const GEMINI_THINKING='LOW';
+export const GEMINI_THINKING='low';
 const MAX_CONTEXT_BYTES=1_500_000;
 
 const findingSchema={
@@ -115,7 +115,7 @@ export async function runGeminiReview({env=process.env,fetchImpl=fetch}={}){
         thinkingConfig:{thinkingLevel:GEMINI_THINKING},
         responseMimeType:'application/json',
         responseSchema:built.schema,
-        maxOutputTokens:8192,
+        maxOutputTokens:16384,
       },
     }),
     signal:AbortSignal.timeout(180000),
