@@ -165,3 +165,15 @@ test('v2 workflow isolates provider credentials and serializes durable PR sessio
   assert.match(yml, /permission-pull-requests: write/);
   assert.doesNotMatch(yml, /permission-contents: write/);
 });
+
+
+test('legacy review.yml is a thin auto-mode wrapper over review-v2', () => {
+  const legacy = fs.readFileSync(new URL('../.github/workflows/review.yml', import.meta.url), 'utf8');
+  const v2 = fs.readFileSync(new URL('../.github/workflows/review-v2.yml', import.meta.url), 'utf8');
+  assert.match(legacy, /uses: \.\/\.github\/workflows\/review-v2\.yml/);
+  assert.match(legacy, /requested_mode: auto/);
+  assert.match(legacy, /secrets: inherit/);
+  assert.doesNotMatch(legacy, /Run Claude|Run Gemini|GEMINI_API_KEY|CLAUDE_CODE_OAUTH_TOKEN/);
+  assert.match(v2, /workflow_call:/);
+  assert.match(v2, /requested_mode:\n\s+required: false\n\s+default: auto/);
+});
