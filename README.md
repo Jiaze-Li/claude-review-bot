@@ -13,7 +13,9 @@ For normal work, remember one command:
 That command is intentionally stateful and simple:
 
 - First review of a PR/session: **Gemini 3.8 Flash, low thinking, one discovery pass**.
-- If material P0/P1/P2 findings exist, push a repair and use the **same command** again.
+- Any P0/P1/P2 discovery candidate gets one **targeted Gemini Flash / medium validation pass** over the candidate file, related symbols/guards, and matching tests.
+- Only **CONFIRMED** material findings block. **REJECTED** and **UNCERTAIN** candidates remain visible in the review audit but do not enter REWORK.
+- If confirmed material findings exist, push a repair and use the **same command** again.
 - The next call becomes targeted **verification**, not another full PR discovery.
 - At most **2 verification rounds** are allowed.
 - P3 findings are non-blocking.
@@ -48,13 +50,22 @@ The automatic state machine is:
 NEW / changed-after-READY
         |
         v
-Gemini DISCOVERY (once)
+Gemini DISCOVERY (once, low)
         |
         +-- no P0/P1/P2 --> READY
         |
-        +-- material findings --> REWORK
-                                  |
-                                  v
+        +-- material candidates
+                |
+                v
+        targeted VALIDATOR (once, medium)
+                |
+        +-------+-------------------+
+        |                           |
+   no CONFIRMED                CONFIRMED
+        |                           |
+      READY                       REWORK
+                                    |
+                                    v
                          Gemini VERIFICATION
                          (existing findings +
                           repair-caused regressions only)
@@ -68,7 +79,7 @@ Gemini DISCOVERY (once)
                                      READY or HUMAN_REQUIRED
 ```
 
-Verification is not allowed to reopen broad, unrelated discovery. A new finding is valid there only when it is a regression directly caused by the repair (except a catastrophic P0/security issue). This is the mechanism that prevents the endless “review → fix → fresh full review → new edge case” loop.
+Material validation is not a second discovery pass: it may only confirm, reject, or mark uncertain the candidates already produced by discovery, and must actively check downstream guards, fingerprints/scope filters, and relevant tests before confirming. Verification is likewise not allowed to reopen broad, unrelated discovery. A new finding is valid there only when it is a regression directly caused by the repair (except a catastrophic P0/security issue). These bounds prevent the endless “review → fix → fresh full review → new edge case” loop.
 
 Codex is deliberately **not automatic in v1**. At HUMAN_REQUIRED, use a targeted Codex or Claude review only when human judgment says the remaining issue is worth escalation. This keeps Codex and Claude usage low.
 
@@ -157,17 +168,30 @@ interface rather than embedding provider-specific logic in ReviewLoop core.
 Default automatic review:
 
 ```text
-model: gemini-3.8-flash
-thinking: low
-discovery passes: 1
-verification passes: max 2
+discovery:
+  model: gemini-3.8-flash
+  thinking: low
+  passes: 1
+
+material validator:
+  model: gemini-3.8-flash
+  thinking: medium
+  passes: max 1 per discovery
+  only CONFIRMED blocks
+
+verification:
+  model: gemini-3.8-flash
+  scope: repair diff + open findings
+  passes: max 2
+
 P3: non-blocking
 same HEAD: no model call
 ```
 
 Gemini receives bounded textual context rather than repository tools. Discovery
-uses the exact PR diff; verification uses only the repair diff plus durable open
-findings. The request has a hard output/thinking-token ceiling and the publisher
+uses the exact PR diff. The material validator receives only targeted context for
+each candidate (primary file, relevant PR hunk, matching symbols/guards and tests).
+Verification uses only the repair diff plus durable open findings. The request has a hard output/thinking-token ceiling and the publisher
 fails closed on malformed output or a moved PR HEAD.
 
 Claude remains an explicit deep-review escape hatch:
