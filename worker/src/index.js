@@ -95,7 +95,7 @@ export default {
     }
 
     const controlRepo = env.CONTROL_REPO || 'Jiaze-Li/claude-review-bot';
-    const controlWorkflow = env.CONTROL_WORKFLOW || 'review.yml';
+    const controlWorkflow = env.CONTROL_WORKFLOW || 'review-v2.yml';
     const controlRef = env.CONTROL_REF || 'main';
 
     const controlInstallation = await githubApi(`/repos/${controlRepo}/installation`, { token: appJwt });
