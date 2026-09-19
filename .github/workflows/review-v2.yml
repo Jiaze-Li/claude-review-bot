@@ -34,6 +34,31 @@ on:
         default: auto
         type: string
 
+  workflow_call:
+    inputs:
+      target_repo:
+        required: true
+        type: string
+      pr_number:
+        required: true
+        type: string
+      base_sha:
+        required: true
+        type: string
+      head_sha:
+        required: true
+        type: string
+      trigger_user:
+        required: true
+        type: string
+      source_comment_id:
+        required: true
+        type: string
+      requested_mode:
+        required: false
+        default: auto
+        type: string
+
 permissions:
   contents: read
 
