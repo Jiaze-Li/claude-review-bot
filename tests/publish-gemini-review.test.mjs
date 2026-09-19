@@ -71,3 +71,32 @@ test('publisher refuses stale HEAD before any write', async () => {
   }), /refusing stale review/);
   assert.equal(calls.length, 1);
 });
+
+
+test('publisher does not advance durable session if HEAD moves after review publication', async () => {
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'publish-gemini-race-'));
+  fs.writeFileSync(path.join(dir,'session-plan.json'),JSON.stringify({decision:{mode:'discovery'},session:null,sessionCommentId:null}));
+  const reviewPath=path.join(dir,'review.json');
+  fs.writeFileSync(reviewPath,JSON.stringify({summary:'clean',findings:[]}));
+  let prReads=0;
+  const calls=[];
+  await assert.rejects(()=>publishGeminiReview({
+    env:{
+      GH_TOKEN:'token',TARGET_REPO:'acme/project',PR_NUMBER:'7',BASE_SHA:BASE,HEAD_SHA:A,
+      SOURCE_COMMENT_ID:'99',REVIEW_PATH:reviewPath,REVIEW_CONTEXT_DIR:dir,
+    },
+    fetchImpl:async(url,init={})=>{
+      calls.push({url,method:init.method||'GET'});
+      if(url.endsWith('/pulls/7')){
+        prReads+=1;
+        return Response.json({base:{sha:BASE},head:{sha:prReads===1?A:'c'.repeat(40)}});
+      }
+      if(url.includes('/pulls/7/files')) return Response.json([]);
+      if(url.endsWith('/pulls/7/reviews')) return Response.json({id:202});
+      if(url.endsWith('/issues/7/comments')) return Response.json({id:101});
+      assert.fail('unexpected URL '+url);
+    },
+  }),/durable session state was not advanced/);
+  assert.equal(calls.filter(c=>c.url.endsWith('/pulls/7/reviews')).length,1);
+  assert.equal(calls.filter(c=>c.url.endsWith('/issues/7/comments')).length,0);
+});
