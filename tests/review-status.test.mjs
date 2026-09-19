@@ -152,7 +152,8 @@ test('v2 workflow isolates provider credentials and serializes durable PR sessio
   assert.match(yml, /CLAUDE_CODE_OAUTH_TOKEN: \$\{\{ secrets\.CLAUDE_CODE_OAUTH_TOKEN \}\}/);
   const geminiBlock = yml.slice(gemini, publishGemini);
   assert.doesNotMatch(geminiBlock, /GH_TOKEN|app-token\.outputs\.token/);
-  const claudeBlock = yml.slice(claude, finished);
+  const publishClaude = yml.indexOf('- name: Publish Claude explicit deep review');
+  const claudeBlock = yml.slice(claude, publishClaude);
   assert.doesNotMatch(claudeBlock, /GH_TOKEN|app-token\.outputs\.token/);
   assert.match(yml, /permission-issues: read/);
   assert.match(yml, /permission-pull-requests: write/);
