@@ -42,8 +42,9 @@ test('Gemini runner sends low thinking and structured schema',async()=>{
     },
   });
   assert.match(request.url,/gemini-3\.8-flash:generateContent$/);
-  assert.equal(request.body.generationConfig.thinkingConfig.thinkingLevel,'LOW');
+  assert.equal(request.body.generationConfig.thinkingConfig.thinkingLevel,'low');
   assert.equal(request.body.generationConfig.responseMimeType,'application/json');
+  assert.equal(request.body.generationConfig.maxOutputTokens,16384);
   assert.equal(result._meta.effort,'low');
   assert.equal(result._meta.usage.total_tokens,130);
   assert.equal(request.headers['x-goog-api-key'],'secret');
