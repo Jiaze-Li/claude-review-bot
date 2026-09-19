@@ -45,7 +45,7 @@ test('verified workflow posts generic run-linked discovery status', async () => 
   assert.doesNotMatch(call.body, /👀|synthetic-test-token/);
 });
 
-for (const mode of ['verification', 'recover', 'claude', 'noop_ready', 'noop_waiting', 'human_required']) {
+for (const mode of ['verification', 'audit', 'recover', 'claude', 'noop_ready', 'noop_waiting', 'human_required']) {
   test(`status renders supported review mode ${mode}`, async () => {
     const fake = fakeFetch();
     await publishRunStatus({
@@ -54,7 +54,9 @@ for (const mode of ['verification', 'recover', 'claude', 'noop_ready', 'noop_wai
     });
     assert.match(fake.calls[0].body, new RegExp(mode === 'verification'
       ? 'Gemini targeted verification'
-      : mode === 'recover'
+      : mode === 'audit'
+        ? 'Gemini one-time final audit'
+        : mode === 'recover'
         ? 'Recovering durable session state'
         : mode === 'claude'
           ? 'Claude deep review'
@@ -104,6 +106,21 @@ for (const outcome of ['success', 'failure', 'cancelled', 'skipped', undefined])
   });
 }
 
+test('skipped final audit does not mask a successful Gemini publication', async () => {
+  const fake = fakeFetch();
+  await publishRunStatus({
+    env: {
+      ...baseEnv,
+      STATUS_STAGE: 'finished',
+      STATUS_COMMENT_ID: '5678',
+      GEMINI_PUBLISH_OUTCOME: 'success',
+      FINAL_AUDIT_PUBLISH_OUTCOME: 'skipped',
+    },
+    fetchImpl: fake.fetchImpl,
+  });
+  assert.match(fake.calls[0].body, /publication completed/);
+});
+
 test('bounded no-op final status explicitly says zero model quota', async () => {
   const fake = fakeFetch();
   await publishRunStatus({
@@ -148,10 +165,14 @@ test('v2 workflow isolates provider credentials and serializes durable PR sessio
   const gemini = yml.indexOf('- name: Run Gemini bounded review');
   const validator = yml.indexOf('- name: Validate Gemini material findings');
   const publishGemini = yml.indexOf('- name: Publish Gemini review and durable session');
+  const autoAudit = yml.indexOf('- name: Prepare automatic final audit');
+  const runFinalAudit = yml.indexOf('- name: Run automatic Gemini final audit');
+  const validateFinalAudit = yml.indexOf('- name: Validate automatic final audit findings');
+  const publishFinalAudit = yml.indexOf('- name: Publish automatic final audit');
   const claude = yml.indexOf('- name: Run Claude explicit deep review');
   const finished = yml.indexOf('- name: Finalize workflow status');
 
-  assert.ok(context < plan && plan < started && started < recover && recover < gemini && gemini < validator && validator < publishGemini && publishGemini < claude && claude < finished);
+  assert.ok(context < plan && plan < started && started < recover && recover < gemini && gemini < validator && validator < publishGemini && publishGemini < autoAudit && autoAudit < runFinalAudit && runFinalAudit < validateFinalAudit && validateFinalAudit < publishFinalAudit && publishFinalAudit < claude && claude < finished);
   assert.match(yml, /group: independent-review-\$\{\{ inputs\.target_repo \}\}-\$\{\{ inputs\.pr_number \}\}/);
   assert.match(yml, /GEMINI_API_KEY: \$\{\{ secrets\.GEMINI_API_KEY \}\}/);
   const recoverBlock = yml.slice(recover, gemini);

@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {
+  applyAuditResult,
   applyDiscoveryResult,
   applyVerificationResult,
   normalizeReviewResult,
@@ -27,7 +28,7 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
   const plan = JSON.parse(fs.readFileSync(path.join(contextRoot, 'session-plan.json'), 'utf8'));
   const raw = JSON.parse(fs.readFileSync(required(env, 'REVIEW_PATH'), 'utf8'));
   const mode = plan.decision?.mode;
-  if (!['discovery', 'verification'].includes(mode)) throw new Error('Gemini publisher requires a model-backed session mode');
+  if (!['discovery', 'verification', 'audit'].includes(mode)) throw new Error('Gemini publisher requires a model-backed session mode');
 
   const pr = await githubJson('https://api.github.com/repos/' + owner + '/' + repo + '/pulls/' + prNumber, env.GH_TOKEN, fetchImpl);
   if (pr.base?.sha !== baseSha) throw new Error('PR base moved before publish; refusing stale review');
@@ -38,6 +39,10 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
   if (mode === 'discovery') {
     normalized = normalizeReviewResult(raw);
     session = applyDiscoveryResult({ result: normalized, baseSha, headSha, sourceCommentId });
+  } else if (mode === 'audit') {
+    normalized = normalizeReviewResult(raw);
+    if (!plan.session) throw new Error('Final audit plan is missing durable prior session');
+    session = applyAuditResult({ session: plan.session, result: normalized, headSha });
   } else {
     normalized = normalizeVerificationResult(raw);
     if (!plan.session) throw new Error('Verification plan is missing durable prior session');
@@ -63,14 +68,15 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
   }
 
   const open = openMaterialFindings(session);
-  let body = '## Gemini ' + (mode === 'discovery' ? 'Discovery' : 'Verification') + ' Review\n\n' + normalized.summary.trim();
+  const reviewKind = mode === 'discovery' ? 'Discovery' : mode === 'audit' ? 'Final Audit' : 'Verification';
+  let body = '## Gemini ' + reviewKind + ' Review\n\n' + normalized.summary.trim();
   if (mode === 'verification') {
     body += '\n\n### Finding verification';
     for (const verdict of normalized.verifications) {
       body += '\n- **' + verdict.findingId + ' — ' + verdict.status + '**: ' + verdict.reason;
     }
   }
-  if (mode === 'discovery' && raw._validation) {
+  if ((mode === 'discovery' || mode === 'audit') && raw._validation) {
     const validations = Array.isArray(raw._validation.validations) ? raw._validation.validations : [];
     const count = (verdict) => validations.filter((entry) => entry.verdict === verdict).length;
     body += '\n\n### Material finding validation';
@@ -88,7 +94,7 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
     }
   }
 
-  if (newFindings.length === 0) body += '\n\nNo new repair finding was reported.';
+  if (newFindings.length === 0) body += '\n\nNo new material finding was reported.';
   if (unanchored.length) {
     body += '\n\n### Findings without an inline anchor';
     for (const finding of unanchored) {
@@ -102,7 +108,7 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
   if (session.status === 'HUMAN_REQUIRED') {
     body += '\n\nAutomatic review has stopped. Use human judgment or a targeted Codex/Claude review; do not start another full discovery automatically.';
   }
-  body += formatRuntime(raw._meta, 'Discovery runtime');
+  body += formatRuntime(raw._meta, mode === 'audit' ? 'Final audit runtime' : mode === 'verification' ? 'Verification runtime' : 'Discovery runtime');
   body += formatRuntime(raw._validation?._meta, 'Validation runtime');
   // This is intentionally NOT the processed-source marker. If durable session
   // persistence fails after the review POST, a retry remains eligible and can
@@ -128,6 +134,10 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
   const sessionCommentId = await upsertSessionComment({
     owner, repo, prNumber, existingId: plan.sessionCommentId, body: sessionBody, token: env.GH_TOKEN, fetchImpl,
   });
+  const publishedStatePath = path.join(contextRoot, 'published-session.json');
+  fs.writeFileSync(publishedStatePath, JSON.stringify({
+    mode, session, sessionCommentId, reviewId: review.id,
+  }, null, 2) + '\n', { mode: 0o600 });
   console.log('Published Gemini ' + mode + ' review ' + (review.html_url || review.id)
     + '; session comment ' + sessionCommentId + '; status ' + session.status + '.');
   return { session, sessionCommentId, reviewId: review.id };

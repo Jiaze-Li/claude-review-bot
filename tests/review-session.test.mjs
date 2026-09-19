@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   MAX_VERIFICATION_ROUNDS,
+  applyAuditResult,
   applyDiscoveryResult,
   applyVerificationResult,
   openMaterialFindings,
@@ -21,9 +22,9 @@ test('new session gets one discovery pass',()=>{
   });
 });
 
-test('discovery with only P3 is READY and P3 is non-blocking',()=>{
+test('discovery with only P3 waits for the final audit and P3 is non-blocking',()=>{
   const s=applyDiscoveryResult({result:{summary:'ok',findings:[finding('P3')]},baseSha:BASE,headSha:A,sourceCommentId:'9'});
-  assert.equal(s.status,'READY');
+  assert.equal(s.status,'AUDIT_PENDING');
   assert.equal(openMaterialFindings(s).length,0);
   assert.equal(s.findings[0].status,'DEFERRED');
 });
@@ -38,12 +39,12 @@ test('material discovery finding waits for a changed HEAD before verification',(
   });
 });
 
-test('verification fixes stable finding without rediscovery',()=>{
+test('verification fixes stable finding and proceeds to the one-time final audit',()=>{
   const s=applyDiscoveryResult({result:{summary:'bug',findings:[finding('P2')]},baseSha:BASE,headSha:A,sourceCommentId:'9'});
   const v=applyVerificationResult({session:s,headSha:B,result:{
     summary:'fixed',verifications:[{findingId:'F001',status:'FIXED',reason:'repair closes trigger'}],findings:[],
   }});
-  assert.equal(v.status,'READY');
+  assert.equal(v.status,'AUDIT_PENDING');
   assert.equal(v.verificationRound,1);
   assert.equal(v.findings[0].status,'FIXED');
 });
@@ -70,10 +71,28 @@ test('verification may add only modeled repair regressions and P3 stays non-bloc
   assert.deepEqual(s.findings.map(x=>[x.id,x.status]),[['F001','FIXED'],['F002','OPEN'],['F003','DEFERRED']]);
 });
 
-test('READY same HEAD is free no-op; changed READY HEAD starts fresh discovery',()=>{
-  const s=applyDiscoveryResult({result:{summary:'clean',findings:[]},baseSha:BASE,headSha:A,sourceCommentId:'9'});
+test('clean discovery schedules one final audit, then READY is a free no-op',()=>{
+  const pending=applyDiscoveryResult({result:{summary:'clean',findings:[]},baseSha:BASE,headSha:A,sourceCommentId:'9'});
+  assert.equal(pending.status,'AUDIT_PENDING');
+  assert.equal(planReviewSession({session:pending,baseSha:BASE,headSha:A}).mode,'audit');
+  const s=applyAuditResult({session:pending,result:{summary:'final audit clean',findings:[]},headSha:A});
+  assert.equal(s.status,'READY');
+  assert.equal(s.auditCompleted,true);
   assert.equal(planReviewSession({session:s,baseSha:BASE,headSha:A}).mode,'noop_ready');
   assert.equal(planReviewSession({session:s,baseSha:BASE,headSha:B}).mode,'discovery');
+});
+
+test('final audit findings are verified without running a second audit',()=>{
+  let s=applyDiscoveryResult({result:{summary:'clean',findings:[]},baseSha:BASE,headSha:A,sourceCommentId:'9'});
+  s=applyAuditResult({session:s,result:{summary:'late bug',findings:[finding('P1','Late bug','final-audit')]},headSha:A});
+  assert.equal(s.status,'REWORK');
+  assert.equal(s.auditCompleted,true);
+  assert.equal(s.findings.at(-1).origin,'FINAL_AUDIT');
+  s=applyVerificationResult({session:s,headSha:B,result:{
+    summary:'fixed',verifications:[{findingId:s.findings.at(-1).id,status:'FIXED',reason:'repair closes final-audit trigger'}],findings:[],
+  }});
+  assert.equal(s.status,'READY');
+  assert.equal(planReviewSession({session:s,baseSha:BASE,headSha:B}).mode,'noop_ready');
 });
 
 test('session comment round-trips durable hidden state',()=>{
@@ -98,7 +117,8 @@ test('verification cannot invent finding IDs outside the open durable registry',
 
 test('target base-tip movement alone never spends another discovery call',()=>{
   const NEW_BASE='e'.repeat(40);
-  const ready=applyDiscoveryResult({result:{summary:'clean',findings:[]},baseSha:BASE,headSha:A,sourceCommentId:'9'});
+  const pending=applyDiscoveryResult({result:{summary:'clean',findings:[]},baseSha:BASE,headSha:A,sourceCommentId:'9'});
+  const ready=applyAuditResult({session:pending,result:{summary:'audit clean',findings:[]},headSha:A});
   assert.equal(planReviewSession({session:ready,baseSha:NEW_BASE,headSha:A}).mode,'noop_ready');
 
   const rework=applyDiscoveryResult({result:{summary:'bug',findings:[finding('P1')]},baseSha:BASE,headSha:A,sourceCommentId:'10'});

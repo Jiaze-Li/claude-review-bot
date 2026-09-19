@@ -18,6 +18,9 @@ That command is intentionally stateful and simple:
 - If confirmed material findings exist, push a repair and use the **same command** again.
 - The next call becomes targeted **verification**, not another full PR discovery.
 - At most **2 verification rounds** are allowed.
+- Once material findings converge, one independent **final Gemini Flash / low audit** runs automatically on the final cumulative PR diff.
+- Final-audit P0/P1/P2 candidates use the same targeted medium validator.
+- The final broad audit runs **at most once per session**. If it finds a material bug, later calls are targeted verification only.
 - P3 findings are non-blocking.
 - Re-running on the same unchanged HEAD spends **no reviewer model quota**.
 - If material findings remain after the verification budget, the session stops at **HUMAN_REQUIRED** instead of looping.
@@ -52,7 +55,7 @@ NEW / changed-after-READY
         v
 Gemini DISCOVERY (once, low)
         |
-        +-- no P0/P1/P2 --> READY
+        +-- no P0/P1/P2 --> FINAL AUDIT (once, low)
         |
         +-- material candidates
                 |
@@ -63,7 +66,28 @@ Gemini DISCOVERY (once, low)
         |                           |
    no CONFIRMED                CONFIRMED
         |                           |
-      READY                       REWORK
+   FINAL AUDIT                    REWORK
+   (once, low)                      |
+        |                           v
+        |                Gemini VERIFICATION
+        |                (existing findings +
+        |                 repair-caused regressions only)
+        |                         |
+        |              +----------+----------+
+        |              |                     |
+        |         FINAL AUDIT             still material
+        |         (once, low)                  |
+        |                              verification #2 max
+        |                                      |
+        |                           FINAL AUDIT or HUMAN_REQUIRED
+        |                                     
+        +------------------+
+                           |
+                 targeted validator if
+                 audit finds P0/P1/P2
+                           |
+                  no CONFIRMED -> READY
+                  CONFIRMED -> REWORK
                                     |
                                     v
                          Gemini VERIFICATION
@@ -79,7 +103,7 @@ Gemini DISCOVERY (once, low)
                                      READY or HUMAN_REQUIRED
 ```
 
-Material validation is not a second discovery pass: it may only confirm, reject, or mark uncertain the candidates already produced by discovery, and must actively check downstream guards, fingerprints/scope filters, and relevant tests before confirming. Verification is likewise not allowed to reopen broad, unrelated discovery. A new finding is valid there only when it is a regression directly caused by the repair (except a catastrophic P0/security issue). These bounds prevent the endless “review → fix → fresh full review → new edge case” loop.
+Material validation is not a second discovery pass: it may only confirm, reject, or mark uncertain the candidates already produced by discovery, and must actively check downstream guards, fingerprints/scope filters, and relevant tests before confirming. Verification is likewise not allowed to reopen broad, unrelated discovery. A new finding is valid there only when it is a regression directly caused by the repair (except a catastrophic P0/security issue). After convergence, one independent final audit gets a fresh look at the final cumulative diff; it can run only once and any confirmed audit finding returns to targeted verification rather than reopening broad discovery. These bounds prevent the endless “review → fix → fresh full review → new edge case” loop.
 
 Codex is deliberately **not automatic in v1**. At HUMAN_REQUIRED, use a targeted Codex or Claude review only when human judgment says the remaining issue is worth escalation. This keeps Codex and Claude usage low.
 
@@ -149,6 +173,7 @@ review-v2.yml (serialized per PR)
         +--> choose automatically:
         |      Gemini discovery
         |      Gemini verification
+        |      one-time Gemini final audit
         |      no-op / HUMAN_REQUIRED
         |
         +--> exact-HEAD publisher
@@ -184,6 +209,13 @@ verification:
   scope: repair diff + open findings
   passes: max 2
 
+final audit:
+  model: gemini-3.8-flash
+  thinking: low
+  scope: final cumulative PR diff
+  passes: max 1 per session
+  P0/P1/P2 candidates: targeted medium validator
+
 P3: non-blocking
 same HEAD: no model call
 ```
@@ -191,8 +223,7 @@ same HEAD: no model call
 Gemini receives bounded textual context rather than repository tools. Discovery
 uses the exact PR diff. The material validator receives only targeted context for
 each candidate (primary file, relevant PR hunk, matching symbols/guards and tests).
-Verification uses only the repair diff plus durable open findings. The request has a hard output/thinking-token ceiling and the publisher
-fails closed on malformed output or a moved PR HEAD.
+Verification uses only the repair diff plus durable open findings. The final audit reuses the cumulative PR diff exactly once after convergence. The request has a hard output/thinking-token ceiling and the publisher fails closed on malformed output or a moved PR HEAD.
 
 Claude remains an explicit deep-review escape hatch:
 
@@ -273,7 +304,7 @@ On a PR in any repository covered by the GitHub App, add:
 Expected behavior: the first call runs a Gemini discovery review and creates an
 **Independent Review Session** comment. If material findings exist, push a repair
 and use the same command again; it automatically runs targeted verification.
-The session eventually reaches READY or HUMAN_REQUIRED and does not loop forever.
+After findings converge, the workflow automatically runs the one-time final audit before READY. The session eventually reaches READY or HUMAN_REQUIRED and does not loop forever.
 
 ## Security model
 

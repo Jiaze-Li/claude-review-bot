@@ -32,7 +32,7 @@ test('recovery persists pending session with both original and retry source mark
   const write=calls.find(c=>c.method==='POST');
   assert.match(write.body.body,/jiaze-review-source-comment:11/);
   assert.match(write.body.body,/jiaze-review-source-comment:22/);
-  assert.match(write.body.body,/Status: \*\*READY\*\*/);
+  assert.match(write.body.body,/Status: \*\*AUDIT_PENDING\*\*/);
 });
 
 test('recovery fails closed if PR HEAD moved and writes no session', async () => {

@@ -3,7 +3,7 @@ import { pathToFileURL } from 'node:url';
 
 const repoPattern = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const positiveId = /^[1-9]\d*$/;
-const reviewModes = new Set(['discovery', 'verification', 'recover', 'claude', 'noop_ready', 'noop_waiting', 'human_required']);
+const reviewModes = new Set(['discovery', 'verification', 'audit', 'recover', 'claude', 'noop_ready', 'noop_waiting', 'human_required']);
 
 function checked(value, pattern, name) {
   if (typeof value !== 'string' || !pattern.test(value)) throw new Error('Missing or invalid ' + name);
@@ -42,13 +42,18 @@ export async function publishRunStatus({ env = process.env, fetchImpl = fetch } 
   if (stage === 'started') {
     if (mode === 'discovery') state = 'Exact-HEAD preflight passed. Gemini discovery review is running.';
     else if (mode === 'verification') state = 'Exact-HEAD preflight passed. Gemini targeted verification is running.';
+    else if (mode === 'audit') state = 'Exact-HEAD preflight passed. Gemini one-time final audit is running.';
     else if (mode === 'claude') state = 'Exact-HEAD preflight passed. Explicit Claude deep review is running.';
     else if (mode === 'recover') state = 'A paid review is already published. Recovering durable session state with no model call.';
     else state = 'No model call is required for this trigger. ' + reason;
   } else if (['recover', 'noop_ready', 'noop_waiting', 'human_required'].includes(mode)) {
     state = 'No model quota was spent. ' + reason;
   } else {
-    const outcome = mode === 'claude' ? env.CLAUDE_PUBLISH_OUTCOME : env.GEMINI_PUBLISH_OUTCOME;
+    const finalAuditOutcome = env.FINAL_AUDIT_PUBLISH_OUTCOME;
+    const geminiOutcome = finalAuditOutcome && finalAuditOutcome !== 'skipped'
+      ? finalAuditOutcome
+      : env.GEMINI_PUBLISH_OUTCOME;
+    const outcome = mode === 'claude' ? env.CLAUDE_PUBLISH_OUTCOME : geminiOutcome;
     state = outcome === 'success'
       ? 'Review publication completed. Read the PR review and durable review-session comment for the result.'
       : 'Review publication was not confirmed. Check the workflow run; no successful publication is being claimed.';

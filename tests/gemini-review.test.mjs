@@ -15,6 +15,15 @@ test('discovery prompt permits one broad pass but rejects architecture/style wor
   assert.match(prompt,/P3 is non-blocking/);
 });
 
+test('final audit is a second independent material-only broad pass',()=>{
+  const {prompt,schema}=buildGeminiRequest({mode:'audit',repo:'a/b',prNumber:'1',headSha:A,prJson:'{}',diff:'final diff',session:null});
+  assert.match(prompt,/ONE final independent broad audit/);
+  assert.match(prompt,/P0\/P1\/P2/);
+  assert.match(prompt,/Do not report P3/);
+  assert.equal(schema.properties.findings.maxItems,4);
+  assert.deepEqual(schema.properties.findings.items.properties.severity.enum,['P0','P1','P2']);
+});
+
 test('verification prompt is restricted to stable open findings and repair-induced regressions',()=>{
   const session=applyDiscoveryResult({result:{summary:'x',findings:[{
     severity:'P1',title:'Bug',body:'Trigger X causes Y, expected Z.',path:'a.js',line:1,riskClass:'state',

@@ -13,6 +13,13 @@ export function planReviewSession({ session = null, baseSha, headSha, reset = fa
     return { mode: 'discovery', previousHead: null, reason: reset ? 'explicit reset' : 'new review session' };
   }
 
+  if (session.status === 'AUDIT_PENDING') {
+    if (session.lastReviewedHead === headSha) {
+      return { mode: 'audit', previousHead: null, reason: 'run one final independent audit before READY' };
+    }
+    return { mode: 'discovery', previousHead: null, reason: 'PR changed before final audit; start a fresh bounded session' };
+  }
+
   if (session.status === 'READY') {
     if (session.lastReviewedHead === headSha) {
       return { mode: 'noop_ready', previousHead: session.lastReviewedHead, reason: 'current HEAD is already READY' };
@@ -60,7 +67,8 @@ export function applyDiscoveryResult({
     baseSha,
     discoveryHead: headSha,
     lastReviewedHead: headSha,
-    status: open.length ? 'REWORK' : 'READY',
+    status: open.length ? 'REWORK' : 'AUDIT_PENDING',
+    auditCompleted: false,
     verificationRound: 0,
     maxVerificationRounds: MAX_VERIFICATION_ROUNDS,
     nextFindingNumber,
@@ -125,7 +133,7 @@ export function applyVerificationResult({
   const verificationRound = (session.verificationRound ?? 0) + 1;
   const open = findings.filter((finding) => finding.status === 'OPEN');
   const status = open.length === 0
-    ? 'READY'
+    ? session.auditCompleted === true ? 'READY' : 'AUDIT_PENDING'
     : verificationRound >= MAX_VERIFICATION_ROUNDS
       ? 'HUMAN_REQUIRED'
       : 'REWORK';
@@ -143,6 +151,46 @@ export function applyVerificationResult({
   };
 }
 
+export function applyAuditResult({
+  session, result, headSha, now = new Date().toISOString(),
+} = {}) {
+  validateSession(session);
+  checkedSha(headSha, 'headSha');
+  if (session.status !== 'AUDIT_PENDING') throw new Error('final audit requires AUDIT_PENDING session');
+  if (session.auditCompleted === true) throw new Error('final audit already completed for this session');
+  const normalized = normalizeReviewResult(result);
+  const findings = session.findings.map((finding) => ({ ...finding }));
+  let nextFindingNumber = Number.isInteger(session.nextFindingNumber) ? session.nextFindingNumber : findings.length + 1;
+  for (const finding of normalized.findings) {
+    findings.push({
+      id: findingId(nextFindingNumber++),
+      ...compactFinding(finding),
+      status: MATERIAL_SEVERITIES.has(finding.severity) ? 'OPEN' : 'DEFERRED',
+      origin: 'FINAL_AUDIT',
+      introducedHead: headSha,
+      lastCheckedHead: headSha,
+      resolutionReason: null,
+    });
+  }
+  const open = findings.filter((finding) => finding.status === 'OPEN');
+  const verificationRound = session.verificationRound ?? 0;
+  const status = open.length === 0
+    ? 'READY'
+    : verificationRound >= MAX_VERIFICATION_ROUNDS
+      ? 'HUMAN_REQUIRED'
+      : 'REWORK';
+  return {
+    ...session,
+    lastReviewedHead: headSha,
+    status,
+    auditCompleted: true,
+    nextFindingNumber,
+    findings,
+    lastSummary: compactText(normalized.summary, 800),
+    updatedAt: now,
+  };
+}
+
 export function openMaterialFindings(session) {
   validateSession(session);
   return session.findings.filter((finding) => finding.status === 'OPEN' && MATERIAL_SEVERITIES.has(finding.severity));
@@ -152,11 +200,14 @@ export function renderSessionComment(session, { sourceCommentIds = [] } = {}) {
   validateSession(session);
   const open = openMaterialFindings(session);
   const verification = `${session.verificationRound ?? 0}/${session.maxVerificationRounds ?? MAX_VERIFICATION_ROUNDS}`;
+  const audit = session.auditCompleted === true ? 'complete' : session.status === 'AUDIT_PENDING' ? 'pending' : 'not run';
   const next = session.status === 'READY'
     ? 'No action required unless the PR changes.'
-    : session.status === 'REWORK'
-      ? 'Push a repair, then comment `@jiaze-claude-review-bot review` again.'
-      : 'Automatic review budget is exhausted. Use human judgment or a targeted Codex/Claude review; do not restart full discovery automatically.';
+    : session.status === 'AUDIT_PENDING'
+      ? 'The one-time final Gemini audit will run automatically. If the workflow stops, comment `@jiaze-claude-review-bot review` to resume it.'
+      : session.status === 'REWORK'
+        ? 'Push a repair, then comment `@jiaze-claude-review-bot review` again.'
+        : 'Automatic review budget is exhausted. Use human judgment or a targeted Codex/Claude review; do not restart full discovery automatically.';
   const findingLines = open.length
     ? open.slice(0, 8).flatMap((finding) => [
       `- ${finding.id} **${finding.severity}** — ${cleanInline(finding.title)}`,
@@ -173,14 +224,14 @@ export function renderSessionComment(session, { sourceCommentIds = [] } = {}) {
     '### Independent Review Session',
     `Status: **${session.status}**`,
     `Default reviewer: **Gemini Flash / low thinking**`,
-    `Discovery: **complete** · Verification: **${verification}**`,
+    `Discovery: **complete** · Final audit: **${audit}** · Verification: **${verification}**`,
     `Open material findings: **${open.length}**`,
     '',
     ...findingLines,
     '',
     `Next: ${next}`,
     '',
-    '<sub>P3 findings are non-blocking. After discovery, verification is limited to existing findings and regressions directly caused by the repair.</sub>',
+    '<sub>P3 findings are non-blocking. After discovery, verification is limited to existing findings and repair regressions. The final broad audit runs at most once per session.</sub>',
     `<!-- jiaze-review-state:${state} -->`,
   ].join('\n');
 }
@@ -251,7 +302,8 @@ function validateSession(session) {
   }
   checkedSha(session.baseSha, 'session.baseSha');
   checkedSha(session.lastReviewedHead, 'session.lastReviewedHead');
-  if (!['READY', 'REWORK', 'HUMAN_REQUIRED'].includes(session.status)) throw new Error('invalid review session status');
+  if (!['AUDIT_PENDING', 'READY', 'REWORK', 'HUMAN_REQUIRED'].includes(session.status)) throw new Error('invalid review session status');
+  if (session.auditCompleted != null && typeof session.auditCompleted !== 'boolean') throw new Error('invalid final audit state');
   if (!Array.isArray(session.findings) || session.findings.length > 64) throw new Error('invalid review session findings');
 }
 
