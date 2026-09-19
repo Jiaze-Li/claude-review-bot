@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import { createHmac, generateKeyPairSync } from 'node:crypto';
 import { isReviewTrigger, parseReviewTrigger } from '../worker/src/review-trigger.js';
 import worker from '../worker/src/index.js';
@@ -139,4 +140,11 @@ test('failed dispatch never returns accepted or posts a reaction/status', async 
   await assert.rejects(worker.fetch(request(), env), /503/);
   assert.equal(calls.filter((call) => call.pathname.endsWith('/dispatches')).length, 1);
   assert.equal(calls.some((call) => /comments|reactions/.test(call.pathname) && call.method !== 'GET'), false);
+});
+
+
+test('deployed Worker config routes normal triggers to review-v2 workflow', () => {
+  const toml=fs.readFileSync(new URL('../worker/wrangler.toml',import.meta.url),'utf8');
+  assert.match(toml,/CONTROL_WORKFLOW\s*=\s*"review-v2\.yml"/);
+  assert.doesNotMatch(toml,/CONTROL_WORKFLOW\s*=\s*"review\.yml"/);
 });
