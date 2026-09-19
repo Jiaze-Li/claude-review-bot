@@ -44,10 +44,6 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
   }
 
   const sessionBody = renderSessionComment(session);
-  const sessionCommentId = await upsertSessionComment({
-    owner, repo, prNumber, existingId: plan.sessionCommentId, body: sessionBody, token: env.GH_TOKEN, fetchImpl,
-  });
-
   const addedLines = await loadAddedLines({ owner, repo, prNumber, token: env.GH_TOKEN, fetchImpl });
   const newFindings = mode === 'discovery'
     ? session.findings
@@ -95,6 +91,19 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
       method: 'POST',
       body: JSON.stringify({ commit_id: headSha, event: 'COMMENT', body, comments: inline }),
     });
+
+  // A review can be attached to an older commit even if the PR moves immediately
+  // after the first preflight. Never advance durable session state until the
+  // exact target HEAD is re-proven after review publication.
+  const afterReview = await githubJson('https://api.github.com/repos/' + owner + '/' + repo + '/pulls/' + prNumber,
+    env.GH_TOKEN, fetchImpl);
+  if (afterReview.base?.sha !== baseSha || afterReview.head?.sha !== headSha) {
+    throw new Error('PR moved while publishing the review; stale review may exist, but durable session state was not advanced');
+  }
+
+  const sessionCommentId = await upsertSessionComment({
+    owner, repo, prNumber, existingId: plan.sessionCommentId, body: sessionBody, token: env.GH_TOKEN, fetchImpl,
+  });
   console.log('Published Gemini ' + mode + ' review ' + (review.html_url || review.id)
     + '; session comment ' + sessionCommentId + '; status ' + session.status + '.');
   return { session, sessionCommentId, reviewId: review.id };
