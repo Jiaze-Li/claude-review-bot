@@ -96,47 +96,73 @@ export async function validateMaterialFindings({ env = process.env, fetchImpl = 
   const includedIds = new Set(contexts.map((entry) => entry.candidateId));
   const prompt = buildValidationPrompt({ repo, prNumber, headSha, contexts });
   const model = env.GEMINI_MODEL || GEMINI_MODEL;
-  const response = await fetchImpl(
-    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
-      body: JSON.stringify({
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
-        generationConfig: {
-          thinkingConfig: { thinkingLevel: VALIDATOR_THINKING },
-          responseFormat: {
-            text: {
-              mimeType: 'APPLICATION_JSON',
-              schema: toGeminiJsonSchema(validationSchema),
+  let returned = null;
+  let payload = null;
+  let structuredAttempts = 0;
+  let lastStructuredError = null;
+  const usage = {
+    promptTokenCount: 0,
+    candidatesTokenCount: 0,
+    thoughtsTokenCount: 0,
+    totalTokenCount: 0,
+  };
+
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    structuredAttempts = attempt;
+    const response = await fetchImpl(
+      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+        body: JSON.stringify({
+          contents: [{ role: 'user', parts: [{ text: prompt }] }],
+          generationConfig: {
+            thinkingConfig: { thinkingLevel: VALIDATOR_THINKING },
+            responseFormat: {
+              text: {
+                mimeType: 'APPLICATION_JSON',
+                schema: toGeminiJsonSchema(validationSchema),
+              },
             },
+            maxOutputTokens: 8192,
           },
-          maxOutputTokens: 8192,
-        },
-      }),
-      signal: AbortSignal.timeout(180000),
-    },
-  );
+        }),
+        signal: AbortSignal.timeout(180000),
+      },
+    );
 
-  if (!response.ok) {
-    const body = await response.text();
-    throw new Error(`Gemini finding validator failed (HTTP ${response.status}): ${body.slice(0, 500)}`);
+    if (!response.ok) {
+      const body = await response.text();
+      throw new Error(`Gemini finding validator failed (HTTP ${response.status}): ${body.slice(0, 500)}`);
+    }
+
+    payload = await response.json();
+    for (const key of Object.keys(usage)) {
+      const value = payload.usageMetadata?.[key];
+      if (typeof value === 'number' && Number.isFinite(value) && value >= 0) usage[key] += value;
+    }
+
+    const text = (payload.candidates?.[0]?.content?.parts || [])
+      .map((part) => typeof part.text === 'string' ? part.text : '')
+      .join('');
+
+    try {
+      if (!text) throw new Error('returned no structured text');
+      returned = normalizeValidationResult(JSON.parse(text), includedIds);
+      break;
+    } catch (error) {
+      lastStructuredError = error;
+      if (attempt === 1) {
+        console.warn(`Gemini finding validator returned malformed structured output; retrying once: ${error.message}`);
+      }
+    }
   }
 
-  const payload = await response.json();
-  const text = (payload.candidates?.[0]?.content?.parts || [])
-    .map((part) => typeof part.text === 'string' ? part.text : '')
-    .join('');
-  if (!text) throw new Error('Gemini finding validator returned no structured text');
-
-  let parsed;
-  try {
-    parsed = JSON.parse(text);
-  } catch (error) {
-    throw new Error(`Gemini finding validator returned invalid JSON: ${error.message}`);
+  if (!returned) {
+    throw new Error(
+      `Gemini finding validator returned invalid structured output after one retry: ${lastStructuredError?.message || 'unknown error'}`,
+    );
   }
-
-  const returned = normalizeValidationResult(parsed, includedIds);
   const byId = new Map(returned.validations.map((entry) => [entry.candidateId, entry]));
   const validations = candidates.map((candidate) => {
     const verdict = !includedIds.has(candidate.candidateId)
@@ -167,7 +193,6 @@ export async function validateMaterialFindings({ env = process.env, fetchImpl = 
     return verdictById.get(candidateId) === 'CONFIRMED';
   });
 
-  const usage = payload.usageMetadata || {};
   const output = {
     ...raw,
     findings: keptFindings,
@@ -181,6 +206,7 @@ export async function validateMaterialFindings({ env = process.env, fetchImpl = 
         resolved_model: model,
         effort: VALIDATOR_THINKING,
         mode: 'finding-validation',
+        attempts: structuredAttempts,
         usage: {
           input_tokens: nonnegative(usage.promptTokenCount),
           output_tokens: nonnegative(usage.candidatesTokenCount),
