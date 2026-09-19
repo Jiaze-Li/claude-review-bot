@@ -284,6 +284,24 @@ jobs:
           REVIEW_OUTPUT_PATH: .review-context/review.json
         run: node scripts/run-gemini-review.mjs
 
+      - name: Validate Gemini material findings
+        if: steps.dedupe.outputs.duplicate != 'true' && steps.plan.outputs.mode == 'discovery'
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          TARGET_REPO_DIR: target
+          REVIEW_CONTEXT_DIR: .review-context
+          REVIEW_INPUT_PATH: .review-context/review.json
+          REVIEW_OUTPUT_PATH: .review-context/review-publish.json
+        run: node scripts/validate-gemini-findings.mjs
+
+      - name: Prepare verification result for publication
+        if: steps.dedupe.outputs.duplicate != 'true' && steps.plan.outputs.mode == 'verification'
+        shell: bash
+        run: cp .review-context/review.json .review-context/review-publish.json
+
       - name: Publish Gemini review and durable session
         id: publish-gemini
         if: steps.dedupe.outputs.duplicate != 'true' && (steps.plan.outputs.mode == 'discovery' || steps.plan.outputs.mode == 'verification')
@@ -295,7 +313,7 @@ jobs:
           HEAD_SHA: ${{ inputs.head_sha }}
           SOURCE_COMMENT_ID: ${{ inputs.source_comment_id }}
           REVIEW_CONTEXT_DIR: .review-context
-          REVIEW_PATH: .review-context/review.json
+          REVIEW_PATH: .review-context/review-publish.json
         run: node scripts/publish-gemini-review.mjs
 
       - name: Run Claude explicit deep review
