@@ -193,14 +193,14 @@ export function parseSessionComment(body) {
 
 export function normalizeReviewResult(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('review result must be an object');
-  const summary = checkedText(value.summary, 6000, 'summary');
+  const summary = checkedText(value.summary, 2500, 'summary');
   if (!Array.isArray(value.findings) || value.findings.length > 8) throw new Error('findings must be an array with at most 8 entries');
   return { summary, findings: value.findings.map(normalizeFinding) };
 }
 
 export function normalizeVerificationResult(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('verification result must be an object');
-  const summary = checkedText(value.summary, 6000, 'summary');
+  const summary = checkedText(value.summary, 2500, 'summary');
   if (!Array.isArray(value.verifications) || value.verifications.length > 16) throw new Error('verifications must be an array with at most 16 entries');
   if (!Array.isArray(value.findings) || value.findings.length > 5) throw new Error('repair findings must be an array with at most 5 entries');
   const seen = new Set();
@@ -214,7 +214,7 @@ export function normalizeVerificationResult(value) {
     return {
       findingId: findingIdValue,
       status,
-      reason: checkedText(entry.reason, 2000, 'verification reason'),
+      reason: checkedText(entry.reason, 1200, 'verification reason'),
     };
   });
   return { summary, verifications, findings: value.findings.map(normalizeFinding) };
@@ -224,17 +224,17 @@ function normalizeFinding(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('finding must be an object');
   const severity = String(value.severity ?? '').trim().toUpperCase();
   if (!['P0', 'P1', 'P2', 'P3'].includes(severity)) throw new Error('invalid finding severity');
-  const path = checkedText(value.path, 1000, 'finding path');
+  const path = checkedText(value.path, 600, 'finding path');
   if (path.startsWith('/') || path.split('/').includes('..')) throw new Error('finding path must be repository-relative');
   const line = value.line == null ? null : value.line;
   if (line !== null && (!Number.isInteger(line) || line < 1)) throw new Error('finding line must be null or a positive integer');
   return {
     severity,
-    title: checkedText(value.title, 300, 'finding title'),
-    body: checkedText(value.body, 4000, 'finding body'),
+    title: checkedText(value.title, 240, 'finding title'),
+    body: checkedText(value.body, 1600, 'finding body'),
     path,
     line,
-    riskClass: checkedText(value.riskClass ?? 'uncategorized', 120, 'riskClass'),
+    riskClass: checkedText(value.riskClass ?? 'uncategorized', 80, 'riskClass'),
   };
 }
 
