@@ -49,7 +49,11 @@ export async function publishRunStatus({ env = process.env, fetchImpl = fetch } 
   } else if (['recover', 'noop_ready', 'noop_waiting', 'human_required'].includes(mode)) {
     state = 'No model quota was spent. ' + reason;
   } else {
-    const outcome = mode === 'claude' ? env.CLAUDE_PUBLISH_OUTCOME : env.GEMINI_PUBLISH_OUTCOME;
+    const finalAuditOutcome = env.FINAL_AUDIT_PUBLISH_OUTCOME;
+    const geminiOutcome = finalAuditOutcome && finalAuditOutcome !== 'skipped'
+      ? finalAuditOutcome
+      : env.GEMINI_PUBLISH_OUTCOME;
+    const outcome = mode === 'claude' ? env.CLAUDE_PUBLISH_OUTCOME : geminiOutcome;
     state = outcome === 'success'
       ? 'Review publication completed. Read the PR review and durable review-session comment for the result.'
       : 'Review publication was not confirmed. Check the workflow run; no successful publication is being claimed.';
