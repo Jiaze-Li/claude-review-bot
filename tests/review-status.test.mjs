@@ -45,7 +45,7 @@ test('verified workflow posts generic run-linked discovery status', async () => 
   assert.doesNotMatch(call.body, /👀|synthetic-test-token/);
 });
 
-for (const mode of ['verification', 'claude', 'noop_ready', 'noop_waiting', 'human_required']) {
+for (const mode of ['verification', 'recover', 'claude', 'noop_ready', 'noop_waiting', 'human_required']) {
   test(`status renders supported review mode ${mode}`, async () => {
     const fake = fakeFetch();
     await publishRunStatus({
@@ -54,9 +54,11 @@ for (const mode of ['verification', 'claude', 'noop_ready', 'noop_waiting', 'hum
     });
     assert.match(fake.calls[0].body, new RegExp(mode === 'verification'
       ? 'Gemini targeted verification'
-      : mode === 'claude'
-        ? 'Claude deep review'
-        : 'No model call'));
+      : mode === 'recover'
+        ? 'Recovering durable session state'
+        : mode === 'claude'
+          ? 'Claude deep review'
+          : 'No model call'));
   });
 }
 
@@ -142,14 +144,17 @@ test('v2 workflow isolates provider credentials and serializes durable PR sessio
   const context = yml.indexOf('- name: Build exact PR review context');
   const plan = yml.indexOf('- name: Plan durable review session');
   const started = yml.indexOf('- name: Announce verified workflow start');
+  const recover = yml.indexOf('- name: Recover published session without model spend');
   const gemini = yml.indexOf('- name: Run Gemini bounded review');
   const publishGemini = yml.indexOf('- name: Publish Gemini review and durable session');
   const claude = yml.indexOf('- name: Run Claude explicit deep review');
   const finished = yml.indexOf('- name: Finalize workflow status');
 
-  assert.ok(context < plan && plan < started && started < gemini && gemini < publishGemini && publishGemini < claude && claude < finished);
+  assert.ok(context < plan && plan < started && started < recover && recover < gemini && gemini < publishGemini && publishGemini < claude && claude < finished);
   assert.match(yml, /group: independent-review-\$\{\{ inputs\.target_repo \}\}-\$\{\{ inputs\.pr_number \}\}/);
   assert.match(yml, /GEMINI_API_KEY: \$\{\{ secrets\.GEMINI_API_KEY \}\}/);
+  const recoverBlock = yml.slice(recover, gemini);
+  assert.doesNotMatch(recoverBlock, /GEMINI_API_KEY|CLAUDE_CODE_OAUTH_TOKEN/);
   assert.match(yml, /CLAUDE_CODE_OAUTH_TOKEN: \$\{\{ secrets\.CLAUDE_CODE_OAUTH_TOKEN \}\}/);
   const geminiBlock = yml.slice(gemini, publishGemini);
   assert.doesNotMatch(geminiBlock, /GH_TOKEN|app-token\.outputs\.token/);
