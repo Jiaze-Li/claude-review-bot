@@ -81,7 +81,7 @@ tests.
 - Checks out the target repository and gives Claude the real PR diff plus read access to the repository code.
 - Claude is review-only: it does not edit, push, merge, or approve code.
 - Publishes actionable findings as inline PR review comments when they can be anchored to changed lines; otherwise includes them in the review summary.
-- Uses Claude Code's moving `sonnet` alias at `medium` effort with a 20-turn ceiling to give non-trivial PRs enough room to finish while still bounding subscription usage.
+- Uses Claude Code's moving `sonnet` alias at `medium` effort with a 24-turn ceiling to give non-trivial PRs enough room to finish while still bounding subscription usage.
 - Reports the resolved model, agent turns, and SDK token usage in each published review.
 
 ## Architecture
@@ -116,7 +116,7 @@ The trusted runner currently sets:
 ```text
 model: sonnet
 effort: medium
-maxTurns: 20
+maxTurns: 24
 ```
 
 `medium` effort reduces reasoning and tool-call token use relative to the default high effort. The turn ceiling prevents unusually large PRs from exploring indefinitely. Each successful review records the resolved model and the SDK-reported input, cache, output, and turn usage so expensive reviews can be identified from the PR itself.
