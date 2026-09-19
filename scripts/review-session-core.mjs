@@ -66,7 +66,7 @@ export function applyDiscoveryResult({
     nextFindingNumber,
     findings,
     acceptedRiskClasses: [],
-    lastSummary: compactText(normalized.summary, 800),
+    lastSummary: compactText(normalized.summary, 500),
     updatedAt: now,
   };
 }
@@ -99,7 +99,7 @@ export function applyVerificationResult({
         ...finding,
         status: 'FIXED',
         lastCheckedHead: headSha,
-        resolutionReason: compactText(verdict.reason, 600),
+        resolutionReason: compactText(verdict.reason, 300),
       };
     }
     return {
@@ -258,9 +258,9 @@ function validateSession(session) {
 function compactFinding(finding) {
   return {
     ...finding,
-    title: compactText(finding.title, 180),
-    body: compactText(finding.body, 600),
-    path: compactText(finding.path, 400),
+    title: compactText(finding.title, 140),
+    body: compactText(finding.body, 450),
+    path: compactText(finding.path, 240),
     riskClass: compactText(finding.riskClass, 60),
   };
 }
