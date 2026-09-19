@@ -74,6 +74,12 @@ export function applyVerificationResult({
   validateSession(session);
   checkedSha(headSha, 'headSha');
   const normalized = normalizeVerificationResult(result);
+  const expectedIds = new Set(session.findings.filter((finding) => finding.status === 'OPEN').map((finding) => finding.id));
+  for (const entry of normalized.verifications) {
+    if (!expectedIds.has(entry.findingId)) {
+      throw new Error('verification referenced unknown or non-open finding id "' + entry.findingId + '"');
+    }
+  }
   const byId = new Map(normalized.verifications.map((entry) => [entry.findingId, entry]));
   const findings = session.findings.map((finding) => {
     if (finding.status !== 'OPEN') return { ...finding };
