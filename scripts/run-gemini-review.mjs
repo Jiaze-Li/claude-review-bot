@@ -12,11 +12,11 @@ const findingSchema={
   additionalProperties:false,
   properties:{
     severity:{type:'string',enum:['P0','P1','P2','P3']},
-    title:{type:'string',maxLength:300},
-    body:{type:'string',maxLength:4000},
-    path:{type:'string',maxLength:1000},
+    title:{type:'string',maxLength:240},
+    body:{type:'string',maxLength:1600},
+    path:{type:'string',maxLength:600},
     line:{type:['integer','null'],minimum:1},
-    riskClass:{type:'string',maxLength:120},
+    riskClass:{type:'string',maxLength:80},
   },
   required:['severity','title','body','path','line','riskClass'],
 };
@@ -46,7 +46,7 @@ ${diff}`,
       schema:{
         type:'object',additionalProperties:false,
         properties:{
-          summary:{type:'string',maxLength:6000},
+          summary:{type:'string',maxLength:2500},
           findings:{type:'array',maxItems:8,items:findingSchema},
         },
         required:['summary','findings'],
@@ -73,13 +73,13 @@ ${diff}`,
     schema:{
       type:'object',additionalProperties:false,
       properties:{
-        summary:{type:'string',maxLength:6000},
+        summary:{type:'string',maxLength:2500},
         verifications:{
           type:'array',maxItems:16,
           items:{type:'object',additionalProperties:false,properties:{
             findingId:{type:'string',maxLength:32},
             status:{type:'string',enum:['FIXED','STILL_OPEN','UNCERTAIN']},
-            reason:{type:'string',maxLength:2000},
+            reason:{type:'string',maxLength:1200},
           },required:['findingId','status','reason']},
         },
         findings:{type:'array',maxItems:5,items:findingSchema},
