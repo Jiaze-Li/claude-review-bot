@@ -90,7 +90,7 @@ export default {
     // Fast path for normal GitHub redeliveries. A public marker is not enough:
     // only a review authored by this exact GitHub App bot is trusted as proof
     // that the source comment already completed a review.
-    if (await hasPublishedReviewForComment(targetRepo, prNumber, commentId, expectedReviewAuthor, targetToken)) {
+    if (await hasProcessedSourceComment(targetRepo, prNumber, commentId, expectedReviewAuthor, targetToken)) {
       return json({ ignored: true, reason: 'source comment already reviewed' });
     }
 
@@ -181,7 +181,7 @@ async function createInstallationToken(installationId, appJwt) {
   return result.token;
 }
 
-async function hasPublishedReviewForComment(targetRepo, prNumber, commentId, expectedReviewAuthor, token) {
+async function hasProcessedSourceComment(targetRepo, prNumber, commentId, expectedReviewAuthor, token) {
   const markers = sourceCommentMarkers(commentId);
   for (let page = 1; page <= 100; page += 1) {
     const reviews = await githubApi(`/repos/${targetRepo}/pulls/${prNumber}/reviews?per_page=100&page=${page}`, { token });
@@ -192,9 +192,24 @@ async function hasPublishedReviewForComment(targetRepo, prNumber, commentId, exp
       markers.some((marker) => review.body.includes(marker)))) {
       return true;
     }
-    if (reviews.length < 100) return false;
+    if (reviews.length < 100) break;
   }
-  throw new Error('Pull request review pagination exceeded safety limit');
+
+  // Model-backed runs are marked by their PR review. No-model terminal paths
+  // (READY-on-same-HEAD, waiting-for-repair, HUMAN_REQUIRED) are marked only
+  // when the final status comment is successfully updated.
+  for (let page = 1; page <= 100; page += 1) {
+    const comments = await githubApi(`/repos/${targetRepo}/issues/${prNumber}/comments?per_page=100&page=${page}`, { token });
+    if (!Array.isArray(comments)) throw new Error('GitHub issue comments response was not an array');
+    if (comments.some((comment) =>
+      comment?.user?.login === expectedReviewAuthor &&
+      typeof comment.body === 'string' &&
+      markers.some((marker) => comment.body.includes(marker)))) {
+      return true;
+    }
+    if (comments.length < 100) return false;
+  }
+  throw new Error('Pull request review/comment pagination exceeded safety limit');
 }
 
 function sourceCommentMarkers(commentId) {
