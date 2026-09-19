@@ -4,5 +4,5 @@ compatibility_date = "2026-08-29"
 
 [vars]
 CONTROL_REPO = "Jiaze-Li/claude-review-bot"
-CONTROL_WORKFLOW = "review.yml"
+CONTROL_WORKFLOW = "review-v2.yml"
 CONTROL_REF = "main"
