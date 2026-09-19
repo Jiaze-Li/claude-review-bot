@@ -138,6 +138,46 @@ test('medium validator rejects a material false positive and keeps nonblocking P
   assert.match(fs.readFileSync(path.join(dir,'validated.json'),'utf8'),/REJECTED/);
 });
 
+test('validator retries one malformed structured response and then succeeds',async()=>{
+  const root=tempRepo();
+  const dir=contextDir({summary:'discovery',findings:[falsePositive]});
+  let calls=0;
+  const output=await validateMaterialFindings({
+    env:{
+      GEMINI_API_KEY:'secret',TARGET_REPO:'a/b',PR_NUMBER:'7',HEAD_SHA:HEAD,
+      TARGET_REPO_DIR:root,REVIEW_CONTEXT_DIR:dir,
+      REVIEW_INPUT_PATH:path.join(dir,'review.json'),
+      REVIEW_OUTPUT_PATH:path.join(dir,'validated.json'),
+    },
+    fetchImpl:async()=>{
+      calls+=1;
+      if(calls===1){
+        return Response.json({
+          candidates:[{content:{parts:[{text:'{"summary":"broken","validations":['}]}}],
+          usageMetadata:{promptTokenCount:100,candidatesTokenCount:10,thoughtsTokenCount:20,totalTokenCount:130},
+        });
+      }
+      return Response.json({
+        candidates:[{content:{parts:[{text:JSON.stringify({
+          summary:'Candidate is defeated by exact evidence fingerprint filtering.',
+          validations:[{
+            candidateId:'D001',verdict:'REJECTED',
+            reason:'Current fingerprint filtering defeats the stale-record path.',
+            evidence:['record.evidenceFingerprint === evidenceFingerprint'],
+          }],
+        })}]}}],
+        usageMetadata:{promptTokenCount:110,candidatesTokenCount:12,thoughtsTokenCount:22,totalTokenCount:144},
+      });
+    },
+  });
+  assert.equal(calls,2);
+  assert.equal(output.findings.length,0);
+  assert.equal(output._validation.validations[0].verdict,'REJECTED');
+  assert.equal(output._validation._meta.attempts,2);
+  assert.equal(output._validation._meta.usage.input_tokens,210);
+  assert.equal(output._validation._meta.usage.total_tokens,274);
+});
+
 test('confirmed material finding remains blocking after validation',async()=>{
   const root=tempRepo();
   const dir=contextDir({summary:'discovery',findings:[falsePositive]});
