@@ -113,8 +113,12 @@ export async function runGeminiReview({env=process.env,fetchImpl=fetch}={}){
       contents:[{role:'user',parts:[{text:built.prompt}]}],
       generationConfig:{
         thinkingConfig:{thinkingLevel:GEMINI_THINKING},
-        responseMimeType:'application/json',
-        responseSchema:built.schema,
+        responseFormat:{
+          text:{
+            mimeType:'application/json',
+            schema:built.schema,
+          },
+        },
         maxOutputTokens:16384,
       },
     }),
