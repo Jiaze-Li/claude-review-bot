@@ -53,8 +53,10 @@ export async function publishRunStatus({ env = process.env, fetchImpl = fetch } 
       : 'Review publication was not confirmed. Check the workflow run; no successful publication is being claimed.';
   }
 
+  const completedNoop = stage === 'finished' && ['noop_ready', 'noop_waiting', 'human_required'].includes(mode);
   const body = [
     '<!-- jiaze-review-run:' + runId + ':' + attempt + ' -->',
+    ...(completedNoop ? ['<!-- jiaze-review-source-comment:' + sourceId + ' -->'] : []),
     '### Independent review',
     state,
     '',
