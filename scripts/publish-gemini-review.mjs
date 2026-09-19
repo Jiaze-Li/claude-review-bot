@@ -70,6 +70,24 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
       body += '\n- **' + verdict.findingId + ' — ' + verdict.status + '**: ' + verdict.reason;
     }
   }
+  if (mode === 'discovery' && raw._validation) {
+    const validations = Array.isArray(raw._validation.validations) ? raw._validation.validations : [];
+    const count = (verdict) => validations.filter((entry) => entry.verdict === verdict).length;
+    body += '\n\n### Material finding validation';
+    if (raw._validation.status === 'SKIPPED') {
+      body += '\nNo P0/P1/P2 candidate required targeted validation.';
+    } else {
+      body += '\n**Confirmed:** ' + count('CONFIRMED')
+        + ' · **Rejected:** ' + count('REJECTED')
+        + ' · **Uncertain:** ' + count('UNCERTAIN');
+      for (const entry of validations) {
+        const title = entry.title ? ' — ' + entry.title : '';
+        body += '\n- **' + (entry.candidateId || '?') + ' · ' + (entry.severity || '?')
+          + ' · ' + (entry.verdict || 'UNCERTAIN') + '**' + title + ': ' + (entry.reason || '');
+      }
+    }
+  }
+
   if (newFindings.length === 0) body += '\n\nNo new repair finding was reported.';
   if (unanchored.length) {
     body += '\n\n### Findings without an inline anchor';
@@ -84,7 +102,8 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
   if (session.status === 'HUMAN_REQUIRED') {
     body += '\n\nAutomatic review has stopped. Use human judgment or a targeted Codex/Claude review; do not start another full discovery automatically.';
   }
-  body += formatRuntime(raw._meta);
+  body += formatRuntime(raw._meta, 'Discovery runtime');
+  body += formatRuntime(raw._validation?._meta, 'Validation runtime');
   // This is intentionally NOT the processed-source marker. If durable session
   // persistence fails after the review POST, a retry remains eligible and can
   // recover this exact already-paid result without another Gemini call.
@@ -183,7 +202,7 @@ async function githubJson(url, token, fetchImpl, init = {}) {
   return response.json();
 }
 
-function formatRuntime(meta) {
+function formatRuntime(meta, label = 'Review runtime') {
   if (!meta || typeof meta !== 'object') return '';
   const usage = meta.usage || {};
   const parts = [
@@ -193,7 +212,7 @@ function formatRuntime(meta) {
   if (usage.input_tokens != null) parts.push('input ' + Number(usage.input_tokens).toLocaleString('en-US'));
   if (usage.output_tokens != null) parts.push('output ' + Number(usage.output_tokens).toLocaleString('en-US'));
   if (usage.thoughts_tokens != null) parts.push('thoughts ' + Number(usage.thoughts_tokens).toLocaleString('en-US'));
-  return '\n\n---\n<sub>Review runtime: ' + parts.join(' · ') + '</sub>';
+  return '\n\n' + (label === 'Discovery runtime' ? '---\n' : '') + '<sub>' + label + ': ' + parts.join(' · ') + '</sub>';
 }
 
 function required(env, key) {
