@@ -236,6 +236,18 @@ jobs:
           REVIEW_REASON: ${{ steps.plan.outputs.reason }}
         run: node scripts/review-status.mjs
 
+      - name: Recover published session without model spend
+        id: recover-session
+        if: steps.dedupe.outputs.duplicate != 'true' && steps.plan.outputs.mode == 'recover'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          SOURCE_COMMENT_ID: ${{ inputs.source_comment_id }}
+          REVIEW_CONTEXT_DIR: .review-context
+        run: node scripts/recover-review-session.mjs
+
       - name: Run Gemini bounded review
         if: steps.dedupe.outputs.duplicate != 'true' && (steps.plan.outputs.mode == 'discovery' || steps.plan.outputs.mode == 'verification')
         env:
