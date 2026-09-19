@@ -47,7 +47,9 @@ test('publisher writes durable session and exact-head PR review', async () => {
   const reviewCall = calls.find((call) => call.url.endsWith('/pulls/7/reviews') && call.method === 'POST');
   assert.equal(reviewCall.body.commit_id, A);
   assert.match(reviewCall.body.body, /Gemini Discovery Review/);
-  assert.match(reviewCall.body.body, /jiaze-review-source-comment:99/);
+  assert.match(reviewCall.body.body, /jiaze-review-pending-session:v1:99:/);
+  assert.doesNotMatch(reviewCall.body.body, /jiaze-review-source-comment:99/);
+  assert.match(sessionCall.body.body, /jiaze-review-source-comment:99/);
   assert.equal(reviewCall.body.comments[0].line, 1);
 });
 
@@ -99,4 +101,31 @@ test('publisher does not advance durable session if HEAD moves after review publ
   }),/durable session state was not advanced/);
   assert.equal(calls.filter(c=>c.url.endsWith('/pulls/7/reviews')).length,1);
   assert.equal(calls.filter(c=>c.url.endsWith('/issues/7/comments')).length,0);
+});
+
+
+test('review publication followed by session-write failure remains recoverable without processed marker', async () => {
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'publish-gemini-partial-'));
+  fs.writeFileSync(path.join(dir,'session-plan.json'),JSON.stringify({decision:{mode:'discovery'},session:null,sessionCommentId:null}));
+  const reviewPath=path.join(dir,'review.json');
+  fs.writeFileSync(reviewPath,JSON.stringify({summary:'clean',findings:[]}));
+  let reviewBody='';
+  await assert.rejects(()=>publishGeminiReview({
+    env:{
+      GH_TOKEN:'token',TARGET_REPO:'acme/project',PR_NUMBER:'7',BASE_SHA:BASE,HEAD_SHA:A,
+      SOURCE_COMMENT_ID:'99',REVIEW_PATH:reviewPath,REVIEW_CONTEXT_DIR:dir,
+    },
+    fetchImpl:async(url,init={})=>{
+      if(url.endsWith('/pulls/7')) return Response.json({base:{sha:BASE},head:{sha:A}});
+      if(url.includes('/pulls/7/files')) return Response.json([]);
+      if(url.endsWith('/pulls/7/reviews')){
+        reviewBody=JSON.parse(init.body).body;
+        return Response.json({id:202});
+      }
+      if(url.endsWith('/issues/7/comments')) return new Response('write failed',{status:503});
+      assert.fail('unexpected URL '+url);
+    },
+  }),/HTTP 503/);
+  assert.match(reviewBody,/jiaze-review-pending-session:v1:99:/);
+  assert.doesNotMatch(reviewBody,/jiaze-review-source-comment:99/);
 });
