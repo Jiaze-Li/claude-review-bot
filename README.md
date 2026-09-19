@@ -1,57 +1,95 @@
 # claude-review-bot
 
-Account-wide Claude PR reviewer for GitHub.
+Account-wide bounded PR review service for GitHub.
 
-Goal: install one GitHub App once, then use the same command in any authorized repository:
+## Daily use
 
-```text
-@claude review
-```
-
-The comment is only a trigger. Claude reviews the actual PR diff and the checked-out repository code, then the bot publishes a GitHub PR Review back to that PR.
-
-## Trigger format and trustworthy status
-
-Use the dedicated command to distinguish this App from the separate official Claude App:
+For normal work, remember one command:
 
 ```text
 @jiaze-claude-review-bot review
 ```
 
-`@claude review` remains a compatible alias. The first nonblank line must contain
-only the command. Matching ignores case, allows extra spaces/tabs between the
-mention and `review`, trailing spaces/tabs, surrounding blank lines, CRLF, and
-up to three leading spaces. Additional text on later lines is tolerated.
-For example:
+That command is intentionally stateful and simple:
+
+- First review of a PR/session: **Gemini 3.8 Flash, low thinking, one discovery pass**.
+- If material P0/P1/P2 findings exist, push a repair and use the **same command** again.
+- The next call becomes targeted **verification**, not another full PR discovery.
+- At most **2 verification rounds** are allowed.
+- P3 findings are non-blocking.
+- Re-running on the same unchanged HEAD spends **no reviewer model quota**.
+- If material findings remain after the verification budget, the session stops at **HUMAN_REQUIRED** instead of looping.
+- Session state is stored in a bot-authored GitHub PR comment, so it survives new ChatGPT conversations, different agents, and local restarts.
+
+You do **not** need to remember discovery, verification, round numbers, or provider selection.
+
+Rare escape hatches:
 
 ```text
-@claude   review
-
-Additional comment text can follow.
+@jiaze-claude-review-bot claude review
+@claude review
 ```
 
-The comment remains only a trigger: extra text is not forwarded as reviewer
-instructions. Put binding requirements in the PR description/repository contract;
-the reviewer still inspects the actual exact-HEAD code and diff. Quoted commands,
-fenced/indented code, lists, mid-prose mentions, and edited comments do not trigger.
-Use a new comment to request another review; duplicate delivery of the same
-comment retains the existing deduplication behavior.
+These request the existing explicit Claude deep review and do not replace the bounded Gemini session.
 
-This App never adds an eyes reaction on webhook receipt. Only after the central
-workflow has actually started, passed deduplication and exact-HEAD preflight does
-it post **Self-hosted Claude review**, with the run URL, attempt, source comment,
-and target HEAD. The same status comment is updated after publication or failure
-when workflow cleanup runs. If the runner is forcibly stopped or the status API
-fails, follow the run URL for the authoritative outcome; a start notice is not a
-completion certificate. Status is best-effort and never converts a failed review
-into success. It uses the existing Pull requests write permission, without giving
-Claude the GitHub token or requiring Issues write permission.
+If the PR has changed so radically that the old review session should be discarded:
 
-An eyes reaction from `claude[bot]` belongs to the separate official App, not
-`jiaze-claude-review-bot[bot]`. This repository cannot prevent that other App from
-reacting. Prefer the dedicated command, or remove this repository from the
-**official Claude App's** repository access while keeping the self-hosted App
-installed. Do not use another App's reaction as proof that this workflow ran.
+```text
+@jiaze-claude-review-bot reset review
+```
+
+Reset is intentionally explicit; the normal review command never silently opens unlimited discovery rounds.
+
+## Review policy
+
+The automatic state machine is:
+
+```text
+NEW / changed-after-READY
+        |
+        v
+Gemini DISCOVERY (once)
+        |
+        +-- no P0/P1/P2 --> READY
+        |
+        +-- material findings --> REWORK
+                                  |
+                                  v
+                         Gemini VERIFICATION
+                         (existing findings +
+                          repair-caused regressions only)
+                                  |
+                     +------------+------------+
+                     |                         |
+                   READY                 still material
+                                               |
+                                      verification #2 max
+                                               |
+                                     READY or HUMAN_REQUIRED
+```
+
+Verification is not allowed to reopen broad, unrelated discovery. A new finding is valid there only when it is a regression directly caused by the repair (except a catastrophic P0/security issue). This is the mechanism that prevents the endless “review → fix → fresh full review → new edge case” loop.
+
+Codex is deliberately **not automatic in v1**. At HUMAN_REQUIRED, use a targeted Codex or Claude review only when human judgment says the remaining issue is worth escalation. This keeps Codex and Claude usage low.
+
+## Security and execution model
+
+The GitHub comment is only a trigger. The central workflow pins the exact PR HEAD, builds trusted diff context, runs the reviewer without a GitHub write token, and re-checks HEAD before publication.
+
+Default Gemini review is intentionally lightweight:
+
+```text
+model: gemini-3.8-flash
+thinking: LOW
+input: exact PR diff for discovery
+       repair diff + durable open findings for verification
+```
+
+Gemini is not given agent tools or repository write access. The existing Claude deep-review path retains its read-only sanitized snapshot and host-enforced tool policy.
+
+A durable **Independent Review Session** comment records READY / REWORK / HUMAN_REQUIRED, stable finding IDs (F001, F002, ...), verification count, and next action. The bot only trusts session comments authored by its own GitHub App identity.
+
+The first nonblank line must contain only a supported command. Matching ignores case and ordinary spaces/tabs; quoted commands, fenced/indented code, lists, mid-prose mentions, and edited comments do not trigger.
 
 ### Deploying a trigger change
 
@@ -72,7 +110,7 @@ source-comment ID in the real central run and its bot-authored status. The new
 or Cloudflare deployment. No deployment or App installation is changed by those
 tests.
 
-## What V1 does
+## Legacy Claude deep-review path
 
 - Listens for `@claude review` on pull requests through one GitHub App.
 - Works across every repository where that App is installed; target repos do not need their own Claude workflow.
@@ -87,31 +125,52 @@ tests.
 ## Architecture
 
 ```text
-PR comment: @claude review
+PR comment: @jiaze-claude-review-bot review
         |
         v
-GitHub App webhook
+GitHub App webhook / Cloudflare Worker
         |
         v
-Cloudflare Worker (small router)
+review-v2.yml (serialized per PR)
+        |
+        +--> exact-HEAD preflight + PR diff
+        +--> restore durable review session
+        +--> choose automatically:
+        |      Gemini discovery
+        |      Gemini verification
+        |      no-op / HUMAN_REQUIRED
+        |
+        +--> exact-HEAD publisher
+        +--> update durable session comment
         |
         v
-this repo: review.yml
-        |
-        +--> checkout exact target PR SHA
-        +--> build diff/context
-        +--> Claude Code review
-        +--> deterministic publisher
-        |
-        v
-GitHub PR Review
+READY / REWORK / HUMAN_REQUIRED
 ```
+
+The provider is an implementation detail. The session policy, stable finding IDs,
+round budget, and GitHub publication are separate from the Gemini/Claude adapters.
+A future ReviewLoop integration should call this service through one thin review
+interface rather than embedding provider-specific logic in ReviewLoop core.
 
 ## Review cost controls
 
-The reviewer intentionally uses the Claude Code `sonnet` model alias rather than a version-pinned model ID. That keeps the reviewer on the current Sonnet generation as Claude Code updates its alias.
+Default automatic review:
 
-The trusted runner currently sets:
+```text
+model: gemini-3.8-flash
+thinking: low
+discovery passes: 1
+verification passes: max 2
+P3: non-blocking
+same HEAD: no model call
+```
+
+Gemini receives bounded textual context rather than repository tools. Discovery
+uses the exact PR diff; verification uses only the repair diff plus durable open
+findings. The request has a hard output/thinking-token ceiling and the publisher
+fails closed on malformed output or a moved PR HEAD.
+
+Claude remains an explicit deep-review escape hatch:
 
 ```text
 model: sonnet
@@ -119,7 +178,9 @@ effort: medium
 maxTurns: 24
 ```
 
-`medium` effort reduces reasoning and tool-call token use relative to the default high effort. The turn ceiling prevents unusually large PRs from exploring indefinitely. Each successful review records the resolved model and the SDK-reported input, cache, output, and turn usage so expensive reviews can be identified from the PR itself.
+It is not part of the normal automatic loop, preserving Claude quota for Worker
+tasks. Codex is also not called automatically; use targeted escalation only after
+the bounded session reaches HUMAN_REQUIRED.
 
 ## One-time setup
 
@@ -168,23 +229,27 @@ Repository variable:
 Repository secrets:
 
 - `APP_PRIVATE_KEY`: complete GitHub App private-key PEM
-- `CLAUDE_CODE_OAUTH_TOKEN`: Claude Code OAuth token
+- `GEMINI_API_KEY`: Google AI Studio / Gemini API key used by the default bounded reviewer
+- `CLAUDE_CODE_OAUTH_TOKEN`: Claude Code OAuth token used only by explicit Claude deep review
 
 The OAuth token can be generated locally with Claude Code using `claude setup-token` if that authentication mode is available to your account.
 
-### 4. Merge the V1 branch into `main`
+### 4. Merge the review-service branch into `main`
 
-The Worker dispatches `.github/workflows/review.yml` on `main`, so the workflow must exist on `main` before end-to-end testing.
+The Worker dispatches `.github/workflows/review-v2.yml` on `main`, so the workflow must exist on `main` before end-to-end testing.
 
 ### 5. Test
 
 On a PR in any repository covered by the GitHub App, add:
 
 ```text
-@claude review
+@jiaze-claude-review-bot review
 ```
 
-Expected behavior: a central workflow starts in this repository and a Claude PR Review appears on the original PR.
+Expected behavior: the first call runs a Gemini discovery review and creates an
+**Independent Review Session** comment. If material findings exist, push a repair
+and use the same command again; it automatically runs targeted verification.
+The session eventually reaches READY or HUMAN_REQUIRED and does not loop forever.
 
 ## Security model
 

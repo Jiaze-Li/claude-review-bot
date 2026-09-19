@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import { createHmac, generateKeyPairSync } from 'node:crypto';
-import { isReviewTrigger } from '../worker/src/review-trigger.js';
+import { isReviewTrigger, parseReviewTrigger } from '../worker/src/review-trigger.js';
 import worker from '../worker/src/index.js';
 
 for (const body of [
@@ -10,6 +11,7 @@ for (const body of [
   '\r\n @claude review \r\n\r\nInspect the actual diff.',
   '@claude review\n\nReview exact HEAD and regression tests.',
   '@jiaze-claude-review-bot review', '@JIAZE-CLAUDE-REVIEW-BOT REVIEW\nDetails.',
+  '@jiaze-claude-review-bot claude review', '@jiaze-claude-review-bot reset review',
   '   @claude review\t ',
 ]) {
   test(`accepts standalone leading command: ${JSON.stringify(body)}`, () => {
@@ -23,12 +25,20 @@ for (const body of [
   '```text\n@claude review\n```', '~~~\n@claude review\n~~~',
   '    @claude review', '\t@claude review',
   '@claude reviewer', '@claude review-all', '@claude review please',
+  '@jiaze-claude-review-bot gemini review', '@jiaze-claude-review-bot review please',
   '@claude\nreview', '@other review', '<!--\n@claude review\n-->',
 ]) {
   test(`rejects non-command or quoted command: ${JSON.stringify(body)}`, () => {
     assert.equal(isReviewTrigger(body), false);
   });
 }
+
+test('dedicated command maps to auto mode while Claude aliases remain explicit', () => {
+  assert.deepEqual(parseReviewTrigger('@jiaze-claude-review-bot review'), { requestedMode: 'auto' });
+  assert.deepEqual(parseReviewTrigger('@jiaze-claude-review-bot reset review'), { requestedMode: 'reset' });
+  assert.deepEqual(parseReviewTrigger('@jiaze-claude-review-bot claude review'), { requestedMode: 'claude' });
+  assert.deepEqual(parseReviewTrigger('@claude review'), { requestedMode: 'claude' });
+});
 
 const secret = 'synthetic-test-webhook-secret';
 const { privateKey } = generateKeyPairSync('rsa', {
@@ -53,7 +63,9 @@ function request(payload = basePayload, overrides = {}) {
     },
   });
 }
-function fakeGithub(t, { permission = 'write', state = 'open', duplicate = false, dispatchFails = false } = {}) {
+function fakeGithub(t, {
+  permission = 'write', state = 'open', duplicate = false, processedNoop = false, dispatchFails = false,
+} = {}) {
   const calls = [];
   t.mock.method(globalThis, 'fetch', async (url, options) => {
     const pathname = new URL(url).pathname;
@@ -70,6 +82,9 @@ function fakeGithub(t, { permission = 'write', state = 'open', duplicate = false
     else if (pathname === '/repos/acme/project/pulls/7') out = { state, head: { sha: 'a'.repeat(40) }, base: { sha: 'b'.repeat(40) } };
     else if (pathname.endsWith('/reviews')) out = duplicate
       ? [{ user: { login: 'jiaze-claude-review-bot[bot]' }, body: '<!-- claude-review-source-comment:99 -->' }]
+      : [];
+    else if (pathname === '/repos/acme/project/issues/7/comments') out = processedNoop
+      ? [{ user: { login: 'jiaze-claude-review-bot[bot]' }, body: '<!-- jiaze-review-source-comment:99 -->' }]
       : [];
     else if (pathname === '/repos/Jiaze-Li/claude-review-bot/installation') out = { id: 11 };
     else assert.fail(`Unexpected GitHub endpoint: ${method} ${pathname}`);
@@ -90,9 +105,10 @@ for (const body of ['@claude review\n\nFocus on the runtime evidence.', '\n @jia
       ref: 'main', inputs: {
         target_repo: 'acme/project', pr_number: '7', base_sha: 'b'.repeat(40),
         head_sha: 'a'.repeat(40), trigger_user: 'maintainer', source_comment_id: '99',
+        requested_mode: body.includes('@claude review') && !body.includes('@jiaze-claude-review-bot') ? 'claude' : 'auto',
       },
     });
-    assert.equal(calls.some((call) => /comments|reactions/.test(call.pathname)), false);
+    assert.equal(calls.some((call) => /comments|reactions/.test(call.pathname) && call.method !== 'GET'), false);
   });
 }
 for (const [name, payload, headers] of [
@@ -109,17 +125,26 @@ for (const [name, payload, headers] of [
     assert.equal(calls.length, 0);
   });
 }
-for (const options of [{ permission: 'read' }, { state: 'closed' }, { duplicate: true }]) {
+for (const options of [{ permission: 'read' }, { state: 'closed' }, { duplicate: true }, { processedNoop: true }]) {
   test(`ignored authorized-path trigger: ${JSON.stringify(options)}`, async (t) => {
     const calls = fakeGithub(t, options);
     const response = await worker.fetch(request(), env);
     assert.equal((await response.json()).ignored, true);
-    assert.equal(calls.some((call) => /dispatches|comments|reactions/.test(call.pathname)), false);
+    assert.equal(calls.some((call) =>
+      call.pathname.endsWith('/dispatches') ||
+      (/comments|reactions/.test(call.pathname) && call.method !== 'GET')), false);
   });
 }
 test('failed dispatch never returns accepted or posts a reaction/status', async (t) => {
   const calls = fakeGithub(t, { dispatchFails: true });
   await assert.rejects(worker.fetch(request(), env), /503/);
   assert.equal(calls.filter((call) => call.pathname.endsWith('/dispatches')).length, 1);
-  assert.equal(calls.some((call) => /comments|reactions/.test(call.pathname)), false);
+  assert.equal(calls.some((call) => /comments|reactions/.test(call.pathname) && call.method !== 'GET'), false);
+});
+
+
+test('deployed Worker config routes normal triggers to review-v2 workflow', () => {
+  const toml=fs.readFileSync(new URL('../worker/wrangler.toml',import.meta.url),'utf8');
+  assert.match(toml,/CONTROL_WORKFLOW\s*=\s*"review-v2\.yml"/);
+  assert.doesNotMatch(toml,/CONTROL_WORKFLOW\s*=\s*"review\.yml"/);
 });

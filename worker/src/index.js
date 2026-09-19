@@ -1,4 +1,4 @@
-import { isReviewTrigger } from './review-trigger.js';
+import { parseReviewTrigger } from './review-trigger.js';
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -52,7 +52,8 @@ export default {
 
     if (payload.action !== 'created') return json({ ignored: true, reason: 'not a created comment' });
     if (!payload.issue?.pull_request) return json({ ignored: true, reason: 'comment is not on a pull request' });
-    if (!isReviewTrigger(payload.comment?.body)) {
+    const reviewCommand = parseReviewTrigger(payload.comment?.body);
+    if (!reviewCommand) {
       return json({ ignored: true, reason: 'first nonblank line is not a review command' });
     }
 
@@ -89,12 +90,12 @@ export default {
     // Fast path for normal GitHub redeliveries. A public marker is not enough:
     // only a review authored by this exact GitHub App bot is trusted as proof
     // that the source comment already completed a review.
-    if (await hasPublishedReviewForComment(targetRepo, prNumber, commentId, expectedReviewAuthor, targetToken)) {
+    if (await hasProcessedSourceComment(targetRepo, prNumber, commentId, expectedReviewAuthor, targetToken)) {
       return json({ ignored: true, reason: 'source comment already reviewed' });
     }
 
     const controlRepo = env.CONTROL_REPO || 'Jiaze-Li/claude-review-bot';
-    const controlWorkflow = env.CONTROL_WORKFLOW || 'review.yml';
+    const controlWorkflow = env.CONTROL_WORKFLOW || 'review-v2.yml';
     const controlRef = env.CONTROL_REF || 'main';
 
     const controlInstallation = await githubApi(`/repos/${controlRepo}/installation`, { token: appJwt });
@@ -118,6 +119,7 @@ export default {
           head_sha: pr.head.sha,
           trigger_user: triggerUser,
           source_comment_id: String(commentId),
+          requested_mode: reviewCommand.requestedMode,
         },
       },
       expectNoContent: true,
@@ -127,6 +129,7 @@ export default {
       accepted: true,
       target: `${targetRepo}#${prNumber}`,
       head_sha: pr.head.sha,
+      requested_mode: reviewCommand.requestedMode,
     }, 202);
   },
 };
@@ -178,24 +181,43 @@ async function createInstallationToken(installationId, appJwt) {
   return result.token;
 }
 
-async function hasPublishedReviewForComment(targetRepo, prNumber, commentId, expectedReviewAuthor, token) {
-  const marker = sourceCommentMarker(commentId);
+async function hasProcessedSourceComment(targetRepo, prNumber, commentId, expectedReviewAuthor, token) {
+  const markers = sourceCommentMarkers(commentId);
   for (let page = 1; page <= 100; page += 1) {
     const reviews = await githubApi(`/repos/${targetRepo}/pulls/${prNumber}/reviews?per_page=100&page=${page}`, { token });
     if (!Array.isArray(reviews)) throw new Error('GitHub pull request reviews response was not an array');
     if (reviews.some((review) =>
       review?.user?.login === expectedReviewAuthor &&
       typeof review.body === 'string' &&
-      review.body.includes(marker))) {
+      markers.some((marker) => review.body.includes(marker)))) {
       return true;
     }
-    if (reviews.length < 100) return false;
+    if (reviews.length < 100) break;
   }
-  throw new Error('Pull request review pagination exceeded safety limit');
+
+  // Model-backed runs are marked by their PR review. No-model terminal paths
+  // (READY-on-same-HEAD, waiting-for-repair, HUMAN_REQUIRED) are marked only
+  // when the final status comment is successfully updated.
+  for (let page = 1; page <= 100; page += 1) {
+    const comments = await githubApi(`/repos/${targetRepo}/issues/${prNumber}/comments?per_page=100&page=${page}`, { token });
+    if (!Array.isArray(comments)) throw new Error('GitHub issue comments response was not an array');
+    if (comments.some((comment) =>
+      comment?.user?.login === expectedReviewAuthor &&
+      typeof comment.body === 'string' &&
+      markers.some((marker) => comment.body.includes(marker)))) {
+      return true;
+    }
+    if (comments.length < 100) return false;
+  }
+  throw new Error('Pull request review/comment pagination exceeded safety limit');
 }
 
-function sourceCommentMarker(commentId) {
-  return `<!-- claude-review-source-comment:${String(commentId)} -->`;
+function sourceCommentMarkers(commentId) {
+  const id = String(commentId);
+  return [
+    `<!-- jiaze-review-source-comment:${id} -->`,
+    `<!-- claude-review-source-comment:${id} -->`,
+  ];
 }
 
 async function githubApi(path, { method = 'GET', token, body, expectNoContent = false } = {}) {

@@ -22,4 +22,14 @@ jobs:
       # Tests use only Node built-ins and mocked GitHub calls. No Claude quota,
       # installation tokens, npm dependency installation or Cloudflare access.
       - run: npm test
-      - run: node --check worker/src/index.js && node --check scripts/review-status.mjs
+      - name: Syntax-check review service scripts
+        run: |
+          node --check worker/src/index.js
+          node --check worker/src/review-trigger.js
+          node --check scripts/review-status.mjs
+          node --check scripts/review-session-core.mjs
+          node --check scripts/plan-review-session.mjs
+          node --check scripts/recover-review-session.mjs
+          node --check scripts/run-gemini-review.mjs
+          node --check scripts/publish-gemini-review.mjs
+          node --check scripts/publish-review.mjs
