@@ -38,10 +38,12 @@ test('state-integrity final audit requires explicit interleaving reasoning',()=>
     mode:'audit',repo:'a/b',prNumber:'1',headSha:A,prJson:'{}',diff:'final diff',session:null,riskProfile,
   });
   assert.match(prompt,/STATE-INTEGRITY RISK/);
-  assert.match(prompt,/two-actor\/process\/worktree interleaving/);
-  assert.match(prompt,/read -> validate -> modify -> write/);
-  assert.match(prompt,/stale snapshots, lost updates, TOCTOU/);
-  assert.match(prompt,/do not infer safety merely because a lock exists/i);
+  assert.match(prompt,/Trace BACKWARD from every write sink into its changed callers/);
+  assert.match(prompt,/lock around the final write is NOT sufficient/i);
+  assert.match(prompt,/snapshot is prepared before lock acquisition/);
+  assert.match(prompt,/actor A reads snapshot S/);
+  assert.match(prompt,/B can still succeed and silently overwrite A'/);
+  assert.match(prompt,/Inspect changed callers and callees together across files/);
 });
 
 test('verification prompt is restricted to stable open findings and repair-induced regressions',()=>{
