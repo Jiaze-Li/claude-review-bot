@@ -162,3 +162,53 @@ test('normal final audit remains low thinking',async()=>{
   assert.doesNotMatch(request.body.contents[0].parts[0].text,/STATE-INTEGRITY RISK/);
   assert.equal(result._meta.effort,'low');
 });
+
+
+test('risk final audit retries malformed structured output once with the same medium request',async()=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'gemini-risk-retry-'));
+  fs.writeFileSync(path.join(dir,'pr.json'),'{}');
+  fs.writeFileSync(path.join(dir,'pr.diff'),'diff --git a/a b/a\n+state lock worktree checkpoint\n');
+  fs.writeFileSync(path.join(dir,'session-plan.json'),JSON.stringify({decision:{mode:'audit'},session:{}}));
+  fs.writeFileSync(path.join(dir,'risk-profile.json'),JSON.stringify({
+    version:1,
+    stateIntegrity:true,
+    signals:{
+      synchronization:['lock'],
+      durableState:['state','checkpoint-history'],
+      multiActor:['worktree'],
+    },
+  }));
+
+  const requests=[];
+  let call=0;
+  const result=await runGeminiReview({
+    env:{GEMINI_API_KEY:'dummy-key',TARGET_REPO:'a/b',PR_NUMBER:'1',HEAD_SHA:A,REVIEW_CONTEXT_DIR:dir},
+    fetchImpl:async(url,init)=>{
+      requests.push(JSON.parse(init.body));
+      call+=1;
+      if(call===1){
+        return Response.json({
+          candidates:[{content:{parts:[{text:'{"summary":"truncated","findings":['}]}}],
+          usageMetadata:{promptTokenCount:100,candidatesTokenCount:12,thoughtsTokenCount:20,totalTokenCount:132},
+        });
+      }
+      return Response.json({
+        candidates:[{content:{parts:[{text:JSON.stringify({summary:'clean',findings:[]})}]}}],
+        usageMetadata:{promptTokenCount:100,candidatesTokenCount:10,thoughtsTokenCount:25,totalTokenCount:135},
+      });
+    },
+  });
+
+  assert.equal(call,2);
+  assert.equal(requests[0].generationConfig.thinkingConfig.thinkingLevel,'medium');
+  assert.equal(requests[1].generationConfig.thinkingConfig.thinkingLevel,'medium');
+  assert.deepEqual(requests[1],requests[0]);
+  assert.equal(result._meta.attempts,2);
+  assert.equal(result._meta.effort,'medium');
+  assert.deepEqual(result._meta.usage,{
+    input_tokens:200,
+    output_tokens:22,
+    thoughts_tokens:45,
+    total_tokens:267,
+  });
+});

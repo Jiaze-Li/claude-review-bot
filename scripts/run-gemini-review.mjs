@@ -158,42 +158,70 @@ export async function runGeminiReview({env=process.env,fetchImpl=fetch}={}){
   const thinking = mode==='audit' && riskProfile?.stateIntegrity === true
     ? RISK_AUDIT_THINKING
     : GEMINI_THINKING;
-  const response=await fetchImpl(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,{
-    method:'POST',
-    headers:{'Content-Type':'application/json','x-goog-api-key':apiKey},
-    body:JSON.stringify({
-      contents:[{role:'user',parts:[{text:built.prompt}]}],
-      generationConfig:{
-        thinkingConfig:{thinkingLevel:thinking},
-        responseFormat:{
-          text:{
-            mimeType:'APPLICATION_JSON',
-            schema:toGeminiJsonSchema(built.schema),
-          },
+  const requestBody=JSON.stringify({
+    contents:[{role:'user',parts:[{text:built.prompt}]}],
+    generationConfig:{
+      thinkingConfig:{thinkingLevel:thinking},
+      responseFormat:{
+        text:{
+          mimeType:'APPLICATION_JSON',
+          schema:toGeminiJsonSchema(built.schema),
         },
-        maxOutputTokens:16384,
       },
-    }),
-    signal:AbortSignal.timeout(180000),
+      maxOutputTokens:16384,
+    },
   });
-  if(!response.ok){
-    const body=await response.text();
-    throw new Error(`Gemini API failed (HTTP ${response.status}): ${body.slice(0,500)}`);
+  const usageTotals={
+    promptTokenCount:0,
+    candidatesTokenCount:0,
+    thoughtsTokenCount:0,
+    totalTokenCount:0,
+  };
+  let result=null;
+  let attempts=0;
+  let lastStructuredError=null;
+
+  for(let attempt=1;attempt<=2;attempt+=1){
+    attempts=attempt;
+    const response=await fetchImpl(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,{
+      method:'POST',
+      headers:{'Content-Type':'application/json','x-goog-api-key':apiKey},
+      body:requestBody,
+      signal:AbortSignal.timeout(180000),
+    });
+    if(!response.ok){
+      const body=await response.text();
+      throw new Error(`Gemini API failed (HTTP ${response.status}): ${body.slice(0,500)}`);
+    }
+    const payload=await response.json();
+    for(const key of Object.keys(usageTotals)){
+      const value=payload.usageMetadata?.[key];
+      if(typeof value==='number'&&Number.isFinite(value)&&value>=0) usageTotals[key]+=value;
+    }
+    const text=(payload.candidates?.[0]?.content?.parts??[]).map(p=>typeof p.text==='string'?p.text:'').join('');
+    try{
+      if(!text) throw new Error('returned no structured text');
+      result=JSON.parse(text);
+      break;
+    }catch(error){
+      lastStructuredError=error;
+      if(attempt===1){
+        console.warn(`Gemini review returned malformed structured output; retrying once: ${error.message}`);
+      }
+    }
   }
-  const payload=await response.json();
-  const text=(payload.candidates?.[0]?.content?.parts??[]).map(p=>typeof p.text==='string'?p.text:'').join('');
-  if(!text) throw new Error('Gemini API returned no structured text');
-  let result;
-  try{result=JSON.parse(text);}catch(error){throw new Error(`Gemini structured output is invalid JSON: ${error.message}`);}
-  const usage=payload.usageMetadata??{};
+
+  if(!result){
+    throw new Error(`Gemini structured output is invalid after one retry: ${lastStructuredError?.message||'unknown error'}`);
+  }
   result._meta={
-    provider:'gemini',requested_model:model,resolved_model:model,effort:thinking,mode,
+    provider:'gemini',requested_model:model,resolved_model:model,effort:thinking,mode,attempts,
     risk_profile:riskProfile,
     usage:{
-      input_tokens:nonnegative(usage.promptTokenCount),
-      output_tokens:nonnegative(usage.candidatesTokenCount),
-      thoughts_tokens:nonnegative(usage.thoughtsTokenCount),
-      total_tokens:nonnegative(usage.totalTokenCount),
+      input_tokens:nonnegative(usageTotals.promptTokenCount),
+      output_tokens:nonnegative(usageTotals.candidatesTokenCount),
+      thoughts_tokens:nonnegative(usageTotals.thoughtsTokenCount),
+      total_tokens:nonnegative(usageTotals.totalTokenCount),
     },
   };
   return result;

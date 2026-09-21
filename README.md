@@ -22,6 +22,7 @@ That command is intentionally stateful and simple:
 - Final-audit P0/P1/P2 candidates use the same targeted medium validator.
 - The final broad audit runs **at most once per session**. If it finds a material bug, later calls are targeted verification only.
 - P3 findings are non-blocking.
+- A malformed/no-text structured Gemini review response is retried **once with the identical prompt, model, thinking level, and schema**; usage from both attempts is reported.
 - Re-running on the same unchanged HEAD spends **no reviewer model quota**.
 - If material findings remain after the verification budget, the session stops at **HUMAN_REQUIRED** instead of looping.
 - Session state is stored in a bot-authored GitHub PR comment, so it survives new ChatGPT conversations, different agents, and local restarts.
