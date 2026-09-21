@@ -195,6 +195,12 @@ jobs:
           git -C target diff --no-ext-diff --no-textconv --name-only "$merge_base" "$HEAD_SHA" > .review-context/changed-files.txt
           git -C target diff --no-ext-diff --no-textconv --stat "$merge_base" "$HEAD_SHA" > .review-context/diff-stat.txt
 
+      - name: Classify deterministic review risk
+        if: steps.dedupe.outputs.duplicate != 'true'
+        env:
+          REVIEW_CONTEXT_DIR: .review-context
+        run: node scripts/detect-review-risk.mjs
+
       - name: Plan durable review session
         id: plan
         if: steps.dedupe.outputs.duplicate != 'true'
