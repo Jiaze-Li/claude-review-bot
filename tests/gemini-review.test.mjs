@@ -24,6 +24,26 @@ test('final audit is a second independent material-only broad pass',()=>{
   assert.deepEqual(schema.properties.findings.items.properties.severity.enum,['P0','P1','P2']);
 });
 
+test('state-integrity final audit requires explicit interleaving reasoning',()=>{
+  const riskProfile={
+    version:1,
+    stateIntegrity:true,
+    signals:{
+      synchronization:['lock','git-ref-update'],
+      durableState:['state','checkpoint-history'],
+      multiActor:['worktree'],
+    },
+  };
+  const {prompt}=buildGeminiRequest({
+    mode:'audit',repo:'a/b',prNumber:'1',headSha:A,prJson:'{}',diff:'final diff',session:null,riskProfile,
+  });
+  assert.match(prompt,/STATE-INTEGRITY RISK/);
+  assert.match(prompt,/two-actor\/process\/worktree interleaving/);
+  assert.match(prompt,/read -> validate -> modify -> write/);
+  assert.match(prompt,/stale snapshots, lost updates, TOCTOU/);
+  assert.match(prompt,/do not infer safety merely because a lock exists/i);
+});
+
 test('verification prompt is restricted to stable open findings and repair-induced regressions',()=>{
   const session=applyDiscoveryResult({result:{summary:'x',findings:[{
     severity:'P1',title:'Bug',body:'Trigger X causes Y, expected Z.',path:'a.js',line:1,riskClass:'state',
