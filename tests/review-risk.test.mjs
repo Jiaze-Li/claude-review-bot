@@ -16,6 +16,7 @@ test('DocFlow-style locked durable state changes trigger state-integrity risk', 
     '+++ b/src/state-store.js',
     '@@ -1,2 +1,9 @@',
     '+return withStateLock(repoRoot, homeDir, exec, () => {',
+    '+  atomicWrite(statePath, content);',
     '+  const parent = ensureLocalStateRef(repoRoot, exec);',
     '+  git(repoRoot, [\'update-ref\', STATE_REF, commit, parent], exec);',
     '+});',
@@ -25,6 +26,7 @@ test('DocFlow-style locked durable state changes trigger state-integrity risk', 
   const risk = detectReviewRisk({ diff });
   assert.equal(risk.stateIntegrity, true);
   assert.ok(risk.signals.synchronization.includes('lock'));
+  assert.ok(risk.signals.synchronization.includes('atomic'));
   assert.ok(risk.signals.synchronization.includes('git-ref-update'));
   assert.ok(risk.signals.durableState.includes('state'));
   assert.ok(risk.signals.multiActor.includes('worktree'));
