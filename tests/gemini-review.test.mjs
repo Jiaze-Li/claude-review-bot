@@ -130,8 +130,10 @@ test('state-integrity final audit escalates to medium thinking',async()=>{
   });
 
   assert.equal(request.body.generationConfig.thinkingConfig.thinkingLevel,'medium');
+  assert.equal(request.body.generationConfig.maxOutputTokens,32768);
   assert.match(request.body.contents[0].parts[0].text,/STATE-INTEGRITY RISK/);
   assert.equal(result._meta.effort,'medium');
+  assert.equal(result._meta.max_output_tokens,32768);
   assert.equal(result._meta.risk_profile.stateIntegrity,true);
 });
 
@@ -159,8 +161,10 @@ test('normal final audit remains low thinking',async()=>{
   });
 
   assert.equal(request.body.generationConfig.thinkingConfig.thinkingLevel,'low');
+  assert.equal(request.body.generationConfig.maxOutputTokens,16384);
   assert.doesNotMatch(request.body.contents[0].parts[0].text,/STATE-INTEGRITY RISK/);
   assert.equal(result._meta.effort,'low');
+  assert.equal(result._meta.max_output_tokens,16384);
 });
 
 
@@ -201,9 +205,12 @@ test('risk final audit retries malformed structured output once with the same me
 
   assert.equal(call,2);
   assert.equal(requests[0].generationConfig.thinkingConfig.thinkingLevel,'medium');
+  assert.equal(requests[0].generationConfig.maxOutputTokens,32768);
   assert.equal(requests[1].generationConfig.thinkingConfig.thinkingLevel,'medium');
+  assert.equal(requests[1].generationConfig.maxOutputTokens,32768);
   assert.deepEqual(requests[1],requests[0]);
   assert.equal(result._meta.attempts,2);
+  assert.equal(result._meta.max_output_tokens,32768);
   assert.equal(result._meta.effort,'medium');
   assert.deepEqual(result._meta.usage,{
     input_tokens:200,
