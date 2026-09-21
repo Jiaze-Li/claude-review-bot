@@ -30,6 +30,7 @@ jobs:
           node --check scripts/review-session-core.mjs
           node --check scripts/plan-review-session.mjs
           node --check scripts/recover-review-session.mjs
+          node --check scripts/detect-review-risk.mjs
           node --check scripts/run-gemini-review.mjs
           node --check scripts/validate-gemini-findings.mjs
           node --check scripts/publish-gemini-review.mjs
