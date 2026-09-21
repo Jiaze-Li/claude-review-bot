@@ -213,6 +213,7 @@ verification:
 final audit:
   model: gemini-3.8-flash
   thinking: low normally; medium only for deterministic state-integrity risk
+  structured-output budget: 16k normally; 32k for medium state-integrity audit
   scope: final cumulative PR diff
   passes: max 1 per session
   state-integrity risk: explicitly test read-modify-write boundaries, stale snapshots,
