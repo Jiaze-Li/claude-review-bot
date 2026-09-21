@@ -158,6 +158,7 @@ export async function runGeminiReview({env=process.env,fetchImpl=fetch}={}){
   const thinking = mode==='audit' && riskProfile?.stateIntegrity === true
     ? RISK_AUDIT_THINKING
     : GEMINI_THINKING;
+  const maxOutputTokens = thinking===RISK_AUDIT_THINKING ? 32768 : 16384;
   const requestBody=JSON.stringify({
     contents:[{role:'user',parts:[{text:built.prompt}]}],
     generationConfig:{
@@ -168,7 +169,7 @@ export async function runGeminiReview({env=process.env,fetchImpl=fetch}={}){
           schema:toGeminiJsonSchema(built.schema),
         },
       },
-      maxOutputTokens:16384,
+      maxOutputTokens,
     },
   });
   const usageTotals={
@@ -216,6 +217,7 @@ export async function runGeminiReview({env=process.env,fetchImpl=fetch}={}){
   }
   result._meta={
     provider:'gemini',requested_model:model,resolved_model:model,effort:thinking,mode,attempts,
+    max_output_tokens:maxOutputTokens,
     risk_profile:riskProfile,
     usage:{
       input_tokens:nonnegative(usageTotals.promptTokenCount),
