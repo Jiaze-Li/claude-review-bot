@@ -4,7 +4,7 @@ import { pathToFileURL } from 'node:url';
 
 const SIGNALS = {
   synchronization: [
-    ['lock', /\b(?:lock|mutex|semaphore|rwlock)\b/i],
+    ['lock', /(?:\b(?:lock|mutex|semaphore|rwlock)\b|[A-Za-z0-9_$]+Lock\b|[_-]lock\b)/],
     ['atomic', /\b(?:atomic|compare[-_ ]?and[-_ ]?swap|cas)\b/i],
     ['transaction', /\btransaction\b/i],
     ['git-ref-update', /\b(?:update-ref|updateRef)\b/i],
