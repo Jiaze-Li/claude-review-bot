@@ -202,6 +202,7 @@ discovery:
 material validator:
   model: gemini-3.8-flash
   thinking: medium
+  structured-output budget: 8k normally; 32k for state-integrity candidates
   passes: max 1 per discovery
   only CONFIRMED blocks
 

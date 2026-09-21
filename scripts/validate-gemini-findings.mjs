@@ -96,6 +96,8 @@ export async function validateMaterialFindings({ env = process.env, fetchImpl = 
   const includedIds = new Set(contexts.map((entry) => entry.candidateId));
   const prompt = buildValidationPrompt({ repo, prNumber, headSha, contexts });
   const model = env.GEMINI_MODEL || GEMINI_MODEL;
+  const stateIntegrityRisk = raw?._meta?.risk_profile?.stateIntegrity === true;
+  const maxOutputTokens = stateIntegrityRisk ? 32768 : 8192;
   let returned = null;
   let payload = null;
   let structuredAttempts = 0;
@@ -124,7 +126,7 @@ export async function validateMaterialFindings({ env = process.env, fetchImpl = 
                 schema: toGeminiJsonSchema(validationSchema),
               },
             },
-            maxOutputTokens: 8192,
+            maxOutputTokens,
           },
         }),
         signal: AbortSignal.timeout(180000),
@@ -207,6 +209,8 @@ export async function validateMaterialFindings({ env = process.env, fetchImpl = 
         effort: VALIDATOR_THINKING,
         mode: 'finding-validation',
         attempts: structuredAttempts,
+        max_output_tokens: maxOutputTokens,
+        risk_profile: raw?._meta?.risk_profile ?? null,
         usage: {
           input_tokens: nonnegative(usage.promptTokenCount),
           output_tokens: nonnegative(usage.candidatesTokenCount),

@@ -131,6 +131,7 @@ test('medium validator rejects a material false positive and keeps nonblocking P
     },
   });
   assert.equal(request.body.generationConfig.thinkingConfig.thinkingLevel,'medium');
+  assert.equal(request.body.generationConfig.maxOutputTokens,8192);
   assert.equal(VALIDATOR_THINKING,'medium');
   assert.deepEqual(output.findings.map((f)=>f.severity),['P3']);
   assert.equal(output._validation.validations[0].verdict,'REJECTED');
@@ -243,4 +244,51 @@ test('no material findings skip the validator API entirely',async()=>{
   assert.equal(calls,0);
   assert.equal(output._validation.status,'SKIPPED');
   assert.equal(output.findings.length,1);
+});
+
+
+test('state-integrity material validator gets larger structured-output budget',async()=>{
+  const root=tempRepo();
+  const dir=contextDir({
+    summary:'risk audit',
+    findings:[falsePositive],
+    _meta:{
+      provider:'gemini',
+      effort:'medium',
+      mode:'audit',
+      risk_profile:{
+        version:1,
+        stateIntegrity:true,
+        signals:{synchronization:['lock'],durableState:['state'],multiActor:['worktree']},
+      },
+    },
+  });
+  let request;
+  const output=await validateMaterialFindings({
+    env:{
+      GEMINI_API_KEY:'secret',TARGET_REPO:'a/b',PR_NUMBER:'7',HEAD_SHA:HEAD,
+      TARGET_REPO_DIR:root,REVIEW_CONTEXT_DIR:dir,
+      REVIEW_INPUT_PATH:path.join(dir,'review.json'),
+      REVIEW_OUTPUT_PATH:path.join(dir,'validated.json'),
+    },
+    fetchImpl:async(url,init)=>{
+      request=JSON.parse(init.body);
+      return Response.json({
+        candidates:[{content:{parts:[{text:JSON.stringify({
+          summary:'Failure survives guards.',
+          validations:[{
+            candidateId:'D001',verdict:'CONFIRMED',
+            reason:'The stale snapshot can reach the sink.',
+            evidence:['caller reads before the lock-protected sink'],
+          }],
+        })}]}}],
+        usageMetadata:{promptTokenCount:1000,candidatesTokenCount:100,thoughtsTokenCount:500,totalTokenCount:1600},
+      });
+    },
+  });
+  assert.equal(request.generationConfig.thinkingConfig.thinkingLevel,'medium');
+  assert.equal(request.generationConfig.maxOutputTokens,32768);
+  assert.equal(output._validation._meta.max_output_tokens,32768);
+  assert.equal(output._validation._meta.risk_profile.stateIntegrity,true);
+  assert.equal(output._validation.validations[0].verdict,'CONFIRMED');
 });
