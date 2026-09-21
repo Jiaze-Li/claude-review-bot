@@ -18,7 +18,7 @@ That command is intentionally stateful and simple:
 - If confirmed material findings exist, push a repair and use the **same command** again.
 - The next call becomes targeted **verification**, not another full PR discovery.
 - At most **2 verification rounds** are allowed.
-- Once material findings converge, one independent **final Gemini Flash / low audit** runs automatically on the final cumulative PR diff.
+- Once material findings converge, one independent final audit runs automatically on the final cumulative PR diff. It stays **Gemini Flash / low** for ordinary PRs; a deterministic state-integrity classifier escalates only shared-state/concurrency-sensitive PRs to **medium** with an explicit interleaving audit.
 - Final-audit P0/P1/P2 candidates use the same targeted medium validator.
 - The final broad audit runs **at most once per session**. If it finds a material bug, later calls are targeted verification only.
 - P3 findings are non-blocking.
@@ -211,9 +211,11 @@ verification:
 
 final audit:
   model: gemini-3.8-flash
-  thinking: low
+  thinking: low normally; medium only for deterministic state-integrity risk
   scope: final cumulative PR diff
   passes: max 1 per session
+  state-integrity risk: explicitly test read-modify-write boundaries, stale snapshots,
+                        lost updates, TOCTOU, CAS/version checks and two-actor interleavings
   P0/P1/P2 candidates: targeted medium validator
 
 P3: non-blocking
@@ -223,7 +225,7 @@ same HEAD: no model call
 Gemini receives bounded textual context rather than repository tools. Discovery
 uses the exact PR diff. The material validator receives only targeted context for
 each candidate (primary file, relevant PR hunk, matching symbols/guards and tests).
-Verification uses only the repair diff plus durable open findings. The final audit reuses the cumulative PR diff exactly once after convergence. The request has a hard output/thinking-token ceiling and the publisher fails closed on malformed output or a moved PR HEAD.
+Verification uses only the repair diff plus durable open findings. Before model review, a zero-model-cost deterministic classifier inspects added diff lines for a narrow combination of synchronization/transaction primitives plus durable/shared-state changes. The final audit reuses the cumulative PR diff exactly once after convergence; only a state-integrity hit changes its thinking level and prompt. The request has a hard output/thinking-token ceiling and the publisher fails closed on malformed output or a moved PR HEAD.
 
 Claude remains an explicit deep-review escape hatch:
 

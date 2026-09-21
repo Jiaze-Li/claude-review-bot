@@ -24,6 +24,26 @@ test('final audit is a second independent material-only broad pass',()=>{
   assert.deepEqual(schema.properties.findings.items.properties.severity.enum,['P0','P1','P2']);
 });
 
+test('state-integrity final audit requires explicit interleaving reasoning',()=>{
+  const riskProfile={
+    version:1,
+    stateIntegrity:true,
+    signals:{
+      synchronization:['lock','git-ref-update'],
+      durableState:['state','checkpoint-history'],
+      multiActor:['worktree'],
+    },
+  };
+  const {prompt}=buildGeminiRequest({
+    mode:'audit',repo:'a/b',prNumber:'1',headSha:A,prJson:'{}',diff:'final diff',session:null,riskProfile,
+  });
+  assert.match(prompt,/STATE-INTEGRITY RISK/);
+  assert.match(prompt,/two-actor\/process\/worktree interleaving/);
+  assert.match(prompt,/read -> validate -> modify -> write/);
+  assert.match(prompt,/stale snapshots, lost updates, TOCTOU/);
+  assert.match(prompt,/do not infer safety merely because a lock exists/i);
+});
+
 test('verification prompt is restricted to stable open findings and repair-induced regressions',()=>{
   const session=applyDiscoveryResult({result:{summary:'x',findings:[{
     severity:'P1',title:'Bug',body:'Trigger X causes Y, expected Z.',path:'a.js',line:1,riskClass:'state',
@@ -79,4 +99,66 @@ test('Gemini JSON-schema adapter strips unsupported length keywords but preserve
     },
     required:['name','line'],
   });
+});
+
+
+test('state-integrity final audit escalates to medium thinking',async()=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'gemini-risk-audit-'));
+  fs.writeFileSync(path.join(dir,'pr.json'),'{}');
+  fs.writeFileSync(path.join(dir,'pr.diff'),'diff --git a/a b/a\n+state lock worktree checkpoint\n');
+  fs.writeFileSync(path.join(dir,'session-plan.json'),JSON.stringify({decision:{mode:'audit'},session:{}}));
+  fs.writeFileSync(path.join(dir,'risk-profile.json'),JSON.stringify({
+    version:1,
+    stateIntegrity:true,
+    signals:{
+      synchronization:['lock'],
+      durableState:['state','checkpoint-history'],
+      multiActor:['worktree'],
+    },
+  }));
+
+  let request;
+  const result=await runGeminiReview({
+    env:{GEMINI_API_KEY:'dummy-key',TARGET_REPO:'a/b',PR_NUMBER:'1',HEAD_SHA:A,REVIEW_CONTEXT_DIR:dir},
+    fetchImpl:async(url,init)=>{
+      request={url,body:JSON.parse(init.body)};
+      return Response.json({
+        candidates:[{content:{parts:[{text:JSON.stringify({summary:'clean',findings:[]})}]}}],
+        usageMetadata:{promptTokenCount:120,candidatesTokenCount:20,thoughtsTokenCount:30,totalTokenCount:170},
+      });
+    },
+  });
+
+  assert.equal(request.body.generationConfig.thinkingConfig.thinkingLevel,'medium');
+  assert.match(request.body.contents[0].parts[0].text,/STATE-INTEGRITY RISK/);
+  assert.equal(result._meta.effort,'medium');
+  assert.equal(result._meta.risk_profile.stateIntegrity,true);
+});
+
+test('normal final audit remains low thinking',async()=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'gemini-normal-audit-'));
+  fs.writeFileSync(path.join(dir,'pr.json'),'{}');
+  fs.writeFileSync(path.join(dir,'pr.diff'),'diff --git a/a b/a\n+renderPanel();\n');
+  fs.writeFileSync(path.join(dir,'session-plan.json'),JSON.stringify({decision:{mode:'audit'},session:{}}));
+  fs.writeFileSync(path.join(dir,'risk-profile.json'),JSON.stringify({
+    version:1,
+    stateIntegrity:false,
+    signals:{synchronization:[],durableState:[],multiActor:[]},
+  }));
+
+  let request;
+  const result=await runGeminiReview({
+    env:{GEMINI_API_KEY:'dummy-key',TARGET_REPO:'a/b',PR_NUMBER:'1',HEAD_SHA:A,REVIEW_CONTEXT_DIR:dir},
+    fetchImpl:async(url,init)=>{
+      request={body:JSON.parse(init.body)};
+      return Response.json({
+        candidates:[{content:{parts:[{text:JSON.stringify({summary:'clean',findings:[]})}]}}],
+        usageMetadata:{},
+      });
+    },
+  });
+
+  assert.equal(request.body.generationConfig.thinkingConfig.thinkingLevel,'low');
+  assert.doesNotMatch(request.body.contents[0].parts[0].text,/STATE-INTEGRITY RISK/);
+  assert.equal(result._meta.effort,'low');
 });
