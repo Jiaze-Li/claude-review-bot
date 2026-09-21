@@ -222,6 +222,7 @@ function formatRuntime(meta, label = 'Review runtime') {
   if (usage.input_tokens != null) parts.push('input ' + Number(usage.input_tokens).toLocaleString('en-US'));
   if (usage.output_tokens != null) parts.push('output ' + Number(usage.output_tokens).toLocaleString('en-US'));
   if (usage.thoughts_tokens != null) parts.push('thoughts ' + Number(usage.thoughts_tokens).toLocaleString('en-US'));
+  if (meta.risk_profile?.stateIntegrity === true) parts.push('risk state-integrity');
   return '\n\n' + (label === 'Discovery runtime' ? '---\n' : '') + '<sub>' + label + ': ' + parts.join(' · ') + '</sub>';
 }
 
