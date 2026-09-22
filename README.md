@@ -11,7 +11,7 @@ events and the current Worker is deployed:
 - moving a draft PR to **Ready for review** starts it automatically;
 - pushing a repair while the session is **REWORK** triggers targeted verification;
 - pushing a new commit after **READY** starts a fresh bounded discovery session;
-- repeated events for the same exact HEAD are idempotent and do not spend another reviewer call.
+- webhook redelivery is idempotent, and an unchanged PR HEAD is a no-op at the durable session planner, so it does not spend another reviewer call.
 
 The manual command remains available as a retry/escape hatch:
 
