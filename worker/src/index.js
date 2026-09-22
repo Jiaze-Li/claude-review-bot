@@ -72,12 +72,14 @@ export default {
     } else {
       const automatic = parseAutomaticPullRequestTrigger(event, payload);
       if (!automatic) return json({ ignored: true, reason: 'event does not trigger review' });
+      const deliveryId = request.headers.get('x-github-delivery');
+      if (!deliveryId) return new Response('Missing GitHub webhook delivery id', { status: 400 });
       trigger = {
         requestedMode: automatic.requestedMode,
         sourceKind: automatic.sourceKind,
         prNumber: payload.pull_request?.number ?? payload.number,
         triggerUser: payload.sender?.login ?? payload.pull_request?.user?.login ?? 'github',
-        sourceId: null,
+        sourceId: automaticSourceId(deliveryId),
         requireWritePermission: false,
       };
     }
@@ -116,9 +118,11 @@ export default {
       return json({ ignored: true, reason: 'draft pull request is not ready for automatic review' });
     }
 
-    const sourceId = trigger.sourceId ?? automaticSourceId(pr.head.sha);
+    const sourceId = trigger.sourceId;
 
-    // Fast path for webhook redeliveries and duplicate PR events for one HEAD.
+    // Fast path for webhook redeliveries. Review generation/HEAD state is handled
+    // by the durable session planner, so a later return to an old HEAD is not
+    // suppressed by historical trigger markers.
     // Only markers published by this exact App identity count as processed.
     if (await hasProcessedSourceComment(targetRepo, prNumber, sourceId, expectedReviewAuthor, targetToken)) {
       return json({ ignored: true, reason: 'review trigger already processed for this HEAD' });
