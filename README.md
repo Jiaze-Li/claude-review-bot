@@ -4,19 +4,28 @@ Account-wide bounded PR review service for GitHub.
 
 ## Daily use
 
-For normal work, remember one command:
+Normal PR review is automatic once the GitHub App is subscribed to **Pull request**
+events and the current Worker is deployed:
+
+- opening a non-draft PR starts a bounded discovery session automatically;
+- moving a draft PR to **Ready for review** starts it automatically;
+- pushing a repair while the session is **REWORK** triggers targeted verification;
+- pushing a new commit after **READY** starts a fresh bounded discovery session;
+- webhook redelivery is idempotent, and an unchanged PR HEAD is a no-op at the durable session planner, so it does not spend another reviewer call.
+
+The manual command remains available as a retry/escape hatch:
 
 ```text
 @jiaze-claude-review-bot review
 ```
 
-That command is intentionally stateful and simple:
+The review session is intentionally stateful and simple:
 
 - First review of a PR/session: **Gemini 3.8 Flash, low thinking, one discovery pass**.
 - Any P0/P1/P2 discovery candidate gets one **targeted Gemini Flash / medium validation pass** over the candidate file, related symbols/guards, and matching tests.
 - Only **CONFIRMED** material findings block. **REJECTED** and **UNCERTAIN** candidates remain visible in the review audit but do not enter REWORK.
-- If confirmed material findings exist, push a repair and use the **same command** again.
-- The next call becomes targeted **verification**, not another full PR discovery.
+- If confirmed material findings exist, push a repair; the new PR commit automatically triggers the next review step.
+- A REWORK repair becomes targeted **verification**, not another full PR discovery.
 - At most **2 verification rounds** are allowed.
 - Once material findings converge, one independent final audit runs automatically on the final cumulative PR diff. It stays **Gemini Flash / low** for ordinary PRs; a deterministic state-integrity classifier escalates only shared-state/concurrency-sensitive PRs to **medium** with an explicit interleaving audit.
 - Final-audit P0/P1/P2 candidates use the same targeted medium validator.
@@ -140,11 +149,15 @@ npm ci
 npm run deploy
 ```
 
-After deployment, use one fresh supported command on a PR and verify the matching
-source-comment ID in the real central run and its bot-authored status. The new
-`test.yml` workflow runs deterministic trigger/status tests without Claude calls
-or Cloudflare deployment. No deployment or App installation is changed by those
-tests.
+After deployment, verify one fresh PR lifecycle event (open a non-draft PR or move
+a draft to Ready) and confirm that the matching automatic trigger reaches the
+central run and its bot-authored status. The manual review command should still
+work as a fallback. The `test.yml` workflow runs deterministic trigger/status
+tests without Claude calls or Cloudflare deployment.
+
+Repository code cannot change the GitHub App event subscription or deploy the
+Cloudflare Worker by itself: after merging a trigger change, subscribe the App to
+**Pull request** events and redeploy the Worker from the merged checkout.
 
 ## Legacy Claude deep-review path
 
@@ -161,7 +174,8 @@ tests.
 ## Architecture
 
 ```text
-PR comment: @jiaze-claude-review-bot review
+PR opened / ready / synchronized
+or manual review command
         |
         v
 GitHub App webhook / Cloudflare Worker
@@ -255,10 +269,10 @@ Suggested permissions:
 - Actions: **Read and write** (to dispatch the central workflow)
 - Contents: **Read-only**
 - Issues: **Read-only** (to receive PR conversation comments)
-- Pull requests: **Read and write** (to publish PR reviews)
+- Pull requests: **Read and write** (to receive PR lifecycle events and publish PR reviews)
 - Metadata: read is implicit
 
-Subscribe to the **Issue comment** event.
+Subscribe to both **Issue comment** and **Pull request** events.
 
 Install the App on your account and choose **All repositories** if you want Codex-like account-wide behavior.
 
@@ -300,16 +314,20 @@ The Worker dispatches `.github/workflows/review-v2.yml` on `main`, so the workfl
 
 ### 5. Test
 
-On a PR in any repository covered by the GitHub App, add:
+Open a non-draft PR in any repository covered by the GitHub App, or move a draft
+PR to **Ready for review**.
+
+Expected behavior: the PR event automatically runs a Gemini discovery review and
+creates an **Independent Review Session** comment. If material findings exist,
+push a repair; the synchronize event automatically runs targeted verification.
+After findings converge, the workflow automatically runs the one-time final audit
+before READY. A later commit after READY starts a fresh bounded discovery session.
+
+The manual command remains useful for retrying a stopped/no-op path:
 
 ```text
 @jiaze-claude-review-bot review
 ```
-
-Expected behavior: the first call runs a Gemini discovery review and creates an
-**Independent Review Session** comment. If material findings exist, push a repair
-and use the same command again; it automatically runs targeted verification.
-After findings converge, the workflow automatically runs the one-time final audit before READY. The session eventually reaches READY or HUMAN_REQUIRED and does not loop forever.
 
 ## Security model
 

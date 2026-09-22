@@ -45,6 +45,17 @@ test('verified workflow posts generic run-linked discovery status', async () => 
   assert.doesNotMatch(call.body, /👀|synthetic-test-token/);
 });
 
+test('automatic PR trigger status does not invent a source-comment link', async () => {
+  const fake = fakeFetch();
+  await publishRunStatus({
+    env: { ...baseEnv, SOURCE_KIND: 'pull_request', SOURCE_COMMENT_ID: '123456789' },
+    fetchImpl: fake.fetchImpl,
+  });
+  assert.match(fake.calls[0].body, /Trigger: automatic pull request event/);
+  assert.doesNotMatch(fake.calls[0].body, /issuecomment-123456789|Source comment/);
+});
+
+
 for (const mode of ['verification', 'audit', 'recover', 'claude', 'noop_ready', 'noop_waiting', 'human_required']) {
   test(`status renders supported review mode ${mode}`, async () => {
     const fake = fakeFetch();
@@ -73,6 +84,7 @@ for (const [field, value] of [
   ['HEAD_SHA', 'wrong'],
   ['TARGET_REPO', 'acme/project/other'],
   ['SOURCE_COMMENT_ID', '99\nextra'],
+  ['SOURCE_KIND', 'unknown'],
   ['REVIEW_MODE', 'unknown'],
 ]) {
   test(`no status before valid workflow identity and preflight: ${field}=${value}`, async () => {
@@ -201,4 +213,5 @@ test('legacy review.yml is a thin auto-mode wrapper over review-v2', () => {
   assert.doesNotMatch(legacy, /Run Claude|Run Gemini|GEMINI_API_KEY|CLAUDE_CODE_OAUTH_TOKEN/);
   assert.match(v2, /workflow_call:/);
   assert.match(v2, /requested_mode:\n\s+required: false\n\s+default: auto/);
+  assert.match(v2, /source_kind:\n\s+required: false\n\s+default: comment/);
 });

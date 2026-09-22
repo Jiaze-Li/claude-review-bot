@@ -1,5 +1,5 @@
 name: Central Independent PR Review
-run-name: Independent review ${{ inputs.target_repo }}#${{ inputs.pr_number }} comment ${{ inputs.source_comment_id }}
+run-name: Independent review ${{ inputs.target_repo }}#${{ inputs.pr_number }} trigger ${{ inputs.source_comment_id }}
 
 on:
   workflow_dispatch:
@@ -25,8 +25,13 @@ on:
         required: true
         type: string
       source_comment_id:
-        description: Trigger comment ID for traceability and idempotency
+        description: Stable trigger ID for traceability and idempotency
         required: true
+        type: string
+      source_kind:
+        description: comment or pull_request
+        required: false
+        default: comment
         type: string
       requested_mode:
         description: auto, claude, or reset
@@ -53,6 +58,10 @@ on:
         type: string
       source_comment_id:
         required: true
+        type: string
+      source_kind:
+        required: false
+        default: comment
         type: string
       requested_mode:
         required: false
@@ -115,6 +124,7 @@ jobs:
           TARGET_REPO: ${{ inputs.target_repo }}
           PR_NUMBER: ${{ inputs.pr_number }}
           SOURCE_COMMENT_ID: ${{ inputs.source_comment_id }}
+          SOURCE_KIND: ${{ inputs.source_kind }}
           EXPECTED_REVIEW_AUTHOR: ${{ steps.app-token.outputs.app-slug }}[bot]
         run: |
           set -euo pipefail
@@ -211,6 +221,7 @@ jobs:
           BASE_SHA: ${{ inputs.base_sha }}
           HEAD_SHA: ${{ inputs.head_sha }}
           SOURCE_COMMENT_ID: ${{ inputs.source_comment_id }}
+          SOURCE_KIND: ${{ inputs.source_kind }}
           REQUESTED_MODE: ${{ inputs.requested_mode }}
           EXPECTED_REVIEW_AUTHOR: ${{ steps.app-token.outputs.app-slug }}[bot]
           REVIEW_CONTEXT_DIR: .review-context
@@ -260,6 +271,7 @@ jobs:
           PR_NUMBER: ${{ inputs.pr_number }}
           HEAD_SHA: ${{ inputs.head_sha }}
           SOURCE_COMMENT_ID: ${{ inputs.source_comment_id }}
+          SOURCE_KIND: ${{ inputs.source_kind }}
           DUPLICATE: ${{ steps.dedupe.outputs.duplicate }}
           PREFLIGHT_OUTCOME: success
           STATUS_STAGE: started
@@ -276,6 +288,7 @@ jobs:
           PR_NUMBER: ${{ inputs.pr_number }}
           HEAD_SHA: ${{ inputs.head_sha }}
           SOURCE_COMMENT_ID: ${{ inputs.source_comment_id }}
+          SOURCE_KIND: ${{ inputs.source_kind }}
           REVIEW_CONTEXT_DIR: .review-context
         run: node scripts/recover-review-session.mjs
 
@@ -318,6 +331,7 @@ jobs:
           BASE_SHA: ${{ inputs.base_sha }}
           HEAD_SHA: ${{ inputs.head_sha }}
           SOURCE_COMMENT_ID: ${{ inputs.source_comment_id }}
+          SOURCE_KIND: ${{ inputs.source_kind }}
           REVIEW_CONTEXT_DIR: .review-context
           REVIEW_PATH: .review-context/review-publish.json
         run: node scripts/publish-gemini-review.mjs
@@ -385,6 +399,7 @@ jobs:
           BASE_SHA: ${{ inputs.base_sha }}
           HEAD_SHA: ${{ inputs.head_sha }}
           SOURCE_COMMENT_ID: ${{ inputs.source_comment_id }}
+          SOURCE_KIND: ${{ inputs.source_kind }}
           REVIEW_CONTEXT_DIR: .review-context
           REVIEW_PATH: .review-context/final-audit-publish.json
         run: node scripts/publish-gemini-review.mjs
@@ -411,6 +426,7 @@ jobs:
           BASE_SHA: ${{ inputs.base_sha }}
           HEAD_SHA: ${{ inputs.head_sha }}
           SOURCE_COMMENT_ID: ${{ inputs.source_comment_id }}
+          SOURCE_KIND: ${{ inputs.source_kind }}
           REVIEW_PATH: .review-context/review.json
         run: node scripts/publish-review.mjs
 
@@ -423,6 +439,7 @@ jobs:
           PR_NUMBER: ${{ inputs.pr_number }}
           HEAD_SHA: ${{ inputs.head_sha }}
           SOURCE_COMMENT_ID: ${{ inputs.source_comment_id }}
+          SOURCE_KIND: ${{ inputs.source_kind }}
           STATUS_STAGE: finished
           STATUS_COMMENT_ID: ${{ steps.review-status.outputs.comment_id }}
           REVIEW_MODE: ${{ steps.plan.outputs.mode }}

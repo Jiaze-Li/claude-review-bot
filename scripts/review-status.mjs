@@ -4,6 +4,7 @@ import { pathToFileURL } from 'node:url';
 const repoPattern = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const positiveId = /^[1-9]\d*$/;
 const reviewModes = new Set(['discovery', 'verification', 'audit', 'recover', 'claude', 'noop_ready', 'noop_waiting', 'human_required']);
+const sourceKinds = new Set(['comment', 'pull_request']);
 
 function checked(value, pattern, name) {
   if (typeof value !== 'string' || !pattern.test(value)) throw new Error('Missing or invalid ' + name);
@@ -27,6 +28,8 @@ export async function publishRunStatus({ env = process.env, fetchImpl = fetch } 
   const controlRepo = checked(env.GITHUB_REPOSITORY, repoPattern, 'GITHUB_REPOSITORY');
   const pr = checked(env.PR_NUMBER, positiveId, 'PR_NUMBER');
   const sourceId = checked(env.SOURCE_COMMENT_ID, positiveId, 'SOURCE_COMMENT_ID');
+  const sourceKind = String(env.SOURCE_KIND || 'comment');
+  if (!sourceKinds.has(sourceKind)) throw new Error('Invalid SOURCE_KIND');
   const runId = checked(env.GITHUB_RUN_ID, positiveId, 'GITHUB_RUN_ID');
   const attempt = checked(env.GITHUB_RUN_ATTEMPT, positiveId, 'GITHUB_RUN_ATTEMPT');
   const head = checked(env.HEAD_SHA, /^[0-9a-f]{40}$/i, 'HEAD_SHA');
@@ -60,6 +63,10 @@ export async function publishRunStatus({ env = process.env, fetchImpl = fetch } 
   }
 
   const completedNoop = stage === 'finished' && ['recover', 'noop_ready', 'noop_waiting', 'human_required'].includes(mode);
+  const sourceReference = sourceKind === 'comment'
+    ? '[Source comment](https://github.com/' + repo + '/pull/' + pr + '#issuecomment-' + sourceId + ')'
+    : 'Trigger: automatic pull request event';
+
   const body = [
     '<!-- jiaze-review-run:' + runId + ':' + attempt + ' -->',
     ...(completedNoop ? ['<!-- jiaze-review-source-comment:' + sourceId + ' -->'] : []),
@@ -67,7 +74,7 @@ export async function publishRunStatus({ env = process.env, fetchImpl = fetch } 
     state,
     '',
     '[Workflow run](https://github.com/' + controlRepo + '/actions/runs/' + runId + '/attempts/' + attempt + ')'
-      + ' · [Source comment](https://github.com/' + repo + '/pull/' + pr + '#issuecomment-' + sourceId + ')',
+      + ' · ' + sourceReference,
     'Target HEAD: ' + head,
     'Mode: ' + mode,
     '',

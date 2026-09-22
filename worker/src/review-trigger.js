@@ -24,3 +24,30 @@ export function parseReviewTrigger(body) {
 export function isReviewTrigger(body) {
   return parseReviewTrigger(body) !== null;
 }
+
+const AUTO_PR_ACTIONS = new Set(['opened', 'ready_for_review', 'reopened', 'synchronize']);
+
+export function parseAutomaticPullRequestTrigger(event, payload) {
+  if (event !== 'pull_request' || !payload || typeof payload !== 'object') return null;
+  if (!AUTO_PR_ACTIONS.has(payload.action)) return null;
+
+  const pr = payload.pull_request;
+  if (!pr || typeof pr !== 'object') return null;
+  if (pr.state && pr.state !== 'open') return null;
+  if (pr.draft === true && payload.action !== 'ready_for_review') return null;
+
+  return { requestedMode: 'auto', sourceKind: 'pull_request' };
+}
+
+// Existing review-session markers require a positive decimal identifier. GitHub
+// webhook deliveries use UUID-like IDs, so encode the delivery hex as decimal.
+// The delivery, not the PR HEAD, defines trigger identity: returning to an old
+// HEAD in a later review generation must remain a valid new event.
+export function automaticSourceId(deliveryId) {
+  const raw = String(deliveryId ?? '').trim();
+  const hex = raw.replaceAll('-', '');
+  if (!/^[0-9a-f]{16,64}$/i.test(hex)) throw new Error('Invalid GitHub webhook delivery id');
+  const id = BigInt(`0x${hex}`).toString(10);
+  if (!/^[1-9]\d*$/.test(id)) throw new Error('Invalid automatic review source id');
+  return id;
+}

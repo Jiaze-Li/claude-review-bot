@@ -1,4 +1,8 @@
-import { parseReviewTrigger } from './review-trigger.js';
+import {
+  automaticSourceId,
+  parseAutomaticPullRequestTrigger,
+  parseReviewTrigger,
+} from './review-trigger.js';
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -40,9 +44,6 @@ export default {
     const validSignature = await verifyWebhook(bodyBytes, signature, env.GITHUB_WEBHOOK_SECRET);
     if (!validSignature) return new Response('Invalid webhook signature', { status: 401 });
 
-    const event = request.headers.get('x-github-event');
-    if (event !== 'issue_comment') return json({ ignored: true, reason: 'not issue_comment' });
-
     let payload;
     try {
       payload = JSON.parse(decoder.decode(bodyBytes));
@@ -50,20 +51,45 @@ export default {
       return new Response('Invalid JSON', { status: 400 });
     }
 
-    if (payload.action !== 'created') return json({ ignored: true, reason: 'not a created comment' });
-    if (!payload.issue?.pull_request) return json({ ignored: true, reason: 'comment is not on a pull request' });
-    const reviewCommand = parseReviewTrigger(payload.comment?.body);
-    if (!reviewCommand) {
-      return json({ ignored: true, reason: 'first nonblank line is not a review command' });
+    const event = request.headers.get('x-github-event');
+    let trigger;
+
+    if (event === 'issue_comment') {
+      if (payload.action !== 'created') return json({ ignored: true, reason: 'not a created comment' });
+      if (!payload.issue?.pull_request) return json({ ignored: true, reason: 'comment is not on a pull request' });
+      const reviewCommand = parseReviewTrigger(payload.comment?.body);
+      if (!reviewCommand) {
+        return json({ ignored: true, reason: 'first nonblank line is not a review command' });
+      }
+      trigger = {
+        requestedMode: reviewCommand.requestedMode,
+        sourceKind: 'comment',
+        prNumber: payload.issue?.number,
+        triggerUser: payload.comment?.user?.login,
+        sourceId: payload.comment?.id ? String(payload.comment.id) : null,
+        requireWritePermission: true,
+      };
+    } else {
+      const automatic = parseAutomaticPullRequestTrigger(event, payload);
+      if (!automatic) return json({ ignored: true, reason: 'event does not trigger review' });
+      const deliveryId = request.headers.get('x-github-delivery');
+      if (!deliveryId) return new Response('Missing GitHub webhook delivery id', { status: 400 });
+      trigger = {
+        requestedMode: automatic.requestedMode,
+        sourceKind: automatic.sourceKind,
+        prNumber: payload.pull_request?.number ?? payload.number,
+        triggerUser: payload.sender?.login ?? payload.pull_request?.user?.login ?? 'github',
+        sourceId: automaticSourceId(deliveryId),
+        requireWritePermission: false,
+      };
     }
 
     const installationId = payload.installation?.id;
     const targetRepo = payload.repository?.full_name;
-    const prNumber = payload.issue?.number;
-    const triggerUser = payload.comment?.user?.login;
-    const commentId = payload.comment?.id;
+    const prNumber = trigger.prNumber;
+    const triggerUser = trigger.triggerUser;
 
-    if (!installationId || !targetRepo || !prNumber || !triggerUser || !commentId) {
+    if (!installationId || !targetRepo || !prNumber || !triggerUser) {
       return new Response('Webhook payload missing required GitHub App fields', { status: 400 });
     }
 
@@ -76,22 +102,30 @@ export default {
 
     const targetToken = await createInstallationToken(installationId, appJwt);
 
-    const permission = await githubApi(`/repos/${targetRepo}/collaborators/${encodeURIComponent(triggerUser)}/permission`, {
-      token: targetToken,
-    });
-
-    if (!['admin', 'maintain', 'write'].includes(permission.permission)) {
-      return json({ ignored: true, reason: `trigger user has ${permission.permission ?? 'no'} write permission` });
+    if (trigger.requireWritePermission) {
+      const permission = await githubApi(
+        `/repos/${targetRepo}/collaborators/${encodeURIComponent(triggerUser)}/permission`,
+        { token: targetToken },
+      );
+      if (!['admin', 'maintain', 'write'].includes(permission.permission)) {
+        return json({ ignored: true, reason: `trigger user has ${permission.permission ?? 'no'} write permission` });
+      }
     }
 
     const pr = await githubApi(`/repos/${targetRepo}/pulls/${prNumber}`, { token: targetToken });
     if (pr.state !== 'open') return json({ ignored: true, reason: 'pull request is not open' });
+    if (trigger.sourceKind === 'pull_request' && pr.draft === true) {
+      return json({ ignored: true, reason: 'draft pull request is not ready for automatic review' });
+    }
 
-    // Fast path for normal GitHub redeliveries. A public marker is not enough:
-    // only a review authored by this exact GitHub App bot is trusted as proof
-    // that the source comment already completed a review.
-    if (await hasProcessedSourceComment(targetRepo, prNumber, commentId, expectedReviewAuthor, targetToken)) {
-      return json({ ignored: true, reason: 'source comment already reviewed' });
+    const sourceId = trigger.sourceId;
+
+    // Fast path for webhook redeliveries. Review generation/HEAD state is handled
+    // by the durable session planner, so a later return to an old HEAD is not
+    // suppressed by historical trigger markers.
+    // Only markers published by this exact App identity count as processed.
+    if (await hasProcessedSourceComment(targetRepo, prNumber, sourceId, expectedReviewAuthor, targetToken)) {
+      return json({ ignored: true, reason: 'review trigger already processed for this HEAD' });
     }
 
     const controlRepo = env.CONTROL_REPO || 'Jiaze-Li/claude-review-bot';
@@ -118,8 +152,9 @@ export default {
           base_sha: pr.base.sha,
           head_sha: pr.head.sha,
           trigger_user: triggerUser,
-          source_comment_id: String(commentId),
-          requested_mode: reviewCommand.requestedMode,
+          source_comment_id: sourceId,
+          source_kind: trigger.sourceKind,
+          requested_mode: trigger.requestedMode,
         },
       },
       expectNoContent: true,
@@ -129,7 +164,8 @@ export default {
       accepted: true,
       target: `${targetRepo}#${prNumber}`,
       head_sha: pr.head.sha,
-      requested_mode: reviewCommand.requestedMode,
+      requested_mode: trigger.requestedMode,
+      source_kind: trigger.sourceKind,
     }, 202);
   },
 };

@@ -202,11 +202,11 @@ export function renderSessionComment(session, { sourceCommentIds = [] } = {}) {
   const verification = `${session.verificationRound ?? 0}/${session.maxVerificationRounds ?? MAX_VERIFICATION_ROUNDS}`;
   const audit = session.auditCompleted === true ? 'complete' : session.status === 'AUDIT_PENDING' ? 'pending' : 'not run';
   const next = session.status === 'READY'
-    ? 'No action required unless the PR changes.'
+    ? 'No action required unless the PR changes; a new commit will start a fresh bounded review automatically.'
     : session.status === 'AUDIT_PENDING'
       ? 'The one-time final Gemini audit will run automatically. If the workflow stops, comment `@jiaze-claude-review-bot review` to resume it.'
       : session.status === 'REWORK'
-        ? 'Push a repair, then comment `@jiaze-claude-review-bot review` again.'
+        ? 'Push a repair; the new PR commit will trigger targeted verification automatically. The review command remains available as a manual retry.'
         : 'Automatic review budget is exhausted. Use human judgment or a targeted Codex/Claude review; do not restart full discovery automatically.';
   const findingLines = open.length
     ? open.slice(0, 8).flatMap((finding) => [
