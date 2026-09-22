@@ -72,12 +72,16 @@ test('automatic PR trigger accepts review-ready lifecycle events but not draft w
   );
 });
 
-test('automatic source id is stable per exact PR HEAD', () => {
-  const head = 'a'.repeat(40);
-  assert.equal(automaticSourceId(head), BigInt(`0x${head}`).toString(10));
-  assert.equal(automaticSourceId(head), automaticSourceId(head));
-  assert.notEqual(automaticSourceId(head), automaticSourceId('b'.repeat(40)));
-  assert.throws(() => automaticSourceId('not-a-sha'), /Invalid pull request HEAD SHA/);
+test('automatic source id is stable per webhook delivery, not per PR HEAD', () => {
+  const delivery = '11111111-2222-3333-4444-555555555555';
+  const hex = delivery.replaceAll('-', '');
+  assert.equal(automaticSourceId(delivery), BigInt(`0x${hex}`).toString(10));
+  assert.equal(automaticSourceId(delivery), automaticSourceId(delivery));
+  assert.notEqual(
+    automaticSourceId(delivery),
+    automaticSourceId('aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'),
+  );
+  assert.throws(() => automaticSourceId('not-a-delivery'), /Invalid GitHub webhook delivery id/);
 });
 
 const secret = 'synthetic-test-webhook-secret';
@@ -113,6 +117,7 @@ function request(payload = basePayload, overrides = {}, event = 'issue_comment')
     method: 'POST', body,
     headers: {
       'x-github-event': event,
+      'x-github-delivery': '11111111-2222-3333-4444-555555555555',
       'x-hub-signature-256': `sha256=${createHmac('sha256', secret).update(body).digest('hex')}`,
       ...overrides,
     },
@@ -203,7 +208,7 @@ for (const action of ['opened', 'ready_for_review', 'reopened', 'synchronize']) 
         base_sha: 'b'.repeat(40),
         head_sha: 'a'.repeat(40),
         trigger_user: 'contributor',
-        source_comment_id: automaticSourceId('a'.repeat(40)),
+        source_comment_id: automaticSourceId('11111111-2222-3333-4444-555555555555'),
         source_kind: 'pull_request',
         requested_mode: 'auto',
       },
@@ -225,12 +230,44 @@ for (const [name, payload, githubOptions] of [
   });
 }
 
-test('duplicate automatic events for the same HEAD are idempotent', async (t) => {
-  const sourceId = automaticSourceId('a'.repeat(40));
+test('redelivery of the same automatic webhook is idempotent', async (t) => {
+  const delivery = '11111111-2222-3333-4444-555555555555';
+  const sourceId = automaticSourceId(delivery);
   const calls = fakeGithub(t, { duplicate: true, duplicateMarkerId: sourceId });
-  const response = await worker.fetch(request(pullRequestPayload, {}, 'pull_request'), env);
+  const response = await worker.fetch(request(
+    pullRequestPayload,
+    { 'x-github-delivery': delivery },
+    'pull_request',
+  ), env);
   assert.equal((await response.json()).ignored, true);
   assert.equal(calls.some((call) => call.pathname.endsWith('/dispatches')), false);
+});
+
+test('historical marker for the same HEAD does not suppress a later delivery generation', async (t) => {
+  const oldDelivery = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+  const newDelivery = '11111111-2222-3333-4444-555555555555';
+  const calls = fakeGithub(t, {
+    duplicate: true,
+    duplicateMarkerId: automaticSourceId(oldDelivery),
+  });
+  const response = await worker.fetch(request(
+    pullRequestPayload,
+    { 'x-github-delivery': newDelivery },
+    'pull_request',
+  ), env);
+  assert.equal(response.status, 202);
+  assert.equal(calls.filter((call) => call.pathname.endsWith('/dispatches')).length, 1);
+});
+
+test('automatic PR events fail closed without a GitHub delivery id', async (t) => {
+  const calls = fakeGithub(t);
+  const response = await worker.fetch(request(
+    pullRequestPayload,
+    { 'x-github-delivery': '' },
+    'pull_request',
+  ), env);
+  assert.equal(response.status, 400);
+  assert.equal(calls.length, 0);
 });
 
 test('unrelated pull_request actions are ignored before GitHub API calls', async (t) => {
