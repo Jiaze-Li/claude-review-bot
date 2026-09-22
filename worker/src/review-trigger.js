@@ -39,14 +39,15 @@ export function parseAutomaticPullRequestTrigger(event, payload) {
   return { requestedMode: 'auto', sourceKind: 'pull_request' };
 }
 
-// Existing review-session markers require a positive decimal identifier. For an
-// automatic PR event, derive that identifier from the exact PR HEAD instead of
-// inventing a comment. This makes all triggers for the same HEAD idempotent and
-// gives every changed HEAD a distinct durable review trigger.
-export function automaticSourceId(headSha) {
-  const sha = String(headSha ?? '').trim();
-  if (!/^[0-9a-f]{40}$/i.test(sha)) throw new Error('Invalid pull request HEAD SHA');
-  const id = BigInt(`0x${sha}`).toString(10);
+// Existing review-session markers require a positive decimal identifier. GitHub
+// webhook deliveries use UUID-like IDs, so encode the delivery hex as decimal.
+// The delivery, not the PR HEAD, defines trigger identity: returning to an old
+// HEAD in a later review generation must remain a valid new event.
+export function automaticSourceId(deliveryId) {
+  const raw = String(deliveryId ?? '').trim();
+  const hex = raw.replaceAll('-', '');
+  if (!/^[0-9a-f]{16,64}$/i.test(hex)) throw new Error('Invalid GitHub webhook delivery id');
+  const id = BigInt(`0x${hex}`).toString(10);
   if (!/^[1-9]\d*$/.test(id)) throw new Error('Invalid automatic review source id');
   return id;
 }
