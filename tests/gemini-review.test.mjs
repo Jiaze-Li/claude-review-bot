@@ -1,12 +1,30 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildGeminiRequest, runGeminiReview, toGeminiJsonSchema } from '../scripts/run-gemini-review.mjs';
+import {
+  buildGeminiRequest,
+  GEMINI_AUDIT_TIMEOUT_DEFAULT_MS,
+  GEMINI_TIMEOUT_DEFAULT_MS,
+  GEMINI_TIMEOUT_MAX_MS,
+  resolveGeminiTimeoutMs,
+  runGeminiReview,
+  toGeminiJsonSchema,
+} from '../scripts/run-gemini-review.mjs';
 import { applyDiscoveryResult } from '../scripts/review-session-core.mjs';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
 const A='a'.repeat(40),BASE='b'.repeat(40);
+
+test('Gemini timeout policy gives audit more bounded headroom and clamps overrides',()=>{
+  assert.equal(resolveGeminiTimeoutMs({mode:'discovery',env:{}}),GEMINI_TIMEOUT_DEFAULT_MS);
+  assert.equal(resolveGeminiTimeoutMs({mode:'verification',env:{}}),GEMINI_TIMEOUT_DEFAULT_MS);
+  assert.equal(resolveGeminiTimeoutMs({mode:'audit',env:{}}),GEMINI_AUDIT_TIMEOUT_DEFAULT_MS);
+  assert.equal(resolveGeminiTimeoutMs({mode:'audit',env:{GEMINI_AUDIT_TIMEOUT_MS:'540000'}}),540000);
+  assert.equal(resolveGeminiTimeoutMs({mode:'audit',env:{GEMINI_AUDIT_TIMEOUT_MS:'9999999'}}),GEMINI_TIMEOUT_MAX_MS);
+  assert.equal(resolveGeminiTimeoutMs({mode:'audit',env:{GEMINI_AUDIT_TIMEOUT_MS:'bad'}}),GEMINI_AUDIT_TIMEOUT_DEFAULT_MS);
+  assert.equal(resolveGeminiTimeoutMs({mode:'audit',env:{GEMINI_TIMEOUT_MS:'300000'}}),300000);
+});
 
 test('discovery prompt permits one broad pass but rejects architecture/style work',()=>{
   const {prompt}=buildGeminiRequest({mode:'discovery',repo:'a/b',prNumber:'1',headSha:A,prJson:'{}',diff:'diff',session:null});
@@ -136,6 +154,7 @@ test('state-integrity final audit escalates to medium thinking',async()=>{
   assert.match(request.body.contents[0].parts[0].text,/STATE-INTEGRITY RISK/);
   assert.equal(result._meta.effort,'medium');
   assert.equal(result._meta.max_output_tokens,32768);
+  assert.equal(result._meta.timeout_ms,GEMINI_AUDIT_TIMEOUT_DEFAULT_MS);
   assert.equal(result._meta.risk_profile.stateIntegrity,true);
 });
 
@@ -167,6 +186,7 @@ test('normal final audit remains low thinking',async()=>{
   assert.doesNotMatch(request.body.contents[0].parts[0].text,/STATE-INTEGRITY RISK/);
   assert.equal(result._meta.effort,'low');
   assert.equal(result._meta.max_output_tokens,16384);
+  assert.equal(result._meta.timeout_ms,GEMINI_AUDIT_TIMEOUT_DEFAULT_MS);
 });
 
 

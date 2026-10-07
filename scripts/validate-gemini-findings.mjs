@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { GEMINI_MODEL, toGeminiJsonSchema } from './run-gemini-review.mjs';
+import { GEMINI_MODEL, resolveGeminiTimeoutMs, toGeminiJsonSchema } from './run-gemini-review.mjs';
 
 export const VALIDATOR_THINKING = 'medium';
 const MATERIAL = new Set(['P0', 'P1', 'P2']);
@@ -98,6 +98,7 @@ export async function validateMaterialFindings({ env = process.env, fetchImpl = 
   const model = env.GEMINI_MODEL || GEMINI_MODEL;
   const stateIntegrityRisk = raw?._meta?.risk_profile?.stateIntegrity === true;
   const maxOutputTokens = stateIntegrityRisk ? 32768 : 8192;
+  const timeoutMs = resolveGeminiTimeoutMs({ mode: raw?._meta?.mode, env });
   let returned = null;
   let payload = null;
   let structuredAttempts = 0;
@@ -129,7 +130,7 @@ export async function validateMaterialFindings({ env = process.env, fetchImpl = 
             maxOutputTokens,
           },
         }),
-        signal: AbortSignal.timeout(180000),
+        signal: AbortSignal.timeout(timeoutMs),
       },
     );
 
@@ -210,6 +211,7 @@ export async function validateMaterialFindings({ env = process.env, fetchImpl = 
         mode: 'finding-validation',
         attempts: structuredAttempts,
         max_output_tokens: maxOutputTokens,
+        timeout_ms: timeoutMs,
         risk_profile: raw?._meta?.risk_profile ?? null,
         usage: {
           input_tokens: nonnegative(usage.promptTokenCount),

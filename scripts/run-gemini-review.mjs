@@ -6,7 +6,21 @@ import { openMaterialFindings } from './review-session-core.mjs';
 export const GEMINI_MODEL='gemini-3.8-flash';
 export const GEMINI_THINKING='low';
 export const RISK_AUDIT_THINKING='medium';
+export const GEMINI_TIMEOUT_DEFAULT_MS=180_000;
+export const GEMINI_AUDIT_TIMEOUT_DEFAULT_MS=480_000;
+export const GEMINI_TIMEOUT_MAX_MS=600_000;
 const MAX_CONTEXT_BYTES=1_500_000;
+
+export function resolveGeminiTimeoutMs({mode,env=process.env}={}){
+  const raw = mode==='audit'
+    ? (env?.GEMINI_AUDIT_TIMEOUT_MS ?? env?.GEMINI_TIMEOUT_MS)
+    : env?.GEMINI_TIMEOUT_MS;
+  const fallback = mode==='audit' ? GEMINI_AUDIT_TIMEOUT_DEFAULT_MS : GEMINI_TIMEOUT_DEFAULT_MS;
+  if(raw==null||raw==='') return fallback;
+  const value=Number(raw);
+  if(!Number.isFinite(value)||value<=0) return fallback;
+  return Math.min(Math.floor(value),GEMINI_TIMEOUT_MAX_MS);
+}
 
 const findingSchema={
   type:'object',
@@ -168,6 +182,7 @@ export async function runGeminiReview({env=process.env,fetchImpl=fetch}={}){
     ? RISK_AUDIT_THINKING
     : GEMINI_THINKING;
   const maxOutputTokens = thinking===RISK_AUDIT_THINKING ? 32768 : 16384;
+  const timeoutMs=resolveGeminiTimeoutMs({mode,env});
   const requestBody=JSON.stringify({
     contents:[{role:'user',parts:[{text:built.prompt}]}],
     generationConfig:{
@@ -197,7 +212,7 @@ export async function runGeminiReview({env=process.env,fetchImpl=fetch}={}){
       method:'POST',
       headers:{'Content-Type':'application/json','x-goog-api-key':apiKey},
       body:requestBody,
-      signal:AbortSignal.timeout(180000),
+      signal:AbortSignal.timeout(timeoutMs),
     });
     if(!response.ok){
       const body=await response.text();
@@ -227,6 +242,7 @@ export async function runGeminiReview({env=process.env,fetchImpl=fetch}={}){
   result._meta={
     provider:'gemini',requested_model:model,resolved_model:model,effort:thinking,mode,attempts,
     max_output_tokens:maxOutputTokens,
+    timeout_ms:timeoutMs,
     risk_profile:riskProfile,
     usage:{
       input_tokens:nonnegative(usageTotals.promptTokenCount),
