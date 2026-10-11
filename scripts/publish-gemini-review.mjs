@@ -102,12 +102,9 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
   }
 
   // Show exactly what the ledger dropped so a human can spot a wrong match.
-  const keptTitles = new Set(newFindings.map((finding) => finding.title));
   const suppressed = mode === 'discovery' ? [] : [
     ...(Array.isArray(raw._ledgerSuppressed) ? raw._ledgerSuppressed : []),
-    ...normalized.findings
-      .filter((finding) => !keptTitles.has(finding.title.replace(/[\r\n]+/g, ' ').trim().slice(0, 140)))
-      .map((finding) => ({ title: finding.title, path: finding.path })),
+    ...droppedFindings(normalized.findings, newFindings),
   ];
   if (suppressed.length) {
     body += '\n\n### Not re-raised (matched concerns already examined in this session)';
@@ -168,6 +165,17 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
   console.log('Published Gemini ' + mode + ' review ' + (review.html_url || review.id)
     + '; session comment ' + sessionCommentId + '; status ' + session.status + '.');
   return { session, sessionCommentId, reviewId: review.id };
+}
+
+// Findings the session filter removed. Identity is path + title: two findings
+// may share a title in different files, and only one of them may be dropped.
+export function droppedFindings(reported, kept) {
+  const key = (finding) => String(finding.path).replace(/[\r\n]+/g, ' ').trim().slice(0, 240)
+    + '\0' + String(finding.title).replace(/[\r\n]+/g, ' ').trim().slice(0, 140);
+  const keptKeys = new Set(kept.map(key));
+  return reported
+    .filter((finding) => !keptKeys.has(key(finding)))
+    .map((finding) => ({ title: finding.title, path: finding.path }));
 }
 
 async function upsertSessionComment({ owner, repo, prNumber, existingId, body, token, fetchImpl }) {
