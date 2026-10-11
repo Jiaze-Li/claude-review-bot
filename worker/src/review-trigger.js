@@ -15,6 +15,9 @@ export function parseReviewTrigger(body) {
   if (/^ {0,3}@jiaze-claude-review-bot[ \t]+reset[ \t]+review[ \t]*$/i.test(firstLine)) {
     return { requestedMode: 'reset' };
   }
+  if (/^ {0,3}@jiaze-claude-review-bot[ \t]+override[ \t]+review[ \t]*$/i.test(firstLine)) {
+    return { requestedMode: 'override' };
+  }
   if (/^ {0,3}@claude[ \t]+review[ \t]*$/i.test(firstLine)) {
     return { requestedMode: 'claude' };
   }

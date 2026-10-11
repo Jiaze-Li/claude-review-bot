@@ -1,6 +1,11 @@
 const MATERIAL_SEVERITIES = new Set(['P0', 'P1', 'P2']);
 export const SESSION_VERSION = 1;
 export const MAX_VERIFICATION_ROUNDS = 2;
+// A P0-P2 finding must carry a concrete failure path (trigger state -> wrong
+// result). Without one it is demoted to non-blocking P3 instead of blocking.
+export const MIN_FAILURE_PATH_CHARS = 30;
+const MAX_DISMISSED = 20;
+const KNOWN_MATCH_THRESHOLD = 0.5;
 
 export function planReviewSession({ session = null, baseSha, headSha, reset = false } = {}) {
   checkedSha(baseSha, 'baseSha');
@@ -74,6 +79,7 @@ export function applyDiscoveryResult({
     nextFindingNumber,
     findings,
     acceptedRiskClasses: [],
+    dismissed: [],
     lastSummary: compactText(normalized.summary, 500),
     updatedAt: now,
   };
@@ -118,7 +124,7 @@ export function applyVerificationResult({
   });
 
   let nextFindingNumber = Number.isInteger(session.nextFindingNumber) ? session.nextFindingNumber : findings.length + 1;
-  for (const finding of normalized.findings) {
+  for (const finding of dropKnownRepeats(normalized.findings, session)) {
     findings.push({
       id: findingId(nextFindingNumber++),
       ...compactFinding(finding),
@@ -161,7 +167,7 @@ export function applyAuditResult({
   const normalized = normalizeReviewResult(result);
   const findings = session.findings.map((finding) => ({ ...finding }));
   let nextFindingNumber = Number.isInteger(session.nextFindingNumber) ? session.nextFindingNumber : findings.length + 1;
-  for (const finding of normalized.findings) {
+  for (const finding of dropKnownRepeats(normalized.findings, session)) {
     findings.push({
       id: findingId(nextFindingNumber++),
       ...compactFinding(finding),
@@ -187,6 +193,116 @@ export function applyAuditResult({
     nextFindingNumber,
     findings,
     lastSummary: compactText(normalized.summary, 800),
+    updatedAt: now,
+  };
+}
+
+// ---- Known-issue ledger -------------------------------------------------
+// Concerns the session already examined (rejected/uncertain by the validator,
+// or deferred P3) must not come back under a new wording and spend another
+// validation round. Matching is deterministic: same file plus similar title.
+
+export function recordDismissed(session, validations, headSha) {
+  validateSession(session);
+  const added = [];
+  for (const entry of Array.isArray(validations) ? validations : []) {
+    const verdict = String(entry?.verdict ?? '').toUpperCase();
+    if (verdict !== 'REJECTED' && verdict !== 'UNCERTAIN') continue;
+    const title = compactText(entry.title, 140);
+    const path = compactText(entry.path, 240);
+    if (!title || !path || path.startsWith('/') || path.split('/').includes('..')) continue;
+    added.push({
+      path,
+      line: Number.isInteger(entry.line) && entry.line > 0 ? entry.line : null,
+      title,
+      riskClass: compactText(entry.riskClass ?? 'uncategorized', 60),
+      verdict,
+      reason: compactText(entry.reason, 160),
+      head: headSha,
+    });
+  }
+  if (!added.length) return session;
+  const dismissed = [...(session.dismissed ?? []), ...added].slice(-MAX_DISMISSED);
+  return { ...session, dismissed };
+}
+
+// Items shown to later reviewers as "already examined".
+export function knownIssues(session) {
+  const dismissed = (session?.dismissed ?? []).map((item) => ({
+    path: item.path, title: item.title, verdict: item.verdict, reason: item.reason,
+  }));
+  const settled = (session?.findings ?? [])
+    .filter((finding) => finding.status === 'FIXED' || finding.status === 'DEFERRED' || finding.status === 'WAIVED')
+    .map((finding) => ({
+      path: finding.path, title: finding.title, verdict: finding.status, reason: finding.resolutionReason ?? '',
+    }));
+  return [...dismissed, ...settled];
+}
+
+export function knownIssuesPromptBlock(session) {
+  const items = knownIssues(session).slice(-30);
+  if (!items.length) return '';
+  const lines = items.map((item) => `- [${item.verdict}] ${item.path} — ${item.title}${item.reason ? ` (${compactText(item.reason, 120)})` : ''}`);
+  return `
+ALREADY EXAMINED in this session (do NOT report these again, even reworded):
+${lines.join('\n')}
+FIXED items may be re-reported only if the current code still demonstrably fails.
+`;
+}
+
+function titleTokens(value) {
+  return new Set(String(value ?? '').toLowerCase().match(/[a-z0-9_]{3,}/g) ?? []);
+}
+
+export function similarity(a, b) {
+  const left = titleTokens(a);
+  const right = titleTokens(b);
+  if (!left.size || !right.size) return 0;
+  let shared = 0;
+  for (const token of left) if (right.has(token)) shared += 1;
+  return shared / (left.size + right.size - shared);
+}
+
+export function matchesKnownDismissal(finding, session) {
+  const candidates = [
+    ...(session?.dismissed ?? []),
+    ...(session?.findings ?? []).filter((item) => item.status === 'DEFERRED'),
+  ];
+  return candidates.some((item) =>
+    item.path === finding.path && similarity(item.title, finding.title) >= KNOWN_MATCH_THRESHOLD);
+}
+
+function dropKnownRepeats(findings, session) {
+  return findings.filter((finding) => !matchesKnownDismissal(finding, session));
+}
+
+// ---- Manual override ----------------------------------------------------
+// A human who has read the open findings can end the session. Waived findings
+// stay in the record; a later commit still starts a fresh bounded session.
+export function applyOverride({ session, headSha, by, now = new Date().toISOString() } = {}) {
+  validateSession(session);
+  checkedSha(headSha, 'headSha');
+  if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})(?:\[bot\])?$/.test(String(by ?? ''))) throw new Error('invalid override user');
+  if (session.status === 'READY') throw new Error('session is already READY');
+  const waived = [];
+  const findings = session.findings.map((finding) => {
+    if (finding.status !== 'OPEN') return { ...finding };
+    waived.push(finding.id);
+    return {
+      ...finding,
+      status: 'WAIVED',
+      lastCheckedHead: headSha,
+      resolutionReason: compactText(`Waived by @${by} (manual override)`, 300),
+    };
+  });
+  return {
+    ...session,
+    status: 'READY',
+    auditCompleted: true,
+    lastReviewedHead: headSha,
+    findings,
+    override: { by, at: now, head: headSha, waived },
+    lastSummary: compactText(`Manually overridden by @${by}; ${waived.length} open finding(s) waived.`, 800),
     updatedAt: now,
   };
 }
@@ -222,7 +338,7 @@ export function renderSessionComment(session, { sourceCommentIds = [] } = {}) {
     '<!-- jiaze-review-session:v1 -->',
     ...processedMarkers,
     '### Independent Review Session',
-    `Status: **${session.status}**`,
+    `Status: **${session.status}**${session.override ? ` (manually overridden by @${cleanInline(session.override.by)})` : ''}`,
     `Default reviewer: **Gemini Flash / low thinking**`,
     `Discovery: **complete** · Final audit: **${audit}** · Verification: **${verification}**`,
     `Open material findings: **${open.length}**`,
@@ -280,8 +396,16 @@ export function normalizeVerificationResult(value) {
 
 function normalizeFinding(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('finding must be an object');
-  const severity = String(value.severity ?? '').trim().toUpperCase();
+  let severity = String(value.severity ?? '').trim().toUpperCase();
   if (!['P0', 'P1', 'P2', 'P3'].includes(severity)) throw new Error('invalid finding severity');
+  // Evidence rule: a material claim without a concrete failure path cannot
+  // block. Findings that omit the field entirely (legacy sessions) are kept.
+  const failurePath = typeof value.failurePath === 'string' ? value.failurePath.replace(/[\r\n]+/g, ' ').trim() : null;
+  let downgradedFrom = null;
+  if (MATERIAL_SEVERITIES.has(severity) && failurePath !== null && failurePath.length < MIN_FAILURE_PATH_CHARS) {
+    downgradedFrom = severity;
+    severity = 'P3';
+  }
   const path = checkedText(value.path, 1000, 'finding path');
   if (path.startsWith('/') || path.split('/').includes('..')) throw new Error('finding path must be repository-relative');
   const line = value.line == null ? null : value.line;
@@ -293,6 +417,8 @@ function normalizeFinding(value) {
     path,
     line,
     riskClass: checkedText(value.riskClass ?? 'uncategorized', 120, 'riskClass'),
+    ...(failurePath ? { failurePath: failurePath.slice(0, 600) } : {}),
+    ...(downgradedFrom ? { downgradedFrom } : {}),
   };
 }
 
@@ -314,6 +440,7 @@ function compactFinding(finding) {
     body: compactText(finding.body, 450),
     path: compactText(finding.path, 240),
     riskClass: compactText(finding.riskClass, 60),
+    ...(finding.failurePath ? { failurePath: compactText(finding.failurePath, 200) } : {}),
   };
 }
 

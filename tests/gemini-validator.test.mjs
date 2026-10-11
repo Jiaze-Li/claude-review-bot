@@ -292,3 +292,29 @@ test('state-integrity material validator gets larger structured-output budget',a
   assert.equal(output._validation._meta.risk_profile.stateIntegrity,true);
   assert.equal(output._validation.validations[0].verdict,'CONFIRMED');
 });
+
+test('CONFIRMED verdict without cited evidence is downgraded to UNCERTAIN', async () => {
+  const fs = await import('node:fs');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const { validateMaterialFindings } = await import('../scripts/validate-gemini-findings.mjs');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'val-ev-'));
+  const repo = path.join(root, 'repo'); const ctx = path.join(root, 'ctx');
+  fs.mkdirSync(path.join(repo, 'src'), { recursive: true }); fs.mkdirSync(ctx);
+  fs.writeFileSync(path.join(repo, 'src/a.js'), 'export const x = 1;\n');
+  fs.writeFileSync(path.join(ctx, 'pr.diff'), '');
+  const input = path.join(ctx, 'review.json');
+  fs.writeFileSync(input, JSON.stringify({ summary: 's', findings: [
+    { severity: 'P1', title: 'Bug', body: 'b', path: 'src/a.js', line: 1, riskClass: 'x' },
+  ] }));
+  const out = await validateMaterialFindings({
+    env: { GEMINI_API_KEY: 'k', TARGET_REPO: 'a/b', PR_NUMBER: '1', HEAD_SHA: 'a'.repeat(40),
+      TARGET_REPO_DIR: repo, REVIEW_CONTEXT_DIR: ctx, REVIEW_INPUT_PATH: input, REVIEW_OUTPUT_PATH: path.join(ctx, 'out.json') },
+    fetchImpl: async () => Response.json({ candidates: [{ content: { parts: [{ text: JSON.stringify({
+      summary: 'v', validations: [{ candidateId: 'D001', verdict: 'CONFIRMED', reason: 'looks real', evidence: [] }],
+    }) }] } }] }),
+  });
+  assert.equal(out._validation.validations[0].verdict, 'UNCERTAIN');
+  assert.equal(out.findings.length, 0);
+  assert.equal(out._validation.validations[0].path, 'src/a.js');
+});
