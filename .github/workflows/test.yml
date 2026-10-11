@@ -35,3 +35,4 @@ jobs:
           node --check scripts/validate-gemini-findings.mjs
           node --check scripts/publish-gemini-review.mjs
           node --check scripts/publish-review.mjs
+          node --check scripts/apply-override.mjs

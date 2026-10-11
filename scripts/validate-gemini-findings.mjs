@@ -185,6 +185,9 @@ export async function validateMaterialFindings({ env = process.env, fetchImpl = 
       ...verdict,
       severity: String(candidate.finding?.severity || '').toUpperCase(),
       title: cleanText(candidate.finding?.title, 300),
+      path: cleanText(candidate.finding?.path, 240),
+      line: Number.isInteger(candidate.finding?.line) ? candidate.finding.line : null,
+      riskClass: cleanText(candidate.finding?.riskClass, 60),
     };
   });
   const verdictById = new Map(validations.map((entry) => [entry.candidateId, entry.verdict]));
@@ -447,6 +450,15 @@ function normalizeValidationResult(value, allowedIds) {
     const evidence = Array.isArray(entry?.evidence)
       ? entry.evidence.slice(0, 6).map((item) => cleanText(item, 600)).filter(Boolean)
       : [];
+    // Evidence rule: a finding cannot block on assertion alone.
+    if (verdict === 'CONFIRMED' && evidence.length === 0) {
+      return {
+        candidateId,
+        verdict: 'UNCERTAIN',
+        reason: ('Downgraded: CONFIRMED without cited evidence. ' + reason).slice(0, 1600),
+        evidence,
+      };
+    }
     return { candidateId, verdict, reason, evidence };
   });
   return { summary, validations };

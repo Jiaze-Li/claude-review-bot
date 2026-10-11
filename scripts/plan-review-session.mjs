@@ -15,7 +15,7 @@ export async function planSession({ env=process.env, fetchImpl=fetch }={}) {
   const headSha=required(env,'HEAD_SHA');
   if(!shaPattern.test(baseSha)||!shaPattern.test(headSha)) throw new Error('Invalid PR SHA');
   const requested=(env.REQUESTED_MODE||'auto').toLowerCase();
-  if(!['auto','claude','reset'].includes(requested)) throw new Error('Invalid REQUESTED_MODE');
+  if(!['auto','claude','reset','override'].includes(requested)) throw new Error('Invalid REQUESTED_MODE');
 
   if(requested==='claude'){
     return {requestedMode:requested,decision:{mode:'claude',previousHead:null,reason:'explicit legacy Claude review'},session:null,sessionCommentId:null};
@@ -52,6 +52,14 @@ export async function planSession({ env=process.env, fetchImpl=fetch }={}) {
       pendingSourceCommentId:pending.pending.sourceCommentId,
       pendingReviewId:pending.reviewId,
     };
+  }
+
+  if(requested==='override'){
+    const overridable=session&&['REWORK','HUMAN_REQUIRED','AUDIT_PENDING'].includes(session.status);
+    const decision=overridable
+      ?{mode:'override',previousHead:null,reason:'manual override by a repository writer'}
+      :{mode:'noop_waiting',previousHead:null,reason:'nothing to override: no unfinished review session for this PR'};
+    return {requestedMode:requested,decision,session,sessionCommentId,pendingSession:null,pendingSourceCommentId:null,pendingReviewId:null};
   }
 
   const decision=planReviewSession({session,baseSha,headSha,reset:requested==='reset'});

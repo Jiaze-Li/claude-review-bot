@@ -34,7 +34,7 @@ on:
         default: comment
         type: string
       requested_mode:
-        description: auto, claude, or reset
+        description: auto, claude, reset, or override
         required: true
         default: auto
         type: string
@@ -292,6 +292,20 @@ jobs:
           REVIEW_CONTEXT_DIR: .review-context
         run: node scripts/recover-review-session.mjs
 
+      - name: Apply manual override
+        id: override
+        if: steps.dedupe.outputs.duplicate != 'true' && steps.plan.outputs.mode == 'override'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          BASE_SHA: ${{ inputs.base_sha }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          TRIGGER_USER: ${{ inputs.trigger_user }}
+          SOURCE_COMMENT_ID: ${{ inputs.source_comment_id }}
+          REVIEW_CONTEXT_DIR: .review-context
+        run: node scripts/apply-override.mjs
+
       - name: Run Gemini bounded review
         if: steps.dedupe.outputs.duplicate != 'true' && (steps.plan.outputs.mode == 'discovery' || steps.plan.outputs.mode == 'verification' || steps.plan.outputs.mode == 'audit')
         env:
@@ -447,4 +461,5 @@ jobs:
           GEMINI_PUBLISH_OUTCOME: ${{ steps.publish-gemini.outcome }}
           FINAL_AUDIT_PUBLISH_OUTCOME: ${{ steps.publish-final-audit.outcome }}
           CLAUDE_PUBLISH_OUTCOME: ${{ steps.publish-claude.outcome }}
+          OVERRIDE_OUTCOME: ${{ steps.override.outcome }}
         run: node scripts/review-status.mjs

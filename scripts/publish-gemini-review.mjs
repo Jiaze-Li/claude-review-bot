@@ -9,6 +9,7 @@ import {
   normalizeVerificationResult,
   openMaterialFindings,
   pendingSessionMarker,
+  recordDismissed,
   renderSessionComment,
 } from './review-session-core.mjs';
 
@@ -47,6 +48,12 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
     normalized = normalizeVerificationResult(raw);
     if (!plan.session) throw new Error('Verification plan is missing durable prior session');
     session = applyVerificationResult({ session: plan.session, result: normalized, headSha });
+  }
+
+  // Remember validator-rejected/uncertain candidates so later passes cannot
+  // re-raise them under a new wording.
+  if (mode === 'discovery' || mode === 'audit') {
+    session = recordDismissed(session, raw._validation?.validations, headSha);
   }
 
   const sessionBody = renderSessionComment(session, { sourceCommentIds: [sourceCommentId] });
@@ -94,6 +101,15 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
     }
   }
 
+  const suppressed = mode === 'discovery' ? 0 : Math.max(0, normalized.findings.length - newFindings.length);
+  if (suppressed) {
+    body += '\n\n_' + suppressed + ' finding(s) matched concerns already examined in this session and were not re-raised._';
+  }
+  const demoted = newFindings.filter((finding) => finding.downgradedFrom);
+  for (const finding of demoted) {
+    body += '\n\n_' + finding.id + ' was reported as ' + finding.downgradedFrom
+      + ' but gave no concrete failure path, so it is recorded as non-blocking P3._';
+  }
   if (newFindings.length === 0) body += '\n\nNo new material finding was reported.';
   if (unanchored.length) {
     body += '\n\n### Findings without an inline anchor';
