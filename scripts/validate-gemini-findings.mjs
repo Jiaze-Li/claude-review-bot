@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { matchesKnownDismissal } from './review-session-core.mjs';
 import { GEMINI_MODEL, resolveGeminiTimeoutMs, toGeminiJsonSchema } from './run-gemini-review.mjs';
 
 export const VALIDATOR_THINKING = 'medium';
@@ -52,8 +53,27 @@ export async function validateMaterialFindings({ env = process.env, fetchImpl = 
   const inputPath = path.resolve(env.REVIEW_INPUT_PATH || path.join(contextRoot, 'review.json'));
   const outputPath = path.resolve(env.REVIEW_OUTPUT_PATH || path.join(contextRoot, 'review-validated.json'));
 
-  const raw = JSON.parse(fs.readFileSync(inputPath, 'utf8'));
+  let raw = JSON.parse(fs.readFileSync(inputPath, 'utf8'));
   if (!Array.isArray(raw.findings)) throw new Error('Gemini discovery output is missing findings');
+
+  // Drop repeats of already-examined concerns BEFORE spending a validator call.
+  // Only the final audit has a prior session ledger to compare against.
+  const planPath = path.join(contextRoot, 'session-plan.json');
+  if (raw?._meta?.mode === 'audit' && fs.existsSync(planPath)) {
+    const priorSession = JSON.parse(fs.readFileSync(planPath, 'utf8')).session;
+    if (priorSession) {
+      const kept = [];
+      const ledgerSuppressed = [];
+      for (const finding of raw.findings) {
+        if (MATERIAL.has(String(finding?.severity || '').toUpperCase()) && matchesKnownDismissal(finding, priorSession)) {
+          ledgerSuppressed.push({ title: cleanText(finding.title, 200), path: cleanText(finding.path, 240) });
+        } else {
+          kept.push(finding);
+        }
+      }
+      raw = { ...raw, findings: kept, _ledgerSuppressed: ledgerSuppressed };
+    }
+  }
 
   const candidates = raw.findings
     .map((finding, index) => ({ candidateId: `D${String(index + 1).padStart(3, '0')}`, finding, index }))

@@ -5,7 +5,9 @@ export const MAX_VERIFICATION_ROUNDS = 2;
 // result). Without one it is demoted to non-blocking P3 instead of blocking.
 export const MIN_FAILURE_PATH_CHARS = 30;
 const MAX_DISMISSED = 20;
-const KNOWN_MATCH_THRESHOLD = 0.5;
+// Deliberately strict: wrongly suppressing a distinct real bug (false READY) is
+// worse than letting a reworded repeat through for one more validation.
+const KNOWN_MATCH_THRESHOLD = 0.8;
 
 export function planReviewSession({ session = null, baseSha, headSha, reset = false } = {}) {
   checkedSha(baseSha, 'baseSha');
