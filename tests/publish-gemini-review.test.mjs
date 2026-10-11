@@ -167,3 +167,14 @@ test('publisher completes the one-time final audit and marks the session READY',
   const persisted=JSON.parse(fs.readFileSync(path.join(dir,'published-session.json'),'utf8'));
   assert.equal(persisted.session.auditCompleted,true);
 });
+
+test('droppedFindings tells apart same-title findings in different files', async () => {
+  const { droppedFindings } = await import('../scripts/publish-gemini-review.mjs');
+  const reported = [
+    { title: 'Stale read', path: 'src/a.js' },
+    { title: 'Stale read', path: 'src/b.js' },
+  ];
+  const kept = [{ title: 'Stale read', path: 'src/b.js' }];
+  assert.deepEqual(droppedFindings(reported, kept), [{ title: 'Stale read', path: 'src/a.js' }]);
+  assert.deepEqual(droppedFindings(reported, reported), []);
+});
