@@ -93,6 +93,19 @@ test('final audit drops a reworded repeat of a dismissed concern but keeps genui
   assert.equal(out.findings[0].path, 'src/auth.js');
 });
 
+test('a distinct bug with similarly worded title in the same file is NOT suppressed', () => {
+  const s = {
+    ...recordDismissed(session(), [dismissal({ title: 'Save function returns wrong value on timeout' })], A),
+    status: 'AUDIT_PENDING',
+  };
+  const out = applyAuditResult({
+    session: s, headSha: A,
+    result: { summary: 'a', findings: [finding({ title: 'Save function returns wrong value on invalid input' })] },
+  });
+  assert.equal(out.findings.length, 1);
+  assert.equal(out.status, 'REWORK');
+});
+
 test('same title in a different file is not suppressed', () => {
   const s = { ...recordDismissed(session(), [dismissal()], A), status: 'AUDIT_PENDING' };
   const out = applyAuditResult({
@@ -224,4 +237,29 @@ test('apply-override refuses when the PR HEAD moved', async () => {
       TRIGGER_USER: 'alice', SOURCE_COMMENT_ID: '77', REVIEW_CONTEXT_DIR: dir },
     fetchImpl: async () => Response.json({ base: { sha: BASE }, head: { sha: C } }),
   }), /PR moved/);
+});
+
+test('validator drops known repeats before calling the model and reports them', async () => {
+  const { validateMaterialFindings } = await import('../scripts/validate-gemini-findings.mjs');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'val-ledger-'));
+  const repo = path.join(root, 'repo'); const ctx = path.join(root, 'ctx');
+  fs.mkdirSync(path.join(repo, 'src'), { recursive: true }); fs.mkdirSync(ctx);
+  fs.writeFileSync(path.join(repo, 'src/a.js'), 'x\n');
+  fs.writeFileSync(path.join(ctx, 'pr.diff'), '');
+  const prior = { ...recordDismissed(session(), [dismissal()], A), status: 'AUDIT_PENDING' };
+  fs.writeFileSync(path.join(ctx, 'session-plan.json'), JSON.stringify({ session: prior }));
+  const input = path.join(ctx, 'audit.json');
+  fs.writeFileSync(input, JSON.stringify({ summary: 's', _meta: { mode: 'audit' }, findings: [
+    finding({ title: 'Save path suffers a lost update' }),
+  ] }));
+  let calls = 0;
+  const out = await validateMaterialFindings({
+    env: { GEMINI_API_KEY: 'k', TARGET_REPO: 'a/b', PR_NUMBER: '1', HEAD_SHA: A,
+      TARGET_REPO_DIR: repo, REVIEW_CONTEXT_DIR: ctx, REVIEW_INPUT_PATH: input, REVIEW_OUTPUT_PATH: path.join(ctx, 'o.json') },
+    fetchImpl: async () => { calls += 1; return Response.json({}); },
+  });
+  assert.equal(calls, 0);
+  assert.equal(out._validation.status, 'SKIPPED');
+  assert.equal(out._ledgerSuppressed.length, 1);
+  assert.equal(out.findings.length, 0);
 });

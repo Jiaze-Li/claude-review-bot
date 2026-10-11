@@ -101,9 +101,20 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
     }
   }
 
-  const suppressed = mode === 'discovery' ? 0 : Math.max(0, normalized.findings.length - newFindings.length);
-  if (suppressed) {
-    body += '\n\n_' + suppressed + ' finding(s) matched concerns already examined in this session and were not re-raised._';
+  // Show exactly what the ledger dropped so a human can spot a wrong match.
+  const keptTitles = new Set(newFindings.map((finding) => finding.title));
+  const suppressed = mode === 'discovery' ? [] : [
+    ...(Array.isArray(raw._ledgerSuppressed) ? raw._ledgerSuppressed : []),
+    ...normalized.findings
+      .filter((finding) => !keptTitles.has(finding.title.replace(/[\r\n]+/g, ' ').trim().slice(0, 140)))
+      .map((finding) => ({ title: finding.title, path: finding.path })),
+  ];
+  if (suppressed.length) {
+    body += '\n\n### Not re-raised (matched concerns already examined in this session)';
+    for (const item of suppressed.slice(0, 6)) {
+      body += '\n- <code>' + escapeHtml(item.path) + '</code> — ' + escapeHtml(item.title);
+    }
+    body += '\n_If one of these is actually a different bug, comment `@jiaze-claude-review-bot reset review`._';
   }
   const demoted = newFindings.filter((finding) => finding.downgradedFrom);
   for (const finding of demoted) {
