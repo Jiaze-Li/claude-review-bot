@@ -16,8 +16,8 @@ events and the current Worker is deployed:
 The manual commands remain available as a retry/escape hatch:
 
 ```text
-@jiaze-claude-review-bot gemini review
-@jiaze-claude-review-bot claude review
+@gemini review
+@claude review
 ```
 
 The review session is intentionally stateful and simple:
@@ -42,12 +42,13 @@ You do **not** need to remember discovery, verification, round numbers, or provi
 Manual commands (the first nonblank line must be exactly one of these):
 
 ```text
-@jiaze-claude-review-bot gemini review   # retry/resume the default Gemini session
-@jiaze-claude-review-bot claude review   # explicit Claude deep review
-@claude review                           # shorthand for the Claude deep review
+@gemini review   # retry/resume the default Gemini session
+@claude review   # explicit Claude deep review (latest Sonnet, medium effort)
 ```
 
-`gemini review` is rarely needed because PR events start the Gemini session automatically; use it to retry a stopped/no-op path. `claude review` requests the explicit Claude deep review and does not replace the bounded Gemini session. The older bare `@jiaze-claude-review-bot review` still works as an alias for `gemini review`.
+Gemini review already runs automatically when a PR is opened, marked ready, or updated, so `@gemini review` is only needed to retry a stopped/no-op path. `@claude review` is never automatic; it runs the explicit Claude deep review and does not replace the bounded Gemini session.
+
+The longer `@jiaze-claude-review-bot gemini review` / `claude review` forms, and the older bare `@jiaze-claude-review-bot review`, still work as aliases.
 
 If the PR has changed so radically that the old review session should be discarded:
 
@@ -171,7 +172,7 @@ npm run deploy
 
 After deployment, verify one fresh PR lifecycle event (open a non-draft PR or move
 a draft to Ready) and confirm that the matching automatic trigger reaches the
-central run and its bot-authored status. The manual `gemini review` command should still
+central run and its bot-authored status. The manual `@gemini review` command should still
 work as a fallback. The `test.yml` workflow runs deterministic trigger/status
 tests without Claude calls or Cloudflare deployment.
 

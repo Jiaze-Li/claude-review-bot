@@ -11,7 +11,7 @@ import {
 import worker from '../worker/src/index.js';
 
 for (const body of [
-  '@claude review', ' @claude review ', '\n\n@claude review\n',
+  '@gemini review', ' @GEMINI  review \n', '@claude review', ' @claude review ', '\n\n@claude review\n',
   '@CLAUDE REVIEW', '@claude   review', '@claude\treview',
   '\r\n @claude review \r\n\r\nInspect the actual diff.',
   '@claude review\n\nReview exact HEAD and regression tests.',
@@ -30,7 +30,7 @@ for (const body of [
   '> @claude review', '- @claude review', '`@claude review`',
   '```text\n@claude review\n```', '~~~\n@claude review\n~~~',
   '    @claude review', '\t@claude review',
-  '@claude reviewer', '@claude review-all', '@claude review please',
+  '@gemini reviewer', '@gemini review please', '> @gemini review', 'Please run @gemini review', '@claude reviewer', '@claude review-all', '@claude review please',
   '@jiaze-claude-review-bot gemini', '@jiaze-claude-review-bot gemini review please',
   '@jiaze-claude-review-bot review please', '> @jiaze-claude-review-bot gemini review',
   '@claude\nreview', '@other review', '<!--\n@claude review\n-->',
@@ -46,6 +46,7 @@ test('dedicated command maps to auto mode while Claude aliases remain explicit',
   assert.deepEqual(parseReviewTrigger('@jiaze-claude-review-bot reset review'), { requestedMode: 'reset' });
   assert.deepEqual(parseReviewTrigger('@jiaze-claude-review-bot claude review'), { requestedMode: 'claude' });
   assert.deepEqual(parseReviewTrigger('@claude review'), { requestedMode: 'claude' });
+  assert.deepEqual(parseReviewTrigger('@gemini review'), { requestedMode: 'auto' });
 });
 
 test('automatic PR trigger accepts review-ready lifecycle events but not draft work', () => {
@@ -167,7 +168,7 @@ function fakeGithub(t, {
   return calls;
 }
 
-for (const body of ['@claude review\n\nFocus on the runtime evidence.', '\n @jiaze-claude-review-bot review \n', '@jiaze-claude-review-bot gemini review']) {
+for (const body of ['@claude review\n\nFocus on the runtime evidence.', '\n @jiaze-claude-review-bot review \n', '@jiaze-claude-review-bot gemini review', '@gemini review']) {
   test('signed relaxed trigger dispatches exact target once without any premature acknowledgement', async (t) => {
     const calls = fakeGithub(t);
     const response = await worker.fetch(request({ ...basePayload, comment: { ...basePayload.comment, body } }), env);
