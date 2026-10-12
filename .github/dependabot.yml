@@ -1,0 +1,12 @@
+version: 2
+updates:
+  # Keeps the Claude Agent SDK current so the `sonnet` alias used by the
+  # explicit Claude deep review (scripts/run-review.mjs) resolves to the
+  # newest Sonnet without a manual edit. Review and merge the PR it opens.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: daily
+    allow:
+      - dependency-name: "@anthropic-ai/claude-agent-sdk"
+    open-pull-requests-limit: 1
