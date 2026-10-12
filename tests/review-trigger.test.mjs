@@ -16,6 +16,7 @@ for (const body of [
   '\r\n @claude review \r\n\r\nInspect the actual diff.',
   '@claude review\n\nReview exact HEAD and regression tests.',
   '@jiaze-claude-review-bot review', '@JIAZE-CLAUDE-REVIEW-BOT REVIEW\nDetails.',
+  '@jiaze-claude-review-bot gemini review', '@JIAZE-CLAUDE-REVIEW-BOT  Gemini\tReview\nDetails.',
   '@jiaze-claude-review-bot claude review', '@jiaze-claude-review-bot reset review',
   '   @claude review\t ',
 ]) {
@@ -30,7 +31,8 @@ for (const body of [
   '```text\n@claude review\n```', '~~~\n@claude review\n~~~',
   '    @claude review', '\t@claude review',
   '@claude reviewer', '@claude review-all', '@claude review please',
-  '@jiaze-claude-review-bot gemini review', '@jiaze-claude-review-bot review please',
+  '@jiaze-claude-review-bot gemini', '@jiaze-claude-review-bot gemini review please',
+  '@jiaze-claude-review-bot review please', '> @jiaze-claude-review-bot gemini review',
   '@claude\nreview', '@other review', '<!--\n@claude review\n-->',
 ]) {
   test(`rejects non-command or quoted command: ${JSON.stringify(body)}`, () => {
@@ -39,6 +41,7 @@ for (const body of [
 }
 
 test('dedicated command maps to auto mode while Claude aliases remain explicit', () => {
+  assert.deepEqual(parseReviewTrigger('@jiaze-claude-review-bot gemini review'), { requestedMode: 'auto' });
   assert.deepEqual(parseReviewTrigger('@jiaze-claude-review-bot review'), { requestedMode: 'auto' });
   assert.deepEqual(parseReviewTrigger('@jiaze-claude-review-bot reset review'), { requestedMode: 'reset' });
   assert.deepEqual(parseReviewTrigger('@jiaze-claude-review-bot claude review'), { requestedMode: 'claude' });
@@ -164,7 +167,7 @@ function fakeGithub(t, {
   return calls;
 }
 
-for (const body of ['@claude review\n\nFocus on the runtime evidence.', '\n @jiaze-claude-review-bot review \n']) {
+for (const body of ['@claude review\n\nFocus on the runtime evidence.', '\n @jiaze-claude-review-bot review \n', '@jiaze-claude-review-bot gemini review']) {
   test('signed relaxed trigger dispatches exact target once without any premature acknowledgement', async (t) => {
     const calls = fakeGithub(t);
     const response = await worker.fetch(request({ ...basePayload, comment: { ...basePayload.comment, body } }), env);
