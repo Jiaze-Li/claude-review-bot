@@ -21,7 +21,7 @@ The manual command remains available as a retry/escape hatch:
 
 The review session is intentionally stateful and simple:
 
-- First review of a PR/session: **Gemini 3.8 Flash, low thinking, one discovery pass**.
+- First review of a PR/session: **latest Gemini Flash (`gemini-flash-latest` alias), medium thinking, one discovery pass**.
 - Any P0/P1/P2 discovery candidate gets one **targeted Gemini Flash / medium validation pass** over the candidate file, related symbols/guards, and matching tests.
 - Only **CONFIRMED** material findings block. **REJECTED** and **UNCERTAIN** candidates remain visible in the review audit but do not enter REWORK.
 - If confirmed material findings exist, push a repair; the new PR commit automatically triggers the next review step.
@@ -81,7 +81,7 @@ The automatic state machine is:
 NEW / changed-after-READY
         |
         v
-Gemini DISCOVERY (once, low)
+Gemini DISCOVERY (once, medium)
         |
         +-- no P0/P1/P2 --> FINAL AUDIT (once, low)
         |
@@ -142,8 +142,8 @@ The GitHub comment is only a trigger. The central workflow pins the exact PR HEA
 Default Gemini review is intentionally lightweight:
 
 ```text
-model: gemini-3.8-flash
-thinking: LOW
+model: gemini-flash-latest   # moving alias; override with GEMINI_MODEL to pin
+thinking: MEDIUM (discovery); LOW for verification and ordinary final audit
 input: exact PR diff for discovery
        repair diff + durable open findings for verification
 ```
@@ -227,24 +227,25 @@ Default automatic review:
 
 ```text
 discovery:
-  model: gemini-3.8-flash
-  thinking: low
+  model: gemini-flash-latest
+  thinking: medium
+  structured-output budget: 32k (medium thinking)
   passes: 1
 
 material validator:
-  model: gemini-3.8-flash
+  model: gemini-flash-latest
   thinking: medium
   structured-output budget: 8k normally; 32k for state-integrity candidates
   passes: max 1 per discovery
   only CONFIRMED blocks
 
 verification:
-  model: gemini-3.8-flash
+  model: gemini-flash-latest
   scope: repair diff + open findings
   passes: max 2
 
 final audit:
-  model: gemini-3.8-flash
+  model: gemini-flash-latest
   thinking: low normally; medium only for deterministic state-integrity risk
   structured-output budget: 16k normally; 32k for medium state-integrity audit
   scope: final cumulative PR diff

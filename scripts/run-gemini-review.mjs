@@ -3,8 +3,10 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { knownIssuesPromptBlock, openMaterialFindings } from './review-session-core.mjs';
 
-export const GEMINI_MODEL='gemini-3.8-flash';
+// Moving alias: always resolves to Google's current Flash model. Override with GEMINI_MODEL to pin.
+export const GEMINI_MODEL='gemini-flash-latest';
 export const GEMINI_THINKING='low';
+export const DISCOVERY_THINKING='medium';
 export const RISK_AUDIT_THINKING='medium';
 export const GEMINI_TIMEOUT_DEFAULT_MS=180_000;
 export const GEMINI_AUDIT_TIMEOUT_DEFAULT_MS=480_000;
@@ -180,9 +182,11 @@ export async function runGeminiReview({env=process.env,fetchImpl=fetch}={}){
 
   const built=buildGeminiRequest({mode,repo,prNumber,headSha,prJson,diff,session,riskProfile});
   const model=env.GEMINI_MODEL||GEMINI_MODEL;
-  const thinking = mode==='audit' && riskProfile?.stateIntegrity === true
-    ? RISK_AUDIT_THINKING
-    : GEMINI_THINKING;
+  const thinking = mode==='discovery'
+    ? DISCOVERY_THINKING
+    : mode==='audit' && riskProfile?.stateIntegrity === true
+      ? RISK_AUDIT_THINKING
+      : GEMINI_THINKING;
   const maxOutputTokens = thinking===RISK_AUDIT_THINKING ? 32768 : 16384;
   const timeoutMs=resolveGeminiTimeoutMs({mode,env});
   const requestBody=JSON.stringify({
@@ -206,6 +210,7 @@ export async function runGeminiReview({env=process.env,fetchImpl=fetch}={}){
   };
   let result=null;
   let attempts=0;
+  let servedModel=null;
   let lastStructuredError=null;
 
   for(let attempt=1;attempt<=2;attempt+=1){
@@ -221,6 +226,7 @@ export async function runGeminiReview({env=process.env,fetchImpl=fetch}={}){
       throw new Error(`Gemini API failed (HTTP ${response.status}): ${body.slice(0,500)}`);
     }
     const payload=await response.json();
+    if(typeof payload.modelVersion==='string'&&payload.modelVersion) servedModel=payload.modelVersion;
     for(const key of Object.keys(usageTotals)){
       const value=payload.usageMetadata?.[key];
       if(typeof value==='number'&&Number.isFinite(value)&&value>=0) usageTotals[key]+=value;
@@ -242,7 +248,7 @@ export async function runGeminiReview({env=process.env,fetchImpl=fetch}={}){
     throw new Error(`Gemini structured output is invalid after one retry: ${lastStructuredError?.message||'unknown error'}`);
   }
   result._meta={
-    provider:'gemini',requested_model:model,resolved_model:model,effort:thinking,mode,attempts,
+    provider:'gemini',requested_model:model,resolved_model:servedModel||model,effort:thinking,mode,attempts,
     max_output_tokens:maxOutputTokens,
     timeout_ms:timeoutMs,
     risk_profile:riskProfile,
