@@ -48,7 +48,7 @@ Manual commands (the first nonblank line must be exactly one of these):
 
 Gemini review already runs automatically when a PR is opened, marked ready, or updated, so `@gemini review` is only needed to retry a stopped/no-op path. `@claude review` is never automatic; it runs the explicit Claude deep review and does not replace the bounded Gemini session.
 
-The longer `@jiaze-claude-review-bot gemini review` / `claude review` forms, and the older bare `@jiaze-claude-review-bot review`, still work as aliases.
+`@gemini review` is the same as the original `@jiaze-claude-review-bot review`, and `@jiaze-claude-review-bot claude review` is the same as `@claude review`; the longer forms keep working.
 
 If the PR has changed so radically that the old review session should be discarded:
 
@@ -348,7 +348,7 @@ before READY. A later commit after READY starts a fresh bounded discovery sessio
 The manual command remains useful for retrying a stopped/no-op path:
 
 ```text
-@jiaze-claude-review-bot gemini review
+@gemini review
 ```
 
 ## Security model

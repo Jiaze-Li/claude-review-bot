@@ -6,9 +6,7 @@ export function parseReviewTrigger(body) {
   const firstLine = body.split(/\r\n|\n|\r/).find((line) => line.trim() !== '');
   if (typeof firstLine !== 'string') return null;
 
-  // `gemini review` is the canonical name for the default bounded Gemini session;
-  // bare `review` is kept as a backward-compatible alias.
-  if (/^ {0,3}@jiaze-claude-review-bot[ \t]+(?:gemini[ \t]+)?review[ \t]*$/i.test(firstLine)) {
+  if (/^ {0,3}@jiaze-claude-review-bot[ \t]+review[ \t]*$/i.test(firstLine)) {
     return { requestedMode: 'auto' };
   }
   if (/^ {0,3}@jiaze-claude-review-bot[ \t]+claude[ \t]+review[ \t]*$/i.test(firstLine)) {
@@ -20,7 +18,7 @@ export function parseReviewTrigger(body) {
   if (/^ {0,3}@jiaze-claude-review-bot[ \t]+override[ \t]+review[ \t]*$/i.test(firstLine)) {
     return { requestedMode: 'override' };
   }
-  // Short forms: `@gemini review` (default bounded Gemini session) and `@claude review`.
+  // Short forms: `@gemini review` (same as the bare bot command) and `@claude review`.
   if (/^ {0,3}@gemini[ \t]+review[ \t]*$/i.test(firstLine)) {
     return { requestedMode: 'auto' };
   }
