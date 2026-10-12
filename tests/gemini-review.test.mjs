@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   buildGeminiRequest,
+  GEMINI_MODEL,
   GEMINI_AUDIT_TIMEOUT_DEFAULT_MS,
   GEMINI_TIMEOUT_DEFAULT_MS,
   GEMINI_TIMEOUT_MAX_MS,
@@ -104,6 +105,12 @@ test('Gemini discovery sends medium thinking on the latest-Flash alias and struc
   assert.equal(request.headers['x-goog-api-key'],'secret');
 });
 
+
+test('review workflow does not pin GEMINI_MODEL, so the latest-Flash alias stays in effect',()=>{
+  const yml=fs.readFileSync(new URL('../.github/workflows/review-v2.yml',import.meta.url),'utf8');
+  assert.doesNotMatch(yml,/GEMINI_MODEL/);
+  assert.equal(GEMINI_MODEL,'gemini-flash-latest');
+});
 
 test('Gemini JSON-schema adapter strips unsupported length keywords but preserves object constraints',()=>{
   const out=toGeminiJsonSchema({
