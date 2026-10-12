@@ -341,7 +341,7 @@ export function renderSessionComment(session, { sourceCommentIds = [] } = {}) {
     ...processedMarkers,
     '### Independent Review Session',
     `Status: **${session.status}**${session.override ? ` (manually overridden by @${cleanInline(session.override.by)})` : ''}`,
-    `Default reviewer: **Gemini Flash / low thinking**`,
+    `Default reviewer: **Gemini Flash (latest) / medium thinking**`,
     `Discovery: **complete** · Final audit: **${audit}** · Verification: **${verification}**`,
     `Open material findings: **${open.length}**`,
     '',

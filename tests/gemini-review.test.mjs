@@ -74,7 +74,7 @@ test('verification prompt is restricted to stable open findings and repair-induc
   assert.match(prompt,/directly caused by this repair/i);
 });
 
-test('Gemini runner sends low thinking and structured schema',async()=>{
+test('Gemini discovery sends medium thinking on the latest-Flash alias and structured schema',async()=>{
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'gemini-review-'));
   fs.writeFileSync(path.join(dir,'pr.json'),'{}');
   fs.writeFileSync(path.join(dir,'pr.diff'),'diff --git a/a b/a\n');
@@ -87,16 +87,19 @@ test('Gemini runner sends low thinking and structured schema',async()=>{
       return Response.json({
         candidates:[{content:{parts:[{text:JSON.stringify({summary:'clean',findings:[]})}]}}],
         usageMetadata:{promptTokenCount:100,candidatesTokenCount:20,thoughtsTokenCount:10,totalTokenCount:130},
+        modelVersion:'gemini-9.9-flash',
       });
     },
   });
-  assert.match(request.url,/gemini-3\.8-flash:generateContent$/);
-  assert.equal(request.body.generationConfig.thinkingConfig.thinkingLevel,'low');
+  assert.match(request.url,/models\/gemini-flash-latest:generateContent$/);
+  assert.equal(request.body.generationConfig.thinkingConfig.thinkingLevel,'medium');
   assert.equal(request.body.generationConfig.responseFormat.text.mimeType,'APPLICATION_JSON');
   assert.ok(request.body.generationConfig.responseFormat.text.schema);
   assert.equal('maxLength' in request.body.generationConfig.responseFormat.text.schema.properties.summary,false);
-  assert.equal(request.body.generationConfig.maxOutputTokens,16384);
-  assert.equal(result._meta.effort,'low');
+  assert.equal(request.body.generationConfig.maxOutputTokens,32768);
+  assert.equal(result._meta.effort,'medium');
+  assert.equal(result._meta.requested_model,'gemini-flash-latest');
+  assert.equal(result._meta.resolved_model,'gemini-9.9-flash');
   assert.equal(result._meta.usage.total_tokens,130);
   assert.equal(request.headers['x-goog-api-key'],'secret');
 });
