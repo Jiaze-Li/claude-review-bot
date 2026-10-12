@@ -13,10 +13,11 @@ events and the current Worker is deployed:
 - pushing a new commit after **READY** starts a fresh bounded discovery session;
 - webhook redelivery is idempotent, and an unchanged PR HEAD is a no-op at the durable session planner, so it does not spend another reviewer call.
 
-The manual command remains available as a retry/escape hatch:
+The manual commands remain available as a retry/escape hatch:
 
 ```text
-@jiaze-claude-review-bot review
+@gemini review
+@claude review
 ```
 
 The review session is intentionally stateful and simple:
@@ -38,14 +39,16 @@ The review session is intentionally stateful and simple:
 
 You do **not** need to remember discovery, verification, round numbers, or provider selection.
 
-Rare escape hatches:
+Manual commands (the first nonblank line must be exactly one of these):
 
 ```text
-@jiaze-claude-review-bot claude review
-@claude review
+@gemini review   # retry/resume the default Gemini session
+@claude review   # explicit Claude deep review (latest Sonnet, medium effort)
 ```
 
-These request the existing explicit Claude deep review and do not replace the bounded Gemini session.
+Gemini review already runs automatically when a PR is opened, marked ready, or updated, so `@gemini review` is only needed to retry a stopped/no-op path. `@claude review` is never automatic; it runs the explicit Claude deep review and does not replace the bounded Gemini session.
+
+`@gemini review` is the same as the original `@jiaze-claude-review-bot review`, and `@jiaze-claude-review-bot claude review` is the same as `@claude review`; the longer forms keep working.
 
 If the PR has changed so radically that the old review session should be discarded:
 
@@ -169,7 +172,7 @@ npm run deploy
 
 After deployment, verify one fresh PR lifecycle event (open a non-draft PR or move
 a draft to Ready) and confirm that the matching automatic trigger reaches the
-central run and its bot-authored status. The manual review command should still
+central run and its bot-authored status. The manual `@gemini review` command should still
 work as a fallback. The `test.yml` workflow runs deterministic trigger/status
 tests without Claude calls or Cloudflare deployment.
 
@@ -345,7 +348,7 @@ before READY. A later commit after READY starts a fresh bounded discovery sessio
 The manual command remains useful for retrying a stopped/no-op path:
 
 ```text
-@jiaze-claude-review-bot review
+@gemini review
 ```
 
 ## Security model

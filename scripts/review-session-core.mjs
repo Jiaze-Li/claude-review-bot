@@ -322,7 +322,7 @@ export function renderSessionComment(session, { sourceCommentIds = [] } = {}) {
   const next = session.status === 'READY'
     ? 'No action required unless the PR changes; a new commit will start a fresh bounded review automatically.'
     : session.status === 'AUDIT_PENDING'
-      ? 'The one-time final Gemini audit will run automatically. If the workflow stops, comment `@jiaze-claude-review-bot review` to resume it.'
+      ? 'The one-time final Gemini audit will run automatically. If the workflow stops, comment `@gemini review` to resume it.'
       : session.status === 'REWORK'
         ? 'Push a repair; the new PR commit will trigger targeted verification automatically. The review command remains available as a manual retry.'
         : 'Automatic review budget is exhausted. Use human judgment or a targeted Codex/Claude review; do not restart full discovery automatically.';

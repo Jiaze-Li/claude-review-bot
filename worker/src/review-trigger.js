@@ -18,6 +18,10 @@ export function parseReviewTrigger(body) {
   if (/^ {0,3}@jiaze-claude-review-bot[ \t]+override[ \t]+review[ \t]*$/i.test(firstLine)) {
     return { requestedMode: 'override' };
   }
+  // Short forms: `@gemini review` (same as the bare bot command) and `@claude review`.
+  if (/^ {0,3}@gemini[ \t]+review[ \t]*$/i.test(firstLine)) {
+    return { requestedMode: 'auto' };
+  }
   if (/^ {0,3}@claude[ \t]+review[ \t]*$/i.test(firstLine)) {
     return { requestedMode: 'claude' };
   }
