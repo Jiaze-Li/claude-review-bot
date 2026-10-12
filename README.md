@@ -190,6 +190,7 @@ Cloudflare Worker by itself: after merging a trigger change, subscribe the App t
 - Claude is review-only: it does not edit, push, merge, or approve code.
 - Publishes actionable findings as inline PR review comments when they can be anchored to changed lines; otherwise includes them in the review summary.
 - Uses Claude Code's moving `sonnet` alias at `medium` effort with a 24-turn ceiling to give non-trivial PRs enough room to finish while still bounding subscription usage.
+- The alias is resolved by the Claude Code CLI bundled in `@anthropic-ai/claude-agent-sdk`, so it only follows new Sonnet releases when the SDK is current. `.github/dependabot.yml` opens a PR for each new SDK release; merge it to move the alias forward. The published review's runtime line shows the resolved model.
 - Reports the resolved model, agent turns, and SDK token usage in each published review.
 
 ## Architecture
