@@ -229,11 +229,13 @@ export async function validateMaterialFindings({ env = process.env, fetchImpl = 
         reason: 'Validator omitted this candidate; treated as uncertain rather than blocking.',
         evidence: [],
       };
-    const groundedVerdict = requireGroundedSourceEvidence(verdict, {
+    // Trusted external observations resolve their premise first. The local quote
+    // check then applies only if the resulting verdict could still block.
+    const externalChecked = applyExternalEvidence(verdict, externalEvidence.get(candidate.candidateId));
+    const checkedVerdict = requireGroundedSourceEvidence(externalChecked, {
       repoRoot,
       context: contextById.get(candidate.candidateId) || '',
     });
-    const checkedVerdict = applyExternalEvidence(groundedVerdict, externalEvidence.get(candidate.candidateId));
     return {
       ...checkedVerdict,
       severity: String(candidate.finding?.severity || '').toUpperCase(),
