@@ -234,7 +234,7 @@ export function knownIssues(session) {
     path: item.path, title: item.title, verdict: item.verdict, reason: item.reason,
   }));
   const settled = (session?.findings ?? [])
-    .filter((finding) => finding.status === 'FIXED' || finding.status === 'DEFERRED' || finding.status === 'WAIVED')
+    .filter((finding) => ['FIXED', 'DEFERRED', 'WAIVED', 'DISMISSED'].includes(finding.status))
     .map((finding) => ({
       path: finding.path, title: finding.title, verdict: finding.status, reason: finding.resolutionReason ?? '',
     }));
@@ -268,14 +268,74 @@ export function similarity(a, b) {
 export function matchesKnownDismissal(finding, session) {
   const candidates = [
     ...(session?.dismissed ?? []),
-    ...(session?.findings ?? []).filter((item) => item.status === 'DEFERRED'),
+    ...(session?.findings ?? []).filter((item) => item.status === 'DEFERRED' || item.status === 'DISMISSED'),
   ];
-  return candidates.some((item) =>
-    item.path === finding.path && similarity(item.title, finding.title) >= KNOWN_MATCH_THRESHOLD);
+  return candidates.some((item) => {
+    if (item.path !== finding.path) return false;
+    // Human-dismissed claims require exact title + matching failure paths:
+    // related but distinct real bugs must still reach the final auditor.
+    if (item.status === 'DISMISSED') {
+      return item.title.trim().toLowerCase() === String(finding.title).trim().toLowerCase()
+        && (!item.failurePath || !finding.failurePath || item.failurePath === finding.failurePath);
+    }
+    return similarity(item.title, finding.title) >= KNOWN_MATCH_THRESHOLD;
+  });
 }
 
 function dropKnownRepeats(findings, session) {
   return findings.filter((finding) => !matchesKnownDismissal(finding, session));
+}
+
+// ---- Evidence-based finding dismissal ----------------------------------
+// Scoped, human-attested adjudication; unlike the broad override, this never
+// pretends an unfinished final audit already completed.
+export function applyFindingDismissal({
+  session, findingId, headSha, by, reason, evidence, sourceCommentId,
+  now = new Date().toISOString(),
+} = {}) {
+  validateSession(session);
+  checkedSha(headSha, 'headSha');
+  if (!['REWORK', 'HUMAN_REQUIRED'].includes(session.status)) {
+    throw new Error('dismissal requires REWORK or HUMAN_REQUIRED');
+  }
+  if (session.lastReviewedHead !== headSha) throw new Error('dismissal requires the exact last-reviewed HEAD');
+  if (!/^F[0-9]{3,}$/.test(String(findingId ?? ''))) throw new Error('invalid dismissal finding id');
+  if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})(?:\[bot\])?$/.test(String(by ?? ''))) {
+    throw new Error('invalid dismissal actor');
+  }
+  if (!/^[1-9]\d*$/.test(String(sourceCommentId ?? ''))) throw new Error('invalid dismissal source comment id');
+  const explanation = checkedText(reason, 400, 'dismissal reason');
+  if (explanation.length < 30) throw new Error('dismissal reason must be at least 30 characters');
+  if (!Array.isArray(evidence) || evidence.length < 1 || evidence.length > 3) {
+    throw new Error('dismissal needs 1-3 cited evidence URLs');
+  }
+  for (const link of evidence) {
+    if (typeof link !== 'string' || link.length > 500) throw new Error('invalid dismissal evidence link');
+    let url;
+    try { url = new URL(link); } catch { throw new Error('invalid dismissal evidence URL'); }
+    if (url.protocol !== 'https:' || !url.hostname || url.username || url.password) {
+      throw new Error('invalid dismissal evidence URL');
+    }
+  }
+  const item = session.findings.find((finding) => finding.id === findingId);
+  if (!item || item.status !== 'OPEN' || !MATERIAL_SEVERITIES.has(item.severity)) {
+    throw new Error('dismissal finding is not an OPEN material finding');
+  }
+  const findings = session.findings.map((finding) => finding.id === findingId
+    ? {
+      ...finding, status: 'DISMISSED', lastCheckedHead: headSha,
+      resolutionReason: compactText('Dismissed by @' + by + ': ' + explanation, 300),
+      dismissal: { by, at: now, head: headSha, sourceCommentId: String(sourceCommentId),
+        reason: explanation, evidence: [...evidence] },
+    }
+    : { ...finding });
+  const remaining = findings.filter((finding) => finding.status === 'OPEN' && MATERIAL_SEVERITIES.has(finding.severity)).length;
+  const status = remaining ? session.status : session.auditCompleted === true ? 'READY' : 'AUDIT_PENDING';
+  return {
+    ...session, findings, status,
+    lastSummary: compactText('Human-dismissed ' + findingId + ' by @' + by + '; remaining material findings: ' + remaining + '.', 800),
+    updatedAt: now,
+  };
 }
 
 // ---- Manual override ----------------------------------------------------
@@ -324,8 +384,14 @@ export function renderSessionComment(session, { sourceCommentIds = [] } = {}) {
     : session.status === 'AUDIT_PENDING'
       ? 'The one-time final Gemini audit will run automatically. If the workflow stops, comment `@gemini review` to resume it.'
       : session.status === 'REWORK'
-        ? 'Push a repair; the new PR commit will trigger targeted verification automatically. The review command remains available as a manual retry.'
+        ? 'Push a repair for real bugs; for a disproven finding post `@gemini dismiss F001` with Reason and Evidence lines. Dismissal does not change product code.'
         : 'Automatic review budget is exhausted. Use human judgment or a targeted Codex/Claude review; do not restart full discovery automatically.';
+  const dismissed = session.findings.filter((finding) => finding.status === 'DISMISSED').slice(-4);
+  const dismissalLines = dismissed.flatMap((finding) => [
+    '- ' + finding.id + ' dismissed by @' + cleanInline(finding.dismissal?.by ?? 'unknown')
+      + ' — ' + cleanInline(finding.dismissal?.reason ?? ''),
+    '  - Evidence: ' + (finding.dismissal?.evidence ?? []).map(cleanInline).join(' · '),
+  ]);
   const findingLines = open.length
     ? open.slice(0, 8).flatMap((finding) => [
       `- ${finding.id} **${finding.severity}** — ${cleanInline(finding.title)}`,
@@ -346,6 +412,7 @@ export function renderSessionComment(session, { sourceCommentIds = [] } = {}) {
     `Open material findings: **${open.length}**`,
     '',
     ...findingLines,
+    ...(dismissalLines.length ? ['', 'Human-dismissed findings (cited, not machine-verified):', ...dismissalLines] : []),
     '',
     `Next: ${next}`,
     '',
