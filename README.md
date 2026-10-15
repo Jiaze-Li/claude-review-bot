@@ -37,6 +37,12 @@ The review session is intentionally stateful and simple:
 - If material findings remain after the verification budget, the session stops at **HUMAN_REQUIRED** instead of looping.
 - Session state is stored in a bot-authored GitHub PR comment, so it survives new ChatGPT conversations, different agents, and local restarts.
 
+### Gemini request timeout policy
+
+Discovery and final audit each allow up to **480 seconds per model request** (verification: **180 seconds**, hard cap: **600 seconds**). The review workflow has a 30-minute overall job limit to accommodate sequential stages. Override per mode with `GEMINI_DISCOVERY_TIMEOUT_MS` or `GEMINI_AUDIT_TIMEOUT_MS`; `GEMINI_TIMEOUT_MS` remains a fallback override.
+
+Workflow logs report the review mode, request/context byte sizes, timeout budget, and elapsed time—not the prompt, diff contents, or API key. A request timeout **fails closed** without claiming a successful review and does not automatically spend another model request. After checking the logs, use `@gemini review` to manually retry an unchanged HEAD. This additional headroom is not a substitute for a future large-PR review strategy.
+
 You do **not** need to remember discovery, verification, round numbers, or provider selection.
 
 Manual commands (the first nonblank line must be exactly one of these):

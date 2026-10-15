@@ -9,6 +9,7 @@ export const GEMINI_THINKING='low';
 export const DISCOVERY_THINKING='medium';
 export const RISK_AUDIT_THINKING='medium';
 export const GEMINI_TIMEOUT_DEFAULT_MS=180_000;
+export const GEMINI_DISCOVERY_TIMEOUT_DEFAULT_MS=480_000;
 export const GEMINI_AUDIT_TIMEOUT_DEFAULT_MS=480_000;
 export const GEMINI_TIMEOUT_MAX_MS=600_000;
 const MAX_CONTEXT_BYTES=1_500_000;
@@ -16,8 +17,12 @@ const MAX_CONTEXT_BYTES=1_500_000;
 export function resolveGeminiTimeoutMs({mode,env=process.env}={}){
   const raw = mode==='audit'
     ? (env?.GEMINI_AUDIT_TIMEOUT_MS ?? env?.GEMINI_TIMEOUT_MS)
-    : env?.GEMINI_TIMEOUT_MS;
-  const fallback = mode==='audit' ? GEMINI_AUDIT_TIMEOUT_DEFAULT_MS : GEMINI_TIMEOUT_DEFAULT_MS;
+    : mode==='discovery'
+      ? (env?.GEMINI_DISCOVERY_TIMEOUT_MS ?? env?.GEMINI_TIMEOUT_MS)
+      : env?.GEMINI_TIMEOUT_MS;
+  const fallback = mode==='audit'
+    ? GEMINI_AUDIT_TIMEOUT_DEFAULT_MS
+    : mode==='discovery' ? GEMINI_DISCOVERY_TIMEOUT_DEFAULT_MS : GEMINI_TIMEOUT_DEFAULT_MS;
   if(raw==null||raw==='') return fallback;
   const value=Number(raw);
   if(!Number.isFinite(value)||value<=0) return fallback;
@@ -161,7 +166,7 @@ ${diff}`,
   };
 }
 
-export async function runGeminiReview({env=process.env,fetchImpl=fetch}={}){
+export async function runGeminiReview({env=process.env,fetchImpl=fetch,logImpl=console.log}={}){
   const apiKey=required(env,'GEMINI_API_KEY');
   const repo=required(env,'TARGET_REPO');
   const prNumber=required(env,'PR_NUMBER');
@@ -202,6 +207,7 @@ export async function runGeminiReview({env=process.env,fetchImpl=fetch}={}){
       maxOutputTokens,
     },
   });
+  const requestBytes=Buffer.byteLength(requestBody,'utf8');
   const usageTotals={
     promptTokenCount:0,
     candidatesTokenCount:0,
@@ -215,17 +221,29 @@ export async function runGeminiReview({env=process.env,fetchImpl=fetch}={}){
 
   for(let attempt=1;attempt<=2;attempt+=1){
     attempts=attempt;
-    const response=await fetchImpl(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,{
-      method:'POST',
-      headers:{'Content-Type':'application/json','x-goog-api-key':apiKey},
-      body:requestBody,
-      signal:AbortSignal.timeout(timeoutMs),
-    });
-    if(!response.ok){
-      const body=await response.text();
-      throw new Error(`Gemini API failed (HTTP ${response.status}): ${body.slice(0,500)}`);
+    const startedAt=Date.now();
+    const signal=AbortSignal.timeout(timeoutMs);
+    logImpl(`Gemini request started: mode=${mode} attempt=${attempt} model=${model} thinking=${thinking} timeout_ms=${timeoutMs} context_bytes=${contextBytes} request_bytes=${requestBytes}`);
+    let payload;
+    try{
+      const response=await fetchImpl(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,{
+        method:'POST',
+        headers:{'Content-Type':'application/json','x-goog-api-key':apiKey},
+        body:requestBody,
+        signal,
+      });
+      if(!response.ok){
+        const body=await response.text();
+        throw new Error(`Gemini API failed (HTTP ${response.status}): ${body.slice(0,500)}`);
+      }
+      payload=await response.json();
+    }catch(error){
+      if(error?.name==='TimeoutError' || (signal.aborted && signal.reason?.name==='TimeoutError')){
+        throw new Error(`Gemini ${mode} request timed out after ${Date.now()-startedAt}ms (timeout_ms=${timeoutMs}, context_bytes=${contextBytes}, request_bytes=${requestBytes}, attempt=${attempt}). No review was published.`,{cause:error});
+      }
+      throw error;
     }
-    const payload=await response.json();
+    logImpl(`Gemini request completed: mode=${mode} attempt=${attempt} elapsed_ms=${Date.now()-startedAt}`);
     if(typeof payload.modelVersion==='string'&&payload.modelVersion) servedModel=payload.modelVersion;
     for(const key of Object.keys(usageTotals)){
       const value=payload.usageMetadata?.[key];
