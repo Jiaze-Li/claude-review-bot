@@ -195,7 +195,11 @@ test('confirmed material finding remains blocking after validation',async()=>{
         validations:[{
           candidateId:'D001',verdict:'CONFIRMED',
           reason:'The sink consumes the stale record without checking its fingerprint.',
-          evidence:['consumer.js lacks a fingerprint check'],
+          evidence:['src/controller.js:2 is the proposed evidence write call'],
+          sourceAnchors:[{
+            path:'src/controller.js',line:2,
+            quote:'bindEvidenceSubmissions({ loopState, submissions, evidenceFingerprint: delta.fingerprint });',
+          }],
         }],
       })}]}}],
       usageMetadata:{promptTokenCount:1000,candidatesTokenCount:100,totalTokenCount:1100},
@@ -204,6 +208,72 @@ test('confirmed material finding remains blocking after validation',async()=>{
   assert.equal(output.findings.length,1);
   assert.equal(output.findings[0].severity,'P1');
   assert.equal(output._validation.validations[0].verdict,'CONFIRMED');
+});
+
+test('fabricated citation remains visible as UNCERTAIN rather than blocking',async()=>{
+  const root=tempRepo();
+  const dir=contextDir({summary:'discovery',findings:[falsePositive]});
+  const output=await validateMaterialFindings({
+    env:{
+      GEMINI_API_KEY:'secret',TARGET_REPO:'a/b',PR_NUMBER:'7',HEAD_SHA:HEAD,
+      TARGET_REPO_DIR:root,REVIEW_CONTEXT_DIR:dir,
+      REVIEW_INPUT_PATH:path.join(dir,'review.json'),REVIEW_OUTPUT_PATH:path.join(dir,'validated.json'),
+    },
+    fetchImpl:async()=>Response.json({candidates:[{content:{parts:[{text:JSON.stringify({
+      summary:'Claim is allegedly confirmed.',
+      validations:[{
+        candidateId:'D001',verdict:'CONFIRMED',
+        reason:'A made-up sink consumes stale records.',
+        evidence:['consumer.js lacks a fingerprint check'],
+        sourceAnchors:[{
+          path:'src/controller.js',line:2,
+          quote:'assertTrustedEvidenceBeforeWriting(newHead)',
+        }],
+      }],
+    })}]}}]}),
+  });
+  assert.equal(output.findings.length,0);
+  assert.equal(output._validation.validations[0].verdict,'UNCERTAIN');
+  assert.match(output._validation.validations[0].reason,/no verifiable source quote/i);
+});
+
+test('verified external Action absence remains eligible to block',async()=>{
+  const root=tempRepo();
+  const wf=path.join(root,'.github','workflows');
+  fs.mkdirSync(wf,{recursive:true});
+  fs.writeFileSync(path.join(wf,'ci.yml'),'steps:\n  - uses: actions/checkout@v99\n');
+  const finding={
+    severity:'P1',
+    title:'Missing Action ref actions/checkout@v99 breaks workflow',
+    body:'GitHub Actions cannot resolve actions/checkout@v99; the version does not exist.',
+    path:'.github/workflows/ci.yml',line:2,riskClass:'Build / CI Failure',
+  };
+  const dir=contextDir({summary:'discovery',findings:[finding]});
+  const output=await validateMaterialFindings({
+    env:{
+      GEMINI_API_KEY:'secret',TARGET_REPO:'a/b',PR_NUMBER:'7',HEAD_SHA:HEAD,
+      TARGET_REPO_DIR:root,REVIEW_CONTEXT_DIR:dir,
+      REVIEW_INPUT_PATH:path.join(dir,'review.json'),REVIEW_OUTPUT_PATH:path.join(dir,'validated.json'),
+    },
+    githubFetchImpl:async(url)=>url.endsWith('/repos/actions/checkout')
+      ? Response.json({full_name:'actions/checkout'})
+      : new Response('',{status:404}),
+    fetchImpl:async()=>Response.json({candidates:[{content:{parts:[{text:JSON.stringify({
+      summary:'Official GitHub repo exists, and both exact refs are absent.',
+      validations:[{
+        candidateId:'D001',verdict:'CONFIRMED',
+        reason:'Code uses the missing ref.',
+        evidence:['Official GitHub tag and branch absent'],
+        sourceAnchors:[{
+          path:'.github/workflows/ci.yml',line:2,
+          quote:'uses: actions/checkout@v99',
+        }],
+      }],
+    })}]}}]}),
+  });
+  assert.equal(output.findings.length,1);
+  assert.equal(output._validation.validations[0].verdict,'CONFIRMED');
+  assert.match(output._validation.validations[0].reason,/both returned 404/);
 });
 
 test('omitted validator verdict becomes nonblocking UNCERTAIN rather than an invented confirmation',async()=>{
@@ -279,7 +349,11 @@ test('state-integrity material validator gets larger structured-output budget',a
           validations:[{
             candidateId:'D001',verdict:'CONFIRMED',
             reason:'The stale snapshot can reach the sink.',
-            evidence:['caller reads before the lock-protected sink'],
+            evidence:['src/controller.js:2 is the unguarded caller'],
+            sourceAnchors:[{
+              path:'src/controller.js',line:2,
+              quote:'bindEvidenceSubmissions({ loopState, submissions, evidenceFingerprint: delta.fingerprint });',
+            }],
           }],
         })}]}}],
         usageMetadata:{promptTokenCount:1000,candidatesTokenCount:100,thoughtsTokenCount:500,totalTokenCount:1600},
@@ -398,6 +472,20 @@ test('external Action ref cannot block when authoritative GitHub lookup is unava
 
 test('F001-F003 regression: genuine local P1 findings never undergo an external fact lookup or downgrade',async()=>{
   const root=tempRepo();
+  const wf=path.join(root,'.github','workflows');
+  fs.mkdirSync(wf,{recursive:true});
+  fs.writeFileSync(path.join(wf,'ci.yml'),Array.from({length:11},(_,i)=>
+    i===9 ? '  - run: echo "${{ github.event.pull_request.title }}"'
+    : i===10 ? '  permissions: contents: read' : '# setup').join('\n'));
+  const auth=path.join(root,'src','auth');
+  fs.mkdirSync(auth,{recursive:true});
+  fs.writeFileSync(path.join(auth,'provider.ts'),Array.from({length:13},(_,i)=>
+    i===11 ? '  session.active = false;' : '// setup').join('\n'));
+  const anchors=[
+    {path:'.github/workflows/ci.yml',line:10,quote:'run: echo "${{ github.event.pull_request.title }}"'},
+    {path:'.github/workflows/ci.yml',line:11,quote:'permissions: contents: read'},
+    {path:'src/auth/provider.ts',line:12,quote:'session.active = false;'},
+  ];
   const findings=[
     {
       severity:'P1',title:'Workflow executes attacker-controlled shell after checkout',
@@ -434,7 +522,8 @@ test('F001-F003 regression: genuine local P1 findings never undergo an external 
           candidateId:'D'+String(i+1).padStart(3,'0'),
           verdict:'CONFIRMED',
           reason:'Reproducible local failure path.',
-          evidence:['Reachable code path and incorrect state'],
+          evidence:['Concrete source path and unsafe state transition'],
+          sourceAnchors:[anchors[i]],
         })),
       })}]}}]});
     },

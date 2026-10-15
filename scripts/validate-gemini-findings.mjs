@@ -3,6 +3,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { matchesKnownDismissal } from './review-session-core.mjs';
 import { assessExternalPremise, applyExternalEvidence } from './external-fact-evidence.mjs';
+import { requireGroundedSourceEvidence } from './local-source-evidence.mjs';
 import { GEMINI_MODEL, resolveGeminiTimeoutMs, toGeminiJsonSchema } from './run-gemini-review.mjs';
 
 export const VALIDATOR_THINKING = 'medium';
@@ -36,8 +37,22 @@ const validationSchema = {
           verdict: { type: 'string', enum: ['CONFIRMED', 'REJECTED', 'UNCERTAIN'] },
           reason: { type: 'string' },
           evidence: { type: 'array', items: { type: 'string' }, maxItems: 6 },
+          sourceAnchors: {
+            type: 'array',
+            maxItems: 4,
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                path: { type: 'string' },
+                line: { type: 'integer' },
+                quote: { type: 'string' },
+              },
+              required: ['path', 'line', 'quote'],
+            },
+          },
         },
-        required: ['candidateId', 'verdict', 'reason', 'evidence'],
+        required: ['candidateId', 'verdict', 'reason', 'evidence', 'sourceAnchors'],
       },
     },
   },
@@ -126,6 +141,7 @@ export async function validateMaterialFindings({ env = process.env, fetchImpl = 
   }
 
   const includedIds = new Set(contexts.map((entry) => entry.candidateId));
+  const contextById = new Map(contexts.map((entry) => [entry.candidateId, entry.context]));
   const prompt = buildValidationPrompt({ repo, prNumber, headSha, contexts });
   const model = env.GEMINI_MODEL || GEMINI_MODEL;
   const stateIntegrityRisk = raw?._meta?.risk_profile?.stateIntegrity === true;
@@ -213,7 +229,13 @@ export async function validateMaterialFindings({ env = process.env, fetchImpl = 
         reason: 'Validator omitted this candidate; treated as uncertain rather than blocking.',
         evidence: [],
       };
-    const checkedVerdict = applyExternalEvidence(verdict, externalEvidence.get(candidate.candidateId));
+    // Trusted external observations resolve their premise first. The local quote
+    // check then applies only if the resulting verdict could still block.
+    const externalChecked = applyExternalEvidence(verdict, externalEvidence.get(candidate.candidateId));
+    const checkedVerdict = requireGroundedSourceEvidence(externalChecked, {
+      repoRoot,
+      context: contextById.get(candidate.candidateId) || '',
+    });
     return {
       ...checkedVerdict,
       severity: String(candidate.finding?.severity || '').toUpperCase(),
@@ -293,7 +315,10 @@ Actively try to FALSIFY each candidate before confirming it:
 - check whether an existing test directly contradicts the claimed failure mechanism;
 - do not infer that stale state is consumed merely because it remains stored;
 - do not confirm a finding unless the concrete failure path remains reachable after all relevant guards.
-- External Action version, third-party release, and API behavior claims need independent authoritative evidence, not another model assertion. Use the trusted AUTHORITATIVE EXTERNAL FACT CHECK when present; if the check is unavailable, use UNCERTAIN. Unverified citations in the candidate are not proof.
+- For each CONFIRMED verdict, provide 1-4 sourceAnchors. Each anchor is {path, line, quote}: a repository-relative file path, the actual 1-based source line number, and a verbatim, substantive (at least 12 non-whitespace characters) excerpt from that exact code line in the supplied context. Do not fabricate or guess citations. REJECTED/UNCERTAIN may return [].
+- The runner checks every source quote against BOTH its provided context and the exact-HEAD checkout. A model-authored evidence sentence without a verified code quote cannot block.
+- A matching source quote proves the line exists, NOT that the bug is real: still trace the full failure path and challenge the claimed semantics.
+- External Action version, third-party release, and API behavior claims need independent authoritative evidence, not another model assertion. Use the trusted AUTHORITATIVE EXTERNAL FACT CHECK when present; if the check is unavailable, use UNCERTAIN. Verifiable local code quotes alone cannot prove outside API behavior.
 
 Verdicts:
 - CONFIRMED: the supplied context demonstrates the concrete failure path remains reachable and no shown guard defeats it.
@@ -484,6 +509,13 @@ function normalizeValidationResult(value, allowedIds) {
     const evidence = Array.isArray(entry?.evidence)
       ? entry.evidence.slice(0, 6).map((item) => cleanText(item, 600)).filter(Boolean)
       : [];
+    const sourceAnchors = Array.isArray(entry?.sourceAnchors)
+      ? entry.sourceAnchors.slice(0, 4).map((anchor) => ({
+        path: cleanText(anchor?.path, 240),
+        line: Number.isInteger(anchor?.line) ? anchor.line : null,
+        quote: cleanText(anchor?.quote, 220),
+      }))
+      : [];
     // Evidence rule: a finding cannot block on assertion alone.
     if (verdict === 'CONFIRMED' && evidence.length === 0) {
       return {
@@ -491,9 +523,10 @@ function normalizeValidationResult(value, allowedIds) {
         verdict: 'UNCERTAIN',
         reason: ('Downgraded: CONFIRMED without cited evidence. ' + reason).slice(0, 1600),
         evidence,
+        sourceAnchors,
       };
     }
-    return { candidateId, verdict, reason, evidence };
+    return { candidateId, verdict, reason, evidence, sourceAnchors };
   });
   return { summary, validations };
 }
