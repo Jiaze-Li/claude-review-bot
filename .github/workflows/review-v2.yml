@@ -80,7 +80,9 @@ concurrency:
 jobs:
   review:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Discovery and final audit each have an eight-minute request budget;
+    # leave time for bounded validation and publication.
+    timeout-minutes: 30
 
     steps:
       - name: Checkout trusted control repository

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   buildGeminiRequest,
   GEMINI_MODEL,
+  GEMINI_DISCOVERY_TIMEOUT_DEFAULT_MS,
   GEMINI_AUDIT_TIMEOUT_DEFAULT_MS,
   GEMINI_TIMEOUT_DEFAULT_MS,
   GEMINI_TIMEOUT_MAX_MS,
@@ -17,10 +18,16 @@ import path from 'node:path';
 
 const A='a'.repeat(40),BASE='b'.repeat(40);
 
-test('Gemini timeout policy gives audit more bounded headroom and clamps overrides',()=>{
-  assert.equal(resolveGeminiTimeoutMs({mode:'discovery',env:{}}),GEMINI_TIMEOUT_DEFAULT_MS);
+test('Gemini timeout policy gives discovery and audit 480 seconds, verification 180 seconds, and bounded overrides',()=>{
+  assert.equal(resolveGeminiTimeoutMs({mode:'discovery',env:{}}),GEMINI_DISCOVERY_TIMEOUT_DEFAULT_MS);
   assert.equal(resolveGeminiTimeoutMs({mode:'verification',env:{}}),GEMINI_TIMEOUT_DEFAULT_MS);
   assert.equal(resolveGeminiTimeoutMs({mode:'audit',env:{}}),GEMINI_AUDIT_TIMEOUT_DEFAULT_MS);
+  assert.equal(resolveGeminiTimeoutMs({mode:'discovery',env:{GEMINI_DISCOVERY_TIMEOUT_MS:'540000'}}),540000);
+  assert.equal(resolveGeminiTimeoutMs({mode:'discovery',env:{GEMINI_DISCOVERY_TIMEOUT_MS:'9999999'}}),GEMINI_TIMEOUT_MAX_MS);
+  assert.equal(resolveGeminiTimeoutMs({mode:'discovery',env:{GEMINI_DISCOVERY_TIMEOUT_MS:'bad'}}),GEMINI_DISCOVERY_TIMEOUT_DEFAULT_MS);
+  assert.equal(resolveGeminiTimeoutMs({mode:'discovery',env:{GEMINI_TIMEOUT_MS:'300000'}}),300000);
+  assert.equal(resolveGeminiTimeoutMs({mode:'discovery',env:{GEMINI_DISCOVERY_TIMEOUT_MS:'480000',GEMINI_TIMEOUT_MS:'300000'}}),480000);
+  assert.equal(resolveGeminiTimeoutMs({mode:'verification',env:{GEMINI_DISCOVERY_TIMEOUT_MS:'540000'}}),GEMINI_TIMEOUT_DEFAULT_MS);
   assert.equal(resolveGeminiTimeoutMs({mode:'audit',env:{GEMINI_AUDIT_TIMEOUT_MS:'540000'}}),540000);
   assert.equal(resolveGeminiTimeoutMs({mode:'audit',env:{GEMINI_AUDIT_TIMEOUT_MS:'9999999'}}),GEMINI_TIMEOUT_MAX_MS);
   assert.equal(resolveGeminiTimeoutMs({mode:'audit',env:{GEMINI_AUDIT_TIMEOUT_MS:'bad'}}),GEMINI_AUDIT_TIMEOUT_DEFAULT_MS);
@@ -81,8 +88,10 @@ test('Gemini discovery sends medium thinking on the latest-Flash alias and struc
   fs.writeFileSync(path.join(dir,'pr.diff'),'diff --git a/a b/a\n');
   fs.writeFileSync(path.join(dir,'session-plan.json'),JSON.stringify({decision:{mode:'discovery'},session:null}));
   let request;
+  const logs=[];
   const result=await runGeminiReview({
     env:{GEMINI_API_KEY:'secret',TARGET_REPO:'a/b',PR_NUMBER:'1',HEAD_SHA:A,REVIEW_CONTEXT_DIR:dir},
+    logImpl:message=>logs.push(message),
     fetchImpl:async(url,init)=>{
       request={url,body:JSON.parse(init.body),headers:init.headers};
       return Response.json({
@@ -102,7 +111,43 @@ test('Gemini discovery sends medium thinking on the latest-Flash alias and struc
   assert.equal(result._meta.requested_model,'gemini-flash-latest');
   assert.equal(result._meta.resolved_model,'gemini-9.9-flash');
   assert.equal(result._meta.usage.total_tokens,130);
+  assert.equal(result._meta.timeout_ms,GEMINI_DISCOVERY_TIMEOUT_DEFAULT_MS);
   assert.equal(request.headers['x-goog-api-key'],'secret');
+  assert.equal(logs.length,2);
+  assert.match(logs[0],/mode=discovery.*timeout_ms=480000.*context_bytes=\d+.*request_bytes=\d+/);
+  assert.match(logs[1],/mode=discovery.*elapsed_ms=\d+/);
+  assert.doesNotMatch(logs.join('\n'),/secret/);
+});
+
+test('Gemini request timeout explains the failure and does not spend an automatic retry',async()=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'gemini-timeout-'));
+  fs.writeFileSync(path.join(dir,'pr.json'),'{}');
+  fs.writeFileSync(path.join(dir,'pr.diff'),'diff --git a/a b/a\n');
+  fs.writeFileSync(path.join(dir,'session-plan.json'),JSON.stringify({decision:{mode:'discovery'},session:null}));
+  const logs=[];
+  let calls=0;
+  await assert.rejects(
+    runGeminiReview({
+      env:{GEMINI_API_KEY:'secret',TARGET_REPO:'a/b',PR_NUMBER:'1',HEAD_SHA:A,REVIEW_CONTEXT_DIR:dir},
+      logImpl:message=>logs.push(message),
+      fetchImpl:async()=>{
+        calls+=1;
+        throw new DOMException('The operation was aborted due to timeout','TimeoutError');
+      },
+    }),
+    error=>{
+      assert.match(error.message,/Gemini discovery request timed out/);
+      assert.match(error.message,/timeout_ms=480000/);
+      assert.match(error.message,/context_bytes=\d+/);
+      assert.match(error.message,/request_bytes=\d+/);
+      assert.match(error.message,/No review was published/);
+      assert.equal(error.cause?.name,'TimeoutError');
+      return true;
+    }
+  );
+  assert.equal(calls,1);
+  assert.equal(logs.length,1);
+  assert.doesNotMatch(logs.join('\n'),/secret/);
 });
 
 
