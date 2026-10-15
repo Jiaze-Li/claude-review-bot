@@ -15,7 +15,7 @@ export async function planSession({ env=process.env, fetchImpl=fetch }={}) {
   const headSha=required(env,'HEAD_SHA');
   if(!shaPattern.test(baseSha)||!shaPattern.test(headSha)) throw new Error('Invalid PR SHA');
   const requested=(env.REQUESTED_MODE||'auto').toLowerCase();
-  if(!['auto','claude','reset','override'].includes(requested)) throw new Error('Invalid REQUESTED_MODE');
+  if(!['auto','claude','reset','override','dismiss'].includes(requested)) throw new Error('Invalid REQUESTED_MODE');
 
   if(requested==='claude'){
     return {requestedMode:requested,decision:{mode:'claude',previousHead:null,reason:'explicit legacy Claude review'},session:null,sessionCommentId:null};
@@ -52,6 +52,15 @@ export async function planSession({ env=process.env, fetchImpl=fetch }={}) {
       pendingSourceCommentId:pending.pending.sourceCommentId,
       pendingReviewId:pending.reviewId,
     };
+  }
+
+  if(requested==='dismiss'){
+    const eligible=session && ['REWORK','HUMAN_REQUIRED'].includes(session.status)
+      && session.lastReviewedHead===headSha && session.findings.some(f=>f.status==='OPEN');
+    const decision=eligible
+      ?{mode:'dismiss',previousHead:null,reason:'adjudicate one evidenced finding without bypassing final audit'}
+      :{mode:'noop_waiting',previousHead:null,reason:'no OPEN finding on the last-reviewed HEAD; review the current HEAD first'};
+    return {requestedMode:requested,decision,session,sessionCommentId,pendingSession:null,pendingSourceCommentId:null,pendingReviewId:null};
   }
 
   if(requested==='override'){

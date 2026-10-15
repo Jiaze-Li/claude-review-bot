@@ -72,6 +72,35 @@ If you have read the open findings and decide the PR is fine to merge anyway (fo
 
 This needs write access, spends no model quota, waives the open findings (they stay in the record as WAIVED), and marks the current HEAD READY. A later commit still starts a fresh bounded session.
 
+### Dismiss a disproven finding without skipping final audit
+
+An authorized repository writer can dismiss **one specific** false-positive P0/P1/P2
+finding on the **same exact reviewed HEAD** by posting a fresh PR comment:
+
+```text
+@gemini dismiss F001
+Reason: The report mixes exact Git reference lookups with matching-refs; the exact endpoint does not return arrays.
+Evidence: https://docs.github.com/en/rest/git/refs
+Evidence: https://api.github.com/repos/actions/checkout/git/ref/tags/v5.0
+```
+
+The `Reason:` line must be 30-400 characters; supply 1-3 `Evidence:` lines
+with credential-free HTTPS URLs. Evidence is **attributed to the human operator**,
+not automatically certified by the bot. The workflow re-reads the source
+comment, validates its PR, author, writer permission and the unchanged HEAD,
+and stores actor, cited links, reason, source comment, HEAD and timestamp in
+the durable session.
+
+Only the named OPEN finding becomes **DISMISSED**. Other P0/P1/P2 findings
+remain OPEN; no product-code change, new Discovery or verification round is
+needed. If no blockers remain, the session enters **AUDIT_PENDING** and the
+existing one-time Final Audit runs immediately. If Final Audit already ran,
+the session may proceed directly to **READY** without re-running the audit.
+
+Resolving a GitHub review thread alone is not a dismissal. The separate
+`override review` command still waives the entire PR and is **not** used
+to adjudicate false positives.
+
 ## Convergence rules
 
 These keep the reviewer from finding "one more thing" forever:

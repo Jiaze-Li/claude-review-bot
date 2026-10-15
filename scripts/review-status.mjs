@@ -3,7 +3,7 @@ import { pathToFileURL } from 'node:url';
 
 const repoPattern = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const positiveId = /^[1-9]\d*$/;
-const reviewModes = new Set(['discovery', 'verification', 'audit', 'recover', 'claude', 'noop_ready', 'noop_waiting', 'human_required', 'override']);
+const reviewModes = new Set(['discovery', 'verification', 'audit', 'recover', 'claude', 'noop_ready', 'noop_waiting', 'human_required', 'override', 'dismiss']);
 const sourceKinds = new Set(['comment', 'pull_request']);
 
 function checked(value, pattern, name) {
@@ -48,8 +48,17 @@ export async function publishRunStatus({ env = process.env, fetchImpl = fetch } 
     else if (mode === 'audit') state = 'Exact-HEAD preflight passed. Gemini one-time final audit is running.';
     else if (mode === 'claude') state = 'Exact-HEAD preflight passed. Explicit Claude deep review is running.';
     else if (mode === 'override') state = 'Exact-HEAD preflight passed. Applying manual override.';
+    else if (mode === 'dismiss') state = 'Exact-HEAD preflight passed. Checking evidence for one finding (no model call).';
     else if (mode === 'recover') state = 'A paid review is already published. Recovering durable session state with no model call.';
     else state = 'No model call is required for this trigger. ' + reason;
+  } else if (mode === 'dismiss') {
+    state = env.DISMISS_OUTCOME !== 'success'
+      ? 'Finding dismissal was not confirmed; durable session did not acknowledge it.'
+      : env.FINAL_AUDIT_PUBLISH_OUTCOME === 'success'
+        ? 'Finding dismissal recorded; the outstanding final audit was published.'
+        : env.AUTO_AUDIT_RUN === 'true'
+          ? 'Finding dismissal recorded; final audit publication was not confirmed. Check workflow logs.'
+          : 'Finding dismissal recorded. No model quota was spent by dismissal.';
   } else if (['recover', 'noop_ready', 'noop_waiting', 'human_required'].includes(mode)) {
     state = 'No model quota was spent. ' + reason;
   } else {
