@@ -190,11 +190,19 @@ test('v2 workflow isolates provider credentials and serializes durable PR sessio
   const recoverBlock = yml.slice(recover, gemini);
   assert.doesNotMatch(recoverBlock, /GEMINI_API_KEY|CLAUDE_CODE_OAUTH_TOKEN/);
   assert.match(yml, /CLAUDE_CODE_OAUTH_TOKEN: \$\{\{ secrets\.CLAUDE_CODE_OAUTH_TOKEN \}\}/);
-  const geminiBlock = yml.slice(gemini, publishGemini);
+  // Only the trusted external-fact validator receives the scoped GitHub token.
+  // The Gemini provider step and final-audit model step remain isolated.
+  const geminiBlock = yml.slice(gemini, validator);
   assert.doesNotMatch(geminiBlock, /GH_TOKEN|app-token\.outputs\.token/);
   const validatorBlock = yml.slice(validator, publishGemini);
   assert.match(validatorBlock, /thinkingLevel|validate-gemini-findings|TARGET_REPO_DIR: target/);
-  assert.doesNotMatch(validatorBlock, /GH_TOKEN|app-token\.outputs\.token/);
+  assert.match(validatorBlock, /GH_TOKEN: \$\{\{ steps\.app-token\.outputs\.token \}\}/);
+  assert.doesNotMatch(validatorBlock, /CLAUDE_CODE_OAUTH_TOKEN/);
+  const finalAuditBlock = yml.slice(runFinalAudit, validateFinalAudit);
+  assert.doesNotMatch(finalAuditBlock, /GH_TOKEN|app-token\.outputs\.token/);
+  const finalValidatorBlock = yml.slice(validateFinalAudit, publishFinalAudit);
+  assert.match(finalValidatorBlock, /GH_TOKEN: \$\{\{ steps\.app-token\.outputs\.token \}\}/);
+  assert.doesNotMatch(finalValidatorBlock, /CLAUDE_CODE_OAUTH_TOKEN/);
   const publishClaude = yml.indexOf('- name: Publish Claude explicit deep review');
   const claudeBlock = yml.slice(claude, publishClaude);
   assert.doesNotMatch(claudeBlock, /GH_TOKEN|app-token\.outputs\.token/);

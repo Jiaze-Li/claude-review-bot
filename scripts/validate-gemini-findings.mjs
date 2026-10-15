@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { matchesKnownDismissal } from './review-session-core.mjs';
+import { assessExternalPremise, applyExternalEvidence } from './external-fact-evidence.mjs';
 import { GEMINI_MODEL, resolveGeminiTimeoutMs, toGeminiJsonSchema } from './run-gemini-review.mjs';
 
 export const VALIDATOR_THINKING = 'medium';
@@ -43,7 +44,7 @@ const validationSchema = {
   required: ['summary', 'validations'],
 };
 
-export async function validateMaterialFindings({ env = process.env, fetchImpl = fetch } = {}) {
+export async function validateMaterialFindings({ env = process.env, fetchImpl = fetch, githubFetchImpl = fetch } = {}) {
   const apiKey = required(env, 'GEMINI_API_KEY');
   const repo = required(env, 'TARGET_REPO');
   const prNumber = required(env, 'PR_NUMBER');
@@ -96,14 +97,25 @@ export async function validateMaterialFindings({ env = process.env, fetchImpl = 
 
   const prDiff = fs.readFileSync(path.join(contextRoot, 'pr.diff'), 'utf8');
   const contexts = [];
+  const externalEvidence = new Map();
   let totalBytes = 0;
   for (const candidate of candidates) {
+    const assessment = await assessExternalPremise(candidate.finding, {
+      fetchImpl: githubFetchImpl,
+      token: env.GH_TOKEN || '',
+    });
+    externalEvidence.set(candidate.candidateId, assessment);
+    const externalContext = assessment
+      ? '\n\n## AUTHORITATIVE EXTERNAL FACT CHECK (trusted runner observation)\n'
+        + assessment.reason + '\n' + assessment.evidence.join('\n')
+      : '';
+    const availableBytes = Math.min(MAX_FINDING_CONTEXT_BYTES, MAX_TOTAL_CONTEXT_BYTES - totalBytes);
     const context = buildValidationContextForFinding({
       finding: candidate.finding,
       repoRoot,
       prDiff,
-      maxBytes: Math.min(MAX_FINDING_CONTEXT_BYTES, MAX_TOTAL_CONTEXT_BYTES - totalBytes),
-    });
+      maxBytes: Math.max(availableBytes - Buffer.byteLength(externalContext, 'utf8'), 0),
+    }) + externalContext;
     totalBytes += Buffer.byteLength(context, 'utf8');
     contexts.push({
       candidateId: candidate.candidateId,
@@ -201,8 +213,9 @@ export async function validateMaterialFindings({ env = process.env, fetchImpl = 
         reason: 'Validator omitted this candidate; treated as uncertain rather than blocking.',
         evidence: [],
       };
+    const checkedVerdict = applyExternalEvidence(verdict, externalEvidence.get(candidate.candidateId));
     return {
-      ...verdict,
+      ...checkedVerdict,
       severity: String(candidate.finding?.severity || '').toUpperCase(),
       title: cleanText(candidate.finding?.title, 300),
       path: cleanText(candidate.finding?.path, 240),
@@ -280,6 +293,7 @@ Actively try to FALSIFY each candidate before confirming it:
 - check whether an existing test directly contradicts the claimed failure mechanism;
 - do not infer that stale state is consumed merely because it remains stored;
 - do not confirm a finding unless the concrete failure path remains reachable after all relevant guards.
+- External Action version, third-party release, and API behavior claims need independent authoritative evidence, not another model assertion. Use the trusted AUTHORITATIVE EXTERNAL FACT CHECK when present; if the check is unavailable, use UNCERTAIN. Unverified citations in the candidate are not proof.
 
 Verdicts:
 - CONFIRMED: the supplied context demonstrates the concrete failure path remains reachable and no shown guard defeats it.

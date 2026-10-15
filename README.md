@@ -107,6 +107,7 @@ These keep the reviewer from finding "one more thing" forever:
 
 - **Known-issue ledger.** Candidates the validator REJECTED or marked UNCERTAIN, and deferred P3s, are remembered in the session. The final audit and verification are told not to re-raise them, and a deterministic filter (same file + similar title) drops repeats that slip through. The review notes how many were dropped.
 - **Evidence rule.** Every finding must give a concrete `failurePath` (input/state -> wrong result). A P0/P1/P2 without one is demoted to non-blocking P3, and a validator CONFIRMED verdict with no cited evidence becomes UNCERTAIN.
+- **Narrow external-fact guard.** Only explicit assertions that a particular GitHub Action `owner/repo@ref` does not exist are eligible for an official GitHub ref check. The absence claim must directly attach to that reference, not an unrelated local defect such as missing permissions. An existing ref disproves the missing-ref claim; absence is considered verified only if the action repository is accessible. All other findings—including workflow security issues, local `provider` bugs, and third-party API claims—follow the ordinary Gemini validation path without an automatic downgrade. Probes use only `api.github.com` with a bounded timeout and never fetch untrusted URLs.
 - **Manual override.** See above.
 
 READY means "the bounded review found no confirmed material problem", not "the code is proven correct".
