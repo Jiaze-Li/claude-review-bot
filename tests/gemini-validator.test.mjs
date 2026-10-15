@@ -318,3 +318,80 @@ test('CONFIRMED verdict without cited evidence is downgraded to UNCERTAIN', asyn
   assert.equal(out.findings.length, 0);
   assert.equal(out._validation.validations[0].path, 'src/a.js');
 });
+
+test('official action tag defeats a Gemini CONFIRMED finding in the complete validator',async()=>{
+  const root=tempRepo();
+  const wf=path.join(root,'.github','workflows');
+  fs.mkdirSync(wf,{recursive:true});
+  fs.writeFileSync(path.join(wf,'plot-style-guard.yml'),'steps:\n  - uses: actions/checkout@v5\n');
+  const finding={
+    severity:'P1',
+    title:'Plot Style Guard references non-existent actions/checkout@v5',
+    body:'The workflow uses: actions/checkout@v5, which is not released; official action only supports v4.',
+    path:'.github/workflows/plot-style-guard.yml',
+    line:2,
+    riskClass:'Build / CI Failure',
+  };
+  const dir=contextDir({summary:'discovery',findings:[finding]});
+  const githubCalls=[];
+  let inspectedPrompt='';
+  const output=await validateMaterialFindings({
+    env:{
+      GEMINI_API_KEY:'gemini-secret',GH_TOKEN:'github-secret',TARGET_REPO:'a/b',
+      PR_NUMBER:'7',HEAD_SHA:HEAD,TARGET_REPO_DIR:root,REVIEW_CONTEXT_DIR:dir,
+      REVIEW_INPUT_PATH:path.join(dir,'review.json'),REVIEW_OUTPUT_PATH:path.join(dir,'validated.json'),
+    },
+    githubFetchImpl:async(url,init)=>{
+      githubCalls.push({url,init});
+      return Response.json({ref:'refs/tags/v5',object:{sha:HEAD}});
+    },
+    fetchImpl:async(_url,init)=>{
+      inspectedPrompt=JSON.parse(init.body).contents[0].parts[0].text;
+      return Response.json({candidates:[{content:{parts:[{text:JSON.stringify({
+        summary:'Another model mistakenly accepted the candidate.',
+        validations:[{
+          candidateId:'D001',verdict:'CONFIRMED',
+          reason:'The action only has releases up to v4.',
+          evidence:['The claimed v5 ref does not exist'],
+        }],
+      })}]}}]});
+    },
+  });
+  assert.equal(output.findings.length,0);
+  assert.equal(output._validation.validations[0].verdict,'REJECTED');
+  assert.match(output._validation.validations[0].reason,/refs\/tags\/v5 exists/);
+  assert.match(inspectedPrompt,/AUTHORITATIVE EXTERNAL FACT CHECK/);
+  assert.equal(githubCalls.length,1);
+  assert.equal(githubCalls[0].url,'https://api.github.com/repos/actions/checkout/git/ref/tags/v5');
+  assert.equal(githubCalls[0].init.headers.Authorization,'Bearer github-secret');
+  assert.doesNotMatch(inspectedPrompt,/github-secret|gemini-secret/);
+  assert.doesNotMatch(JSON.stringify(output),/github-secret|gemini-secret/);
+});
+
+test('external Action ref cannot block when authoritative GitHub lookup is unavailable',async()=>{
+  const root=tempRepo();
+  const finding={
+    severity:'P1',
+    title:'Non-existent actions/checkout@v5 breaks CI',
+    body:'GitHub Actions cannot resolve uses: actions/checkout@v5.',
+    path:'.github/workflows/plot-style-guard.yml',
+    line:1,
+    riskClass:'Build / CI Failure',
+  };
+  const dir=contextDir({summary:'discovery',findings:[finding]});
+  const output=await validateMaterialFindings({
+    env:{
+      GEMINI_API_KEY:'secret',TARGET_REPO:'a/b',PR_NUMBER:'7',HEAD_SHA:HEAD,
+      TARGET_REPO_DIR:root,REVIEW_CONTEXT_DIR:dir,
+      REVIEW_INPUT_PATH:path.join(dir,'review.json'),REVIEW_OUTPUT_PATH:path.join(dir,'validated.json'),
+    },
+    githubFetchImpl:async()=>new Response('',{status:403}),
+    fetchImpl:async()=>Response.json({candidates:[{content:{parts:[{text:JSON.stringify({
+      summary:'Claims official version is missing.',
+      validations:[{candidateId:'D001',verdict:'CONFIRMED',reason:'No v5',evidence:['Assertion only']}],
+    })}]}}]}),
+  });
+  assert.equal(output.findings.length,0);
+  assert.equal(output._validation.validations[0].verdict,'UNCERTAIN');
+  assert.match(output._validation.validations[0].reason,/Could not verify/);
+});

@@ -78,6 +78,7 @@ These keep the reviewer from finding "one more thing" forever:
 
 - **Known-issue ledger.** Candidates the validator REJECTED or marked UNCERTAIN, and deferred P3s, are remembered in the session. The final audit and verification are told not to re-raise them, and a deterministic filter (same file + similar title) drops repeats that slip through. The review notes how many were dropped.
 - **Evidence rule.** Every finding must give a concrete `failurePath` (input/state -> wrong result). A P0/P1/P2 without one is demoted to non-blocking P3, and a validator CONFIRMED verdict with no cited evidence becomes UNCERTAIN.
+- **External-fact guard.** Claims that a GitHub Action tag/branch does not exist are checked against GitHub's authoritative ref API before they can block. An existing ref disproves the candidate even if Gemini marks it CONFIRMED; an absent ref is considered verified only when the action repository itself is accessible. Other recognized external dependency/release/API assertions without a supported authoritative probe remain UNCERTAIN, not a blocking CONFIRMED. Purely local code bugs retain the usual finding-validation behavior. Probes use only the fixed `api.github.com` endpoint and a bounded timeout; no untrusted URLs are fetched.
 - **Manual override.** See above.
 
 READY means "the bounded review found no confirmed material problem", not "the code is proven correct".

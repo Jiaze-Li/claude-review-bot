@@ -323,6 +323,7 @@ jobs:
         if: steps.dedupe.outputs.duplicate != 'true' && (steps.plan.outputs.mode == 'discovery' || steps.plan.outputs.mode == 'audit')
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           TARGET_REPO: ${{ inputs.target_repo }}
           PR_NUMBER: ${{ inputs.pr_number }}
           HEAD_SHA: ${{ inputs.head_sha }}
@@ -396,6 +397,7 @@ jobs:
         if: steps.auto-audit.outputs.run == 'true'
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           TARGET_REPO: ${{ inputs.target_repo }}
           PR_NUMBER: ${{ inputs.pr_number }}
           HEAD_SHA: ${{ inputs.head_sha }}
