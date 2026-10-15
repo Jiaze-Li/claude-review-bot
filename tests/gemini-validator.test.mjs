@@ -395,3 +395,53 @@ test('external Action ref cannot block when authoritative GitHub lookup is unava
   assert.equal(output._validation.validations[0].verdict,'UNCERTAIN');
   assert.match(output._validation.validations[0].reason,/Could not verify/);
 });
+
+test('F001-F003 regression: genuine local P1 findings never undergo an external fact lookup or downgrade',async()=>{
+  const root=tempRepo();
+  const findings=[
+    {
+      severity:'P1',title:'Workflow executes attacker-controlled shell after checkout',
+      body:'Workflow uses actions/checkout@v4 then executes untrusted user input.',
+      path:'.github/workflows/ci.yml',line:10,riskClass:'workflow-injection',
+    },
+    {
+      severity:'P1',title:'Workflow step missing permissions',
+      body:'The job uses actions/checkout@v4 but is missing contents: write permissions.',
+      path:'.github/workflows/ci.yml',line:11,riskClass:'workflow-config',
+    },
+    {
+      severity:'P1',title:'Auth provider fails to clear token on logout',
+      body:'A local provider leaves an invalid token in persistent storage.',
+      path:'src/auth/provider.ts',line:12,riskClass:'auth-state',
+    },
+  ];
+  const dir=contextDir({summary:'three local bugs',findings});
+  let externalCalls=0;
+  let modelCalls=0;
+  const output=await validateMaterialFindings({
+    env:{
+      GEMINI_API_KEY:'fake',TARGET_REPO:'example/repo',PR_NUMBER:'7',HEAD_SHA:HEAD,
+      TARGET_REPO_DIR:root,REVIEW_CONTEXT_DIR:dir,
+      REVIEW_INPUT_PATH:path.join(dir,'review.json'),
+      REVIEW_OUTPUT_PATH:path.join(dir,'validated.json'),
+    },
+    githubFetchImpl:async()=>{externalCalls+=1;throw Error('No external lookups should occur');},
+    fetchImpl:async()=>{
+      modelCalls+=1;
+      return Response.json({candidates:[{content:{parts:[{text:JSON.stringify({
+        summary:'Concrete local defects remain.',
+        validations:findings.map((_,i)=>({
+          candidateId:'D'+String(i+1).padStart(3,'0'),
+          verdict:'CONFIRMED',
+          reason:'Reproducible local failure path.',
+          evidence:['Reachable code path and incorrect state'],
+        })),
+      })}]}}]});
+    },
+  });
+  assert.equal(externalCalls,0);
+  assert.equal(modelCalls,1);
+  assert.equal(output.findings.length,3);
+  assert.deepEqual(output._validation.validations.map(v=>v.verdict),
+    ['CONFIRMED','CONFIRMED','CONFIRMED']);
+});

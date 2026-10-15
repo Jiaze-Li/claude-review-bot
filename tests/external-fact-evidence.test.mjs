@@ -62,13 +62,12 @@ test('inaccessible repository or upstream outage cannot produce CONFIRMED',async
   assert.equal(applyExternalEvidence(modelConfirmed,bad).verdict,'UNCERTAIN');
 });
 
-test('other unsupported external API facts are non-blocking until independently verified',async()=>{
+test('unsupported external API assertions retain the normal validator verdict',async()=>{
   const external={title:'Stripe API returns 404 for unsupported mode',body:'The Stripe API will reject this newly released mode.',path:'src/payments.js'};
-  assert.deepEqual(classifyExternalPremise(external),{kind:'other-external'});
-  const assessed=await assessExternalPremise(external,{fetchImpl:()=>{throw Error('Must not use an arbitrary network endpoint');}});
-  const checked=applyExternalEvidence(modelConfirmed,assessed);
-  assert.equal(checked.verdict,'UNCERTAIN');
-  assert.match(checked.reason,/No authoritative probe/);
+  assert.deepEqual(classifyExternalPremise(external),{kind:'code-only'});
+  const assessed=await assessExternalPremise(external,{fetchImpl:()=>{throw Error('The deterministic guard must not browse arbitrary URLs');}});
+  assert.equal(assessed,null);
+  assert.equal(applyExternalEvidence(modelConfirmed,assessed).verdict,'CONFIRMED');
 });
 
 test('purely local code bugs retain CONFIRMED status and never call the network',async()=>{
@@ -80,7 +79,74 @@ test('purely local code bugs retain CONFIRMED status and never call the network'
 });
 
 test('SHA-pinned action references cannot be treated as missing tag/branch',async()=>{
-  const c={...candidate,title:'Missing actions/checkout@'+SHA,body:'There is no tag for actions/checkout@'+SHA};
+  const c={...candidate,title:'Non-existent actions/checkout@'+SHA,body:''};
   const assessed=await assessExternalPremise(c,{fetchImpl:()=>{throw Error('Must not probe a SHA as a tag');}});
   assert.equal(assessed.disposition,'uncertain');
+});
+
+test('F001: ordinary workflow issues mentioning an Action are still local findings',async()=>{
+  const finding={
+    path:'.github/workflows/ci.yml',
+    title:'Workflow script injection in an untrusted step',
+    body:'The workflow uses: actions/checkout@v4 and then executes attacker-controlled script input.',
+  };
+  assert.deepEqual(classifyExternalPremise(finding),{kind:'code-only'});
+  const result=await assessExternalPremise(finding,{fetchImpl:()=>{throw Error('No external lookup for local defects');}});
+  assert.equal(applyExternalEvidence(modelConfirmed,result).verdict,'CONFIRMED');
+});
+
+test('F002: missing permissions cannot be confused with an absent Action ref',async()=>{
+  const finding={
+    path:'.github/workflows/ci.yml',
+    title:'Workflow step missing permissions',
+    body:'The job uses actions/checkout@v4 but is missing contents: write permission.',
+  };
+  assert.deepEqual(classifyExternalPremise(finding),{kind:'code-only'});
+  assert.equal(await assessExternalPremise(finding,{fetchImpl:()=>{throw Error('No external lookup');}}),null);
+  assert.equal(applyExternalEvidence(modelConfirmed,null).verdict,'CONFIRMED');
+  assert.deepEqual(classifyExternalPremise({
+    ...finding,title:'actions/checkout@v4 is missing permissions',body:'',
+  }),{kind:'code-only'});
+});
+
+test('F003: local provider and external names must not demote real code bugs',async()=>{
+  for(const title of [
+    'Auth provider fails to clear token on logout',
+    'External vendor handler loses accepted persistence state',
+    'ThemeProvider fails to restore a saved theme',
+  ]){
+    const finding={path:'src/auth/provider.ts',title,body:'The source file fails to update local state.'};
+    assert.deepEqual(classifyExternalPremise(finding),{kind:'code-only'});
+    assert.equal(await assessExternalPremise(finding,{fetchImpl:()=>{throw Error('No external lookup');}}),null);
+  }
+});
+
+test('Action refs need a directly attached absence statement',()=>{
+  const positive=[
+    'Plot Style Guard references non-existent actions/checkout@v5',
+    'Workflow uses non-existent `actions/checkout@v5`.',
+    'The actions/checkout@v5 ref does not exist.',
+    'Workflow requests missing Action version actions/checkout@v5',
+  ];
+  for(const title of positive){
+    assert.deepEqual(classifyExternalPremise({path:'.github/workflows/ci.yml',title}),
+      {kind:'github-action-ref',owner:'actions',repo:'checkout',ref:'v5'},title);
+  }
+  const unrelated={
+    path:'.github/workflows/ci.yml',
+    title:'Missing permissions',
+    body:'The workflow invokes actions/checkout@v4.',
+  };
+  assert.deepEqual(classifyExternalPremise(unrelated),{kind:'code-only'});
+});
+
+test('only the specifically missing Action ref is probed when multiple Actions appear',()=>{
+  const finding={path:'.github/workflows/ci.yml',
+    title:'Workflow uses actions/checkout@v4 but also references non-existent actions/upload-artifact@v9'};
+  assert.deepEqual(classifyExternalPremise(finding),
+    {kind:'github-action-ref',owner:'actions',repo:'upload-artifact',ref:'v9'});
+  assert.deepEqual(classifyExternalPremise({
+    path:'.github/workflows/ci.yml',
+    title:'Non-existent owner/repo/subdirectory@v9',
+  }),{kind:'code-only'});
 });

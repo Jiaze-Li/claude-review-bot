@@ -1,29 +1,39 @@
 // Trusted, bounded probes for external premises in material review findings.
 // Repository text is untrusted: all probe URLs are constructed for api.github.com.
-const ACTION_REF = /\b([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)(?:\/[A-Za-z0-9_.-]+)*@([A-Za-z0-9_.-]+)\b/g;
-const ABSENT_CLAIM = /\b(?:non[- ]existent|does(?:n't| not) exist|never (?:published|released)|not (?:found|published|released|available)|missing|unavailable|unable to resolve|cannot (?:be )?resolved|can't resolve|invalid (?:ref|version|tag|release)|no (?:[A-Za-z0-9.-]+\s+){0,6}(?:tag|branch|release|version)|only (?:has|supports) (?:releases|versions) up to)\b/i;
-const EXTERNAL_SOURCE = /\b(?:GitHub Actions?|GitHub API|Google API|Stripe API|OpenAI API|Anthropic API|AWS API|Azure API|Cloudflare API|third[- ]party|external|upstream|vendor|provider|official (?:release|docs|documentation|version)|npm|pypi|maven|nuget|crates\.io|package registry|published (?:release|version)|SDK)\b/i;
-const EXTERNAL_ASSERTION = /\b(?:version|release|tag|branch|API|SDK|endpoint|removed|deprecated|unsupported|support|missing|unavailable|published|returns?|responds?|rejected|not found|non[- ]existent|exist|resolve|breaks?|fails?|[45]0[1349])\b/i;
+// Do not let ordinary workflow bugs or generic words like "provider" suppress
+// a real finding. Only an explicit claim that a SPECIFIC Action ref is absent
+// qualifies for deterministic external verification.
+const ACTION_REF = /(?<![A-Za-z0-9_.\/-])([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)@([A-Za-z0-9_.-]+)\b/g;
+// Absence must directly modify the reference, not "missing permissions" or
+// another local defect in the same title, body, or workflow.
+const REF_ABSENT_BEFORE = /(?:\b(?:non[- ]existent|unreleased|unpublished|unresolvable)\s+(?:(?:GitHub\s+)?(?:Action\s+)?(?:ref(?:erence)?|tag|version|branch)\s+)?|\b(?:missing|invalid|unknown|unavailable)\s+(?:(?:GitHub\s+)?(?:Action\s+)?(?:ref(?:erence)?|tag|version|branch)\s+))\s*[`'"]?\s*$/i;
+const REF_ABSENT_AFTER = /^\s*[`'"]?\s*(?:,\s*which\s+)?(?:does\s+not\s+exist|doesn't\s+exist|cannot\s+(?:be\s+)?resolved|can't\s+(?:be\s+)?resolved|(?:is|was)\s+(?:non[- ]existent|unreleased|unpublished|not\s+(?:found|published|released|available)))(?=$|[.,;:)\s])/i;
 const API_TIMEOUT_MS = 5_000;
 
 export function classifyExternalPremise(finding) {
-  const text = [finding?.title, finding?.failurePath, finding?.body, finding?.riskClass]
-    .filter(v => typeof v === 'string').join('\n');
-  const action = ACTION_REF.exec(text);
-  ACTION_REF.lastIndex = 0;
-  if (action && ABSENT_CLAIM.test(text) && (/\.github\/workflows\//i.test(String(finding?.path ?? '')) || /\b(?:GitHub Action|actions\/|uses\s*:|workflow|action ref|action version)\b/i.test(text))) {
-    const [, owner, repo, ref] = action;
-    if (owner.length <= 100 && repo.length <= 100 && ref.length <= 100
-        && /^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(owner)
-        && /^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(repo)
-        && /^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(ref)) {
-      return { kind: 'github-action-ref', owner, repo, ref };
+  // Keep the independent statements separate. A "missing permissions" title
+  // must never attach its absence predicate to an Action in another field.
+  const statements = [finding?.title, finding?.body, finding?.failurePath]
+    .filter(value => typeof value === 'string');
+  const workflowPath = /^\.github\/workflows\/[^/]+\.(?:yml|yaml)$/i.test(String(finding?.path ?? ''));
+
+  for (const statement of statements) {
+    if (!workflowPath && !/\b(?:GitHub\s+Actions?|Action\s+ref|Action\s+version)\b/i.test(statement)) continue;
+    for (const action of statement.matchAll(ACTION_REF)) {
+      const before = statement.slice(Math.max(0, action.index - 140), action.index);
+      const after = statement.slice(action.index + action[0].length, action.index + action[0].length + 120);
+      if (!REF_ABSENT_BEFORE.test(before) && !REF_ABSENT_AFTER.test(after)) continue;
+      const [, owner, repo, ref] = action;
+      if (owner.length <= 100 && repo.length <= 100 && ref.length <= 100
+          && /^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(owner)
+          && /^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(repo)
+          && /^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(ref)) {
+        return { kind: 'github-action-ref', owner, repo, ref };
+      }
     }
   }
-  if ((action && /\.github\/workflows\//i.test(String(finding?.path ?? '')))
-      || (EXTERNAL_SOURCE.test(text) && EXTERNAL_ASSERTION.test(text))) {
-    return { kind: 'other-external' };
-  }
+  // All other findings, including generic third-party/API speculation, stay
+  // on the original Gemini evidence-validation path. Never auto-demote them.
   return { kind: 'code-only' };
 }
 
@@ -47,13 +57,6 @@ async function fetchOfficial(url, { fetchImpl, token }) {
 export async function assessExternalPremise(finding, { fetchImpl = fetch, token = '' } = {}) {
   const kind = classifyExternalPremise(finding);
   if (kind.kind === 'code-only') return null;
-  if (kind.kind === 'other-external') {
-    return {
-      disposition: 'uncertain',
-      reason: 'This claim depends on an external release, dependency, or API fact. No authoritative probe is available for it; code snippets and another model assertion are not proof.',
-      evidence: [],
-    };
-  }
   const { owner, repo, ref } = kind;
   const target = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
   // A commit SHA can be a valid Action ref without a tag/branch. Fail closed instead.
