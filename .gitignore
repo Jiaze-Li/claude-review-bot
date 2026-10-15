@@ -4,3 +4,5 @@ worker/.wrangler/
 *.pem
 .env
 .env.*
+
+/node_modules/
