@@ -7,7 +7,7 @@ const ACTION_REF = /(?<![A-Za-z0-9_.\/-])([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)@([
 // Absence must directly modify the reference, not "missing permissions" or
 // another local defect in the same title, body, or workflow.
 const REF_ABSENT_BEFORE = /(?:\b(?:non[- ]existent|unreleased|unpublished|unresolvable)\s+(?:(?:GitHub\s+)?(?:Action\s+)?(?:ref(?:erence)?|tag|version|branch)\s+)?|\b(?:missing|invalid|unknown|unavailable)\s+(?:(?:GitHub\s+)?(?:Action\s+)?(?:ref(?:erence)?|tag|version|branch)\s+))\s*[`'"]?\s*$/i;
-const REF_ABSENT_AFTER = /^\s*[`'"]?\s*(?:,\s*which\s+)?(?:does\s+not\s+exist|doesn't\s+exist|cannot\s+(?:be\s+)?resolved|can't\s+(?:be\s+)?resolved|(?:is|was)\s+(?:non[- ]existent|unreleased|unpublished|not\s+(?:found|published|released|available)))(?=$|[.,;:)\s])/i;
+const REF_ABSENT_AFTER = /^\s*[`'"]?\s*(?:,\s*which\s+)?(?:(?:ref(?:erence)?|tag|version|branch)\s+(?:does\s+not|doesn't)\s+exist|does\s+not\s+exist|doesn't\s+exist|cannot\s+(?:be\s+)?resolved|can't\s+(?:be\s+)?resolved|(?:is|was)\s+(?:non[- ]existent|unreleased|unpublished|not\s+(?:found|published|released|available)))(?=$|[.,;:)\s])/i;
 const API_TIMEOUT_MS = 5_000;
 
 export function classifyExternalPremise(finding) {
