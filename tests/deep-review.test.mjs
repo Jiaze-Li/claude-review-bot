@@ -11,7 +11,7 @@ import {
 import { runDeepReviewCommand } from '../scripts/deep-review.mjs';
 import { syncCommitStatus } from '../scripts/sync-commit-status.mjs';
 import { planSession } from '../scripts/plan-review-session.mjs';
-import { sweepStaleDeepReviews } from '../scripts/sweep-stale-deep-reviews.mjs';
+import { closeStaleDeepReview, findStaleDeepReviews } from '../scripts/sweep-stale-deep-reviews.mjs';
 
 const BASE = 'b'.repeat(40), A = 'a'.repeat(40), C = 'c'.repeat(40);
 const T0 = '2026-10-16T08:00:00.000Z';
@@ -334,11 +334,9 @@ function sweepFetch({ repos, prs, comments, onWrite, liveHead = {} }) {
   };
 }
 
-test('sweeper discovers installed repositories itself, closes stale deep reviews, and leaves fresh/moved/archived ones alone', async () => {
+test('sweeper finds stale deep reviews across installed repositories without any configured list', async () => {
   const stale = beginDeepReview({ session: readySession(), baseSha: BASE, headSha: A, reserveUsd: 2, now: '2020-01-01T00:00:00.000Z' });
   const fresh = beginDeepReview({ session: readySession(C), baseSha: BASE, headSha: C, reserveUsd: 2, now: new Date().toISOString() });
-  const body = (s) => renderSessionComment(s);
-  const writes = [];
   const fetchImpl = sweepFetch({
     repos: [{ full_name: 'acme/project' }, { full_name: 'acme/second' }, { full_name: 'acme/old', archived: true }],
     prs: {
@@ -346,31 +344,56 @@ test('sweeper discovers installed repositories itself, closes stale deep reviews
       'acme/second': [{ number: 3, head: { sha: A } }],
     },
     comments: {
-      'acme/project#7': [{ id: 70, user: { login: 'bot[bot]' }, body: body(stale) }],
-      'acme/project#8': [{ id: 80, user: { login: 'bot[bot]' }, body: body(fresh) }],
-      'acme/project#9': [{ id: 90, user: { login: 'bot[bot]' }, body: body(stale) }],
-      'acme/second#3': [{ id: 30, user: { login: 'bot[bot]' }, body: body(stale) }],
+      'acme/project#7': [{ id: 70, user: { login: 'bot[bot]' }, body: renderSessionComment(stale) }],
+      'acme/project#8': [{ id: 80, user: { login: 'bot[bot]' }, body: renderSessionComment(fresh) }],
+      'acme/project#9': [{ id: 90, user: { login: 'bot[bot]' }, body: renderSessionComment(stale) }],
+      'acme/second#3': [{ id: 30, user: { login: 'bot[bot]' }, body: renderSessionComment(stale) }],
     },
-    onWrite: (w) => writes.push(w),
+    onWrite: () => assert.fail('find must never write'),
   });
-  const closed = await sweepStaleDeepReviews({ env: { EXPECTED_REVIEW_AUTHOR: 'bot[bot]', GH_TOKEN: 't', STATUS_TOKEN: 's' }, fetchImpl });
-  assert.deepEqual(closed, ['acme/project#7', 'acme/second#3']);
-  assert.match(writes[0].body.body, /Status: \*\*HUMAN_REQUIRED\*\*/);
-  assert.equal(writes[1].body.state, 'error');
-  assert.equal(writes.length, 4);
+  const found = await findStaleDeepReviews({ env: { EXPECTED_REVIEW_AUTHOR: 'bot[bot]', GH_TOKEN: 't' }, fetchImpl });
+  assert.deepEqual(found, [{ repo: 'acme/project', pr: 7 }, { repo: 'acme/second', pr: 3 }]);
 });
 
-test('sweeper re-verifies the live PR right before writing and never overwrites a moved PR', async () => {
+test('close fails a stale review closed and posts an error status', async () => {
   const stale = beginDeepReview({ session: readySession(), baseSha: BASE, headSha: A, reserveUsd: 2, now: '2020-01-01T00:00:00.000Z' });
   const writes = [];
   const fetchImpl = sweepFetch({
-    repos: [{ full_name: 'acme/project' }],
-    prs: { 'acme/project': [{ number: 7, head: { sha: A } }] },
+    repos: [], prs: { 'acme/project': [{ number: 7, head: { sha: A } }] },
     comments: { 'acme/project#7': [{ id: 70, user: { login: 'bot[bot]' }, body: renderSessionComment(stale) }] },
-    liveHead: { 'acme/project#7': C },
     onWrite: (w) => writes.push(w),
   });
-  const closed = await sweepStaleDeepReviews({ env: { EXPECTED_REVIEW_AUTHOR: 'bot[bot]', GH_TOKEN: 't', STATUS_TOKEN: 's' }, fetchImpl });
-  assert.deepEqual(closed, []);
-  assert.equal(writes.length, 0);
+  const ok = await closeStaleDeepReview({ repo: 'acme/project', prNumber: 7, env: { EXPECTED_REVIEW_AUTHOR: 'bot[bot]', GH_TOKEN: 't', STATUS_TOKEN: 's' }, fetchImpl });
+  assert.equal(ok, true);
+  assert.match(writes[0].body.body, /Status: \*\*HUMAN_REQUIRED\*\*/);
+  assert.equal(writes[1].body.state, 'error');
+});
+
+test('close inside the lock leaves alone a review that was restarted or moved since the scan', async () => {
+  const stale = beginDeepReview({ session: readySession(), baseSha: BASE, headSha: A, reserveUsd: 2, now: '2020-01-01T00:00:00.000Z' });
+  const restarted = beginDeepReview({ session: readySession(), baseSha: BASE, headSha: A, reserveUsd: 2, now: new Date().toISOString() });
+  for (const [label, body, liveHead] of [['restarted', renderSessionComment(restarted), A], ['moved', renderSessionComment(stale), C]]) {
+    const writes = [];
+    const fetchImpl = sweepFetch({
+      repos: [], prs: { 'acme/project': [{ number: 7, head: { sha: A } }] },
+      comments: { 'acme/project#7': [{ id: 70, user: { login: 'bot[bot]' }, body }] },
+      liveHead: { 'acme/project#7': liveHead },
+      onWrite: (w) => writes.push(w),
+    });
+    const ok = await closeStaleDeepReview({ repo: 'acme/project', prNumber: 7, env: { EXPECTED_REVIEW_AUTHOR: 'bot[bot]', GH_TOKEN: 't', STATUS_TOKEN: 's' }, fetchImpl });
+    assert.equal(ok, false, label);
+    assert.equal(writes.length, 0, label);
+  }
+});
+
+test('the sweeper close job shares the main review workflow PR lock and a live run cannot outlive the stale threshold', () => {
+  const sweep = fs.readFileSync(new URL('../.github/workflows/sweep-stale-deep-reviews.yml', import.meta.url), 'utf8');
+  const main = fs.readFileSync(new URL('../.github/workflows/review-v2.yml', import.meta.url), 'utf8');
+  assert.match(main, /group: independent-review-\$\{\{ inputs\.target_repo \}\}-\$\{\{ inputs\.pr_number \}\}\n  cancel-in-progress: false/);
+  assert.match(sweep, /group: independent-review-\$\{\{ matrix\.repo \}\}-\$\{\{ matrix\.pr \}\}\n      cancel-in-progress: false/);
+  assert.match(sweep, /max-parallel: 1/);
+  const step = main.slice(main.indexOf('- name: Run Claude explicit deep review'));
+  const minutes = Number(step.match(/timeout-minutes: (\d+)/)[1]);
+  assert.ok((minutes + 5) * 60 * 1000 <= DEEP_REVIEW_STALE_MS, 'stale threshold must exceed the live Claude step timeout plus setup margin');
+  assert.equal(DEEP_REVIEW_STALE_MS, 20 * 60 * 1000);
 });

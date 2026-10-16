@@ -475,6 +475,7 @@ jobs:
         run: node scripts/publish-gemini-review.mjs
 
       - name: Run Claude explicit deep review
+        timeout-minutes: 12
         if: steps.dedupe.outputs.duplicate != 'true' && steps.plan.outputs.mode == 'claude' && steps.begin-deep.outputs.run == 'true'
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
