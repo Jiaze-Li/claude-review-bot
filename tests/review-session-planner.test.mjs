@@ -130,3 +130,20 @@ test('explicit reset ignores a recoverable pending review and starts fresh disco
   assert.equal(plan.decision.mode,'discovery');
   assert.equal(plan.decision.reason,'explicit reset');
 });
+
+test('explicit Claude request recovers a newer published-but-unpersisted session first and says it did not run',async()=>{
+  const durable=applyDiscoveryResult({result:{summary:'clean',findings:[]},baseSha:BASE,headSha:A,sourceCommentId:'1'});
+  const newer={...applyDiscoveryResult({
+    result:{summary:'bug',findings:[{severity:'P1',title:'Bug',body:'Trigger X causes Y; expected Z.',path:'a.js',line:1,riskClass:'state'}]},
+    baseSha:BASE,headSha:A,sourceCommentId:'2'}),updatedAt:'2099-01-01T00:00:00.000Z'};
+  const plan=await planSession({
+    env:env({REQUESTED_MODE:'claude'}),
+    fetchImpl:fetchState({
+      comments:[comment(7,renderSessionComment(durable))],
+      reviews:[{id:11,user:{login:author},body:'review\n'+pendingSessionMarker(newer,'2')}],
+    }),
+  });
+  assert.equal(plan.decision.mode,'recover');
+  assert.match(plan.decision.reason,/NOT run; send it again/);
+  assert.equal(plan.pendingSession.findings[0].id,'F001');
+});

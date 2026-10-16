@@ -32,6 +32,26 @@ export async function planSession({ env=process.env, fetchImpl=fetch }={}) {
     if(!session) throw new Error('Latest bot-authored review session comment is unreadable; refusing to discard durable state');
   }
 
+  const pendingCandidates=reviews
+    .filter(r=>r?.user?.login===expectedAuthor && typeof r.body==='string')
+    .map(r=>({reviewId:String(r.id),pending:parsePendingSessionReview(r.body)}))
+    .filter(r=>r.pending && r.pending.session.lastReviewedHead===headSha)
+    .sort((a,b)=>Number(b.reviewId)-Number(a.reviewId));
+  const pending=pendingCandidates[0]??null;
+  if(requested!=='reset' && pending && isPendingNewer(session,pending.pending.session)){
+    return {
+      requestedMode:requested,
+      decision:{mode:'recover',previousHead:null,reason:requested==='claude'
+        ?'recover published review session without another model call. Your @claude review request was NOT run; send it again after this recovery.'
+        :'recover published review session without another model call'},
+      session,
+      sessionCommentId,
+      pendingSession:pending.pending.session,
+      pendingSourceCommentId:pending.pending.sourceCommentId,
+      pendingReviewId:pending.reviewId,
+    };
+  }
+
   if(requested==='claude'){
     // Explicit deep review joins the durable session for this exact HEAD. A fresh
     // in-progress marker means a run is already going; a stale one is restartable.
@@ -43,24 +63,6 @@ export async function planSession({ env=process.env, fetchImpl=fetch }={}) {
         ?{mode:'noop_waiting',previousHead:null,reason:'Your @claude review request was NOT queued and no Claude review ran: there is no completed automatic review for this exact commit yet. This commit is not READY for deep review purposes. After the automatic review finishes (or after you comment @gemini review), send @claude review again.'}
         :{mode:'claude',previousHead:null,reason:'explicit Claude deep review bound to this HEAD'};
     return {requestedMode:requested,decision,session,sessionCommentId,pendingSession:null,pendingSourceCommentId:null,pendingReviewId:null};
-  }
-
-  const pendingCandidates=reviews
-    .filter(r=>r?.user?.login===expectedAuthor && typeof r.body==='string')
-    .map(r=>({reviewId:String(r.id),pending:parsePendingSessionReview(r.body)}))
-    .filter(r=>r.pending && r.pending.session.lastReviewedHead===headSha)
-    .sort((a,b)=>Number(b.reviewId)-Number(a.reviewId));
-  const pending=pendingCandidates[0]??null;
-  if(requested!=='reset' && pending && isPendingNewer(session,pending.pending.session)){
-    return {
-      requestedMode:requested,
-      decision:{mode:'recover',previousHead:null,reason:'recover published review session without another model call'},
-      session,
-      sessionCommentId,
-      pendingSession:pending.pending.session,
-      pendingSourceCommentId:pending.pending.sourceCommentId,
-      pendingReviewId:pending.reviewId,
-    };
   }
 
   if(requested==='dismiss'){
