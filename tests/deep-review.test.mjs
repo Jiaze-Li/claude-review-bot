@@ -11,6 +11,7 @@ import {
 import { runDeepReviewCommand } from '../scripts/deep-review.mjs';
 import { syncCommitStatus } from '../scripts/sync-commit-status.mjs';
 import { planSession } from '../scripts/plan-review-session.mjs';
+import { sweepStaleDeepReviews } from '../scripts/sweep-stale-deep-reviews.mjs';
 
 const BASE = 'b'.repeat(40), A = 'a'.repeat(40), C = 'c'.repeat(40);
 const T0 = '2026-10-16T08:00:00.000Z';
@@ -172,12 +173,12 @@ test('fail closes an in-progress run to HUMAN_REQUIRED and accounts the spend', 
 
 test('a stale in-progress marker from a dead run is failed by the next trigger', async () => {
   const gh = fakeGitHub();
-  const stale = beginDeepReview({ session: readySession(), baseSha: BASE, headSha: A, now: T0 });
+  const stale = beginDeepReview({ session: readySession(), baseSha: BASE, headSha: A, reserveUsd: 1.25, now: T0 });
   const dir = ctxDir({ decision: { mode: 'deep_review_stale' }, session: stale, sessionCommentId: '300' });
   const later = new Date(Date.parse(T0) + DEEP_REVIEW_STALE_MS + 1000).toISOString();
   const f = await runDeepReviewCommand('fail', { env: cenv(dir), fetchImpl: gh.fetchImpl, now: later });
   assert.equal(f.status, 'HUMAN_REQUIRED');
-  assert.equal(f.deepSpendUsd, 2); // unknown spend of a dead run is charged at the full per-run allotment
+  assert.equal(f.deepSpendUsd, 1.25); // unknown spend of a dead run stays charged at what that run reserved
 });
 
 test('fail never touches a fresh in-progress marker owned by another live run', async () => {
@@ -286,4 +287,54 @@ test('Claude blocker is not suppressed by a concern Gemini already rejected', ()
   const done = completeDeepReview({ session: begun, result: { summary: 'bug', findings: [finding('P1')] }, headSha: A });
   assert.equal(done.status, 'REWORK');
   assert.equal(done.findings.at(-1).origin, 'CLAUDE_DEEP');
+});
+
+test('begin posts the pending status BEFORE the durable write, so a failed write cannot leave an old green', async () => {
+  const order = [];
+  const fetchImpl = async (url, init = {}) => {
+    if (/\/pulls\/7$/.test(url)) return Response.json({ base: { sha: BASE }, head: { sha: A } });
+    if (/statuses\//.test(url)) { order.push('status:' + JSON.parse(init.body).state); return Response.json({}); }
+    if (init.method === 'PATCH') { order.push('write'); return new Response('boom', { status: 500 }); }
+    assert.fail('unexpected ' + url);
+  };
+  const dir = ctxDir({ decision: { mode: 'claude' }, session: readySession(), sessionCommentId: '300' });
+  await assert.rejects(() => runDeepReviewCommand('begin', { env: cenv(dir, { STATUS_TOKEN: 's' }), fetchImpl, now: T0 }), /HTTP 500/);
+  assert.deepEqual(order, ['status:pending', 'write']);
+});
+
+test('strict mode: begin refuses to start when the pending status cannot be posted', async () => {
+  const gh = fakeGitHub();
+  const dir = ctxDir({ decision: { mode: 'claude' }, session: readySession(), sessionCommentId: '300' });
+  await assert.rejects(() => runDeepReviewCommand('begin', { env: cenv(dir, { STATUS_STRICT: 'true' }), fetchImpl: gh.fetchImpl, now: T0 }), /permission/);
+  assert.equal(gh.writes.length, 0);
+});
+
+test('final mirror turns a stale READY into error when the attempted deep review job failed', async () => {
+  const posted = [];
+  await syncCommitStatus({ env: senv({ DEEP_REVIEW_ATTEMPTED: 'true', JOB_FAILED: 'true' }), fetchImpl: statusFetch(readySession(A), posted) });
+  assert.equal(posted[0].body.state, 'error');
+  const ok = [];
+  await syncCommitStatus({ env: senv({ DEEP_REVIEW_ATTEMPTED: 'true' }), fetchImpl: statusFetch(readySession(A), ok) });
+  assert.equal(ok[0].body.state, 'success');
+});
+
+test('sweeper closes a stale deep review without any trigger and leaves fresh or moved ones alone', async () => {
+  const stale = beginDeepReview({ session: readySession(), baseSha: BASE, headSha: A, reserveUsd: 2, now: '2020-01-01T00:00:00.000Z' });
+  const fresh = beginDeepReview({ session: readySession(C), baseSha: BASE, headSha: C, reserveUsd: 2, now: new Date().toISOString() });
+  const writes = [];
+  const fetchImpl = async (url, init = {}) => {
+    if (/pulls\?state=open/.test(url)) return Response.json([{ number: 7, head: { sha: A } }, { number: 8, head: { sha: C } }, { number: 9, head: { sha: C } }]);
+    if (/issues\/7\/comments/.test(url)) return Response.json([{ id: 70, user: { login: 'bot[bot]' }, body: renderSessionComment(stale) }]);
+    if (/issues\/8\/comments/.test(url)) return Response.json([{ id: 80, user: { login: 'bot[bot]' }, body: renderSessionComment(fresh) }]);
+    if (/issues\/9\/comments/.test(url)) return Response.json([{ id: 90, user: { login: 'bot[bot]' }, body: renderSessionComment(stale) }]); // stale but PR moved on
+    if (init.method) { writes.push({ url, method: init.method, body: JSON.parse(init.body) }); return Response.json({}); }
+    assert.fail('unexpected ' + url);
+  };
+  const closed = await sweepStaleDeepReviews({
+    env: { REVIEW_TARGET_REPOS: 'acme/project', EXPECTED_REVIEW_AUTHOR: 'bot[bot]', GH_TOKEN: 't', STATUS_TOKEN: 's' }, fetchImpl,
+  });
+  assert.deepEqual(closed, ['acme/project#7']);
+  assert.match(writes[0].body.body, /Status: \*\*HUMAN_REQUIRED\*\*/);
+  assert.equal(writes[1].body.state, 'error');
+  assert.equal(writes.length, 2);
 });

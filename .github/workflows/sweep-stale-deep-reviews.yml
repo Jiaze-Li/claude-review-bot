@@ -1,0 +1,51 @@
+name: Sweep Stale Deep Reviews
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sweep:
+    if: vars.REVIEW_TARGET_REPOS != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout trusted control repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Create least-privilege GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ vars.REVIEW_TARGET_REPOS_NAMES }}
+          permission-pull-requests: write
+          permission-issues: read
+
+      - name: Create best-effort commit-status token
+        id: status-token
+        continue-on-error: true
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ vars.REVIEW_TARGET_REPOS_NAMES }}
+          permission-statuses: write
+
+      - name: Close deep reviews that never reported back
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          STATUS_TOKEN: ${{ steps.status-token.outputs.token }}
+          STATUS_STRICT: ${{ vars.REQUIRE_STATUS_CHECK }}
+          REVIEW_TARGET_REPOS: ${{ vars.REVIEW_TARGET_REPOS }}
+          EXPECTED_REVIEW_AUTHOR: ${{ steps.app-token.outputs.app-slug }}[bot]
+        run: node scripts/sweep-stale-deep-reviews.mjs

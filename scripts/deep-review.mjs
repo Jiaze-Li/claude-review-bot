@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { postCommitStatus } from './sync-commit-status.mjs';
 import {
   DEEP_REVIEW_RUN_BUDGET_USD,
   beginDeepReview,
@@ -32,6 +33,13 @@ export async function runDeepReviewCommand(command, { env = process.env, fetchIm
       reserveUsd: exhausted ? 0 : runBudget, now,
     });
     if (exhausted) session = failDeepReview({ session, headSha: ctx.headSha, reason: 'per-PR deep review budget exhausted', now });
+    // Required status goes pending/error FIRST, so a failed durable write below can never leave an old green.
+    await postCommitStatus({
+      env, fetchImpl, target: ctx.target, headSha: ctx.headSha,
+      status: exhausted
+        ? { state: 'error', description: 'Claude deep review budget exhausted: human judgment required' }
+        : { state: 'pending', description: 'Claude deep review in progress' },
+    });
     const commentId = await upsertSession(ctx, session, [], fetchImpl, exhausted);
     fs.writeFileSync(stateFile, JSON.stringify({ session, sessionCommentId: commentId }) + '\n', { mode: 0o600 });
     output(env, 'began', 'true');
@@ -65,7 +73,7 @@ export async function runDeepReviewCommand(command, { env = process.env, fetchIm
       fallbackCost = allottedBudget(env);
     } else if (ctx.plan.decision?.mode === 'deep_review_stale' && isDeepReviewStale(ctx.plan.session, Date.parse(now))) {
       session = ctx.plan.session; commentId = ctx.plan.sessionCommentId;
-      fallbackCost = DEEP_REVIEW_RUN_BUDGET_USD;
+      fallbackCost = ctx.plan.session.deepReview?.reservedUsd ?? DEEP_REVIEW_RUN_BUDGET_USD;
     } else {
       console.log('No deep review owned by this job and no stale marker; nothing to fail.');
       return null;

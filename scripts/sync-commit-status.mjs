@@ -14,35 +14,52 @@ export async function syncCommitStatus({ env = process.env, fetchImpl = fetch } 
   const prNumber = required(env, 'PR_NUMBER');
   const headSha = required(env, 'HEAD_SHA');
   if (!/^[0-9a-f]{40}$/i.test(headSha)) throw new Error('Invalid HEAD_SHA');
+  if (!env.STATUS_TOKEN) return postCommitStatus({ env, fetchImpl, target, headSha, status: null }); // warns, or throws in strict mode
+  const session = await latestSession({ target, prNumber, author: required(env, 'EXPECTED_REVIEW_AUTHOR'), token: required(env, 'GH_TOKEN'), fetchImpl });
+  let status = sessionCommitStatus(session, headSha);
+  if (env.JOB_FAILED === 'true' && status.state === 'pending' && (!session || session.lastReviewedHead !== headSha)) {
+    status = { state: 'error', description: 'Review run failed for this commit; comment @gemini review to retry' };
+  }
+  // A deep review that was attempted but whose job failed must never leave an old green or a
+  // forever-pending status, even if persisting the failure to the session comment itself failed.
+  if (env.DEEP_REVIEW_ATTEMPTED === 'true' && env.JOB_FAILED === 'true'
+    && !(session && session.lastReviewedHead === headSha && ['REWORK', 'HUMAN_REQUIRED'].includes(session.status))) {
+    status = { state: 'error', description: 'Claude deep review did not complete: human judgment required' };
+  }
+  return postCommitStatus({ env, fetchImpl, target, headSha, status });
+}
+
+// Shared by begin (explicit pending BEFORE any durable write) and the final mirror.
+export async function postCommitStatus({ env = process.env, fetchImpl = fetch, target = env.TARGET_REPO, headSha = env.HEAD_SHA, status }) {
   const strict = env.STATUS_STRICT === 'true';
   if (!env.STATUS_TOKEN) {
     if (strict) throw new Error('Commit status required (REQUIRE_STATUS_CHECK=true) but the GitHub App has no commit-status permission');
     console.warn('::warning::No status token (GitHub App lacks commit-status permission?); required check was NOT updated.');
     return null;
   }
-  const session = await latestSession({ target, prNumber, author: required(env, 'EXPECTED_REVIEW_AUTHOR'), token: required(env, 'GH_TOKEN'), fetchImpl });
-  let status = sessionCommitStatus(session, headSha);
-  if (env.JOB_FAILED === 'true' && status.state === 'pending' && (!session || session.lastReviewedHead !== headSha)) {
-    status = { state: 'error', description: 'Review run failed for this commit; comment @gemini review to retry' };
-  }
   const runUrl = env.GITHUB_SERVER_URL && env.GITHUB_REPOSITORY && env.GITHUB_RUN_ID
     ? `${env.GITHUB_SERVER_URL}/${env.GITHUB_REPOSITORY}/actions/runs/${env.GITHUB_RUN_ID}` : undefined;
-  const response = await fetchImpl(`https://api.github.com/repos/${target}/statuses/${headSha}`, {
-    method: 'POST',
-    headers: {
-      Accept: 'application/vnd.github+json', Authorization: `Bearer ${env.STATUS_TOKEN}`, 'Content-Type': 'application/json',
-      'X-GitHub-Api-Version': '2022-11-28', 'User-Agent': 'jiaze-review-bot',
-    },
-    body: JSON.stringify({ state: status.state, context: STATUS_CONTEXT, description: status.description.slice(0, 140), ...(runUrl ? { target_url: runUrl } : {}) }),
-    signal: AbortSignal.timeout(15000),
-  });
-  if (!response.ok) {
-    if (strict) throw new Error(`Commit status required but not posted (HTTP ${response.status})`);
-    console.warn(`::warning::Commit status not posted (HTTP ${response.status}); required check was NOT updated.`);
-    return null;
+  let lastStatus = 0;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    const response = await fetchImpl(`https://api.github.com/repos/${target}/statuses/${headSha}`, {
+      method: 'POST',
+      headers: {
+        Accept: 'application/vnd.github+json', Authorization: `Bearer ${env.STATUS_TOKEN}`, 'Content-Type': 'application/json',
+        'X-GitHub-Api-Version': '2022-11-28', 'User-Agent': 'jiaze-review-bot',
+      },
+      body: JSON.stringify({ state: status.state, context: STATUS_CONTEXT, description: status.description.slice(0, 140), ...(runUrl ? { target_url: runUrl } : {}) }),
+      signal: AbortSignal.timeout(15000),
+    });
+    if (response.ok) {
+      console.log(`Commit status ${status.state} posted for ${headSha.slice(0, 12)}: ${status.description}`);
+      return status;
+    }
+    lastStatus = response.status;
+    if (response.status < 500 && response.status !== 429) break; // permission/validation errors do not heal on retry
   }
-  console.log(`Commit status ${status.state} posted for ${headSha.slice(0, 12)}: ${status.description}`);
-  return status;
+  if (strict) throw new Error(`Commit status required but not posted (HTTP ${lastStatus})`);
+  console.warn(`::warning::Commit status not posted (HTTP ${lastStatus}); required check was NOT updated.`);
+  return null;
 }
 
 async function latestSession({ target, prNumber, author, token, fetchImpl }) {

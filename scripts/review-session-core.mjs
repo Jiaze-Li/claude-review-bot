@@ -580,6 +580,7 @@ export function renderSessionComment(session, { sourceCommentIds = [] } = {}) {
     `Default reviewer: **Gemini Flash (latest) / medium thinking**`,
     `Discovery: **complete** · Final audit: **${audit}** · Verification: **${verification}**`,
     `Open material findings: **${open.length}**`,
+    ...(session.deepSpendUsd > 0 ? [`Claude spend (deep review + fallback, SDK estimate): **$${session.deepSpendUsd.toFixed(2)}** of $${DEEP_REVIEW_PR_BUDGET_USD.toFixed(2)} per-PR cap · remaining $${deepReviewBudgetLeft(session).toFixed(2)}`] : []),
     '',
     ...findingLines,
     ...(dismissalLines.length ? ['', 'Human-dismissed findings (cited, not machine-verified):', ...dismissalLines] : []),

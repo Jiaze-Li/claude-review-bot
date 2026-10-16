@@ -58,6 +58,12 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
     session = recordDismissed(session, raw._validation?.validations, headSha);
   }
 
+  // Claude fallback calls (review and validation) spend the same per-PR Claude budget.
+  const fallbackCost = [raw._meta, raw._validation?._meta]
+    .filter((meta) => meta?.provider === 'claude')
+    .reduce((sum, meta) => sum + (Number.isFinite(meta.total_cost_usd) ? meta.total_cost_usd : 0), 0);
+  if (fallbackCost > 0) session = { ...session, deepSpendUsd: Math.round(((session.deepSpendUsd ?? 0) + fallbackCost) * 10000) / 10000 };
+
   const sessionBody = renderSessionComment(session, { sourceCommentIds: [sourceCommentId] });
   const pendingMarker = pendingSessionMarker(session, sourceCommentId);
   const addedLines = await loadAddedLines({ owner, repo, prNumber, token: env.GH_TOKEN, fetchImpl });

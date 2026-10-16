@@ -90,3 +90,25 @@ test('malformed Claude fallback output is rejected rather than published', async
     /findings must be an array/,
   );
 });
+
+test('fallback reports a cost, charging a conservative default when the SDK gives none', async () => {
+  const calls = [];
+  const r = await runGeminiReview({
+    env: env(ctx(), { CLAUDE_CODE_OAUTH_TOKEN: 't' }), logImpl: () => {},
+    fetchImpl: async () => new Response('x', { status: 402 }), queryImpl: fakeQuery(calls),
+  });
+  assert.equal(r._meta.total_cost_usd, 0.5);
+});
+
+test('fallback is blocked once the per-PR Claude budget is exhausted', async () => {
+  const dir = ctx();
+  const plan = JSON.parse(fs.readFileSync(path.join(dir, 'session-plan.json'), 'utf8'));
+  plan.session = { version: 1, baseSha: 'b'.repeat(40), lastReviewedHead: A, status: 'AUDIT_PENDING', findings: [], deepSpendUsd: 6 };
+  fs.writeFileSync(path.join(dir, 'session-plan.json'), JSON.stringify(plan));
+  const calls = [];
+  await assert.rejects(runGeminiReview({
+    env: env(dir, { CLAUDE_CODE_OAUTH_TOKEN: 't' }), logImpl: () => {},
+    fetchImpl: async () => new Response('x', { status: 402 }), queryImpl: fakeQuery(calls),
+  }), /budget is exhausted/);
+  assert.equal(calls.length, 0);
+});
