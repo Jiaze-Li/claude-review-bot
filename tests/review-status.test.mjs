@@ -197,12 +197,13 @@ test('v2 workflow isolates provider credentials and serializes durable PR sessio
   const validatorBlock = yml.slice(validator, publishGemini);
   assert.match(validatorBlock, /thinkingLevel|validate-gemini-findings|TARGET_REPO_DIR: target/);
   assert.match(validatorBlock, /GH_TOKEN: \$\{\{ steps\.app-token\.outputs\.token \}\}/);
-  assert.doesNotMatch(validatorBlock, /CLAUDE_CODE_OAUTH_TOKEN/);
+  // Claude fallback validates when Gemini is out of credits; the fallback subprocess is tool-less and gets a scrubbed env (see claude-fallback tests).
+  assert.match(validatorBlock, /CLAUDE_CODE_OAUTH_TOKEN/);
   const finalAuditBlock = yml.slice(runFinalAudit, validateFinalAudit);
   assert.doesNotMatch(finalAuditBlock, /GH_TOKEN|app-token\.outputs\.token/);
   const finalValidatorBlock = yml.slice(validateFinalAudit, publishFinalAudit);
   assert.match(finalValidatorBlock, /GH_TOKEN: \$\{\{ steps\.app-token\.outputs\.token \}\}/);
-  assert.doesNotMatch(finalValidatorBlock, /CLAUDE_CODE_OAUTH_TOKEN/);
+  assert.match(finalValidatorBlock, /CLAUDE_CODE_OAUTH_TOKEN/);
   const publishClaude = yml.indexOf('- name: Publish Claude explicit deep review');
   const claudeBlock = yml.slice(claude, publishClaude);
   assert.doesNotMatch(claudeBlock, /GH_TOKEN|app-token\.outputs\.token/);

@@ -1,7 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { knownIssuesPromptBlock, openMaterialFindings } from './review-session-core.mjs';
+import { knownIssuesPromptBlock, normalizeReviewResult, normalizeVerificationResult, openMaterialFindings } from './review-session-core.mjs';
+import {GeminiUnavailableError,isGeminiUnavailableStatus,runClaudeStructured} from './claude-fallback.mjs';
 
 // Moving alias: always resolves to Google's current Flash model. Override with GEMINI_MODEL to pin.
 export const GEMINI_MODEL='gemini-flash-latest';
@@ -166,7 +167,7 @@ ${diff}`,
   };
 }
 
-export async function runGeminiReview({env=process.env,fetchImpl=fetch,logImpl=console.log}={}){
+export async function runGeminiReview({env=process.env,fetchImpl=fetch,logImpl=console.log,queryImpl=null}={}){
   const apiKey=required(env,'GEMINI_API_KEY');
   const repo=required(env,'TARGET_REPO');
   const prNumber=required(env,'PR_NUMBER');
@@ -218,6 +219,7 @@ export async function runGeminiReview({env=process.env,fetchImpl=fetch,logImpl=c
   let attempts=0;
   let servedModel=null;
   let lastStructuredError=null;
+  let unavailable=null;
 
   for(let attempt=1;attempt<=2;attempt+=1){
     attempts=attempt;
@@ -234,10 +236,16 @@ export async function runGeminiReview({env=process.env,fetchImpl=fetch,logImpl=c
       });
       if(!response.ok){
         const body=await response.text();
-        throw new Error(`Gemini API failed (HTTP ${response.status}): ${body.slice(0,500)}`);
+        const message=`Gemini API failed (HTTP ${response.status}): ${body.slice(0,500)}`;
+        if(isGeminiUnavailableStatus(response.status)) throw new GeminiUnavailableError(message,response.status);
+        throw new Error(message);
       }
       payload=await response.json();
     }catch(error){
+      if(error instanceof GeminiUnavailableError){
+        unavailable=error;
+        break;
+      }
       if(error?.name==='TimeoutError' || (signal.aborted && signal.reason?.name==='TimeoutError')){
         throw new Error(`Gemini ${mode} request timed out after ${Date.now()-startedAt}ms (timeout_ms=${timeoutMs}, context_bytes=${contextBytes}, request_bytes=${requestBytes}, attempt=${attempt}). No review was published.`,{cause:error});
       }
@@ -262,6 +270,23 @@ export async function runGeminiReview({env=process.env,fetchImpl=fetch,logImpl=c
     }
   }
 
+  if(unavailable){
+    logImpl(`Gemini unavailable (HTTP ${unavailable.status}); falling back to Claude for this ${mode} review`);
+    const fallback=await runClaudeStructured({prompt:built.prompt,schema:built.schema,timeoutMs,env,logImpl,queryImpl});
+    // Fail here, not at publish time, with the exact normalizer the publisher applies to every provider's output.
+    if(mode==='verification') normalizeVerificationResult(fallback.structured); else normalizeReviewResult(fallback.structured);
+    return {
+      ...fallback.structured,
+      _meta:{
+        ...fallback.meta,
+        mode,attempts,
+        fallback_from:'gemini',fallback_reason:`HTTP ${unavailable.status}`,
+        max_output_tokens:null,
+        timeout_ms:timeoutMs,
+        risk_profile:riskProfile,
+      },
+    };
+  }
   if(!result){
     throw new Error(`Gemini structured output is invalid after one retry: ${lastStructuredError?.message||'unknown error'}`);
   }

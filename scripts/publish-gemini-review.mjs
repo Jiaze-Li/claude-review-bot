@@ -76,7 +76,7 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
 
   const open = openMaterialFindings(session);
   const reviewKind = mode === 'discovery' ? 'Discovery' : mode === 'audit' ? 'Final Audit' : 'Verification';
-  let body = '## Gemini ' + reviewKind + ' Review\n\n' + normalized.summary.trim();
+  let body = '## ' + (raw._meta?.provider === 'claude' ? 'Claude' : 'Gemini') + ' ' + reviewKind + ' Review\n\n' + normalized.summary.trim();
   if (mode === 'verification') {
     body += '\n\n### Finding verification';
     for (const verdict of normalized.verifications) {
@@ -257,6 +257,7 @@ function formatRuntime(meta, label = 'Review runtime') {
   if (usage.input_tokens != null) parts.push('input ' + Number(usage.input_tokens).toLocaleString('en-US'));
   if (usage.output_tokens != null) parts.push('output ' + Number(usage.output_tokens).toLocaleString('en-US'));
   if (usage.thoughts_tokens != null) parts.push('thoughts ' + Number(usage.thoughts_tokens).toLocaleString('en-US'));
+  if (meta.fallback_from) parts.push('fallback from ' + escapeHtml(meta.fallback_from) + ' (' + escapeHtml(meta.fallback_reason || 'unavailable') + ')');
   if (meta.risk_profile?.stateIntegrity === true) parts.push('risk state-integrity');
   return '\n\n' + (label === 'Discovery runtime' ? '---\n' : '') + '<sub>' + label + ': ' + parts.join(' · ') + '</sub>';
 }

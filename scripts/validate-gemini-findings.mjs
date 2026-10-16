@@ -4,6 +4,7 @@ import { pathToFileURL } from 'node:url';
 import { matchesKnownDismissal } from './review-session-core.mjs';
 import { assessExternalPremise, applyExternalEvidence } from './external-fact-evidence.mjs';
 import { requireGroundedSourceEvidence } from './local-source-evidence.mjs';
+import { GeminiUnavailableError, isGeminiUnavailableStatus, runClaudeStructured } from './claude-fallback.mjs';
 import { GEMINI_MODEL, resolveGeminiTimeoutMs, toGeminiJsonSchema } from './run-gemini-review.mjs';
 
 export const VALIDATOR_THINKING = 'medium';
@@ -151,6 +152,9 @@ export async function validateMaterialFindings({ env = process.env, fetchImpl = 
   let payload = null;
   let structuredAttempts = 0;
   let lastStructuredError = null;
+  // A review that already fell back to Claude means Gemini is down; do not spend another failing request.
+  let unavailable = raw?._meta?.provider === 'claude' ? new GeminiUnavailableError('review already fell back to Claude', 0) : null;
+  let claudeMeta = null;
   const usage = {
     promptTokenCount: 0,
     candidatesTokenCount: 0,
@@ -158,7 +162,7 @@ export async function validateMaterialFindings({ env = process.env, fetchImpl = 
     totalTokenCount: 0,
   };
 
-  for (let attempt = 1; attempt <= 2; attempt += 1) {
+  for (let attempt = 1; !unavailable && attempt <= 2; attempt += 1) {
     structuredAttempts = attempt;
     const response = await fetchImpl(
       `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
@@ -184,7 +188,12 @@ export async function validateMaterialFindings({ env = process.env, fetchImpl = 
 
     if (!response.ok) {
       const body = await response.text();
-      throw new Error(`Gemini finding validator failed (HTTP ${response.status}): ${body.slice(0, 500)}`);
+      const message = `Gemini finding validator failed (HTTP ${response.status}): ${body.slice(0, 500)}`;
+      if (isGeminiUnavailableStatus(response.status)) {
+        unavailable = new GeminiUnavailableError(message, response.status);
+        break;
+      }
+      throw new Error(message);
     }
 
     payload = await response.json();
@@ -209,6 +218,16 @@ export async function validateMaterialFindings({ env = process.env, fetchImpl = 
     }
   }
 
+  if (unavailable) {
+    console.log(`Gemini unavailable (HTTP ${unavailable.status}); validating findings with Claude instead`);
+    const fallback = await runClaudeStructured({ prompt, schema: validationSchema, timeoutMs, env });
+    returned = normalizeValidationResult(fallback.structured, includedIds);
+    claudeMeta = {
+      ...fallback.meta,
+      fallback_from: 'gemini',
+      fallback_reason: unavailable.status ? `HTTP ${unavailable.status}` : 'Gemini unavailable for this review',
+    };
+  }
   if (!returned) {
     throw new Error(
       `Gemini finding validator returned invalid structured output after one retry: ${lastStructuredError?.message || 'unknown error'}`,
@@ -261,7 +280,14 @@ export async function validateMaterialFindings({ env = process.env, fetchImpl = 
       status: 'VALIDATED',
       summary: cleanText(returned.summary, 2500),
       validations,
-      _meta: {
+      _meta: claudeMeta ? {
+        ...claudeMeta,
+        mode: 'finding-validation',
+        attempts: 1,
+        max_output_tokens: null,
+        timeout_ms: timeoutMs,
+        risk_profile: raw?._meta?.risk_profile ?? null,
+      } : {
         provider: 'gemini',
         requested_model: model,
         resolved_model: model,
