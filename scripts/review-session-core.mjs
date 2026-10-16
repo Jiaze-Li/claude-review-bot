@@ -11,7 +11,7 @@ export const DEEP_REVIEW_RUN_BUDGET_USD = 2;
 export const DEEP_REVIEW_PR_BUDGET_USD = 6;
 // An IN_PROGRESS session older than this belongs to a run that died without
 // reporting; it must resolve instead of waiting forever.
-// Must stay above the longest a LIVE deep review can run (Claude step timeout 12 min + setup/publish margin).
+// Safe to equal the Claude step timeout: the sweeper and planner act only inside the per-PR review lock.
 export const DEEP_REVIEW_STALE_MS = 20 * 60 * 1000;
 // Deliberately strict: wrongly suppressing a distinct real bug (false READY) is
 // worse than letting a reworded repeat through for one more validation.

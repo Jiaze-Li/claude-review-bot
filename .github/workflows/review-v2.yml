@@ -76,6 +76,8 @@ concurrency:
   # first to publish state, then plans from that updated state.
   group: independent-review-${{ inputs.target_repo }}-${{ inputs.pr_number }}
   cancel-in-progress: false
+  # Default (single) lets a newer pending run cancel an older one, which would silently drop a queued request.
+  queue: max
 
 jobs:
   review:
@@ -475,7 +477,7 @@ jobs:
         run: node scripts/publish-gemini-review.mjs
 
       - name: Run Claude explicit deep review
-        timeout-minutes: 12
+        timeout-minutes: 20
         if: steps.dedupe.outputs.duplicate != 'true' && steps.plan.outputs.mode == 'claude' && steps.begin-deep.outputs.run == 'true'
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}

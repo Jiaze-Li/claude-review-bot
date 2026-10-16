@@ -45,13 +45,15 @@ jobs:
     timeout-minutes: 5
     strategy:
       fail-fast: false
-      max-parallel: 1
+      max-parallel: 4
       matrix: ${{ fromJSON(needs.find.outputs.matrix) }}
     # Same group name as review-v2.yml, so closing a PR's stale review is serialized with any
     # review of that PR: nothing can start or finish between the re-read and the write below.
+    # Different PRs are independent, hence max-parallel above 1.
     concurrency:
       group: independent-review-${{ matrix.repo }}-${{ matrix.pr }}
       cancel-in-progress: false
+      queue: max
     steps:
       - name: Checkout trusted control repository
         uses: actions/checkout@v6

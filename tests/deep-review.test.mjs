@@ -386,14 +386,20 @@ test('close inside the lock leaves alone a review that was restarted or moved si
   }
 });
 
-test('the sweeper close job shares the main review workflow PR lock and a live run cannot outlive the stale threshold', () => {
+test('the sweeper close job shares the main review workflow PR lock, queues instead of cancelling, and runs different PRs in parallel', () => {
   const sweep = fs.readFileSync(new URL('../.github/workflows/sweep-stale-deep-reviews.yml', import.meta.url), 'utf8');
   const main = fs.readFileSync(new URL('../.github/workflows/review-v2.yml', import.meta.url), 'utf8');
-  assert.match(main, /group: independent-review-\$\{\{ inputs\.target_repo \}\}-\$\{\{ inputs\.pr_number \}\}\n  cancel-in-progress: false/);
-  assert.match(sweep, /group: independent-review-\$\{\{ matrix\.repo \}\}-\$\{\{ matrix\.pr \}\}\n      cancel-in-progress: false/);
-  assert.match(sweep, /max-parallel: 1/);
+  assert.match(main, /group: independent-review-\$\{\{ inputs\.target_repo \}\}-\$\{\{ inputs\.pr_number \}\}\n  cancel-in-progress: false\n(?:  #.*\n)*  queue: max/);
+  assert.match(sweep, /group: independent-review-\$\{\{ matrix\.repo \}\}-\$\{\{ matrix\.pr \}\}\n      cancel-in-progress: false\n      queue: max/);
+  assert.match(sweep, /max-parallel: 4/);
+});
+
+test('the Claude step is bounded below the whole job timeout so publish and cleanup still have time', () => {
+  const main = fs.readFileSync(new URL('../.github/workflows/review-v2.yml', import.meta.url), 'utf8');
   const step = main.slice(main.indexOf('- name: Run Claude explicit deep review'));
-  const minutes = Number(step.match(/timeout-minutes: (\d+)/)[1]);
-  assert.ok((minutes + 5) * 60 * 1000 <= DEEP_REVIEW_STALE_MS, 'stale threshold must exceed the live Claude step timeout plus setup margin');
+  const stepMinutes = Number(step.match(/timeout-minutes: (\d+)/)[1]);
+  const jobMinutes = Number(main.match(/\n    timeout-minutes: (\d+)/)[1]);
+  assert.equal(stepMinutes, 20);
+  assert.ok(stepMinutes + 5 <= jobMinutes);
   assert.equal(DEEP_REVIEW_STALE_MS, 20 * 60 * 1000);
 });
