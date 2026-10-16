@@ -5,11 +5,18 @@ export const MAX_VERIFICATION_ROUNDS = 2;
 // result). Without one it is demoted to non-blocking P3 instead of blocking.
 export const MIN_FAILURE_PATH_CHARS = 30;
 const MAX_DISMISSED = 20;
+// Explicit Claude deep review budgets. The per-PR cap is cumulative across every
+// deep run (including failed ones) and is persisted in the session.
+export const DEEP_REVIEW_RUN_BUDGET_USD = 2;
+export const DEEP_REVIEW_PR_BUDGET_USD = 6;
+// An IN_PROGRESS session older than this belongs to a run that died without
+// reporting; it must resolve instead of waiting forever.
+export const DEEP_REVIEW_STALE_MS = 45 * 60 * 1000;
 // Deliberately strict: wrongly suppressing a distinct real bug (false READY) is
 // worse than letting a reworded repeat through for one more validation.
 const KNOWN_MATCH_THRESHOLD = 0.8;
 
-export function planReviewSession({ session = null, baseSha, headSha, reset = false } = {}) {
+export function planReviewSession({ session = null, baseSha, headSha, reset = false, now = Date.now() } = {}) {
   checkedSha(baseSha, 'baseSha');
   checkedSha(headSha, 'headSha');
 
@@ -18,6 +25,22 @@ export function planReviewSession({ session = null, baseSha, headSha, reset = fa
   // metadata from discovery, not as a reason to spend another discovery call.
   if (reset || !session || session.version !== SESSION_VERSION) {
     return { mode: 'discovery', previousHead: null, reason: reset ? 'explicit reset' : 'new review session' };
+  }
+
+  // A push during a deep review must not wipe the session: plan as if the deep review had
+  // never started, from the status it interrupted (open findings and rounds are preserved).
+  if (session.status === 'REVIEW_IN_PROGRESS' && session.lastReviewedHead !== headSha) {
+    return planReviewSession({
+      session: { ...session, status: session.deepReview?.resumeStatus ?? 'AUDIT_PENDING' },
+      baseSha, headSha, now,
+    });
+  }
+
+  if (session.status === 'REVIEW_IN_PROGRESS') {
+    if (isDeepReviewStale(session, now)) {
+      return { mode: 'deep_review_stale', previousHead: session.lastReviewedHead, reason: 'deep review did not report back in time' };
+    }
+    return { mode: 'noop_waiting', previousHead: session.lastReviewedHead, reason: 'deep review is still in progress for this HEAD' };
   }
 
   if (session.status === 'AUDIT_PENDING') {
@@ -197,6 +220,151 @@ export function applyAuditResult({
     lastSummary: compactText(normalized.summary, 800),
     updatedAt: now,
   };
+}
+
+// ---- Explicit Claude deep review inside the session ----------------------
+// The deep review is bound to one exact HEAD. While it runs the session is
+// REVIEW_IN_PROGRESS (never READY); success merges its findings into the same
+// ledger Gemini uses; any failure ends in HUMAN_REQUIRED.
+export function isDeepReviewStale(session, now = Date.now()) {
+  if (session?.status !== 'REVIEW_IN_PROGRESS') return false;
+  const started = Date.parse(session.deepReview?.startedAt ?? '');
+  return !Number.isFinite(started) || now - started > DEEP_REVIEW_STALE_MS;
+}
+
+export function deepReviewBudgetLeft(session) {
+  const spent = Number.isFinite(session?.deepSpendUsd) && session.deepSpendUsd > 0 ? session.deepSpendUsd : 0;
+  return Math.max(0, DEEP_REVIEW_PR_BUDGET_USD - spent);
+}
+
+export function beginDeepReview({
+  session = null, baseSha, headSha, runId = null, reserveUsd = 0, now = new Date().toISOString(),
+} = {}) {
+  checkedSha(baseSha, 'baseSha');
+  checkedSha(headSha, 'headSha');
+  if (session) validateSession(session);
+  // Deep review is an additional gate on a Gemini session for this exact HEAD. Seeding a
+  // session from Claude alone would skip Gemini discovery/verification for the HEAD.
+  if (!session || session.lastReviewedHead !== headSha) {
+    throw new Error('deep review requires an existing review session for this exact HEAD');
+  }
+  if (session.status === 'REVIEW_IN_PROGRESS' && !isDeepReviewStale(session, Date.parse(now))) {
+    throw new Error('a deep review is already in progress for this HEAD');
+  }
+  // A stale in-progress marker is replaced; the status it interrupted is remembered.
+  const resumeStatus = session.status === 'REVIEW_IN_PROGRESS' ? (session.deepReview?.resumeStatus ?? 'AUDIT_PENDING') : session.status;
+  const base = session;
+  return {
+    ...base,
+    lastReviewedHead: headSha,
+    status: 'REVIEW_IN_PROGRESS',
+    // The run's allotted budget is charged up front and reconciled at finalize/fail, so a run
+    // that is interrupted (new commit, kill, stale replacement) can never escape the PR cap.
+    deepSpendUsd: roundUsd((session.deepSpendUsd ?? 0) + nonNegative(reserveUsd)),
+    deepReview: { head: headSha, startedAt: now, runId: runId == null ? null : String(runId), resumeStatus, state: 'IN_PROGRESS', reservedUsd: nonNegative(reserveUsd) },
+    updatedAt: now,
+  };
+}
+
+const SEVERITY_ORDER = { P0: 0, P1: 1, P2: 2, P3: 3 };
+
+export function completeDeepReview({
+  session, result, headSha, spentUsd = 0, now = new Date().toISOString(),
+} = {}) {
+  validateSession(session);
+  checkedSha(headSha, 'headSha');
+  if (session.status !== 'REVIEW_IN_PROGRESS' || session.deepReview?.head !== headSha || session.lastReviewedHead !== headSha) {
+    throw new Error('deep review result does not match the in-progress session HEAD');
+  }
+  if (!result || typeof result !== 'object' || Array.isArray(result) || !Array.isArray(result.findings)) {
+    throw new Error('deep review result must be an object with a findings array');
+  }
+  // Material findings first so the 6-entry session limit never drops a blocker.
+  const ordered = [...result.findings].sort((a, b) => (SEVERITY_ORDER[a?.severity] ?? 9) - (SEVERITY_ORDER[b?.severity] ?? 9));
+  const normalized = normalizeReviewResult({
+    summary: String(result.summary ?? '').slice(0, 4000),
+    findings: ordered.slice(0, 6),
+  });
+  const omitted = ordered.slice(6).filter((f) => MATERIAL_SEVERITIES.has(f?.severity)).length;
+  if (omitted > 0) throw new Error(`deep review reported more than 6 material findings (${omitted} omitted); refusing to drop blockers`);
+  const findings = session.findings.map((finding) => ({ ...finding }));
+  let nextFindingNumber = Number.isInteger(session.nextFindingNumber) ? session.nextFindingNumber : findings.length + 1;
+  // Claude's material findings are never suppressed by Gemini's rejection ledger; only an
+  // identical still-OPEN finding is skipped to avoid duplicates.
+  const openKeys = new Set(findings.filter((f) => f.status === 'OPEN').map((f) => `${f.path}\0${String(f.title).trim().toLowerCase()}`));
+  for (const finding of normalized.findings.filter((f) => !openKeys.has(`${f.path}\0${String(f.title).trim().toLowerCase()}`))) {
+    findings.push({
+      id: findingId(nextFindingNumber++),
+      ...compactFinding({ ...finding, riskClass: finding.riskClass === 'uncategorized' ? 'deep-review' : finding.riskClass }),
+      status: MATERIAL_SEVERITIES.has(finding.severity) ? 'OPEN' : 'DEFERRED',
+      origin: 'CLAUDE_DEEP',
+      introducedHead: headSha,
+      lastCheckedHead: headSha,
+      resolutionReason: null,
+    });
+  }
+  const open = findings.filter((finding) => finding.status === 'OPEN' && MATERIAL_SEVERITIES.has(finding.severity));
+  const resume = session.deepReview?.resumeStatus;
+  const verificationRound = session.verificationRound ?? 0;
+  const status = open.length > 0
+    ? verificationRound >= MAX_VERIFICATION_ROUNDS ? 'HUMAN_REQUIRED' : 'REWORK'
+    : resume === 'HUMAN_REQUIRED' ? 'HUMAN_REQUIRED'
+      : session.auditCompleted === true ? 'READY' : 'AUDIT_PENDING';
+  return {
+    ...session,
+    status,
+    findings,
+    nextFindingNumber,
+    deepSpendUsd: reconcileSpend(session, spentUsd),
+    deepReview: { ...session.deepReview, state: 'COMPLETE', completedAt: now },
+    lastSummary: compactText(normalized.summary, 800),
+    updatedAt: now,
+  };
+}
+
+export function failDeepReview({
+  session, headSha, reason, spentUsd = 0, now = new Date().toISOString(),
+} = {}) {
+  validateSession(session);
+  checkedSha(headSha, 'headSha');
+  if (session.status !== 'REVIEW_IN_PROGRESS' || session.lastReviewedHead !== headSha) {
+    throw new Error('failed deep review does not match the in-progress session HEAD');
+  }
+  return {
+    ...session,
+    status: 'HUMAN_REQUIRED',
+    deepSpendUsd: reconcileSpend(session, spentUsd),
+    deepReview: { ...session.deepReview, state: 'FAILED', failedAt: now, reason: compactText(reason || 'deep review did not complete', 300) },
+    lastSummary: compactText(`Deep review did not complete: ${reason || 'unknown reason'}`, 800),
+    updatedAt: now,
+  };
+}
+
+// GitHub commit status for the exact HEAD the session reviewed. Only READY is success.
+export function sessionCommitStatus(session, headSha) {
+  if (!session || session.lastReviewedHead !== headSha) {
+    return { state: 'pending', description: 'Independent review has not completed for this commit' };
+  }
+  switch (session.status) {
+    case 'READY': return { state: 'success', description: 'Independent review complete: READY' };
+    case 'REVIEW_IN_PROGRESS': return { state: 'pending', description: 'Claude deep review in progress' };
+    case 'AUDIT_PENDING': return { state: 'pending', description: 'Final audit pending' };
+    case 'REWORK': return { state: 'failure', description: 'Open material findings: rework needed' };
+    default: return { state: 'error', description: 'Automatic review stopped: human judgment required' };
+  }
+}
+
+function reconcileSpend(session, actualUsd) {
+  const reserved = nonNegative(session.deepReview?.reservedUsd);
+  return roundUsd(Math.max(0, (session.deepSpendUsd ?? 0) - reserved + nonNegative(actualUsd)));
+}
+
+function nonNegative(value) {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+function roundUsd(value) {
+  return Math.round(value * 10000) / 10000;
 }
 
 // ---- Known-issue ledger -------------------------------------------------
@@ -381,6 +549,8 @@ export function renderSessionComment(session, { sourceCommentIds = [] } = {}) {
   const audit = session.auditCompleted === true ? 'complete' : session.status === 'AUDIT_PENDING' ? 'pending' : 'not run';
   const next = session.status === 'READY'
     ? 'No action required unless the PR changes; a new commit will start a fresh bounded review automatically.'
+    : session.status === 'REVIEW_IN_PROGRESS'
+      ? 'Claude deep review is running for this exact commit; the PR is not READY until it finishes. If it stops, comment `@claude review` to restart.'
     : session.status === 'AUDIT_PENDING'
       ? 'The one-time final Gemini audit will run automatically. If the workflow stops, comment `@gemini review` to resume it.'
       : session.status === 'REWORK'
@@ -497,7 +667,7 @@ function validateSession(session) {
   }
   checkedSha(session.baseSha, 'session.baseSha');
   checkedSha(session.lastReviewedHead, 'session.lastReviewedHead');
-  if (!['AUDIT_PENDING', 'READY', 'REWORK', 'HUMAN_REQUIRED'].includes(session.status)) throw new Error('invalid review session status');
+  if (!['AUDIT_PENDING', 'READY', 'REWORK', 'HUMAN_REQUIRED', 'REVIEW_IN_PROGRESS'].includes(session.status)) throw new Error('invalid review session status');
   if (session.auditCompleted != null && typeof session.auditCompleted !== 'boolean') throw new Error('invalid final audit state');
   if (!Array.isArray(session.findings) || session.findings.length > 64) throw new Error('invalid review session findings');
 }

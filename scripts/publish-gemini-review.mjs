@@ -40,6 +40,8 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
   if (mode === 'discovery') {
     normalized = normalizeReviewResult(raw);
     session = applyDiscoveryResult({ result: normalized, baseSha, headSha, sourceCommentId });
+    // The per-PR deep-review spend ledger must survive a fresh discovery on a new HEAD.
+    if (plan.session?.deepSpendUsd > 0) session = { ...session, deepSpendUsd: plan.session.deepSpendUsd };
   } else if (mode === 'audit') {
     normalized = normalizeReviewResult(raw);
     if (!plan.session) throw new Error('Final audit plan is missing durable prior session');

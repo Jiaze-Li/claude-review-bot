@@ -3,7 +3,7 @@ import { pathToFileURL } from 'node:url';
 
 const repoPattern = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const positiveId = /^[1-9]\d*$/;
-const reviewModes = new Set(['discovery', 'verification', 'audit', 'recover', 'claude', 'noop_ready', 'noop_waiting', 'human_required', 'override', 'dismiss']);
+const reviewModes = new Set(['discovery', 'verification', 'audit', 'recover', 'claude', 'noop_ready', 'noop_waiting', 'human_required', 'deep_review_stale', 'override', 'dismiss']);
 const sourceKinds = new Set(['comment', 'pull_request']);
 
 function checked(value, pattern, name) {
@@ -59,7 +59,7 @@ export async function publishRunStatus({ env = process.env, fetchImpl = fetch } 
         : env.AUTO_AUDIT_RUN === 'true'
           ? 'Finding dismissal recorded; final audit publication was not confirmed. Check workflow logs.'
           : 'Finding dismissal recorded. No model quota was spent by dismissal.';
-  } else if (['recover', 'noop_ready', 'noop_waiting', 'human_required'].includes(mode)) {
+  } else if (['recover', 'noop_ready', 'noop_waiting', 'human_required', 'deep_review_stale'].includes(mode)) {
     state = 'No model quota was spent. ' + reason;
   } else {
     const finalAuditOutcome = env.FINAL_AUDIT_PUBLISH_OUTCOME;
@@ -74,7 +74,7 @@ export async function publishRunStatus({ env = process.env, fetchImpl = fetch } 
       : 'Review publication was not confirmed. Check the workflow run; no successful publication is being claimed.';
   }
 
-  const completedNoop = stage === 'finished' && ['recover', 'noop_ready', 'noop_waiting', 'human_required'].includes(mode);
+  const completedNoop = stage === 'finished' && ['recover', 'noop_ready', 'noop_waiting', 'human_required', 'deep_review_stale'].includes(mode);
   const sourceReference = sourceKind === 'comment'
     ? '[Source comment](https://github.com/' + repo + '/pull/' + pr + '#issuecomment-' + sourceId + ')'
     : 'Trigger: automatic pull request event';

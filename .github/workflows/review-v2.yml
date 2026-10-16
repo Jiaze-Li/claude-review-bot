@@ -118,6 +118,17 @@ jobs:
           permission-pull-requests: write
           permission-issues: read
 
+      - name: Create best-effort commit-status token
+        id: status-token
+        continue-on-error: true
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ steps.target.outputs.owner }}
+          repositories: ${{ steps.target.outputs.repo }}
+          permission-statuses: write
+
       - name: Check source comment idempotency
         id: dedupe
         shell: bash
@@ -280,6 +291,32 @@ jobs:
           REVIEW_MODE: ${{ steps.plan.outputs.mode }}
           REVIEW_REASON: ${{ steps.plan.outputs.reason }}
         run: node scripts/review-status.mjs
+
+      - name: Begin Claude deep review in the durable session
+        id: begin-deep
+        if: steps.dedupe.outputs.duplicate != 'true' && steps.plan.outputs.mode == 'claude'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          BASE_SHA: ${{ inputs.base_sha }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          SOURCE_COMMENT_ID: ${{ inputs.source_comment_id }}
+          REVIEW_CONTEXT_DIR: .review-context
+        run: node scripts/deep-review.mjs begin
+
+      - name: Mark required status pending before the deep review runs
+        id: pending-status
+        if: steps.dedupe.outputs.duplicate != 'true' && steps.plan.outputs.mode == 'claude' && steps.begin-deep.outputs.run == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          STATUS_TOKEN: ${{ steps.status-token.outputs.token }}
+          STATUS_STRICT: ${{ vars.REQUIRE_STATUS_CHECK }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          EXPECTED_REVIEW_AUTHOR: ${{ steps.app-token.outputs.app-slug }}[bot]
+        run: node scripts/sync-commit-status.mjs
 
       - name: Recover published session without model spend
         id: recover-session
@@ -449,9 +486,10 @@ jobs:
         run: node scripts/publish-gemini-review.mjs
 
       - name: Run Claude explicit deep review
-        if: steps.dedupe.outputs.duplicate != 'true' && steps.plan.outputs.mode == 'claude'
+        if: steps.dedupe.outputs.duplicate != 'true' && steps.plan.outputs.mode == 'claude' && steps.begin-deep.outputs.run == 'true' && steps.pending-status.outcome == 'success'
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          DEEP_REVIEW_MAX_BUDGET_USD: ${{ steps.begin-deep.outputs.run_budget_usd }}
           TARGET_REPO: ${{ inputs.target_repo }}
           PR_NUMBER: ${{ inputs.pr_number }}
           HEAD_SHA: ${{ inputs.head_sha }}
@@ -462,7 +500,7 @@ jobs:
 
       - name: Publish Claude explicit deep review
         id: publish-claude
-        if: steps.dedupe.outputs.duplicate != 'true' && steps.plan.outputs.mode == 'claude'
+        if: steps.dedupe.outputs.duplicate != 'true' && steps.plan.outputs.mode == 'claude' && steps.begin-deep.outputs.run == 'true' && steps.pending-status.outcome == 'success'
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           TARGET_REPO: ${{ inputs.target_repo }}
@@ -473,6 +511,34 @@ jobs:
           SOURCE_KIND: ${{ inputs.source_kind }}
           REVIEW_PATH: .review-context/review.json
         run: node scripts/publish-review.mjs
+
+      - name: Merge Claude deep review into the durable session
+        id: finalize-deep
+        if: steps.dedupe.outputs.duplicate != 'true' && steps.plan.outputs.mode == 'claude' && steps.begin-deep.outputs.run == 'true' && steps.pending-status.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          BASE_SHA: ${{ inputs.base_sha }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          SOURCE_COMMENT_ID: ${{ inputs.source_comment_id }}
+          REVIEW_CONTEXT_DIR: .review-context
+          REVIEW_PATH: .review-context/review.json
+        run: node scripts/deep-review.mjs finalize
+
+      - name: Fail closed if the deep review did not complete
+        if: always() && steps.dedupe.outputs.duplicate != 'true' && ((steps.begin-deep.outputs.began == 'true' && steps.begin-deep.outputs.run == 'true' && steps.finalize-deep.outcome != 'success') || steps.plan.outputs.mode == 'deep_review_stale')
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          BASE_SHA: ${{ inputs.base_sha }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          SOURCE_COMMENT_ID: ${{ inputs.source_comment_id }}
+          REVIEW_CONTEXT_DIR: .review-context
+          DEEP_REVIEW_MAX_BUDGET_USD: ${{ steps.begin-deep.outputs.run_budget_usd }}
+          DEEP_REVIEW_FAILURE_REASON: deep review failed, timed out, hit its turn/budget limit, or never reported back (see the workflow run)
+        run: node scripts/deep-review.mjs fail
 
       - name: Finalize workflow status
         if: always() && steps.review-status.outputs.comment_id != ''
@@ -495,3 +561,17 @@ jobs:
           DISMISS_OUTCOME: ${{ steps.dismiss.outcome }}
           AUTO_AUDIT_RUN: ${{ steps.auto-audit.outputs.run }}
         run: node scripts/review-status.mjs
+
+      - name: Mirror review state to the required commit status
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          STATUS_TOKEN: ${{ steps.status-token.outputs.token }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          EXPECTED_REVIEW_AUTHOR: ${{ steps.app-token.outputs.app-slug }}[bot]
+          STATUS_STRICT: ${{ vars.REQUIRE_STATUS_CHECK }}
+          JOB_FAILED: ${{ job.status == 'failure' || job.status == 'cancelled' }}
+        run: node scripts/sync-commit-status.mjs

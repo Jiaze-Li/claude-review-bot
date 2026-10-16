@@ -65,16 +65,28 @@ test('explicit reset starts a fresh discovery while preserving session comment l
   assert.equal(plan.decision.reason,'explicit reset');
 });
 
-test('explicit Claude mode bypasses session lookup entirely',async()=>{
-  let calls=0;
+test('explicit Claude mode joins the durable session for this HEAD',async()=>{
+  const session=applyDiscoveryResult({result:{summary:'clean',findings:[]},baseSha:BASE,headSha:A,sourceCommentId:'1'});
   const plan=await planSession({
     env:env({REQUESTED_MODE:'claude'}),
-    fetchImpl:async()=>{calls+=1;throw new Error('should not fetch');},
+    fetchImpl:fetchState({comments:[comment(7,renderSessionComment(session))]}),
   });
-  assert.equal(calls,0);
   assert.equal(plan.decision.mode,'claude');
+  assert.equal(plan.sessionCommentId,'7');
+  assert.equal(plan.session.lastReviewedHead,A);
 });
 
+test('explicit Claude mode waits instead of seeding a session when no review exists for this HEAD',async()=>{
+  const none=await planSession({env:env({REQUESTED_MODE:'claude'}),fetchImpl:fetchState()});
+  assert.equal(none.decision.mode,'noop_waiting');
+  assert.match(none.decision.reason,/NOT queued.*send @claude review again/);
+  const old=applyDiscoveryResult({result:{summary:'clean',findings:[]},baseSha:BASE,headSha:C,sourceCommentId:'1'});
+  const other=await planSession({
+    env:env({REQUESTED_MODE:'claude'}),
+    fetchImpl:fetchState({comments:[comment(7,renderSessionComment(old))]}),
+  });
+  assert.equal(other.decision.mode,'noop_waiting');
+});
 
 test('planner recovers a trusted pending current-HEAD review instead of rerunning Gemini',async()=>{
   const pending=applyDiscoveryResult({
