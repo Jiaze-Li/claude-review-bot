@@ -318,23 +318,59 @@ test('final mirror turns a stale READY into error when the attempted deep review
   assert.equal(ok[0].body.state, 'success');
 });
 
-test('sweeper closes a stale deep review without any trigger and leaves fresh or moved ones alone', async () => {
-  const stale = beginDeepReview({ session: readySession(), baseSha: BASE, headSha: A, reserveUsd: 2, now: '2020-01-01T00:00:00.000Z' });
-  const fresh = beginDeepReview({ session: readySession(C), baseSha: BASE, headSha: C, reserveUsd: 2, now: new Date().toISOString() });
-  const writes = [];
-  const fetchImpl = async (url, init = {}) => {
-    if (/pulls\?state=open/.test(url)) return Response.json([{ number: 7, head: { sha: A } }, { number: 8, head: { sha: C } }, { number: 9, head: { sha: C } }]);
-    if (/issues\/7\/comments/.test(url)) return Response.json([{ id: 70, user: { login: 'bot[bot]' }, body: renderSessionComment(stale) }]);
-    if (/issues\/8\/comments/.test(url)) return Response.json([{ id: 80, user: { login: 'bot[bot]' }, body: renderSessionComment(fresh) }]);
-    if (/issues\/9\/comments/.test(url)) return Response.json([{ id: 90, user: { login: 'bot[bot]' }, body: renderSessionComment(stale) }]); // stale but PR moved on
-    if (init.method) { writes.push({ url, method: init.method, body: JSON.parse(init.body) }); return Response.json({}); }
+function sweepFetch({ repos, prs, comments, onWrite, liveHead = {} }) {
+  return async (url, init = {}) => {
+    if (/installation\/repositories/.test(url)) return Response.json({ repositories: repos });
+    const pull = String(url).match(/repos\/([^/]+\/[^/]+)\/pulls\?state=open/);
+    if (pull) return Response.json(prs[pull[1]] ?? []);
+    const live = String(url).match(/repos\/([^/]+\/[^/]+)\/pulls\/(\d+)$/);
+    if (live) return Response.json({ head: { sha: liveHead[`${live[1]}#${live[2]}`] ?? prs[live[1]].find((p) => String(p.number) === live[2]).head.sha } });
+    const one = String(url).match(/repos\/([^/]+\/[^/]+)\/issues\/comments\/(\d+)$/);
+    if (one && !init.method) return Response.json(Object.values(comments).flat().find((c) => String(c.id) === one[2]));
+    const list = String(url).match(/repos\/([^/]+\/[^/]+)\/issues\/(\d+)\/comments/);
+    if (list) return Response.json(comments[`${list[1]}#${list[2]}`] ?? []);
+    if (init.method) { onWrite({ url, method: init.method, body: JSON.parse(init.body) }); return Response.json({}); }
     assert.fail('unexpected ' + url);
   };
-  const closed = await sweepStaleDeepReviews({
-    env: { REVIEW_TARGET_REPOS: 'acme/project', EXPECTED_REVIEW_AUTHOR: 'bot[bot]', GH_TOKEN: 't', STATUS_TOKEN: 's' }, fetchImpl,
+}
+
+test('sweeper discovers installed repositories itself, closes stale deep reviews, and leaves fresh/moved/archived ones alone', async () => {
+  const stale = beginDeepReview({ session: readySession(), baseSha: BASE, headSha: A, reserveUsd: 2, now: '2020-01-01T00:00:00.000Z' });
+  const fresh = beginDeepReview({ session: readySession(C), baseSha: BASE, headSha: C, reserveUsd: 2, now: new Date().toISOString() });
+  const body = (s) => renderSessionComment(s);
+  const writes = [];
+  const fetchImpl = sweepFetch({
+    repos: [{ full_name: 'acme/project' }, { full_name: 'acme/second' }, { full_name: 'acme/old', archived: true }],
+    prs: {
+      'acme/project': [{ number: 7, head: { sha: A } }, { number: 8, head: { sha: C } }, { number: 9, head: { sha: C } }],
+      'acme/second': [{ number: 3, head: { sha: A } }],
+    },
+    comments: {
+      'acme/project#7': [{ id: 70, user: { login: 'bot[bot]' }, body: body(stale) }],
+      'acme/project#8': [{ id: 80, user: { login: 'bot[bot]' }, body: body(fresh) }],
+      'acme/project#9': [{ id: 90, user: { login: 'bot[bot]' }, body: body(stale) }],
+      'acme/second#3': [{ id: 30, user: { login: 'bot[bot]' }, body: body(stale) }],
+    },
+    onWrite: (w) => writes.push(w),
   });
-  assert.deepEqual(closed, ['acme/project#7']);
+  const closed = await sweepStaleDeepReviews({ env: { EXPECTED_REVIEW_AUTHOR: 'bot[bot]', GH_TOKEN: 't', STATUS_TOKEN: 's' }, fetchImpl });
+  assert.deepEqual(closed, ['acme/project#7', 'acme/second#3']);
   assert.match(writes[0].body.body, /Status: \*\*HUMAN_REQUIRED\*\*/);
   assert.equal(writes[1].body.state, 'error');
-  assert.equal(writes.length, 2);
+  assert.equal(writes.length, 4);
+});
+
+test('sweeper re-verifies the live PR right before writing and never overwrites a moved PR', async () => {
+  const stale = beginDeepReview({ session: readySession(), baseSha: BASE, headSha: A, reserveUsd: 2, now: '2020-01-01T00:00:00.000Z' });
+  const writes = [];
+  const fetchImpl = sweepFetch({
+    repos: [{ full_name: 'acme/project' }],
+    prs: { 'acme/project': [{ number: 7, head: { sha: A } }] },
+    comments: { 'acme/project#7': [{ id: 70, user: { login: 'bot[bot]' }, body: renderSessionComment(stale) }] },
+    liveHead: { 'acme/project#7': C },
+    onWrite: (w) => writes.push(w),
+  });
+  const closed = await sweepStaleDeepReviews({ env: { EXPECTED_REVIEW_AUTHOR: 'bot[bot]', GH_TOKEN: 't', STATUS_TOKEN: 's' }, fetchImpl });
+  assert.deepEqual(closed, []);
+  assert.equal(writes.length, 0);
 });
