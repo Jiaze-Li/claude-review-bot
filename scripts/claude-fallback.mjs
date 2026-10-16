@@ -2,6 +2,8 @@
 // Used only when Gemini is out of credits/quota or the service is down; the
 // caller keeps the same prompt, schema and output shape so nothing downstream changes.
 
+// Charged when the SDK reports no cost, so unknown never means free.
+export const FALLBACK_UNKNOWN_COST_USD = 0.5;
 export const CLAUDE_FALLBACK_MODEL = 'sonnet';
 export const CLAUDE_FALLBACK_EFFORT = 'medium';
 const CLAUDE_FALLBACK_MAX_TURNS = 3;
@@ -85,6 +87,7 @@ export async function runClaudeStructured({
       requested_model: CLAUDE_FALLBACK_MODEL,
       resolved_model: resolvedModel || CLAUDE_FALLBACK_MODEL,
       effort: CLAUDE_FALLBACK_EFFORT,
+      total_cost_usd: typeof result.total_cost_usd === 'number' && result.total_cost_usd > 0 ? result.total_cost_usd : FALLBACK_UNKNOWN_COST_USD,
       usage: {
         input_tokens: num(usage.input_tokens),
         output_tokens: num(usage.output_tokens),

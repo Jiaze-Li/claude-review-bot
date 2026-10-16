@@ -1,0 +1,91 @@
+name: Sweep Stale Deep Reviews
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  find:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.find.outputs.matrix }}
+      count: ${{ steps.find.outputs.count }}
+    steps:
+      - name: Checkout trusted control repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Create least-privilege GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          permission-pull-requests: read
+          permission-issues: read
+
+      - name: List deep reviews that look dead (read-only)
+        id: find
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          EXPECTED_REVIEW_AUTHOR: ${{ steps.app-token.outputs.app-slug }}[bot]
+        run: node scripts/sweep-stale-deep-reviews.mjs find
+
+  close:
+    needs: find
+    if: needs.find.outputs.count != '0' && needs.find.outputs.count != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix: ${{ fromJSON(needs.find.outputs.matrix) }}
+    # Same group name as review-v2.yml, so closing a PR's stale review is serialized with any
+    # review of that PR: nothing can start or finish between the re-read and the write below.
+    # Different PRs are independent, hence max-parallel above 1.
+    concurrency:
+      group: independent-review-${{ matrix.repo }}-${{ matrix.pr }}
+      cancel-in-progress: false
+      queue: max
+    steps:
+      - name: Checkout trusted control repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Create least-privilege GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          permission-pull-requests: write
+          permission-issues: read
+
+      - name: Create best-effort commit-status token
+        id: status-token
+        continue-on-error: true
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          permission-statuses: write
+
+      - name: Close the stale deep review inside the PR lock
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          STATUS_TOKEN: ${{ steps.status-token.outputs.token }}
+          STATUS_STRICT: ${{ vars.REQUIRE_STATUS_CHECK }}
+          EXPECTED_REVIEW_AUTHOR: ${{ steps.app-token.outputs.app-slug }}[bot]
+          SWEEP_REPO: ${{ matrix.repo }}
+          SWEEP_PR: ${{ matrix.pr }}
+        run: node scripts/sweep-stale-deep-reviews.mjs close

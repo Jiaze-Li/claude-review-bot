@@ -40,6 +40,8 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
   if (mode === 'discovery') {
     normalized = normalizeReviewResult(raw);
     session = applyDiscoveryResult({ result: normalized, baseSha, headSha, sourceCommentId });
+    // The per-PR deep-review spend ledger must survive a fresh discovery on a new HEAD.
+    if (plan.session?.deepSpendUsd > 0) session = { ...session, deepSpendUsd: plan.session.deepSpendUsd };
   } else if (mode === 'audit') {
     normalized = normalizeReviewResult(raw);
     if (!plan.session) throw new Error('Final audit plan is missing durable prior session');
@@ -55,6 +57,12 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
   if (mode === 'discovery' || mode === 'audit') {
     session = recordDismissed(session, raw._validation?.validations, headSha);
   }
+
+  // Claude fallback calls (review and validation) spend the same per-PR Claude budget.
+  const fallbackCost = [raw._meta, raw._validation?._meta]
+    .filter((meta) => meta?.provider === 'claude')
+    .reduce((sum, meta) => sum + (Number.isFinite(meta.total_cost_usd) ? meta.total_cost_usd : 0), 0);
+  if (fallbackCost > 0) session = { ...session, deepSpendUsd: Math.round(((session.deepSpendUsd ?? 0) + fallbackCost) * 10000) / 10000 };
 
   const sessionBody = renderSessionComment(session, { sourceCommentIds: [sourceCommentId] });
   const pendingMarker = pendingSessionMarker(session, sourceCommentId);

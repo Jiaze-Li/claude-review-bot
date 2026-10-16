@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { knownIssuesPromptBlock, normalizeReviewResult, normalizeVerificationResult, openMaterialFindings } from './review-session-core.mjs';
+import { deepReviewBudgetLeft, knownIssuesPromptBlock, normalizeReviewResult, normalizeVerificationResult, openMaterialFindings } from './review-session-core.mjs';
 import {GeminiUnavailableError,isGeminiUnavailableStatus,runClaudeStructured} from './claude-fallback.mjs';
 
 // Moving alias: always resolves to Google's current Flash model. Override with GEMINI_MODEL to pin.
@@ -271,6 +271,7 @@ export async function runGeminiReview({env=process.env,fetchImpl=fetch,logImpl=c
   }
 
   if(unavailable){
+    if(deepReviewBudgetLeft(plan.session)<0.05) throw new Error('Claude fallback blocked: the per-PR Claude budget is exhausted; human judgment required');
     logImpl(`Gemini unavailable (HTTP ${unavailable.status}); falling back to Claude for this ${mode} review`);
     const fallback=await runClaudeStructured({prompt:built.prompt,schema:built.schema,timeoutMs,env,logImpl,queryImpl});
     // Fail here, not at publish time, with the exact normalizer the publisher applies to every provider's output.

@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { parsePendingSessionReview, parseSessionComment, planReviewSession } from './review-session-core.mjs';
+import { isDeepReviewStale, parsePendingSessionReview, parseSessionComment, planReviewSession } from './review-session-core.mjs';
 
 const repoPattern=/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const shaPattern=/^[0-9a-f]{40}$/i;
@@ -16,10 +16,6 @@ export async function planSession({ env=process.env, fetchImpl=fetch }={}) {
   if(!shaPattern.test(baseSha)||!shaPattern.test(headSha)) throw new Error('Invalid PR SHA');
   const requested=(env.REQUESTED_MODE||'auto').toLowerCase();
   if(!['auto','claude','reset','override','dismiss'].includes(requested)) throw new Error('Invalid REQUESTED_MODE');
-
-  if(requested==='claude'){
-    return {requestedMode:requested,decision:{mode:'claude',previousHead:null,reason:'explicit legacy Claude review'},session:null,sessionCommentId:null};
-  }
 
   const expectedAuthor=required(env,'EXPECTED_REVIEW_AUTHOR');
   const comments=await loadComments(target,pr,env.GH_TOKEN,fetchImpl);
@@ -45,13 +41,28 @@ export async function planSession({ env=process.env, fetchImpl=fetch }={}) {
   if(requested!=='reset' && pending && isPendingNewer(session,pending.pending.session)){
     return {
       requestedMode:requested,
-      decision:{mode:'recover',previousHead:null,reason:'recover published review session without another model call'},
+      decision:{mode:'recover',previousHead:null,reason:requested==='claude'
+        ?'recover published review session without another model call. Your @claude review request was NOT run; send it again after this recovery.'
+        :'recover published review session without another model call'},
       session,
       sessionCommentId,
       pendingSession:pending.pending.session,
       pendingSourceCommentId:pending.pending.sourceCommentId,
       pendingReviewId:pending.reviewId,
     };
+  }
+
+  if(requested==='claude'){
+    // Explicit deep review joins the durable session for this exact HEAD. A fresh
+    // in-progress marker means a run is already going; a stale one is restartable.
+    const waiting=session && session.lastReviewedHead===headSha && session.status==='REVIEW_IN_PROGRESS' && !isDeepReviewStale(session);
+    const hasSession=session && session.lastReviewedHead===headSha;
+    const decision=waiting
+      ?{mode:'noop_waiting',previousHead:headSha,reason:'a Claude deep review is already in progress for this HEAD'}
+      :!hasSession
+        ?{mode:'noop_waiting',previousHead:null,reason:'Your @claude review request was NOT queued and no Claude review ran: there is no completed automatic review for this exact commit yet. This commit is not READY for deep review purposes. After the automatic review finishes (or after you comment @gemini review), send @claude review again.'}
+        :{mode:'claude',previousHead:null,reason:'explicit Claude deep review bound to this HEAD'};
+    return {requestedMode:requested,decision,session,sessionCommentId,pendingSession:null,pendingSourceCommentId:null,pendingReviewId:null};
   }
 
   if(requested==='dismiss'){
