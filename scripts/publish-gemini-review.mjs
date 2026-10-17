@@ -5,6 +5,7 @@ import {
   applyAuditResult,
   applyDiscoveryResult,
   applyVerificationResult,
+  chargeClaudeFallback,
   normalizeReviewResult,
   normalizeVerificationResult,
   openMaterialFindings,
@@ -42,6 +43,11 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
     session = applyDiscoveryResult({ result: normalized, baseSha, headSha, sourceCommentId });
     // The per-PR deep-review spend ledger must survive a fresh discovery on a new HEAD.
     if (plan.session?.deepSpendUsd > 0) session = { ...session, deepSpendUsd: plan.session.deepSpendUsd };
+    // Keep both ledgers when a new HEAD requires fresh discovery.
+    if (Number.isFinite(plan.session?.fallbackSpendUsd))
+      session = { ...session, fallbackSpendUsd: plan.session.fallbackSpendUsd };
+    else if (plan.session?.deepSpendUsd > 0)
+      session = { ...session, fallbackSpendUsd: plan.session.deepSpendUsd };
   } else if (mode === 'audit') {
     normalized = normalizeReviewResult(raw);
     if (!plan.session) throw new Error('Final audit plan is missing durable prior session');
@@ -50,6 +56,12 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
     normalized = normalizeVerificationResult(raw);
     if (!plan.session) throw new Error('Verification plan is missing durable prior session');
     session = applyVerificationResult({ session: plan.session, result: normalized, headSha });
+  }
+
+  // Successful publication clears only an earlier provider-unavailable stop.
+  if (session.reviewFailure) {
+    const { reviewFailure, ...recovered } = session;
+    session = recovered;
   }
 
   // Remember validator-rejected/uncertain candidates so later passes cannot
@@ -62,7 +74,7 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
   const fallbackCost = [raw._meta, raw._validation?._meta]
     .filter((meta) => meta?.provider === 'claude')
     .reduce((sum, meta) => sum + (Number.isFinite(meta.total_cost_usd) ? meta.total_cost_usd : 0), 0);
-  if (fallbackCost > 0) session = { ...session, deepSpendUsd: Math.round(((session.deepSpendUsd ?? 0) + fallbackCost) * 10000) / 10000 };
+  if (fallbackCost > 0) session = chargeClaudeFallback(session, fallbackCost);
 
   const sessionBody = renderSessionComment(session, { sourceCommentIds: [sourceCommentId] });
   const pendingMarker = pendingSessionMarker(session, sourceCommentId);
