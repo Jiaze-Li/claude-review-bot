@@ -35,6 +35,9 @@ The review session is intentionally stateful and simple:
 - A malformed/no-text structured Gemini review response is retried **once with the identical prompt, model, thinking level, and schema**; usage from both attempts is reported.
 - Re-running on the same unchanged HEAD spends **no reviewer model quota**.
 - If material findings remain after the verification budget, the session stops at **HUMAN_REQUIRED** instead of looping.
+- If Gemini is unavailable (HTTP 402/429/5xx), Claude automatically takes over while both the fallback pool ($3 per PR) and shared Claude cap ($6 per PR) permit it. Explicit deep reviews retain access to the shared cap without spending the fallback pool. Claude calls use the remaining fallback budget as their SDK `maxBudgetUsd`.
+- If Gemini is unavailable **and** fallback cannot run (budget, credential, or SDK failure), the bot records a durable **HUMAN_REQUIRED / reviewer unavailable** state for the exact HEAD rather than leaving a misleading `AUDIT_PENDING`. Once Gemini quota is restored, comment `@gemini review` to retry that interrupted stage **on the same HEAD**, with no automatic budget reset. Model or publication failures unrelated to provider unavailability still fail closed.
+- Old sessions without separate fallback spending cannot distinguish which Claude calls consumed their budget; the prior combined spend is conservatively counted against the fallback pool. A prior PR's exhausted $6 limit is not reset by this change.
 - Session state is stored in a bot-authored GitHub PR comment, so it survives new ChatGPT conversations, different agents, and local restarts.
 
 ### Gemini request timeout policy
