@@ -175,10 +175,12 @@ test('v2 workflow isolates provider credentials and serializes durable PR sessio
   const started = yml.indexOf('- name: Announce verified workflow start');
   const recover = yml.indexOf('- name: Recover published session without model spend');
   const gemini = yml.indexOf('- name: Run Gemini bounded review');
+  const stopGemini = yml.indexOf('- name: Record provider-unavailable discovery or verification');
   const validator = yml.indexOf('- name: Validate Gemini material findings');
   const publishGemini = yml.indexOf('- name: Publish Gemini review and durable session');
   const autoAudit = yml.indexOf('- name: Prepare automatic final audit');
   const runFinalAudit = yml.indexOf('- name: Run automatic Gemini final audit');
+  const stopFinalAudit = yml.indexOf('- name: Record provider-unavailable final audit');
   const validateFinalAudit = yml.indexOf('- name: Validate automatic final audit findings');
   const publishFinalAudit = yml.indexOf('- name: Publish automatic final audit');
   const claude = yml.indexOf('- name: Run Claude explicit deep review');
@@ -192,15 +194,23 @@ test('v2 workflow isolates provider credentials and serializes durable PR sessio
   assert.match(yml, /CLAUDE_CODE_OAUTH_TOKEN: \$\{\{ secrets\.CLAUDE_CODE_OAUTH_TOKEN \}\}/);
   // Only the trusted external-fact validator receives the scoped GitHub token.
   // The Gemini provider step and final-audit model step remain isolated.
-  const geminiBlock = yml.slice(gemini, validator);
+  const geminiBlock = yml.slice(gemini, stopGemini);
   assert.doesNotMatch(geminiBlock, /GH_TOKEN|app-token\.outputs\.token/);
+  // Failure persistence is a separate GitHub-only step, never part of the
+  // provider's execution environment.
+  const stopBlock = yml.slice(stopGemini, validator);
+  assert.match(stopBlock, /GH_TOKEN: \$\{\{ steps\.app-token\.outputs\.token \}\}/);
+  assert.doesNotMatch(stopBlock, /GEMINI_API_KEY|CLAUDE_CODE_OAUTH_TOKEN/);
   const validatorBlock = yml.slice(validator, publishGemini);
   assert.match(validatorBlock, /thinkingLevel|validate-gemini-findings|TARGET_REPO_DIR: target/);
   assert.match(validatorBlock, /GH_TOKEN: \$\{\{ steps\.app-token\.outputs\.token \}\}/);
   // Claude fallback validates when Gemini is out of credits; the fallback subprocess is tool-less and gets a scrubbed env (see claude-fallback tests).
   assert.match(validatorBlock, /CLAUDE_CODE_OAUTH_TOKEN/);
-  const finalAuditBlock = yml.slice(runFinalAudit, validateFinalAudit);
+  const finalAuditBlock = yml.slice(runFinalAudit, stopFinalAudit);
   assert.doesNotMatch(finalAuditBlock, /GH_TOKEN|app-token\.outputs\.token/);
+  const stopAuditBlock = yml.slice(stopFinalAudit, validateFinalAudit);
+  assert.match(stopAuditBlock, /GH_TOKEN: \$\{\{ steps\.app-token\.outputs\.token \}\}/);
+  assert.doesNotMatch(stopAuditBlock, /GEMINI_API_KEY|CLAUDE_CODE_OAUTH_TOKEN/);
   const finalValidatorBlock = yml.slice(validateFinalAudit, publishFinalAudit);
   assert.match(finalValidatorBlock, /GH_TOKEN: \$\{\{ steps\.app-token\.outputs\.token \}\}/);
   assert.match(finalValidatorBlock, /CLAUDE_CODE_OAUTH_TOKEN/);
