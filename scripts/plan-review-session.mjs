@@ -82,7 +82,8 @@ export async function planSession({ env=process.env, fetchImpl=fetch }={}) {
     return {requestedMode:requested,decision,session,sessionCommentId,pendingSession:null,pendingSourceCommentId:null,pendingReviewId:null};
   }
 
-  const decision=planReviewSession({session,baseSha,headSha,reset:requested==='reset'});
+  const decision=planReviewSession({session,baseSha,headSha,reset:requested==='reset',
+    retryUnavailable:requested==='auto' && env.SOURCE_KIND==='comment'});
   return {requestedMode:requested,decision,session,sessionCommentId,pendingSession:null,pendingSourceCommentId:null,pendingReviewId:null};
 }
 
