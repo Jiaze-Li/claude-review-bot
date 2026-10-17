@@ -76,7 +76,8 @@ export function planReviewSession({ session = null, baseSha, headSha, reset = fa
     // reopen ordinary human findings, verification exhaustion, or a moved HEAD.
     if (retryUnavailable && session.reviewFailure?.code === 'REVIEWER_UNAVAILABLE'
         && session.lastReviewedHead === headSha) {
-      return { mode: session.reviewFailure.mode, previousHead: null,
+      return { mode: session.reviewFailure.mode,
+        previousHead: session.reviewFailure.mode === 'verification' ? session.reviewFailure.previousHead : null,
         reason: 'retry provider-unavailable review on the same exact HEAD' };
     }
     return { mode: 'human_required', previousHead: session.lastReviewedHead ?? null, reason: 'session already requires human judgment' };
@@ -284,7 +285,6 @@ export function stopUnavailableReviewSession({
     baseSha, headSha, sourceCommentId, now,
   });
   validateSession(base);
-  if (base.baseSha !== baseSha) throw new Error('failed review base does not match session');
   const explanation = compactText(reason || 'Gemini and Claude fallback unavailable', 240);
   const stopped = {
     ...base,
@@ -294,6 +294,7 @@ export function stopUnavailableReviewSession({
     reviewFailure: {
       code: 'REVIEWER_UNAVAILABLE', mode, head: headSha,
       sourceCommentId: String(sourceCommentId ?? ''),
+      ...(mode === 'verification' ? { previousHead: base.lastReviewedHead } : {}),
       reason: explanation,
     },
     lastSummary: `Automatic ${mode} review incomplete: ${explanation}`,
