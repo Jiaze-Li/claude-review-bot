@@ -9,6 +9,9 @@ const MAX_DISMISSED = 20;
 // deep run (including failed ones) and is persisted in the session.
 export const DEEP_REVIEW_RUN_BUDGET_USD = 2;
 export const DEEP_REVIEW_PR_BUDGET_USD = 6;
+// Reserve half of the shared cap for explicitly requested Claude reviews.
+// Fallback calls count against BOTH this pool and the shared per-PR cap.
+export const CLAUDE_FALLBACK_PR_BUDGET_USD = 3;
 // An IN_PROGRESS session older than this belongs to a run that died without
 // reporting; it must resolve instead of waiting forever.
 // Safe to equal the Claude step timeout: the sweeper and planner act only inside the per-PR review lock.
@@ -17,7 +20,7 @@ export const DEEP_REVIEW_STALE_MS = 20 * 60 * 1000;
 // worse than letting a reworded repeat through for one more validation.
 const KNOWN_MATCH_THRESHOLD = 0.8;
 
-export function planReviewSession({ session = null, baseSha, headSha, reset = false, now = Date.now() } = {}) {
+export function planReviewSession({ session = null, baseSha, headSha, reset = false, retryUnavailable = false, now = Date.now() } = {}) {
   checkedSha(baseSha, 'baseSha');
   checkedSha(headSha, 'headSha');
 
@@ -69,6 +72,13 @@ export function planReviewSession({ session = null, baseSha, headSha, reset = fa
   }
 
   if (session.status === 'HUMAN_REQUIRED') {
+    // Only an explicit manual retry can resume a provider-unavailable stop. Never
+    // reopen ordinary human findings, verification exhaustion, or a moved HEAD.
+    if (retryUnavailable && session.reviewFailure?.code === 'REVIEWER_UNAVAILABLE'
+        && session.lastReviewedHead === headSha) {
+      return { mode: session.reviewFailure.mode, previousHead: null,
+        reason: 'retry provider-unavailable review on the same exact HEAD' };
+    }
     return { mode: 'human_required', previousHead: session.lastReviewedHead ?? null, reason: 'session already requires human judgment' };
   }
 
@@ -106,6 +116,7 @@ export function applyDiscoveryResult({
     findings,
     acceptedRiskClasses: [],
     dismissed: [],
+    fallbackSpendUsd: 0,
     lastSummary: compactText(normalized.summary, 500),
     updatedAt: now,
   };
@@ -236,6 +247,59 @@ export function isDeepReviewStale(session, now = Date.now()) {
 export function deepReviewBudgetLeft(session) {
   const spent = Number.isFinite(session?.deepSpendUsd) && session.deepSpendUsd > 0 ? session.deepSpendUsd : 0;
   return Math.max(0, DEEP_REVIEW_PR_BUDGET_USD - spent);
+}
+
+// Older sessions only persisted a combined ledger; conservatively charge their
+// entire pre-migration spend to the fallback pool. We cannot infer provenance.
+export function claudeFallbackBudgetLeft(session) {
+  const fallbackSpent = Number.isFinite(session?.fallbackSpendUsd)
+    ? session.fallbackSpendUsd : (session?.deepSpendUsd ?? 0);
+  return Math.max(0, Math.min(deepReviewBudgetLeft(session),
+    CLAUDE_FALLBACK_PR_BUDGET_USD - fallbackSpent));
+}
+
+export function chargeClaudeFallback(session, costUsd) {
+  validateSession(session);
+  const amount = nonNegative(costUsd);
+  const fallbackSpent = Number.isFinite(session.fallbackSpendUsd)
+    ? session.fallbackSpendUsd : (session.deepSpendUsd ?? 0);
+  return {
+    ...session,
+    deepSpendUsd: roundUsd((session.deepSpendUsd ?? 0) + amount),
+    fallbackSpendUsd: roundUsd(fallbackSpent + amount),
+  };
+}
+
+// No model response was published. Preserve the existing finding ledger and
+// report HUMAN_REQUIRED for the attempted HEAD without pretending it passed.
+export function stopUnavailableReviewSession({
+  session = null, baseSha, headSha, sourceCommentId, mode, reason,
+  spentUsd = 0, now = new Date().toISOString(),
+} = {}) {
+  checkedSha(baseSha, 'baseSha');
+  checkedSha(headSha, 'headSha');
+  if (!['discovery', 'verification', 'audit'].includes(mode)) throw new Error('invalid failed review mode');
+  const base = session ?? applyDiscoveryResult({
+    result: { summary: 'Automated review could not run.', findings: [] },
+    baseSha, headSha, sourceCommentId, now,
+  });
+  validateSession(base);
+  if (base.baseSha !== baseSha) throw new Error('failed review base does not match session');
+  const explanation = compactText(reason || 'Gemini and Claude fallback unavailable', 240);
+  const stopped = {
+    ...base,
+    status: 'HUMAN_REQUIRED',
+    lastReviewedHead: headSha,
+    auditCompleted: mode === 'discovery' ? false : base.auditCompleted,
+    reviewFailure: {
+      code: 'REVIEWER_UNAVAILABLE', mode, head: headSha,
+      sourceCommentId: String(sourceCommentId ?? ''),
+      reason: explanation,
+    },
+    lastSummary: `Automatic ${mode} review incomplete: ${explanation}`,
+    updatedAt: now,
+  };
+  return chargeClaudeFallback(stopped, spentUsd);
 }
 
 export function beginDeepReview({
@@ -548,7 +612,9 @@ export function renderSessionComment(session, { sourceCommentIds = [] } = {}) {
   const open = openMaterialFindings(session);
   const verification = `${session.verificationRound ?? 0}/${session.maxVerificationRounds ?? MAX_VERIFICATION_ROUNDS}`;
   const audit = session.auditCompleted === true ? 'complete' : session.status === 'AUDIT_PENDING' ? 'pending' : 'not run';
-  const next = session.status === 'READY'
+  const next = session.reviewFailure?.code === 'REVIEWER_UNAVAILABLE'
+    ? 'Review did not complete. Restore Gemini quota and comment `@gemini review` to retry this exact HEAD; otherwise seek human review. Claude fallback remains budget-limited.'
+    : session.status === 'READY'
     ? 'No action required unless the PR changes; a new commit will start a fresh bounded review automatically.'
     : session.status === 'REVIEW_IN_PROGRESS'
       ? 'Claude deep review is running for this exact commit; the PR is not READY until it finishes. If it stops, comment `@claude review` to restart.'
@@ -579,9 +645,11 @@ export function renderSessionComment(session, { sourceCommentIds = [] } = {}) {
     '### Independent Review Session',
     `Status: **${session.status}**${session.override ? ` (manually overridden by @${cleanInline(session.override.by)})` : ''}`,
     `Default reviewer: **Gemini Flash (latest) / medium thinking**`,
-    `Discovery: **complete** · Final audit: **${audit}** · Verification: **${verification}**`,
+    `Discovery: **${session.reviewFailure?.mode === 'discovery' ? 'not completed' : 'complete'}** · Final audit: **${audit}** · Verification: **${verification}**`,
     `Open material findings: **${open.length}**`,
-    ...(session.deepSpendUsd > 0 ? [`Claude spend (deep review + fallback, SDK estimate): **$${session.deepSpendUsd.toFixed(2)}** of $${DEEP_REVIEW_PR_BUDGET_USD.toFixed(2)} per-PR cap · remaining $${deepReviewBudgetLeft(session).toFixed(2)}`] : []),
+    ...(session.reviewFailure ? [`Review stopped: **${cleanInline(session.reviewFailure.mode)}** · ${cleanInline(session.reviewFailure.reason)}`] : []),
+    ...(session.deepSpendUsd > 0 ? [`Claude spend (deep review + fallback, SDK estimate): **${session.deepSpendUsd.toFixed(2)}** of ${DEEP_REVIEW_PR_BUDGET_USD.toFixed(2)} per-PR cap · remaining ${deepReviewBudgetLeft(session).toFixed(2)}`] : []),
+    `Automatic fallback budget remaining: **${claudeFallbackBudgetLeft(session).toFixed(2)}** of ${CLAUDE_FALLBACK_PR_BUDGET_USD.toFixed(2)} per PR`,
     '',
     ...findingLines,
     ...(dismissalLines.length ? ['', 'Human-dismissed findings (cited, not machine-verified):', ...dismissalLines] : []),
