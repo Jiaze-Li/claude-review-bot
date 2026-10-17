@@ -294,7 +294,7 @@ export function stopUnavailableReviewSession({
     reviewFailure: {
       code: 'REVIEWER_UNAVAILABLE', mode, head: headSha,
       sourceCommentId: String(sourceCommentId ?? ''),
-      ...(mode === 'verification' ? { previousHead: base.lastReviewedHead } : {}),
+      ...(mode === 'verification' ? { previousHead: base.reviewFailure?.previousHead ?? base.lastReviewedHead } : {}),
       reason: explanation,
     },
     lastSummary: `Automatic ${mode} review incomplete: ${explanation}`,
