@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { deepReviewBudgetLeft, knownIssuesPromptBlock, normalizeReviewResult, normalizeVerificationResult, openMaterialFindings } from './review-session-core.mjs';
+import { claudeFallbackBudgetLeft, knownIssuesPromptBlock, normalizeReviewResult, normalizeVerificationResult, openMaterialFindings } from './review-session-core.mjs';
 import {GeminiUnavailableError,isGeminiUnavailableStatus,runClaudeStructured} from './claude-fallback.mjs';
 
 // Moving alias: always resolves to Google's current Flash model. Override with GEMINI_MODEL to pin.
@@ -271,11 +271,33 @@ export async function runGeminiReview({env=process.env,fetchImpl=fetch,logImpl=c
   }
 
   if(unavailable){
-    if(deepReviewBudgetLeft(plan.session)<0.05) throw new Error('Claude fallback blocked: the per-PR Claude budget is exhausted; human judgment required');
+    const remaining=claudeFallbackBudgetLeft(plan.session);
+    const recordStop=(reason,spentUsd=0)=>{
+      fs.writeFileSync(path.join(contextRoot,'fallback-unavailable.json'),
+        JSON.stringify({mode,headSha,reason,spentUsd})+'\n',{mode:0o600});
+    };
+    if(remaining<0.05){
+      recordStop('Gemini HTTP '+unavailable.status+'; per-PR Claude fallback budget exhausted');
+      throw new Error('Claude fallback blocked: the per-PR Claude budget is exhausted; human judgment required');
+    }
+    if(!env.CLAUDE_CODE_OAUTH_TOKEN){
+      recordStop('Gemini HTTP '+unavailable.status+'; Claude fallback credential unavailable');
+      throw new Error('Claude fallback unavailable: CLAUDE_CODE_OAUTH_TOKEN is not set');
+    }
     logImpl(`Gemini unavailable (HTTP ${unavailable.status}); falling back to Claude for this ${mode} review`);
-    const fallback=await runClaudeStructured({prompt:built.prompt,schema:built.schema,timeoutMs,env,logImpl,queryImpl});
-    // Fail here, not at publish time, with the exact normalizer the publisher applies to every provider's output.
-    if(mode==='verification') normalizeVerificationResult(fallback.structured); else normalizeReviewResult(fallback.structured);
+    let fallback;
+    try{
+      fallback=await runClaudeStructured({prompt:built.prompt,schema:built.schema,timeoutMs,
+        maxBudgetUsd:remaining,env,logImpl,queryImpl});
+      // Validate before publication. Invalid output must never be declared READY.
+      if(mode==='verification') normalizeVerificationResult(fallback.structured); else normalizeReviewResult(fallback.structured);
+    }catch(error){
+      // If the SDK could not return usage, conservatively reserve its entire
+      // maxBudgetUsd. Repeating a failed paid call must not bypass the cap.
+      recordStop('Gemini HTTP '+unavailable.status+'; Claude fallback failed: '+String(error.message||error).slice(0,160),
+        fallback?.meta?.total_cost_usd??remaining);
+      throw error;
+    }
     return {
       ...fallback.structured,
       _meta:{
