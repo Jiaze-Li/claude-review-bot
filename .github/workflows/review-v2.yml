@@ -359,6 +359,7 @@ jobs:
         run: npm ci --legacy-peer-deps --ignore-scripts --no-audit --no-fund --omit=dev
 
       - name: Run Gemini bounded review
+        id: gemini-run
         if: steps.dedupe.outputs.duplicate != 'true' && (steps.plan.outputs.mode == 'discovery' || steps.plan.outputs.mode == 'verification' || steps.plan.outputs.mode == 'audit')
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -369,6 +370,18 @@ jobs:
           REVIEW_CONTEXT_DIR: .review-context
           REVIEW_OUTPUT_PATH: .review-context/review.json
         run: node scripts/run-gemini-review.mjs
+
+      - name: Record provider-unavailable discovery or verification
+        if: failure() && steps.gemini-run.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          BASE_SHA: ${{ inputs.base_sha }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          SOURCE_COMMENT_ID: ${{ inputs.source_comment_id }}
+          REVIEW_CONTEXT_DIR: .review-context
+        run: node scripts/stop-unavailable-review.mjs
 
       - name: Validate Gemini material findings
         if: steps.dedupe.outputs.duplicate != 'true' && (steps.plan.outputs.mode == 'discovery' || steps.plan.outputs.mode == 'audit')
@@ -435,6 +448,7 @@ jobs:
           echo "run=true" >> "$GITHUB_OUTPUT"
 
       - name: Run automatic Gemini final audit
+        id: final-gemini-run
         if: steps.auto-audit.outputs.run == 'true'
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -445,6 +459,18 @@ jobs:
           REVIEW_CONTEXT_DIR: .review-context
           REVIEW_OUTPUT_PATH: .review-context/final-audit.json
         run: node scripts/run-gemini-review.mjs
+
+      - name: Record provider-unavailable final audit
+        if: failure() && steps.final-gemini-run.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          BASE_SHA: ${{ inputs.base_sha }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          SOURCE_COMMENT_ID: ${{ inputs.source_comment_id }}
+          REVIEW_CONTEXT_DIR: .review-context
+        run: node scripts/stop-unavailable-review.mjs
 
       - name: Validate automatic final audit findings
         if: steps.auto-audit.outputs.run == 'true'
