@@ -90,6 +90,7 @@ export async function runClaudeStructured({
       resolved_model: resolvedModel || CLAUDE_FALLBACK_MODEL,
       effort: CLAUDE_FALLBACK_EFFORT,
       total_cost_usd: typeof result.total_cost_usd === 'number' && result.total_cost_usd > 0 ? result.total_cost_usd : FALLBACK_UNKNOWN_COST_USD,
+      cost_source: typeof result.total_cost_usd === 'number' && result.total_cost_usd > 0 ? 'sdk' : 'reserve',
       usage: {
         input_tokens: num(usage.input_tokens),
         output_tokens: num(usage.output_tokens),
