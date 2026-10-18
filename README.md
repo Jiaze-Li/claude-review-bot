@@ -10,7 +10,7 @@ events and the current Worker is deployed:
 - opening a non-draft PR starts a bounded discovery session automatically;
 - moving a draft PR to **Ready for review** starts it automatically;
 - pushing a repair while the session is **REWORK** triggers targeted verification;
-- pushing a new commit after **READY** starts a fresh bounded discovery session;
+- pushing a new commit after **READY** first classifies the exact delta from the last reviewed HEAD: small low-risk changes get an incremental review, while broad/high-risk changes get full discovery + audit;
 - webhook redelivery is idempotent, and an unchanged PR HEAD is a no-op at the durable session planner, so it does not spend another reviewer call.
 
 The manual commands remain available as a retry/escape hatch:
@@ -26,11 +26,11 @@ The review session is intentionally stateful and simple:
 - Any P0/P1/P2 discovery candidate gets one **targeted Gemini Flash / medium validation pass** over the candidate file, related symbols/guards, and matching tests.
 - Only **CONFIRMED** material findings block. **REJECTED** and **UNCERTAIN** candidates remain visible in the review audit but do not enter REWORK.
 - If confirmed material findings exist, push a repair; the new PR commit automatically triggers the next review step.
-- A REWORK repair becomes targeted **verification**, not another full PR discovery.
+- A REWORK repair becomes targeted **verification** plus checks for independent regressions introduced by that HEAD delta, not another full PR discovery.
 - At most **2 verification rounds** are allowed.
 - Once material findings converge, one independent final audit runs automatically on the final cumulative PR diff. It stays **Gemini Flash / low** for ordinary PRs; a deterministic state-integrity classifier escalates only shared-state/concurrency-sensitive PRs to **medium** with an explicit interleaving audit.
 - Final-audit P0/P1/P2 candidates use the same targeted medium validator.
-- The final broad audit runs **at most once per session**. If it finds a material bug, later calls are targeted verification only.
+- The final broad audit runs **at most once per full-review session**. Safe incremental updates reuse that audit for unchanged code; after 15 successful incremental reviews a fresh full audit is required.
 - P3 findings are non-blocking.
 - A malformed/no-text structured Gemini review response is retried **once with the identical prompt, model, thinking level, and schema**; usage from both attempts is reported.
 - Re-running on the same unchanged HEAD spends **no reviewer model quota**.
@@ -39,6 +39,30 @@ The review session is intentionally stateful and simple:
 - If Gemini is unavailable **and** fallback cannot run (budget, credential, or SDK failure), the bot records a durable **HUMAN_REQUIRED / reviewer unavailable** state for the exact HEAD rather than leaving a misleading `AUDIT_PENDING`. Once Gemini quota is restored, comment `@gemini review` to retry that interrupted stage **on the same HEAD**, with no automatic budget reset. Model or publication failures unrelated to provider unavailability still fail closed.
 - Old sessions without separate fallback spending cannot distinguish which Claude calls consumed their budget; the prior combined spend is conservatively counted against the fallback pool. A prior PR's exhausted $6 limit is not reset by this change.
 - Session state is stored in a bot-authored GitHub PR comment, so it survives new ChatGPT conversations, different agents, and local restarts.
+
+### HEAD changes after READY
+
+A successful full audit establishes a trusted code-tree baseline. On the next HEAD,
+the reviewer computes the exact diff between the previous **reviewed** HEAD and
+the new HEAD (not the cumulative 100-commit PR diff). A delta of at most 50
+added/deleted lines across at most 3 files is eligible for a single incremental
+Gemini review, with surrounding function context. Changes to high-risk paths
+(workflows, security, schemas, dependencies, migration/persistence, etc.), risk
+signals in changed lines, renames/deletions/binary files, large patches, unknown
+old revisions, and uncertain diff metadata cause **full Discovery + Final Audit**.
+
+Incremental review still validates any material findings, publishes on the exact
+HEAD, and never inherits the previous commit's green status without a successful
+model result. Findings, verification state, and the Claude spending ledger survive
+eligible changes. If new bugs are found, their fixes enter the existing bounded
+Verification path without repeating Final Audit. The 15th completed incremental
+review is followed by a full refresh on the next update. An explicit manual
+override does **not** establish a reusable audited baseline.
+
+A forced push or rebase is compared by final code trees, not by commit ancestry.
+If the old reviewed commit can no longer be fetched, the bot fails back to
+full review. A provider outage on an incremental HEAD remains HUMAN_REQUIRED;
+a manual retry resumes the same delta rather than silently clearing the gate.
 
 ### Gemini request timeout policy
 
@@ -121,7 +145,7 @@ READY means "the bounded review found no confirmed material problem", not "the c
 The automatic state machine is:
 
 ```text
-NEW / changed-after-READY
+NEW PR / high-risk delta / periodic full refresh
         |
         v
 Gemini DISCOVERY (once, medium)
@@ -187,7 +211,8 @@ Default Gemini review is intentionally lightweight:
 ```text
 model: gemini-flash-latest   # moving alias; override with GEMINI_MODEL to pin
 thinking: MEDIUM (discovery); LOW for verification and ordinary final audit
-input: exact PR diff for discovery
+input: exact cumulative PR diff for discovery and final audit
+       exact previous-HEAD..new-HEAD delta for incremental review
        repair diff + durable open findings for verification
 ```
 

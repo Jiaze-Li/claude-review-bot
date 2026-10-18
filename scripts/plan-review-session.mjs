@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { isDeepReviewStale, parsePendingSessionReview, parseSessionComment, planReviewSession } from './review-session-core.mjs';
+import { prepareIncrementalDelta } from './select-incremental-review.mjs';
 
 const repoPattern=/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const shaPattern=/^[0-9a-f]{40}$/i;
@@ -141,6 +142,24 @@ function appendOutput(name,value,env){
 if(process.argv[1] && import.meta.url===pathToFileURL(process.argv[1]).href){
   try{
     const plan=await planSession();
+    if (plan.decision.mode === 'incremental_candidate') {
+      const previousHead = plan.decision.previousHead;
+      const scope = prepareIncrementalDelta({
+        repoDir: path.resolve(process.env.SOURCE_REPO_DIR || 'target'),
+        contextDir: path.resolve(process.env.REVIEW_CONTEXT_DIR || '.review-context'),
+        previousHead,
+        headSha: required(process.env, 'HEAD_SHA'),
+        session: plan.session,
+        token: process.env.GH_TOKEN,
+      });
+      plan.decision = {
+        mode: scope.mode,
+        previousHead: scope.mode === 'incremental' ? previousHead : null,
+        reason: scope.reason,
+      };
+      console.log('Review scope: ' + scope.mode + ' — ' + scope.reason
+        + (scope.changedLines == null ? '' : ' (' + scope.files + ' files, ' + scope.changedLines + ' lines)'));
+    }
     const output=path.resolve(process.env.REVIEW_CONTEXT_DIR||'.review-context','session-plan.json');
     fs.mkdirSync(path.dirname(output),{recursive:true,mode:0o700});
     fs.writeFileSync(output,JSON.stringify(plan,null,2)+'\n',{mode:0o600});

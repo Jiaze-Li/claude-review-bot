@@ -242,17 +242,26 @@ jobs:
           REVIEW_CONTEXT_DIR: .review-context
         run: node scripts/plan-review-session.mjs
 
-      - name: Build repair-only verification diff
-        if: steps.dedupe.outputs.duplicate != 'true' && steps.plan.outputs.mode == 'verification'
+      - name: Build repair / incremental delta diff
+        if: steps.dedupe.outputs.duplicate != 'true' && (steps.plan.outputs.mode == 'verification' || steps.plan.outputs.mode == 'incremental')
         shell: bash
         env:
           PREVIOUS_HEAD: ${{ steps.plan.outputs.previous_head }}
           HEAD_SHA: ${{ inputs.head_sha }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
           [[ "$PREVIOUS_HEAD" =~ ^[0-9a-f]{40}$ ]] || { echo "Invalid prior reviewed HEAD" >&2; exit 1; }
+          if [[ -f .review-context/repair.diff ]]; then
+            echo "Incremental delta already prepared by scope classifier."
+            exit 0
+          fi
           if ! git -C target cat-file -e "${PREVIOUS_HEAD}^{commit}" 2>/dev/null; then
-            git -C target fetch --no-tags --depth=1 origin "$PREVIOUS_HEAD"
+            # checkout uses persist-credentials:false; scope an App token to this fetch only.
+            auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+            GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
+              GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" \
+              git -C target fetch --no-tags --depth=1 origin "$PREVIOUS_HEAD"
           fi
           git -C target diff --no-ext-diff --no-textconv --unified=80 "$PREVIOUS_HEAD" "$HEAD_SHA" > .review-context/repair.diff
 
@@ -354,13 +363,13 @@ jobs:
 
       - name: Install Claude fallback dependencies
         continue-on-error: true # only needed if Gemini is out of credits; must never block a healthy Gemini review
-        if: steps.dedupe.outputs.duplicate != 'true' && (steps.plan.outputs.mode == 'discovery' || steps.plan.outputs.mode == 'verification' || steps.plan.outputs.mode == 'audit')
+        if: steps.dedupe.outputs.duplicate != 'true' && (steps.plan.outputs.mode == 'discovery' || steps.plan.outputs.mode == 'incremental' || steps.plan.outputs.mode == 'verification' || steps.plan.outputs.mode == 'audit')
         shell: bash
         run: npm ci --legacy-peer-deps --ignore-scripts --no-audit --no-fund --omit=dev
 
       - name: Run Gemini bounded review
         id: gemini-run
-        if: steps.dedupe.outputs.duplicate != 'true' && (steps.plan.outputs.mode == 'discovery' || steps.plan.outputs.mode == 'verification' || steps.plan.outputs.mode == 'audit')
+        if: steps.dedupe.outputs.duplicate != 'true' && (steps.plan.outputs.mode == 'discovery' || steps.plan.outputs.mode == 'incremental' || steps.plan.outputs.mode == 'verification' || steps.plan.outputs.mode == 'audit')
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -384,7 +393,7 @@ jobs:
         run: node scripts/stop-unavailable-review.mjs
 
       - name: Validate Gemini material findings
-        if: steps.dedupe.outputs.duplicate != 'true' && (steps.plan.outputs.mode == 'discovery' || steps.plan.outputs.mode == 'audit')
+        if: steps.dedupe.outputs.duplicate != 'true' && (steps.plan.outputs.mode == 'discovery' || steps.plan.outputs.mode == 'incremental' || steps.plan.outputs.mode == 'audit')
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -405,7 +414,7 @@ jobs:
 
       - name: Publish Gemini review and durable session
         id: publish-gemini
-        if: steps.dedupe.outputs.duplicate != 'true' && (steps.plan.outputs.mode == 'discovery' || steps.plan.outputs.mode == 'verification' || steps.plan.outputs.mode == 'audit')
+        if: steps.dedupe.outputs.duplicate != 'true' && (steps.plan.outputs.mode == 'discovery' || steps.plan.outputs.mode == 'incremental' || steps.plan.outputs.mode == 'verification' || steps.plan.outputs.mode == 'audit')
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           TARGET_REPO: ${{ inputs.target_repo }}

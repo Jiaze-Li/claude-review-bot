@@ -3,7 +3,7 @@ import { pathToFileURL } from 'node:url';
 
 const repoPattern = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const positiveId = /^[1-9]\d*$/;
-const reviewModes = new Set(['discovery', 'verification', 'audit', 'recover', 'claude', 'noop_ready', 'noop_waiting', 'human_required', 'deep_review_stale', 'override', 'dismiss']);
+const reviewModes = new Set(['discovery', 'incremental', 'verification', 'audit', 'recover', 'claude', 'noop_ready', 'noop_waiting', 'human_required', 'deep_review_stale', 'override', 'dismiss']);
 const sourceKinds = new Set(['comment', 'pull_request']);
 
 function checked(value, pattern, name) {
@@ -44,6 +44,7 @@ export async function publishRunStatus({ env = process.env, fetchImpl = fetch } 
   let state;
   if (stage === 'started') {
     if (mode === 'discovery') state = 'Exact-HEAD preflight passed. Gemini discovery review is running.';
+    else if (mode === 'incremental') state = 'Exact-HEAD preflight passed. Gemini delta review is running.';
     else if (mode === 'verification') state = 'Exact-HEAD preflight passed. Gemini targeted verification is running.';
     else if (mode === 'audit') state = 'Exact-HEAD preflight passed. Gemini one-time final audit is running.';
     else if (mode === 'claude') state = 'Exact-HEAD preflight passed. Explicit Claude deep review is running.';

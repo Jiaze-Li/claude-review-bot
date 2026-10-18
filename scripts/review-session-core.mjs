@@ -58,7 +58,9 @@ export function planReviewSession({ session = null, baseSha, headSha, reset = fa
     if (session.lastReviewedHead === headSha) {
       return { mode: 'noop_ready', previousHead: session.lastReviewedHead, reason: 'current HEAD is already READY' };
     }
-    return { mode: 'discovery', previousHead: null, reason: 'PR changed after READY; start a fresh bounded session' };
+    return session.auditCompleted === true && !session.override
+      ? { mode: 'incremental_candidate', previousHead: session.lastReviewedHead, reason: 'classify new delta before deciding review scope' }
+      : { mode: 'discovery', previousHead: null, reason: 'no reusable full-audit baseline' };
   }
 
   if (session.status === 'REWORK') {
@@ -77,7 +79,7 @@ export function planReviewSession({ session = null, baseSha, headSha, reset = fa
     if (retryUnavailable && session.reviewFailure?.code === 'REVIEWER_UNAVAILABLE'
         && session.lastReviewedHead === headSha) {
       return { mode: session.reviewFailure.mode,
-        previousHead: session.reviewFailure.mode === 'verification' ? session.reviewFailure.previousHead : null,
+        previousHead: ['verification', 'incremental'].includes(session.reviewFailure.mode) ? session.reviewFailure.previousHead : null,
         reason: 'retry provider-unavailable review on the same exact HEAD' };
     }
     return { mode: 'human_required', previousHead: session.lastReviewedHead ?? null, reason: 'session already requires human judgment' };
@@ -119,6 +121,53 @@ export function applyDiscoveryResult({
     dismissed: [],
     fallbackSpendUsd: 0,
     lastSummary: compactText(normalized.summary, 500),
+    updatedAt: now,
+  };
+}
+
+// A previously audited READY tree is the baseline. Retain all prior findings
+// and the audit attestation; only new delta findings can block the new HEAD.
+export function applyIncrementalResult({
+  session, result, headSha, now = new Date().toISOString(),
+} = {}) {
+  validateSession(session);
+  checkedSha(headSha, 'headSha');
+  const retry = session.status === 'HUMAN_REQUIRED'
+    && session.reviewFailure?.code === 'REVIEWER_UNAVAILABLE'
+    && session.reviewFailure.mode === 'incremental'
+    && session.reviewFailure.head === headSha
+    && session.reviewFailure.previousHead;
+  if ((session.status !== 'READY' && !retry) || session.auditCompleted !== true || session.override) {
+    throw new Error('incremental review requires an audited READY baseline or exact-HEAD provider retry');
+  }
+  if (session.lastReviewedHead === headSha && !retry) throw new Error('incremental review needs a changed HEAD');
+  const normalized = normalizeReviewResult(result);
+  const findings = session.findings.map((finding) => ({ ...finding }));
+  let nextFindingNumber = Number.isInteger(session.nextFindingNumber) ? session.nextFindingNumber : findings.length + 1;
+  for (const finding of normalized.findings) {
+    findings.push({
+      id: findingId(nextFindingNumber++),
+      ...compactFinding(finding),
+      status: MATERIAL_SEVERITIES.has(finding.severity) ? 'OPEN' : 'DEFERRED',
+      origin: 'INCREMENTAL',
+      introducedHead: headSha,
+      lastCheckedHead: headSha,
+      resolutionReason: null,
+    });
+  }
+  const open = findings.some((finding) => finding.status === 'OPEN' && MATERIAL_SEVERITIES.has(finding.severity));
+  const { reviewFailure: _oldFailure, ...base } = session;
+  return {
+    ...base,
+    lastReviewedHead: headSha,
+    fullAuditHead: session.fullAuditHead ?? (retry ? session.reviewFailure.previousHead : session.lastReviewedHead),
+    incrementalReviewCount: (session.incrementalReviewCount ?? 0) + 1,
+    status: open ? 'REWORK' : 'READY',
+    auditCompleted: true,
+    verificationRound: 0,
+    nextFindingNumber,
+    findings,
+    lastSummary: compactText(normalized.summary, 800),
     updatedAt: now,
   };
 }
@@ -228,6 +277,8 @@ export function applyAuditResult({
     lastReviewedHead: headSha,
     status,
     auditCompleted: true,
+    fullAuditHead: headSha,
+    incrementalReviewCount: 0,
     nextFindingNumber,
     findings,
     lastSummary: compactText(normalized.summary, 800),
@@ -279,7 +330,7 @@ export function stopUnavailableReviewSession({
 } = {}) {
   checkedSha(baseSha, 'baseSha');
   checkedSha(headSha, 'headSha');
-  if (!['discovery', 'verification', 'audit'].includes(mode)) throw new Error('invalid failed review mode');
+  if (!['discovery', 'verification', 'incremental', 'audit'].includes(mode)) throw new Error('invalid failed review mode');
   const base = session ?? applyDiscoveryResult({
     result: { summary: 'Automated review could not run.', findings: [] },
     baseSha, headSha, sourceCommentId, now,
@@ -294,7 +345,7 @@ export function stopUnavailableReviewSession({
     reviewFailure: {
       code: 'REVIEWER_UNAVAILABLE', mode, head: headSha,
       sourceCommentId: String(sourceCommentId ?? ''),
-      ...(mode === 'verification' ? { previousHead: base.reviewFailure?.previousHead ?? base.lastReviewedHead } : {}),
+      ...(['verification', 'incremental'].includes(mode) ? { previousHead: base.reviewFailure?.previousHead ?? base.lastReviewedHead } : {}),
       reason: explanation,
     },
     lastSummary: `Automatic ${mode} review incomplete: ${explanation}`,
@@ -616,7 +667,7 @@ export function renderSessionComment(session, { sourceCommentIds = [] } = {}) {
   const next = session.reviewFailure?.code === 'REVIEWER_UNAVAILABLE'
     ? 'Review did not complete. Restore Gemini quota and comment `@gemini review` to retry this exact HEAD; otherwise seek human review. Claude fallback remains budget-limited.'
     : session.status === 'READY'
-    ? 'No action required unless the PR changes; a new commit will start a fresh bounded review automatically.'
+    ? 'No action required unless the PR changes; a small safe delta receives incremental review and risky changes receive full review.'
     : session.status === 'REVIEW_IN_PROGRESS'
       ? 'Claude deep review is running for this exact commit; the PR is not READY until it finishes. If it stops, comment `@claude review` to restart.'
     : session.status === 'AUDIT_PENDING'
@@ -647,6 +698,7 @@ export function renderSessionComment(session, { sourceCommentIds = [] } = {}) {
     `Status: **${session.status}**${session.override ? ` (manually overridden by @${cleanInline(session.override.by)})` : ''}`,
     `Default reviewer: **Gemini Flash (latest) / medium thinking**`,
     `Discovery: **${session.reviewFailure?.mode === 'discovery' ? 'not completed' : 'complete'}** · Final audit: **${audit}** · Verification: **${verification}**`,
+    ...(session.incrementalReviewCount ? [`Incremental reviews since full audit: **${session.incrementalReviewCount}** (full-audit HEAD: ${cleanInline((session.fullAuditHead ?? session.discoveryHead ?? '').slice(0, 12))})`] : []),
     `Open material findings: **${open.length}**`,
     ...(session.reviewFailure ? [`Review stopped: **${cleanInline(session.reviewFailure.mode)}** · ${cleanInline(session.reviewFailure.reason)}`] : []),
     ...(session.deepSpendUsd > 0 ? [`Claude spend (deep review + fallback, SDK estimate): **${session.deepSpendUsd.toFixed(2)}** of ${DEEP_REVIEW_PR_BUDGET_USD.toFixed(2)} per-PR cap · remaining ${deepReviewBudgetLeft(session).toFixed(2)}`] : []),
@@ -657,7 +709,7 @@ export function renderSessionComment(session, { sourceCommentIds = [] } = {}) {
     '',
     `Next: ${next}`,
     '',
-    '<sub>P3 findings are non-blocking. After discovery, verification is limited to existing findings and repair regressions. The final broad audit runs at most once per session.</sub>',
+    '<sub>P3 findings are non-blocking. Verification covers open findings and new delta regressions. Audited unchanged code is reused after safe incremental reviews; high-risk deltas receive full review.</sub>',
     `<!-- jiaze-review-state:${state} -->`,
   ].join('\n');
 }
