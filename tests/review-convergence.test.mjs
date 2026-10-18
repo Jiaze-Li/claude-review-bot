@@ -400,3 +400,13 @@ test('new targeted verdict resolves the same carried candidate but silence never
   const repeated=recordUncertainFindings(next,[uncertainCandidate()],B,'discovery',prior);
   assert.equal(unresolvedMaterialFindings(repeated).length,1);
 });
+
+test('explicit reset on an unchanged HEAD also preserves unresolved material evidence',()=>{
+  const prior=recordUncertainFindings(session(),[uncertainCandidate()],A,'discovery');
+  const reset=applyDiscoveryResult({result:{summary:'reset model silent',findings:[]},
+    baseSha:BASE,headSha:A,sourceCommentId:'45'});
+  const carried=recordUncertainFindings(reset,[],A,'discovery',prior);
+  assert.equal(carried.status,'HUMAN_REQUIRED');
+  assert.equal(unresolvedMaterialFindings(carried).length,1);
+  assert.equal(sessionCommitStatus(carried,A).state,'error');
+});
