@@ -12,7 +12,9 @@ import {
   openMaterialFindings,
   pendingSessionMarker,
   recordDismissed,
+  recordUncertainFindings,
   renderSessionComment,
+  unresolvedMaterialFindings,
 } from './review-session-core.mjs';
 
 const REVIEW_BODY_MAX_BYTES = 60000;
@@ -74,10 +76,12 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
     session = recovered;
   }
 
-  // Remember validator-rejected/uncertain candidates so later passes cannot
-  // re-raise them under a new wording.
+  // Only source-backed REJECTED candidates are settled. UNCERTAIN P0–P2
+  // candidates are persisted with their own IDs and block READY until a
+  // code-backed decision or an explicitly attested human risk acceptance.
   if (mode === 'discovery' || mode === 'incremental' || mode === 'audit') {
     session = recordDismissed(session, raw._validation?.validations, headSha);
+    session = recordUncertainFindings(session, raw._validation?.validations, headSha, mode);
   }
 
   // Charge every completed Claude call separately, preserving reported versus
@@ -158,10 +162,15 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
         + escapeHtml(location) + '</code>: ' + finding.body;
     }
   }
-  body += '\n\n### Session result\n**' + session.status + '** · open material findings: **' + open.length
+  const unresolved = unresolvedMaterialFindings(session);
+  body += '\n\n### Session result\n**' + session.status + '** · confirmed open material findings: **' + open.length
+    + '** · unresolved material candidates: **' + unresolved.length
     + '** · verification: **' + session.verificationRound + '/' + session.maxVerificationRounds + '**';
-  if (session.status === 'HUMAN_REQUIRED') {
-    body += '\n\nAutomatic review has stopped. Use human judgment or a targeted Codex/Claude review; do not start another full discovery automatically.';
+  if (unresolved.length) {
+    body += '\n\n**Not merge-ready:** targeted validation could not settle ' + unresolved.length
+      + ' P0–P2 candidate(s). Inspect and adjudicate the F-numbered candidates with code evidence; they are not confirmed defects.';
+  } else if (session.status === 'HUMAN_REQUIRED') {
+    body += '\n\nAutomatic review has stopped. Human judgment is required before merger.';
   }
   body += formatRuntime(raw._meta, mode === 'audit' ? 'Final audit runtime' : mode === 'verification' ? 'Verification runtime' : 'Discovery runtime');
   body += formatRuntime(raw._validation?._meta, 'Validation runtime');
