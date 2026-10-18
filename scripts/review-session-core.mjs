@@ -734,11 +734,11 @@ export function recordUncertainFindings(session, validations, headSha, mode, pre
   const checked = Array.isArray(validations) ? validations : [];
   const uncertain = checked.filter(entry =>
     entry?.verdict === 'UNCERTAIN' && MATERIAL_SEVERITIES.has(entry.severity));
-  // A new HEAD and its fresh Discovery must not silently erase a prior
-  // inconclusive P2 merely because the model failed to repeat the claim.
+  // A fresh Discovery (after new code OR an explicit reset) must not erase
+  // a prior inconclusive P2 just because the model failed to repeat it.
   // Only a new targeted CONFIRMED or REJECTED verdict for the *same*
   // candidate establishes enough evidence to replace it.
-  const prior = mode === 'discovery' && previousSession?.lastReviewedHead !== headSha
+  const prior = mode === 'discovery'
     ? unresolvedMaterialFindings(previousSession)
     : [];
   const key = entry => String(entry?.path ?? '').trim().toLowerCase()
