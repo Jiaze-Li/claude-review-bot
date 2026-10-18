@@ -103,7 +103,10 @@ test('provider failure never turns an unreviewed incremental HEAD green; exact r
   const retry = planReviewSession({ session: failed, baseSha: BASE, headSha: B, retryUnavailable: true });
   assert.equal(retry.mode, 'incremental');
   assert.equal(retry.previousHead, A);
-  assert.equal(planReviewSession({ session: failed, baseSha: BASE, headSha: C, retryUnavailable: true }).mode, 'human_required');
+  // A maintainer can explicitly retry a moved HEAD; the old incremental delta
+  // no longer describes that tree, so run a new full discovery instead.
+  assert.equal(planReviewSession({ session: failed, baseSha: BASE, headSha: C, retryUnavailable: true }).mode, 'discovery');
+  assert.equal(planReviewSession({ session: failed, baseSha: BASE, headSha: C }).mode, 'human_required');
   const reviewed = applyIncrementalResult({ session: failed, headSha: B, result: empty });
   assert.equal(reviewed.status, 'READY');
   assert.equal(reviewed.reviewFailure, undefined);
