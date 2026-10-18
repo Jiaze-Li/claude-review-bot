@@ -49,6 +49,11 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
       session = { ...session, fallbackSpendUsd: plan.session.fallbackSpendUsd };
     else if (plan.session?.deepSpendUsd > 0)
       session = { ...session, fallbackSpendUsd: plan.session.deepSpendUsd };
+    // Existing PRs predate cost provenance; preserve both newly introduced
+    // fields across a fresh discovery without inventing historical details.
+    for (const field of ['claudeSdkSpendUsd', 'claudeUnknownReserveUsd']) {
+      if (Number.isFinite(plan.session?.[field])) session = { ...session, [field]: plan.session[field] };
+    }
   } else if (mode === 'incremental') {
     normalized = normalizeReviewResult(raw);
     if (!plan.session) throw new Error('Incremental review plan is missing the previously audited session');
@@ -75,11 +80,12 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
     session = recordDismissed(session, raw._validation?.validations, headSha);
   }
 
-  // Claude fallback calls (review and validation) spend the same per-PR Claude budget.
-  const fallbackCost = [raw._meta, raw._validation?._meta]
-    .filter((meta) => meta?.provider === 'claude')
-    .reduce((sum, meta) => sum + (Number.isFinite(meta.total_cost_usd) ? meta.total_cost_usd : 0), 0);
-  if (fallbackCost > 0) session = chargeClaudeFallback(session, fallbackCost);
+  // Charge every completed Claude call separately, preserving reported versus
+  // conservatively reserved spend. Never label a legacy amount as SDK-reported.
+  for (const meta of [raw._meta, raw._validation?._meta]) {
+    if (meta?.provider === 'claude' && Number.isFinite(meta.total_cost_usd) && meta.total_cost_usd > 0)
+      session = chargeClaudeFallback(session, meta.total_cost_usd, meta.cost_source === 'reserve' ? 'reserve' : 'sdk');
+  }
 
   const sessionBody = renderSessionComment(session, { sourceCommentIds: [sourceCommentId] });
   const pendingMarker = pendingSessionMarker(session, sourceCommentId);
