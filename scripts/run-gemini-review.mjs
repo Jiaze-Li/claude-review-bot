@@ -60,9 +60,16 @@ ${prJson}
 `;
 
   if(mode==='discovery'){
+    const unresolved=(session?.findings??[]).filter(f=>f.status==='UNCERTAIN'&&['P0','P1','P2'].includes(f.severity));
+    const carryPrompt=unresolved.length
+      ? 'PREVIOUS UNRESOLVED MATERIAL CANDIDATES (not confirmed bugs):\n'
+        +JSON.stringify(unresolved.slice(0,8).map(f=>({severity:f.severity,path:f.path,
+          title:f.title,reason:f.body,priorHead:f.lastCheckedHead})))
+        +'\nInspect these against this HEAD; omission alone does not prove a concern was refuted.\n'
+      : '';
     return {
       prompt:`${common}
-This is the ONE broad discovery pass for this review session. You may discover new material issues in the PR diff.
+${carryPrompt}This is the ONE broad discovery pass for this review session. You may discover new material issues in the PR diff.
 Do not try to exhaust every natural-language synonym or redesign intentionally documented scope limitations.
 Return at most 6 findings.
 
