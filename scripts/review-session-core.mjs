@@ -318,6 +318,13 @@ export function claudeFallbackBudgetLeft(session) {
   return deepReviewBudgetLeft(session);
 }
 
+// Only an authenticated PR comment explicitly requesting a review may exceed
+// the automatic cap. A dismiss/override command is human-initiated, but it is
+// NOT authorization to spend beyond the limit during its follow-on audit.
+export function isManualBudgetExemptReview({ sourceKind, requestedMode } = {}) {
+  return sourceKind === 'comment' && ['auto', 'reset'].includes(requestedMode);
+}
+
 export function claudeFallbackCallBudget(session, { manual = false, pendingUsd = 0 } = {}) {
   return manual ? DEEP_REVIEW_RUN_BUDGET_USD
     : Math.max(0, roundUsd(claudeFallbackBudgetLeft(session) - nonNegative(pendingUsd)));
