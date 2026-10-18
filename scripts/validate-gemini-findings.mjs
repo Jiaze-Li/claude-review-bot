@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { matchesKnownDismissal } from './review-session-core.mjs';
+import { CLAUDE_AUTO_MIN_BUDGET_USD, claudeFallbackCallBudget, matchesKnownDismissal } from './review-session-core.mjs';
 import { assessExternalPremise, applyExternalEvidence } from './external-fact-evidence.mjs';
 import { requireGroundedSourceEvidence } from './local-source-evidence.mjs';
 import { GeminiUnavailableError, isGeminiUnavailableStatus, runClaudeStructured } from './claude-fallback.mjs';
@@ -60,7 +60,7 @@ const validationSchema = {
   required: ['summary', 'validations'],
 };
 
-export async function validateMaterialFindings({ env = process.env, fetchImpl = fetch, githubFetchImpl = fetch } = {}) {
+export async function validateMaterialFindings({ env = process.env, fetchImpl = fetch, githubFetchImpl = fetch, queryImpl = null } = {}) {
   const apiKey = required(env, 'GEMINI_API_KEY');
   const repo = required(env, 'TARGET_REPO');
   const prNumber = required(env, 'PR_NUMBER');
@@ -220,8 +220,36 @@ export async function validateMaterialFindings({ env = process.env, fetchImpl = 
 
   if (unavailable) {
     console.log(`Gemini unavailable (HTTP ${unavailable.status}); validating findings with Claude instead`);
-    const fallback = await runClaudeStructured({ prompt, schema: validationSchema, timeoutMs, env });
-    returned = normalizeValidationResult(fallback.structured, includedIds);
+    const plan = fs.existsSync(planPath) ? JSON.parse(fs.readFileSync(planPath, 'utf8')) : null;
+    const manual = env.SOURCE_KIND === 'comment' && ['auto', 'reset'].includes(plan?.requestedMode);
+    // The discovery/audit fallback has already consumed part of this run's
+    // allowance, even though the publisher has not yet persisted it.
+    const primaryCharge = raw?._meta?.provider === 'claude' && Number.isFinite(raw._meta.total_cost_usd)
+      ? [{ amount: raw._meta.total_cost_usd, source: raw._meta.cost_source === 'reserve' ? 'reserve' : 'sdk' }]
+      : [];
+    const priorUsd = primaryCharge.reduce((sum, c) => sum + c.amount, 0);
+    const budget = claudeFallbackCallBudget(plan?.session, { manual, pendingUsd: priorUsd });
+    const recordStop = (reason, extraCharges = []) => {
+      const costCharges = [...primaryCharge, ...extraCharges];
+      fs.writeFileSync(path.join(contextRoot, 'fallback-unavailable.json'),
+        JSON.stringify({ mode: raw?._meta?.mode, headSha, reason, costCharges,
+          spentUsd: costCharges.reduce((sum, c) => sum + c.amount, 0) }) + '\n', { mode: 0o600 });
+    };
+    if (!manual && budget < CLAUDE_AUTO_MIN_BUDGET_USD) {
+      recordStop('Claude validation budget exhausted or below minimum starting allowance');
+      throw new Error('Claude finding validator blocked: automatic budget is exhausted or insufficient for a full validation');
+    }
+    let fallback = null;
+    try {
+      fallback = await runClaudeStructured({ prompt, schema: validationSchema, timeoutMs,
+        maxBudgetUsd: budget, env, queryImpl });
+      returned = normalizeValidationResult(fallback.structured, includedIds);
+    } catch (error) {
+      recordStop('Claude finding validator failed: ' + String(error.message || error).slice(0, 170),
+        [{ amount: fallback?.meta?.total_cost_usd ?? budget,
+          source: fallback?.meta?.cost_source ?? 'reserve' }]);
+      throw error;
+    }
     claudeMeta = {
       ...fallback.meta,
       fallback_from: 'gemini',
