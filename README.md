@@ -135,11 +135,11 @@ comment, validates its PR, author, writer permission and the unchanged HEAD,
 and stores actor, cited links, reason, source comment, HEAD and timestamp in
 the durable session.
 
-Only the named OPEN finding becomes **DISMISSED**. Other P0/P1/P2 findings
-remain OPEN; no product-code change, new Discovery or verification round is
-needed. If no blockers remain, the session enters **AUDIT_PENDING** and the
-existing one-time Final Audit runs immediately. If Final Audit already ran,
-the session may proceed directly to **READY** without re-running the audit.
+Only the named OPEN or UNCERTAIN material candidate becomes **DISMISSED**.
+Other confirmed or unresolved candidates remain blocking. A successful cited
+dismissal does not pretend the underlying claim was model-verified. If the
+audit has not passed, the session enters **AUDIT_PENDING** and runs the normal
+Final Audit; an already completed audit is not repeated.
 
 Resolving a GitHub review thread alone is not a dismissal. The separate
 `override review` command still waives the entire PR and is **not** used
@@ -149,70 +149,49 @@ to adjudicate false positives.
 
 These keep the reviewer from finding "one more thing" forever:
 
-- **Known-issue ledger.** Candidates the validator REJECTED or marked UNCERTAIN, and deferred P3s, are remembered in the session. The final audit and verification are told not to re-raise them, and a deterministic filter (same file + similar title) drops repeats that slip through. The review notes how many were dropped.
+- **Known-issue ledger.** Only REJECTED candidates, human-dismissed claims and nonblocking P3s enter the settled/suppression ledger. UNCERTAIN P0–P2 concerns retain actionable IDs and **are never suppressed as settled**. The review notes which settled items were omitted.
 - **Evidence rule.** Every finding must give a concrete `failurePath` (input/state -> wrong result). A P0/P1/P2 without one is demoted to non-blocking P3, and a validator CONFIRMED verdict with no cited evidence becomes UNCERTAIN.
-- **Exact-HEAD source check.** A validator `CONFIRMED` verdict additionally needs a real code quote (`path`, one-based `line`, exact excerpt) present both in the supplied targeted context and at that line in the reviewed checkout. Unsupported or invented source citations become visible `UNCERTAIN`, not blockers. This verifies the source quote, **not the correctness of the claimed failure path**; externally dependent claims still require authoritative verification.
+- **Exact-HEAD source check.** A validator `CONFIRMED` verdict additionally needs a real code quote (`path`, one-based `line`, exact excerpt) present both in targeted context and at that line in the reviewed checkout. Unsupported or invented citations become visible **UNCERTAIN blockers**, not invented confirmed bugs. This verifies a quote, **not the correctness of a claimed failure path**; externally dependent claims still require authoritative verification.
 - **Narrow external-fact guard.** Only explicit assertions that a particular GitHub Action `owner/repo@ref` does not exist are eligible for an official GitHub ref check. The absence claim must directly attach to that reference, not an unrelated local defect such as missing permissions. An existing ref disproves the missing-ref claim; absence is considered verified only if the action repository is accessible. All other findings—including workflow security issues, local `provider` bugs, and third-party API claims—follow the ordinary Gemini validation path without an automatic downgrade. Probes use only `api.github.com` with a bounded timeout and never fetch untrusted URLs.
 - **Manual override.** See above.
 
-READY means "the bounded review found no confirmed material problem", not "the code is proven correct".
+READY means the **review's** required evidence is resolved and its audit gate passed; separate CI, approvals and GitHub branch protection remain mandatory before merge. A manual override is visibly marked.
 
 ## Review policy
 
 The automatic state machine is:
 
 ```text
-NEW PR / high-risk delta / periodic full refresh
-        |
-        v
-Gemini DISCOVERY (once, medium)
-        |
-        +-- no P0/P1/P2 --> FINAL AUDIT (once, low)
-        |
-        +-- material candidates
-                |
-                v
-        targeted VALIDATOR (once, medium)
-                |
-        +-------+-------------------+
-        |                           |
-   no CONFIRMED                CONFIRMED
-        |                           |
-   FINAL AUDIT                    REWORK
-   (once, low)                      |
-        |                           v
-        |                Gemini VERIFICATION
-        |                (existing findings +
-        |                 repair-caused regressions only)
-        |                         |
-        |              +----------+----------+
-        |              |                     |
-        |         FINAL AUDIT             still material
-        |         (once, low)                  |
-        |                              verification #2 max
-        |                                      |
-        |                           FINAL AUDIT or HUMAN_REQUIRED
-        |                                     
-        +------------------+
-                           |
-                 targeted validator if
-                 audit finds P0/P1/P2
-                           |
-                  no CONFIRMED -> READY
-                  CONFIRMED -> REWORK
-                                    |
-                                    v
-                         Gemini VERIFICATION
-                         (existing findings +
-                          repair-caused regressions only)
-                                  |
-                     +------------+------------+
-                     |                         |
-                   READY                 still material
-                                               |
-                                      verification #2 max
-                                               |
-                                     READY or HUMAN_REQUIRED
+New PR / changed HEAD
+       |
+       v
+Discovery or incremental review
+       |
+       +-- No material candidates ------+
+       |                                |
+       +-- P0/P1/P2 candidates          |
+                    |                   |
+             Targeted validator         |
+                    |                   |
+        +-----------+----------+        |
+        |           |          |        |
+     REJECTED   CONFIRMED   UNCERTAIN    |
+        |           |          |        |
+        |         REWORK   HUMAN_REQUIRED
+        |           |          |
+        |        fix + push   evidence-based dismissal,
+        |           |        code change or explicit waiver
+        |           |          |
+        +-----------+----------+--------+
+                                       |
+                              Final audit if required
+                                       |
+                         same material-validation rules
+                                       |
+                       zero unresolved material candidates
+                                       |
+                                     READY
+                          (also require independent CI)
 ```
 
 Material validation is not a second discovery pass: it may only confirm, reject, or mark uncertain the candidates already produced by discovery, and must actively check downstream guards, fingerprints/scope filters, and relevant tests before confirming. **UNCERTAIN is not REJECTED:** it is persisted as a review blocker (not a confirmed bug); an independent audit may not silently suppress it. After evidence-based human dismissal, the normal final-audit rule still applies. Verification is likewise not allowed to reopen broad, unrelated discovery. A new finding is valid there only when it is a regression directly caused by the repair (except a catastrophic P0/security issue). After convergence, one independent final audit gets a fresh look at the final cumulative diff; it can run only once and any confirmed audit finding returns to targeted verification rather than reopening broad discovery. These bounds prevent the endless “review → fix → fresh full review → new edge case” loop.
