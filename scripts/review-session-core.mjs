@@ -72,6 +72,13 @@ export function planReviewSession({ session = null, baseSha, headSha, reset = fa
   }
 
   if (session.status === 'HUMAN_REQUIRED') {
+    // Changed code can trigger fresh discovery for uncertain-only sessions.
+    // The exact unmodified HEAD still requires scoped, evidence-based adjudication.
+    if (session.lastReviewedHead !== headSha
+        && unresolvedMaterialFindings(session).length > 0
+        && !session.findings.some(f => f.status === 'OPEN' && MATERIAL_SEVERITIES.has(f.severity))) {
+      return { mode: 'discovery', previousHead: null, reason: 'new HEAD after unresolved material candidate; run a fresh full review' };
+    }
     // Only an explicit manual retry can resume a provider-unavailable stop. Never
     // reopen ordinary human findings, verification exhaustion, or a moved HEAD.
     if (retryUnavailable && session.reviewFailure?.code === 'REVIEWER_UNAVAILABLE') {
@@ -233,7 +240,8 @@ export function applyVerificationResult({
   const verificationRound = (session.verificationRound ?? 0) + 1;
   const open = findings.filter((finding) => finding.status === 'OPEN');
   const status = open.length === 0
-    ? session.auditCompleted === true ? 'READY' : 'AUDIT_PENDING'
+    ? unresolvedMaterialFindings(session).length > 0 ? 'HUMAN_REQUIRED'
+      : session.auditCompleted === true ? 'READY' : 'AUDIT_PENDING'
     : verificationRound >= MAX_VERIFICATION_ROUNDS
       ? 'HUMAN_REQUIRED'
       : 'REWORK';
@@ -453,7 +461,8 @@ export function completeDeepReview({
     && session.reviewFailure?.head === headSha;
   const status = open.length > 0
     ? verificationRound >= MAX_VERIFICATION_ROUNDS ? 'HUMAN_REQUIRED' : 'REWORK'
-    : resume === 'HUMAN_REQUIRED' && !providerRecovery ? 'HUMAN_REQUIRED'
+    : unresolvedMaterialFindings(session).length > 0 ? 'HUMAN_REQUIRED'
+      : resume === 'HUMAN_REQUIRED' && !providerRecovery ? 'HUMAN_REQUIRED'
       : session.auditCompleted === true ? 'READY' : 'AUDIT_PENDING';
   const completed = {
     ...session,
@@ -493,7 +502,9 @@ export function sessionCommitStatus(session, headSha) {
     return { state: 'pending', description: 'Independent review has not completed for this commit' };
   }
   switch (session.status) {
-    case 'READY': return { state: 'success', description: 'Independent review complete: READY' };
+    case 'READY': return unresolvedMaterialFindings(session).length > 0
+      ? { state: 'error', description: 'Material review candidates remain unresolved' }
+      : { state: 'success', description: 'Independent review complete: READY' };
     case 'REVIEW_IN_PROGRESS': return { state: 'pending', description: 'Claude deep review in progress' };
     case 'AUDIT_PENDING': return { state: 'pending', description: 'Final audit pending' };
     case 'REWORK': return { state: 'failure', description: 'Open material findings: rework needed' };
@@ -525,16 +536,15 @@ function roundUsd(value) {
 }
 
 // ---- Known-issue ledger -------------------------------------------------
-// Concerns the session already examined (rejected/uncertain by the validator,
-// or deferred P3) must not come back under a new wording and spend another
-// validation round. Matching is deterministic: same file plus similar title.
+// Only evidence-backed REJECTED candidates enter this deduplication ledger.
+// Material UNCERTAIN candidates must never be suppressed or called resolved.
 
 export function recordDismissed(session, validations, headSha) {
   validateSession(session);
   const added = [];
   for (const entry of Array.isArray(validations) ? validations : []) {
     const verdict = String(entry?.verdict ?? '').toUpperCase();
-    if (verdict !== 'REJECTED' && verdict !== 'UNCERTAIN') continue;
+    if (verdict !== 'REJECTED') continue;
     const title = compactText(entry.title, 140);
     const path = compactText(entry.path, 240);
     if (!title || !path || path.startsWith('/') || path.split('/').includes('..')) continue;
@@ -555,7 +565,7 @@ export function recordDismissed(session, validations, headSha) {
 
 // Items shown to later reviewers as "already examined".
 export function knownIssues(session) {
-  const dismissed = (session?.dismissed ?? []).map((item) => ({
+  const dismissed = (session?.dismissed ?? []).filter(item => item.verdict === 'REJECTED').map((item) => ({
     path: item.path, title: item.title, verdict: item.verdict, reason: item.reason,
   }));
   const settled = (session?.findings ?? [])
@@ -592,7 +602,7 @@ export function similarity(a, b) {
 
 export function matchesKnownDismissal(finding, session) {
   const candidates = [
-    ...(session?.dismissed ?? []),
+    ...(session?.dismissed ?? []).filter(item => item.verdict === 'REJECTED'),
     ...(session?.findings ?? []).filter((item) => item.status === 'DEFERRED' || item.status === 'DISMISSED'),
   ];
   return candidates.some((item) => {
@@ -643,8 +653,8 @@ export function applyFindingDismissal({
     }
   }
   const item = session.findings.find((finding) => finding.id === findingId);
-  if (!item || item.status !== 'OPEN' || !MATERIAL_SEVERITIES.has(item.severity)) {
-    throw new Error('dismissal finding is not an OPEN material finding');
+  if (!item || !['OPEN', 'UNCERTAIN'].includes(item.status) || !MATERIAL_SEVERITIES.has(item.severity)) {
+    throw new Error('dismissal finding must be an OPEN or UNCERTAIN material candidate');
   }
   const findings = session.findings.map((finding) => finding.id === findingId
     ? {
@@ -654,8 +664,11 @@ export function applyFindingDismissal({
         reason: explanation, evidence: [...evidence] },
     }
     : { ...finding });
-  const remaining = findings.filter((finding) => finding.status === 'OPEN' && MATERIAL_SEVERITIES.has(finding.severity)).length;
-  const status = remaining ? session.status : session.auditCompleted === true ? 'READY' : 'AUDIT_PENDING';
+  const remaining = findings.filter(finding =>
+    ['OPEN', 'UNCERTAIN'].includes(finding.status) && MATERIAL_SEVERITIES.has(finding.severity)).length;
+  const status = remaining
+    ? findings.some(f => f.status === 'OPEN') ? 'REWORK' : 'HUMAN_REQUIRED'
+    : session.auditCompleted === true ? 'READY' : 'AUDIT_PENDING';
   return {
     ...session, findings, status,
     lastSummary: compactText('Human-dismissed ' + findingId + ' by @' + by + '; remaining material findings: ' + remaining + '.', 800),
@@ -673,7 +686,7 @@ export function applyOverride({ session, headSha, by, now = new Date().toISOStri
   if (session.status === 'READY') throw new Error('session is already READY');
   const waived = [];
   const findings = session.findings.map((finding) => {
-    if (finding.status !== 'OPEN') return { ...finding };
+    if (!['OPEN', 'UNCERTAIN'].includes(finding.status)) return { ...finding };
     waived.push(finding.id);
     return {
       ...finding,
@@ -699,15 +712,68 @@ export function openMaterialFindings(session) {
   return session.findings.filter((finding) => finding.status === 'OPEN' && MATERIAL_SEVERITIES.has(finding.severity));
 }
 
+export function unresolvedMaterialFindings(session) {
+  return (session?.findings ?? []).filter(finding => finding.status === 'UNCERTAIN'
+    && MATERIAL_SEVERITIES.has(finding.severity));
+}
+
+// The validator already performs a bounded, targeted evidence check. An
+// inconclusive material candidate is a durable blocker, not a confirmed defect.
+export function recordUncertainFindings(session, validations, headSha, mode) {
+  validateSession(session);
+  checkedSha(headSha, 'headSha');
+  if (!['discovery', 'incremental', 'audit'].includes(mode)) throw new Error('invalid uncertain review mode');
+  const uncertain = (Array.isArray(validations) ? validations : []).filter(entry =>
+    entry?.verdict === 'UNCERTAIN' && MATERIAL_SEVERITIES.has(entry.severity));
+  if (!uncertain.length) return session;
+  if (session.findings.length + uncertain.length > 64) {
+    throw new Error('too many unresolved material candidates to persist safely');
+  }
+  const findings = [...session.findings];
+  let nextFindingNumber = session.nextFindingNumber ?? findings.length + 1;
+  for (const entry of uncertain) {
+    findings.push({
+      id: findingId(nextFindingNumber++),
+      severity: entry.severity,
+      title: compactText(entry.title || 'Unresolved material candidate', 140),
+      body: compactText(entry.reason || 'Targeted validation did not establish a verdict.', 450),
+      path: compactText(entry.path || 'unknown', 240),
+      line: Number.isInteger(entry.line) && entry.line > 0 ? entry.line : null,
+      riskClass: compactText(entry.riskClass || 'unresolved-validation', 60),
+      origin: 'VALIDATOR_UNCERTAIN',
+      candidateId: compactText(entry.candidateId || '?', 16),
+      status: 'UNCERTAIN',
+      introducedHead: headSha,
+      lastCheckedHead: headSha,
+      resolutionReason: null,
+    });
+  }
+  const confirmedOpen = findings.some(f => f.status === 'OPEN' && MATERIAL_SEVERITIES.has(f.severity));
+  const status = confirmedOpen && (session.verificationRound ?? 0) < MAX_VERIFICATION_ROUNDS
+    ? 'REWORK' : 'HUMAN_REQUIRED';
+  return {
+    ...session,
+    findings,
+    nextFindingNumber,
+    status,
+    auditCompleted: mode === 'audit' ? false : session.auditCompleted,
+    lastSummary: compactText(session.lastSummary + ' | ' + uncertain.length
+      + ' unresolved material candidate(s) require evidence-based review.', 800),
+  };
+}
+
 export function renderSessionComment(session, { sourceCommentIds = [] } = {}) {
   validateSession(session);
   const open = openMaterialFindings(session);
+  const unresolved = unresolvedMaterialFindings(session);
   const verification = `${session.verificationRound ?? 0}/${session.maxVerificationRounds ?? MAX_VERIFICATION_ROUNDS}`;
   const audit = session.auditCompleted === true ? 'complete' : session.status === 'AUDIT_PENDING' ? 'pending' : 'not run';
   const next = session.reviewFailure?.code === 'REVIEWER_UNAVAILABLE'
     ? 'Provider review did not complete. Comment `@gemini review` to retry the latest HEAD, or `@claude review` for an existing exact-HEAD session. A manual request bypasses the automatic $6 cap but not provider quota or the $2 per-call ceiling.'
+    : unresolved.length > 0
+    ? 'Inconclusive material candidate(s): inspect the cited code. If disproven, use `@gemini dismiss F001` with Reason and Evidence links; otherwise fix and push for a fresh review. Manual override explicitly accepts risk.'
     : session.status === 'READY'
-    ? 'No action required unless the PR changes; a small safe delta receives incremental review and risky changes receive full review.'
+    ? 'Review is clear on this HEAD; confirm separate CI checks and GitHub merge requirements before merging.'
     : session.status === 'REVIEW_IN_PROGRESS'
       ? 'Claude deep review is running for this exact commit; the PR is not READY until it finishes. If it stops, comment `@claude review` to restart.'
     : session.status === 'AUDIT_PENDING'
@@ -721,12 +787,17 @@ export function renderSessionComment(session, { sourceCommentIds = [] } = {}) {
       + ' — ' + cleanInline(finding.dismissal?.reason ?? ''),
     '  - Evidence: ' + (finding.dismissal?.evidence ?? []).map(cleanInline).join(' · '),
   ]);
-  const findingLines = open.length
-    ? open.slice(0, 8).flatMap((finding) => [
+  const findingLines = [
+    ...open.slice(0, 8).flatMap(finding => [
       `- ${finding.id} **${finding.severity}** — ${cleanInline(finding.title)}`,
       `  - ${cleanInline(finding.path)}${finding.line ? `:${finding.line}` : ''} — ${cleanInline(finding.body).slice(0, 800)}`,
-    ])
-    : ['- none'];
+    ]),
+    ...unresolved.slice(0, 8).flatMap(finding => [
+      `- ${finding.id} **${finding.severity} · UNCERTAIN (not confirmed)** — ${cleanInline(finding.title)}`,
+      `  - ${cleanInline(finding.path)}${finding.line ? `:${finding.line}` : ''} — ${cleanInline(finding.body).slice(0, 800)}`,
+    ]),
+  ];
+  if (!findingLines.length) findingLines.push('- none');
   const state = encodeSessionState(session);
   const processedMarkers = [...new Set(sourceCommentIds.map(String).filter((id) => /^[1-9]\d*$/.test(id)))]
     .slice(-8)
@@ -739,7 +810,8 @@ export function renderSessionComment(session, { sourceCommentIds = [] } = {}) {
     `Default reviewer: **Gemini Flash (latest) / medium thinking**`,
     `Discovery: **${session.reviewFailure?.mode === 'discovery' ? 'not completed' : 'complete'}** · Final audit: **${audit}** · Verification: **${verification}**`,
     ...(session.incrementalReviewCount ? [`Incremental reviews since full audit: **${session.incrementalReviewCount}** (full-audit HEAD: ${cleanInline((session.fullAuditHead ?? session.discoveryHead ?? '').slice(0, 12))})`] : []),
-    `Open material findings: **${open.length}**`,
+    `Open confirmed material findings: **${open.length}**`,
+    `Unresolved material candidates: **${unresolved.length}**`,
     ...(session.reviewFailure ? [`Review stopped: **${cleanInline(session.reviewFailure.mode)}** · ${cleanInline(session.reviewFailure.reason)}`] : []),
     ...(session.deepSpendUsd > 0 ? [`Claude charged ledger (SDK cost + conservative reserves): **${session.deepSpendUsd.toFixed(2)}** · automatic per-PR cap ${DEEP_REVIEW_PR_BUDGET_USD.toFixed(2)} · automatic remaining ${deepReviewBudgetLeft(session).toFixed(2)}`] : []),
     ...(session.deepSpendUsd > 0 ? [`Cost breakdown: SDK-reported **${(session.claudeSdkSpendUsd ?? 0).toFixed(4)}** · unknown-usage reserve **${(session.claudeUnknownReserveUsd ?? 0).toFixed(4)}** · historical/unclassified **${Math.max(0, roundUsd(session.deepSpendUsd - (session.claudeSdkSpendUsd ?? 0) - (session.claudeUnknownReserveUsd ?? 0) - (session.deepReview?.state === 'IN_PROGRESS' ? session.deepReview.reservedUsd ?? 0 : 0))).toFixed(4)}**`] : []),
