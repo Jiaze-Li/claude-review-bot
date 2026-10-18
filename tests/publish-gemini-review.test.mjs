@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { publishGeminiReview } from '../scripts/publish-gemini-review.mjs';
-import { applyDiscoveryResult } from '../scripts/review-session-core.mjs';
+import { applyDiscoveryResult, sessionCommitStatus } from '../scripts/review-session-core.mjs';
 
 const A = 'a'.repeat(40);
 const BASE = 'b'.repeat(40);
@@ -177,4 +177,86 @@ test('droppedFindings tells apart same-title findings in different files', async
   const kept = [{ title: 'Stale read', path: 'src/b.js' }];
   assert.deepEqual(droppedFindings(reported, kept), [{ title: 'Stale read', path: 'src/a.js' }]);
   assert.deepEqual(droppedFindings(reported, reported), []);
+});
+
+test('publisher preserves material UNCERTAIN candidate and never marks an inconclusive review READY', async()=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'publish-uncertain-'));
+  fs.writeFileSync(path.join(dir,'session-plan.json'),JSON.stringify({
+    requestedMode:'auto',decision:{mode:'discovery'},session:null,sessionCommentId:null,
+  }));
+  const reviewPath=path.join(dir,'review.json');
+  fs.writeFileSync(reviewPath,JSON.stringify({
+    summary:'Possible budget authorization bug',findings:[],
+    _meta:{provider:'gemini',resolved_model:'gemini-flash-latest'},
+    _validation:{status:'VALIDATED',validations:[{
+      candidateId:'D001',verdict:'UNCERTAIN',severity:'P2',
+      title:'Dismiss comment might bypass spending cap',path:'.github/workflows/review-v2.yml',
+      line:462,riskClass:'budget',reason:'Caller context was missing for the validator.',
+    }]},
+  }));
+  let sessionComment='';
+  let reviewBody='';
+  const out=await publishGeminiReview({
+    env:{GH_TOKEN:'token',TARGET_REPO:'acme/project',PR_NUMBER:'7',
+      BASE_SHA:BASE,HEAD_SHA:A,SOURCE_COMMENT_ID:'99',
+      REVIEW_PATH:reviewPath,REVIEW_CONTEXT_DIR:dir},
+    fetchImpl:async(url,init={})=>{
+      if(url.endsWith('/pulls/7')) return Response.json({base:{sha:BASE},head:{sha:A}});
+      if(url.includes('/pulls/7/files')) return Response.json([]);
+      if(url.endsWith('/issues/7/comments')){
+        sessionComment=JSON.parse(init.body).body;
+        return Response.json({id:101});
+      }
+      if(url.endsWith('/pulls/7/reviews')){
+        reviewBody=JSON.parse(init.body).body;
+        return Response.json({id:202});
+      }
+      assert.fail('unexpected '+url);
+    },
+  });
+  assert.equal(out.session.status,'HUMAN_REQUIRED');
+  assert.equal(out.session.auditCompleted,false);
+  assert.equal(out.session.findings[0].status,'UNCERTAIN');
+  assert.equal(out.session.findings[0].id,'F001');
+  assert.equal(out.session.dismissed.length,0);
+  assert.equal(sessionCommitStatus(out.session,A).state,'error');
+  assert.match(sessionComment,/Unresolved material candidates: \*\*1\*\*/);
+  assert.match(reviewBody,/Not merge-ready/);
+  assert.match(reviewBody,/F001 · P2/);
+  assert.match(reviewBody,/\*\*HUMAN_REQUIRED\*\*/);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dir,'published-session.json'),'utf8')).session.status,
+    'HUMAN_REQUIRED');
+});
+
+test('publisher refuses READY after an uncertain final-audit verdict',async()=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'publish-audit-uncertain-'));
+  const pending=applyDiscoveryResult({result:{summary:'discovery clean',findings:[]},
+    baseSha:BASE,headSha:A,sourceCommentId:'99'});
+  fs.writeFileSync(path.join(dir,'session-plan.json'),JSON.stringify({
+    decision:{mode:'audit'},session:pending,sessionCommentId:'101',
+  }));
+  const reviewPath=path.join(dir,'audit.json');
+  fs.writeFileSync(reviewPath,JSON.stringify({
+    summary:'No confirmed defects',findings:[],
+    _validation:{status:'VALIDATED',validations:[{
+      candidateId:'D001',verdict:'UNCERTAIN',severity:'P1',
+      title:'Potential state corruption',path:'src/model.js',
+      line:4,riskClass:'state',reason:'Targeted source evidence was inconclusive.',
+    }]},
+  }));
+  const out=await publishGeminiReview({
+    env:{GH_TOKEN:'token',TARGET_REPO:'acme/project',PR_NUMBER:'7',
+      BASE_SHA:BASE,HEAD_SHA:A,SOURCE_COMMENT_ID:'100',
+      REVIEW_PATH:reviewPath,REVIEW_CONTEXT_DIR:dir},
+    fetchImpl:async(url,init={})=>{
+      if(url.endsWith('/pulls/7')) return Response.json({base:{sha:BASE},head:{sha:A}});
+      if(url.includes('/pulls/7/files')) return Response.json([]);
+      if(url.endsWith('/pulls/7/reviews')) return Response.json({id:202});
+      if(url.endsWith('/issues/comments/101')) return Response.json({id:101});
+      assert.fail('unexpected '+url);
+    },
+  });
+  assert.equal(out.session.status,'HUMAN_REQUIRED');
+  assert.equal(out.session.auditCompleted,false);
+  assert.equal(sessionCommitStatus(out.session,A).state,'error');
 });
