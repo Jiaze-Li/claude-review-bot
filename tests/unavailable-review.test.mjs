@@ -9,7 +9,8 @@ import { planSession } from '../scripts/plan-review-session.mjs';
 import {
   CLAUDE_AUTO_MIN_BUDGET_USD, DEEP_REVIEW_PR_BUDGET_USD,
   chargeClaudeFallback, claudeFallbackBudgetLeft, claudeFallbackCallBudget,
-  planReviewSession, renderSessionComment, stopUnavailableReviewSession,
+  applyAuditResult, applyDiscoveryResult, planReviewSession, renderSessionComment,
+  sessionCommitStatus, stopUnavailableReviewSession,
 } from '../scripts/review-session-core.mjs';
 
 const BASE = 'b'.repeat(40), HEAD = 'a'.repeat(40), PRIOR = 'c'.repeat(40);
@@ -220,4 +221,22 @@ test('verification retry on a moved HEAD preserves the original repair baseline'
   const plan=planReviewSession({session:stopped,baseSha:BASE,headSha:'d'.repeat(40),retryUnavailable:true});
   assert.equal(plan.mode,'verification');
   assert.equal(plan.previousHead,PRIOR);
+});
+
+test('a successful manually retried final audit clears HUMAN_REQUIRED only when findings are clean',()=>{
+  const audited=applyDiscoveryResult({result:{summary:'clean',findings:[]},
+    baseSha:BASE,headSha:HEAD,sourceCommentId:'10'});
+  const stopped=stopUnavailableReviewSession({session:audited,baseSha:BASE,headSha:HEAD,
+    sourceCommentId:'20',mode:'audit',reason:'Gemini 402 and fallback exhausted'});
+  assert.equal(stopped.status,'HUMAN_REQUIRED');
+  assert.equal(planReviewSession({session:stopped,baseSha:BASE,headSha:HEAD,retryUnavailable:true}).mode,'audit');
+  const clear=applyAuditResult({session:stopped,headSha:HEAD,result:{summary:'independent audit clean',findings:[]}});
+  assert.equal(clear.status,'READY');
+  assert.equal(sessionCommitStatus(clear,HEAD).state,'success');
+  const bug=applyAuditResult({session:stopped,headSha:HEAD,result:{summary:'bug',findings:[{
+    severity:'P2',title:'Failed write',body:'A known state loses data after retry',
+    path:'src/app.js',line:2,riskClass:'state',
+  }]}});
+  assert.equal(bug.status,'REWORK');
+  assert.equal(sessionCommitStatus(bug,HEAD).state,'failure');
 });
