@@ -50,6 +50,7 @@ export async function stopUnavailableReview({ env = process.env, fetchImpl = fet
   }
   const reason = String(marker.reason || 'Both model providers unavailable').slice(0, 240);
   const spentUsd = Number.isFinite(marker.spentUsd) && marker.spentUsd > 0 ? marker.spentUsd : 0;
+  const costCharges = Array.isArray(marker.costCharges) ? marker.costCharges : null;
   const endpoint = 'https://api.github.com/repos/' + repo;
   const current = await githubJson(endpoint + '/pulls/' + pr, token, fetchImpl);
   if (current.head?.sha !== headSha || current.base?.sha !== baseSha) {
@@ -60,7 +61,7 @@ export async function stopUnavailableReview({ env = process.env, fetchImpl = fet
     && previous.reviewFailure?.head === headSha && previous.reviewFailure?.mode === marker.mode;
   const session = duplicate ? previous : stopUnavailableReviewSession({
     session: previous, baseSha, headSha, sourceCommentId, mode: marker.mode,
-    reason, spentUsd,
+    reason, spentUsd, costCharges,
   });
   const body = renderSessionComment(session, { sourceCommentIds: [sourceCommentId] });
   const existingId = plan.sessionCommentId ? required({ id: String(plan.sessionCommentId) }, 'id', NUMBER) : null;
