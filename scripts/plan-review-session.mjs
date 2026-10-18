@@ -68,10 +68,10 @@ export async function planSession({ env=process.env, fetchImpl=fetch }={}) {
 
   if(requested==='dismiss'){
     const eligible=session && ['REWORK','HUMAN_REQUIRED'].includes(session.status)
-      && session.lastReviewedHead===headSha && session.findings.some(f=>f.status==='OPEN');
+      && session.lastReviewedHead===headSha && session.findings.some(f=>['OPEN','UNCERTAIN'].includes(f.status));
     const decision=eligible
       ?{mode:'dismiss',previousHead:null,reason:'adjudicate one evidenced finding without bypassing final audit'}
-      :{mode:'noop_waiting',previousHead:null,reason:'no OPEN finding on the last-reviewed HEAD; review the current HEAD first'};
+      :{mode:'noop_waiting',previousHead:null,reason:'no OPEN or UNCERTAIN finding on the last-reviewed HEAD; review the current HEAD first'};
     return {requestedMode:requested,decision,session,sessionCommentId,pendingSession:null,pendingSourceCommentId:null,pendingReviewId:null};
   }
 
