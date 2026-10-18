@@ -44,7 +44,7 @@ export async function stopUnavailableReview({ env = process.env, fetchImpl = fet
   const pr = required(env, 'PR_NUMBER', NUMBER);
   const sourceCommentId = required(env, 'SOURCE_COMMENT_ID', NUMBER);
   const token = required(env, 'GH_TOKEN');
-  if (!['discovery', 'verification', 'audit'].includes(marker.mode)
+  if (!['discovery', 'incremental', 'verification', 'audit'].includes(marker.mode)
       || marker.mode !== plan.decision?.mode || marker.headSha !== headSha) {
     throw new Error('Provider failure marker does not match the exact planned review');
   }

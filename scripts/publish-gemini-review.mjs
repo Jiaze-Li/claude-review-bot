@@ -4,6 +4,7 @@ import { pathToFileURL } from 'node:url';
 import {
   applyAuditResult,
   applyDiscoveryResult,
+  applyIncrementalResult,
   applyVerificationResult,
   chargeClaudeFallback,
   normalizeReviewResult,
@@ -30,7 +31,7 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
   const plan = JSON.parse(fs.readFileSync(path.join(contextRoot, 'session-plan.json'), 'utf8'));
   const raw = JSON.parse(fs.readFileSync(required(env, 'REVIEW_PATH'), 'utf8'));
   const mode = plan.decision?.mode;
-  if (!['discovery', 'verification', 'audit'].includes(mode)) throw new Error('Gemini publisher requires a model-backed session mode');
+  if (!['discovery', 'incremental', 'verification', 'audit'].includes(mode)) throw new Error('Gemini publisher requires a model-backed session mode');
 
   const pr = await githubJson('https://api.github.com/repos/' + owner + '/' + repo + '/pulls/' + prNumber, env.GH_TOKEN, fetchImpl);
   if (pr.base?.sha !== baseSha) throw new Error('PR base moved before publish; refusing stale review');
@@ -48,6 +49,10 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
       session = { ...session, fallbackSpendUsd: plan.session.fallbackSpendUsd };
     else if (plan.session?.deepSpendUsd > 0)
       session = { ...session, fallbackSpendUsd: plan.session.deepSpendUsd };
+  } else if (mode === 'incremental') {
+    normalized = normalizeReviewResult(raw);
+    if (!plan.session) throw new Error('Incremental review plan is missing the previously audited session');
+    session = applyIncrementalResult({ session: plan.session, result: normalized, headSha });
   } else if (mode === 'audit') {
     normalized = normalizeReviewResult(raw);
     if (!plan.session) throw new Error('Final audit plan is missing durable prior session');
@@ -66,7 +71,7 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
 
   // Remember validator-rejected/uncertain candidates so later passes cannot
   // re-raise them under a new wording.
-  if (mode === 'discovery' || mode === 'audit') {
+  if (mode === 'discovery' || mode === 'incremental' || mode === 'audit') {
     session = recordDismissed(session, raw._validation?.validations, headSha);
   }
 
@@ -95,7 +100,7 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
   }
 
   const open = openMaterialFindings(session);
-  const reviewKind = mode === 'discovery' ? 'Discovery' : mode === 'audit' ? 'Final Audit' : 'Verification';
+  const reviewKind = mode === 'discovery' ? 'Discovery' : mode === 'incremental' ? 'Incremental' : mode === 'audit' ? 'Final Audit' : 'Verification';
   let body = '## ' + (raw._meta?.provider === 'claude' ? 'Claude' : 'Gemini') + ' ' + reviewKind + ' Review\n\n' + normalized.summary.trim();
   if (mode === 'verification') {
     body += '\n\n### Finding verification';
@@ -103,7 +108,7 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
       body += '\n- **' + verdict.findingId + ' — ' + verdict.status + '**: ' + verdict.reason;
     }
   }
-  if ((mode === 'discovery' || mode === 'audit') && raw._validation) {
+  if (['discovery', 'incremental', 'audit'].includes(mode) && raw._validation) {
     const validations = Array.isArray(raw._validation.validations) ? raw._validation.validations : [];
     const count = (verdict) => validations.filter((entry) => entry.verdict === verdict).length;
     body += '\n\n### Material finding validation';

@@ -79,7 +79,7 @@ test('clean discovery schedules one final audit, then READY is a free no-op',()=
   assert.equal(s.status,'READY');
   assert.equal(s.auditCompleted,true);
   assert.equal(planReviewSession({session:s,baseSha:BASE,headSha:A}).mode,'noop_ready');
-  assert.equal(planReviewSession({session:s,baseSha:BASE,headSha:B}).mode,'discovery');
+  assert.equal(planReviewSession({session:s,baseSha:BASE,headSha:B}).mode,'incremental_candidate');
 });
 
 test('final audit findings are verified without running a second audit',()=>{

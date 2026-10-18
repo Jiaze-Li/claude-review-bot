@@ -72,14 +72,14 @@ test('state-integrity final audit requires explicit interleaving reasoning',()=>
   assert.match(prompt,/Inspect changed callers and callees together across files/);
 });
 
-test('verification prompt is restricted to stable open findings and repair-induced regressions',()=>{
+test('verification covers stable open findings and new bugs introduced by the repair delta',()=>{
   const session=applyDiscoveryResult({result:{summary:'x',findings:[{
     severity:'P1',title:'Bug',body:'Trigger X causes Y, expected Z.',path:'a.js',line:1,riskClass:'state',
   }]},baseSha:BASE,headSha:A,sourceCommentId:'1'});
   const {prompt}=buildGeminiRequest({mode:'verification',repo:'a/b',prNumber:'1',headSha:A,prJson:'{}',diff:'repair',session});
   assert.match(prompt,/not a fresh PR-wide review/i);
   assert.match(prompt,/F001/);
-  assert.match(prompt,/directly caused by this repair/i);
+  assert.match(prompt,/independent bugs introduced by this HEAD delta/i);
 });
 
 test('Gemini discovery sends medium thinking on the latest-Flash alias and structured schema',async()=>{

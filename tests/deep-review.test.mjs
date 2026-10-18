@@ -78,7 +78,7 @@ test('a new commit invalidates READY and in-progress; status is per exact HEAD',
   assert.equal(sessionCommitStatus(ready, A).state, 'success');
   assert.equal(sessionCommitStatus(ready, C).state, 'pending');
   const inProgress = beginDeepReview({ session: ready, baseSha: BASE, headSha: A, now: T0 });
-  assert.equal(planReviewSession({ session: inProgress, baseSha: BASE, headSha: C }).mode, 'discovery');
+  assert.equal(planReviewSession({ session: inProgress, baseSha: BASE, headSha: C }).mode, 'incremental_candidate');
   // ...but a push during a deep review on a REWORK session keeps its open findings and rounds.
   const rework = applyDiscoveryResult({ result: { summary: 'bug', findings: [{ severity: 'P1', title: 'Bug', body: 'Trigger X causes Y; expected Z.', path: 'a.js', line: 1, riskClass: 'state' }] }, baseSha: BASE, headSha: A, sourceCommentId: '1' });
   const during = beginDeepReview({ session: rework, baseSha: BASE, headSha: A, now: T0 });
