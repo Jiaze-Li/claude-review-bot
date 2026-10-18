@@ -81,7 +81,7 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
   // code-backed decision or an explicitly attested human risk acceptance.
   if (mode === 'discovery' || mode === 'incremental' || mode === 'audit') {
     session = recordDismissed(session, raw._validation?.validations, headSha);
-    session = recordUncertainFindings(session, raw._validation?.validations, headSha, mode);
+    session = recordUncertainFindings(session, raw._validation?.validations, headSha, mode, plan.session);
   }
 
   // Charge every completed Claude call separately, preserving reported versus
