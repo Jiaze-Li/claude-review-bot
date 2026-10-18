@@ -8,7 +8,7 @@ import { stopUnavailableReview } from '../scripts/stop-unavailable-review.mjs';
 import { planSession } from '../scripts/plan-review-session.mjs';
 import {
   CLAUDE_AUTO_MIN_BUDGET_USD, DEEP_REVIEW_PR_BUDGET_USD,
-  chargeClaudeFallback, claudeFallbackBudgetLeft, claudeFallbackCallBudget,
+  chargeClaudeFallback, claudeFallbackBudgetLeft, claudeFallbackCallBudget, isManualBudgetExemptReview,
   applyAuditResult, applyDiscoveryResult, planReviewSession, renderSessionComment,
   sessionCommitStatus, stopUnavailableReviewSession,
 } from '../scripts/review-session-core.mjs';
@@ -239,4 +239,36 @@ test('a successful manually retried final audit clears HUMAN_REQUIRED only when 
   }]}});
   assert.equal(bug.status,'REWORK');
   assert.equal(sessionCommitStatus(bug,HEAD).state,'failure');
+});
+
+test('only explicit review comments qualify for manual budget exemption',()=>{
+  assert.equal(isManualBudgetExemptReview({sourceKind:'comment',requestedMode:'auto'}),true);
+  assert.equal(isManualBudgetExemptReview({sourceKind:'comment',requestedMode:'reset'}),true);
+  for (const requestedMode of ['dismiss','override','claude','unknown',undefined]) {
+    assert.equal(isManualBudgetExemptReview({sourceKind:'comment',requestedMode}),false);
+  }
+  assert.equal(isManualBudgetExemptReview({sourceKind:'pull_request',requestedMode:'auto'}),false);
+});
+
+test('a dismiss-triggered final audit cannot bypass an exhausted automatic Claude budget',async()=>{
+  const dir=folder('audit',{version:1,baseSha:BASE,lastReviewedHead:HEAD,status:'AUDIT_PENDING',
+    auditCompleted:false,findings:[],deepSpendUsd:6});
+  const plan=JSON.parse(fs.readFileSync(path.join(dir,'session-plan.json'),'utf8'));
+  plan.requestedMode='dismiss';
+  fs.writeFileSync(path.join(dir,'session-plan.json'),JSON.stringify(plan));
+  const calls=[];
+  await assert.rejects(runGeminiReview({env:runnerEnv(dir,{SOURCE_KIND:'comment'}),
+    fetchImpl:unavailable(),queryImpl:fakeClaude(calls),logImpl:()=>{}}),
+    /automatic budget is exhausted or insufficient/);
+  assert.equal(calls.length,0);
+});
+
+test('the final audit workflow preserves the originating command, not a fabricated manual review',()=>{
+  const workflow=fs.readFileSync(new URL('../.github/workflows/review-v2.yml',import.meta.url),'utf8');
+  const auditPlan=workflow.split('      - name: Prepare automatic final audit')[1]
+    ?.split('      - name: Run automatic Gemini final audit')[0] ?? '';
+  assert.match(auditPlan,/jq -r '\.requestedMode \/\/ empty'/);
+  assert.match(auditPlan,/requestedMode: \$requested_mode/);
+  assert.match(auditPlan,/requested_mode.*dismiss/);
+  assert.doesNotMatch(auditPlan,/requestedMode: "auto"/);
 });
