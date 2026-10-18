@@ -5,13 +5,11 @@ export const MAX_VERIFICATION_ROUNDS = 2;
 // result). Without one it is demoted to non-blocking P3 instead of blocking.
 export const MIN_FAILURE_PATH_CHARS = 30;
 const MAX_DISMISSED = 20;
-// Explicit Claude deep review budgets. The per-PR cap is cumulative across every
-// deep run (including failed ones) and is persisted in the session.
+// Automatic Claude calls share one conservative per-PR ledger. An explicitly
+// requested review may exceed this cap, but each Claude call stays bounded.
 export const DEEP_REVIEW_RUN_BUDGET_USD = 2;
 export const DEEP_REVIEW_PR_BUDGET_USD = 6;
-// Reserve half of the shared cap for explicitly requested Claude reviews.
-// Fallback calls count against BOTH this pool and the shared per-PR cap.
-export const CLAUDE_FALLBACK_PR_BUDGET_USD = 3;
+export const CLAUDE_AUTO_MIN_BUDGET_USD = 0.5;
 // An IN_PROGRESS session older than this belongs to a run that died without
 // reporting; it must resolve instead of waiting forever.
 // Safe to equal the Claude step timeout: the sweeper and planner act only inside the per-PR review lock.
@@ -55,6 +53,13 @@ export function planReviewSession({ session = null, baseSha, headSha, reset = fa
   }
 
   if (session.status === 'READY') {
+    // Fail closed on inconsistent durable state instead of treating a stale
+    // green status as authoritative for the reviewed HEAD.
+    if (session.auditCompleted !== true || openMaterialFindings(session).length > 0
+        || unresolvedMaterialFindings(session).length > 0) {
+      return { mode: 'human_required', previousHead: session.lastReviewedHead,
+        reason: 'inconsistent READY state: incomplete audit or unresolved material candidate' };
+    }
     if (session.lastReviewedHead === headSha) {
       return { mode: 'noop_ready', previousHead: session.lastReviewedHead, reason: 'current HEAD is already READY' };
     }
@@ -74,13 +79,29 @@ export function planReviewSession({ session = null, baseSha, headSha, reset = fa
   }
 
   if (session.status === 'HUMAN_REQUIRED') {
+    // Changed code can trigger fresh discovery for uncertain-only sessions.
+    // The exact unmodified HEAD still requires scoped, evidence-based adjudication.
+    if (session.lastReviewedHead !== headSha
+        && unresolvedMaterialFindings(session).length > 0
+        && !session.findings.some(f => f.status === 'OPEN' && MATERIAL_SEVERITIES.has(f.severity))) {
+      return { mode: 'discovery', previousHead: null, reason: 'new HEAD after unresolved material candidate; run a fresh full review' };
+    }
     // Only an explicit manual retry can resume a provider-unavailable stop. Never
     // reopen ordinary human findings, verification exhaustion, or a moved HEAD.
-    if (retryUnavailable && session.reviewFailure?.code === 'REVIEWER_UNAVAILABLE'
-        && session.lastReviewedHead === headSha) {
-      return { mode: session.reviewFailure.mode,
-        previousHead: ['verification', 'incremental'].includes(session.reviewFailure.mode) ? session.reviewFailure.previousHead : null,
-        reason: 'retry provider-unavailable review on the same exact HEAD' };
+    if (retryUnavailable && session.reviewFailure?.code === 'REVIEWER_UNAVAILABLE') {
+      const failedMode = session.reviewFailure.mode;
+      const previousHead = session.reviewFailure.previousHead ?? null;
+      // A moved HEAD makes the old audit/discovery/incremental context stale.
+      // Verification may continue from the original pre-failure repair baseline.
+      if (session.lastReviewedHead !== headSha) {
+        if (failedMode === 'verification' && previousHead) {
+          return { mode: 'verification', previousHead, reason: 'manually retry provider-unavailable verification on the latest HEAD' };
+        }
+        return { mode: 'discovery', previousHead: null, reason: 'manually review the latest HEAD after provider unavailability' };
+      }
+      return { mode: failedMode,
+        previousHead: ['verification', 'incremental'].includes(failedMode) ? previousHead : null,
+        reason: 'manually retry provider-unavailable review on the same HEAD' };
     }
     return { mode: 'human_required', previousHead: session.lastReviewedHead ?? null, reason: 'session already requires human judgment' };
   }
@@ -226,7 +247,8 @@ export function applyVerificationResult({
   const verificationRound = (session.verificationRound ?? 0) + 1;
   const open = findings.filter((finding) => finding.status === 'OPEN');
   const status = open.length === 0
-    ? session.auditCompleted === true ? 'READY' : 'AUDIT_PENDING'
+    ? unresolvedMaterialFindings(session).length > 0 ? 'HUMAN_REQUIRED'
+      : session.auditCompleted === true ? 'READY' : 'AUDIT_PENDING'
     : verificationRound >= MAX_VERIFICATION_ROUNDS
       ? 'HUMAN_REQUIRED'
       : 'REWORK';
@@ -249,7 +271,11 @@ export function applyAuditResult({
 } = {}) {
   validateSession(session);
   checkedSha(headSha, 'headSha');
-  if (session.status !== 'AUDIT_PENDING') throw new Error('final audit requires AUDIT_PENDING session');
+  const providerRetry = session.status === 'HUMAN_REQUIRED'
+    && session.reviewFailure?.code === 'REVIEWER_UNAVAILABLE'
+    && session.reviewFailure?.mode === 'audit'
+    && session.reviewFailure?.head === headSha;
+  if (session.status !== 'AUDIT_PENDING' && !providerRetry) throw new Error('final audit requires AUDIT_PENDING session');
   if (session.auditCompleted === true) throw new Error('final audit already completed for this session');
   const normalized = normalizeReviewResult(result);
   const findings = session.findings.map((finding) => ({ ...finding }));
@@ -301,17 +327,27 @@ export function deepReviewBudgetLeft(session) {
   return Math.max(0, DEEP_REVIEW_PR_BUDGET_USD - spent);
 }
 
-// Older sessions only persisted a combined ledger; conservatively charge their
-// entire pre-migration spend to the fallback pool. We cannot infer provenance.
+// Fallback has NO separate $3 pool. Only automated calls obey the shared $6
+// cap; a human-triggered review gets a fresh bounded $2 budget per Claude call.
 export function claudeFallbackBudgetLeft(session) {
-  const fallbackSpent = Number.isFinite(session?.fallbackSpendUsd)
-    ? session.fallbackSpendUsd : (session?.deepSpendUsd ?? 0);
-  return Math.max(0, Math.min(deepReviewBudgetLeft(session),
-    CLAUDE_FALLBACK_PR_BUDGET_USD - fallbackSpent));
+  return deepReviewBudgetLeft(session);
 }
 
-export function chargeClaudeFallback(session, costUsd) {
+// Only an authenticated PR comment explicitly requesting a review may exceed
+// the automatic cap. A dismiss/override command is human-initiated, but it is
+// NOT authorization to spend beyond the limit during its follow-on audit.
+export function isManualBudgetExemptReview({ sourceKind, requestedMode } = {}) {
+  return sourceKind === 'comment' && ['auto', 'reset'].includes(requestedMode);
+}
+
+export function claudeFallbackCallBudget(session, { manual = false, pendingUsd = 0 } = {}) {
+  return manual ? DEEP_REVIEW_RUN_BUDGET_USD
+    : Math.max(0, roundUsd(claudeFallbackBudgetLeft(session) - nonNegative(pendingUsd)));
+}
+
+export function chargeClaudeFallback(session, costUsd, costSource = 'sdk') {
   validateSession(session);
+  if (!['sdk', 'reserve'].includes(costSource)) throw new Error('unknown Claude cost source');
   const amount = nonNegative(costUsd);
   const fallbackSpent = Number.isFinite(session.fallbackSpendUsd)
     ? session.fallbackSpendUsd : (session.deepSpendUsd ?? 0);
@@ -319,6 +355,8 @@ export function chargeClaudeFallback(session, costUsd) {
     ...session,
     deepSpendUsd: roundUsd((session.deepSpendUsd ?? 0) + amount),
     fallbackSpendUsd: roundUsd(fallbackSpent + amount),
+    claudeSdkSpendUsd: roundUsd((session.claudeSdkSpendUsd ?? 0) + (costSource === 'sdk' ? amount : 0)),
+    claudeUnknownReserveUsd: roundUsd((session.claudeUnknownReserveUsd ?? 0) + (costSource === 'reserve' ? amount : 0)),
   };
 }
 
@@ -326,7 +364,7 @@ export function chargeClaudeFallback(session, costUsd) {
 // report HUMAN_REQUIRED for the attempted HEAD without pretending it passed.
 export function stopUnavailableReviewSession({
   session = null, baseSha, headSha, sourceCommentId, mode, reason,
-  spentUsd = 0, now = new Date().toISOString(),
+  spentUsd = 0, costSource = 'reserve', costCharges = null, now = new Date().toISOString(),
 } = {}) {
   checkedSha(baseSha, 'baseSha');
   checkedSha(headSha, 'headSha');
@@ -351,7 +389,9 @@ export function stopUnavailableReviewSession({
     lastSummary: `Automatic ${mode} review incomplete: ${explanation}`,
     updatedAt: now,
   };
-  return chargeClaudeFallback(stopped, spentUsd);
+  const charges = Array.isArray(costCharges) && costCharges.length
+    ? costCharges : [{ amount: spentUsd, source: costSource }];
+  return charges.reduce((state, charge) => chargeClaudeFallback(state, charge.amount, charge.source), stopped);
 }
 
 export function beginDeepReview({
@@ -386,7 +426,7 @@ export function beginDeepReview({
 const SEVERITY_ORDER = { P0: 0, P1: 1, P2: 2, P3: 3 };
 
 export function completeDeepReview({
-  session, result, headSha, spentUsd = 0, now = new Date().toISOString(),
+  session, result, headSha, spentUsd = 0, costSource = 'sdk', now = new Date().toISOString(),
 } = {}) {
   validateSession(session);
   checkedSha(headSha, 'headSha');
@@ -423,24 +463,30 @@ export function completeDeepReview({
   const open = findings.filter((finding) => finding.status === 'OPEN' && MATERIAL_SEVERITIES.has(finding.severity));
   const resume = session.deepReview?.resumeStatus;
   const verificationRound = session.verificationRound ?? 0;
+  const providerRecovery = resume === 'HUMAN_REQUIRED'
+    && session.reviewFailure?.code === 'REVIEWER_UNAVAILABLE'
+    && session.reviewFailure?.head === headSha;
   const status = open.length > 0
     ? verificationRound >= MAX_VERIFICATION_ROUNDS ? 'HUMAN_REQUIRED' : 'REWORK'
-    : resume === 'HUMAN_REQUIRED' ? 'HUMAN_REQUIRED'
+    : unresolvedMaterialFindings(session).length > 0 ? 'HUMAN_REQUIRED'
+      : resume === 'HUMAN_REQUIRED' && !providerRecovery ? 'HUMAN_REQUIRED'
       : session.auditCompleted === true ? 'READY' : 'AUDIT_PENDING';
-  return {
+  const completed = {
     ...session,
+    ...reconcileDeepSpend(session, spentUsd, costSource),
     status,
     findings,
     nextFindingNumber,
-    deepSpendUsd: reconcileSpend(session, spentUsd),
     deepReview: { ...session.deepReview, state: 'COMPLETE', completedAt: now },
     lastSummary: compactText(normalized.summary, 800),
     updatedAt: now,
   };
+  if (providerRecovery) delete completed.reviewFailure;
+  return completed;
 }
 
 export function failDeepReview({
-  session, headSha, reason, spentUsd = 0, now = new Date().toISOString(),
+  session, headSha, reason, spentUsd = 0, costSource = 'reserve', now = new Date().toISOString(),
 } = {}) {
   validateSession(session);
   checkedSha(headSha, 'headSha');
@@ -449,8 +495,8 @@ export function failDeepReview({
   }
   return {
     ...session,
+    ...reconcileDeepSpend(session, spentUsd, costSource),
     status: 'HUMAN_REQUIRED',
-    deepSpendUsd: reconcileSpend(session, spentUsd),
     deepReview: { ...session.deepReview, state: 'FAILED', failedAt: now, reason: compactText(reason || 'deep review did not complete', 300) },
     lastSummary: compactText(`Deep review did not complete: ${reason || 'unknown reason'}`, 800),
     updatedAt: now,
@@ -463,7 +509,10 @@ export function sessionCommitStatus(session, headSha) {
     return { state: 'pending', description: 'Independent review has not completed for this commit' };
   }
   switch (session.status) {
-    case 'READY': return { state: 'success', description: 'Independent review complete: READY' };
+    case 'READY': return session.auditCompleted !== true || openMaterialFindings(session).length > 0
+      || unresolvedMaterialFindings(session).length > 0
+      ? { state: 'error', description: 'Review evidence incomplete or material candidates unresolved' }
+      : { state: 'success', description: 'Independent review complete: READY' };
     case 'REVIEW_IN_PROGRESS': return { state: 'pending', description: 'Claude deep review in progress' };
     case 'AUDIT_PENDING': return { state: 'pending', description: 'Final audit pending' };
     case 'REWORK': return { state: 'failure', description: 'Open material findings: rework needed' };
@@ -476,6 +525,16 @@ function reconcileSpend(session, actualUsd) {
   return roundUsd(Math.max(0, (session.deepSpendUsd ?? 0) - reserved + nonNegative(actualUsd)));
 }
 
+function reconcileDeepSpend(session, actualUsd, costSource) {
+  if (!['sdk', 'reserve'].includes(costSource)) throw new Error('unknown Claude cost source');
+  const amount = nonNegative(actualUsd);
+  return {
+    deepSpendUsd: reconcileSpend(session, amount),
+    claudeSdkSpendUsd: roundUsd((session.claudeSdkSpendUsd ?? 0) + (costSource === 'sdk' ? amount : 0)),
+    claudeUnknownReserveUsd: roundUsd((session.claudeUnknownReserveUsd ?? 0) + (costSource === 'reserve' ? amount : 0)),
+  };
+}
+
 function nonNegative(value) {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0;
 }
@@ -485,16 +544,15 @@ function roundUsd(value) {
 }
 
 // ---- Known-issue ledger -------------------------------------------------
-// Concerns the session already examined (rejected/uncertain by the validator,
-// or deferred P3) must not come back under a new wording and spend another
-// validation round. Matching is deterministic: same file plus similar title.
+// Only evidence-backed REJECTED candidates enter this deduplication ledger.
+// Material UNCERTAIN candidates must never be suppressed or called resolved.
 
 export function recordDismissed(session, validations, headSha) {
   validateSession(session);
   const added = [];
   for (const entry of Array.isArray(validations) ? validations : []) {
     const verdict = String(entry?.verdict ?? '').toUpperCase();
-    if (verdict !== 'REJECTED' && verdict !== 'UNCERTAIN') continue;
+    if (verdict !== 'REJECTED') continue;
     const title = compactText(entry.title, 140);
     const path = compactText(entry.path, 240);
     if (!title || !path || path.startsWith('/') || path.split('/').includes('..')) continue;
@@ -515,7 +573,7 @@ export function recordDismissed(session, validations, headSha) {
 
 // Items shown to later reviewers as "already examined".
 export function knownIssues(session) {
-  const dismissed = (session?.dismissed ?? []).map((item) => ({
+  const dismissed = (session?.dismissed ?? []).filter(item => item.verdict === 'REJECTED').map((item) => ({
     path: item.path, title: item.title, verdict: item.verdict, reason: item.reason,
   }));
   const settled = (session?.findings ?? [])
@@ -552,7 +610,7 @@ export function similarity(a, b) {
 
 export function matchesKnownDismissal(finding, session) {
   const candidates = [
-    ...(session?.dismissed ?? []),
+    ...(session?.dismissed ?? []).filter(item => item.verdict === 'REJECTED'),
     ...(session?.findings ?? []).filter((item) => item.status === 'DEFERRED' || item.status === 'DISMISSED'),
   ];
   return candidates.some((item) => {
@@ -603,8 +661,8 @@ export function applyFindingDismissal({
     }
   }
   const item = session.findings.find((finding) => finding.id === findingId);
-  if (!item || item.status !== 'OPEN' || !MATERIAL_SEVERITIES.has(item.severity)) {
-    throw new Error('dismissal finding is not an OPEN material finding');
+  if (!item || !['OPEN', 'UNCERTAIN'].includes(item.status) || !MATERIAL_SEVERITIES.has(item.severity)) {
+    throw new Error('dismissal finding must be an OPEN or UNCERTAIN material candidate');
   }
   const findings = session.findings.map((finding) => finding.id === findingId
     ? {
@@ -614,8 +672,11 @@ export function applyFindingDismissal({
         reason: explanation, evidence: [...evidence] },
     }
     : { ...finding });
-  const remaining = findings.filter((finding) => finding.status === 'OPEN' && MATERIAL_SEVERITIES.has(finding.severity)).length;
-  const status = remaining ? session.status : session.auditCompleted === true ? 'READY' : 'AUDIT_PENDING';
+  const remaining = findings.filter(finding =>
+    ['OPEN', 'UNCERTAIN'].includes(finding.status) && MATERIAL_SEVERITIES.has(finding.severity)).length;
+  const status = remaining
+    ? findings.some(f => f.status === 'OPEN') ? 'REWORK' : 'HUMAN_REQUIRED'
+    : session.auditCompleted === true ? 'READY' : 'AUDIT_PENDING';
   return {
     ...session, findings, status,
     lastSummary: compactText('Human-dismissed ' + findingId + ' by @' + by + '; remaining material findings: ' + remaining + '.', 800),
@@ -633,7 +694,7 @@ export function applyOverride({ session, headSha, by, now = new Date().toISOStri
   if (session.status === 'READY') throw new Error('session is already READY');
   const waived = [];
   const findings = session.findings.map((finding) => {
-    if (finding.status !== 'OPEN') return { ...finding };
+    if (!['OPEN', 'UNCERTAIN'].includes(finding.status)) return { ...finding };
     waived.push(finding.id);
     return {
       ...finding,
@@ -659,15 +720,95 @@ export function openMaterialFindings(session) {
   return session.findings.filter((finding) => finding.status === 'OPEN' && MATERIAL_SEVERITIES.has(finding.severity));
 }
 
+export function unresolvedMaterialFindings(session) {
+  return (session?.findings ?? []).filter(finding => finding.status === 'UNCERTAIN'
+    && MATERIAL_SEVERITIES.has(finding.severity));
+}
+
+// The validator already performs a bounded, targeted evidence check. An
+// inconclusive material candidate is a durable blocker, not a confirmed defect.
+export function recordUncertainFindings(session, validations, headSha, mode, previousSession = null) {
+  validateSession(session);
+  checkedSha(headSha, 'headSha');
+  if (!['discovery', 'incremental', 'audit'].includes(mode)) throw new Error('invalid uncertain review mode');
+  const checked = Array.isArray(validations) ? validations : [];
+  const uncertain = checked.filter(entry =>
+    entry?.verdict === 'UNCERTAIN' && MATERIAL_SEVERITIES.has(entry.severity));
+  // A fresh Discovery (after new code OR an explicit reset) must not erase
+  // a prior inconclusive P2 just because the model failed to repeat it.
+  // Only a new targeted CONFIRMED or REJECTED verdict for the *same*
+  // candidate establishes enough evidence to replace it.
+  const prior = mode === 'discovery'
+    ? unresolvedMaterialFindings(previousSession)
+    : [];
+  const key = entry => String(entry?.path ?? '').trim().toLowerCase()
+    + '\0' + String(entry?.title ?? '').trim().toLowerCase();
+  const resolved = new Set(checked.filter(entry =>
+    ['CONFIRMED','REJECTED'].includes(entry?.verdict)).map(key));
+  const repeated = new Set(uncertain.map(key));
+  const carried = prior.filter(entry => !resolved.has(key(entry)) && !repeated.has(key(entry)));
+  const count = uncertain.length + carried.length;
+  if (!count) return session;
+  if (session.findings.length + count > 64) {
+    throw new Error('too many unresolved material candidates to persist safely');
+  }
+  const findings = [...session.findings];
+  let nextFindingNumber = session.nextFindingNumber ?? findings.length + 1;
+  for (const entry of uncertain) {
+    findings.push({
+      id: findingId(nextFindingNumber++),
+      severity: entry.severity,
+      title: compactText(entry.title || 'Unresolved material candidate', 140),
+      body: compactText(entry.reason || 'Targeted validation did not establish a verdict.', 450),
+      path: compactText(entry.path || 'unknown', 240),
+      line: Number.isInteger(entry.line) && entry.line > 0 ? entry.line : null,
+      riskClass: compactText(entry.riskClass || 'unresolved-validation', 60),
+      origin: 'VALIDATOR_UNCERTAIN',
+      candidateId: compactText(entry.candidateId || '?', 16),
+      status: 'UNCERTAIN',
+      introducedHead: headSha,
+      lastCheckedHead: headSha,
+      resolutionReason: null,
+    });
+  }
+  for (const entry of carried) {
+    findings.push({
+      ...entry,
+      id: findingId(nextFindingNumber++),
+      origin: 'CARRIED_UNCERTAIN',
+      status: 'UNCERTAIN',
+      // This prior concern has not been verified on the new HEAD.
+      lastCheckedHead: entry.lastCheckedHead ?? previousSession.lastReviewedHead,
+      resolutionReason: null,
+    });
+  }
+  const confirmedOpen = findings.some(f => f.status === 'OPEN' && MATERIAL_SEVERITIES.has(f.severity));
+  const status = confirmedOpen && (session.verificationRound ?? 0) < MAX_VERIFICATION_ROUNDS
+    ? 'REWORK' : 'HUMAN_REQUIRED';
+  return {
+    ...session,
+    findings,
+    nextFindingNumber,
+    status,
+    auditCompleted: mode === 'audit' ? false : session.auditCompleted,
+    lastSummary: compactText(session.lastSummary + ' | ' + count
+      + ' unresolved material candidate(s), including ' + carried.length
+      + ' carried from earlier HEAD, require evidence-based review.', 800),
+  };
+}
+
 export function renderSessionComment(session, { sourceCommentIds = [] } = {}) {
   validateSession(session);
   const open = openMaterialFindings(session);
+  const unresolved = unresolvedMaterialFindings(session);
   const verification = `${session.verificationRound ?? 0}/${session.maxVerificationRounds ?? MAX_VERIFICATION_ROUNDS}`;
   const audit = session.auditCompleted === true ? 'complete' : session.status === 'AUDIT_PENDING' ? 'pending' : 'not run';
   const next = session.reviewFailure?.code === 'REVIEWER_UNAVAILABLE'
-    ? 'Review did not complete. Restore Gemini quota and comment `@gemini review` to retry this exact HEAD; otherwise seek human review. Claude fallback remains budget-limited.'
+    ? 'Provider review did not complete. Comment `@gemini review` to retry the latest HEAD, or `@claude review` for an existing exact-HEAD session. A manual request bypasses the automatic $6 cap but not provider quota or the $2 per-call ceiling.'
+    : unresolved.length > 0
+    ? 'Inconclusive material candidate(s): inspect the cited code. If disproven, use `@gemini dismiss F001` with Reason and Evidence links; otherwise fix and push for a fresh review. Manual override explicitly accepts risk.'
     : session.status === 'READY'
-    ? 'No action required unless the PR changes; a small safe delta receives incremental review and risky changes receive full review.'
+    ? 'Review is clear on this HEAD; confirm separate CI checks and GitHub merge requirements before merging.'
     : session.status === 'REVIEW_IN_PROGRESS'
       ? 'Claude deep review is running for this exact commit; the PR is not READY until it finishes. If it stops, comment `@claude review` to restart.'
     : session.status === 'AUDIT_PENDING'
@@ -681,12 +822,17 @@ export function renderSessionComment(session, { sourceCommentIds = [] } = {}) {
       + ' — ' + cleanInline(finding.dismissal?.reason ?? ''),
     '  - Evidence: ' + (finding.dismissal?.evidence ?? []).map(cleanInline).join(' · '),
   ]);
-  const findingLines = open.length
-    ? open.slice(0, 8).flatMap((finding) => [
+  const findingLines = [
+    ...open.slice(0, 8).flatMap(finding => [
       `- ${finding.id} **${finding.severity}** — ${cleanInline(finding.title)}`,
       `  - ${cleanInline(finding.path)}${finding.line ? `:${finding.line}` : ''} — ${cleanInline(finding.body).slice(0, 800)}`,
-    ])
-    : ['- none'];
+    ]),
+    ...unresolved.slice(0, 8).flatMap(finding => [
+      `- ${finding.id} **${finding.severity} · UNCERTAIN (not confirmed)** — ${cleanInline(finding.title)}`,
+      `  - ${cleanInline(finding.path)}${finding.line ? `:${finding.line}` : ''} — ${cleanInline(finding.body).slice(0, 800)}`,
+    ]),
+  ];
+  if (!findingLines.length) findingLines.push('- none');
   const state = encodeSessionState(session);
   const processedMarkers = [...new Set(sourceCommentIds.map(String).filter((id) => /^[1-9]\d*$/.test(id)))]
     .slice(-8)
@@ -699,10 +845,12 @@ export function renderSessionComment(session, { sourceCommentIds = [] } = {}) {
     `Default reviewer: **Gemini Flash (latest) / medium thinking**`,
     `Discovery: **${session.reviewFailure?.mode === 'discovery' ? 'not completed' : 'complete'}** · Final audit: **${audit}** · Verification: **${verification}**`,
     ...(session.incrementalReviewCount ? [`Incremental reviews since full audit: **${session.incrementalReviewCount}** (full-audit HEAD: ${cleanInline((session.fullAuditHead ?? session.discoveryHead ?? '').slice(0, 12))})`] : []),
-    `Open material findings: **${open.length}**`,
+    `Open confirmed material findings: **${open.length}**`,
+    `Unresolved material candidates: **${unresolved.length}**`,
     ...(session.reviewFailure ? [`Review stopped: **${cleanInline(session.reviewFailure.mode)}** · ${cleanInline(session.reviewFailure.reason)}`] : []),
-    ...(session.deepSpendUsd > 0 ? [`Claude spend (deep review + fallback, SDK estimate): **${session.deepSpendUsd.toFixed(2)}** of ${DEEP_REVIEW_PR_BUDGET_USD.toFixed(2)} per-PR cap · remaining ${deepReviewBudgetLeft(session).toFixed(2)}`] : []),
-    `Automatic fallback budget remaining: **${claudeFallbackBudgetLeft(session).toFixed(2)}** of ${CLAUDE_FALLBACK_PR_BUDGET_USD.toFixed(2)} per PR`,
+    ...(session.deepSpendUsd > 0 ? [`Claude charged ledger (SDK cost + conservative reserves): **${session.deepSpendUsd.toFixed(2)}** · automatic per-PR cap ${DEEP_REVIEW_PR_BUDGET_USD.toFixed(2)} · automatic remaining ${deepReviewBudgetLeft(session).toFixed(2)}`] : []),
+    ...(session.deepSpendUsd > 0 ? [`Cost breakdown: SDK-reported **${(session.claudeSdkSpendUsd ?? 0).toFixed(4)}** · unknown-usage reserve **${(session.claudeUnknownReserveUsd ?? 0).toFixed(4)}** · historical/unclassified **${Math.max(0, roundUsd(session.deepSpendUsd - (session.claudeSdkSpendUsd ?? 0) - (session.claudeUnknownReserveUsd ?? 0) - (session.deepReview?.state === 'IN_PROGRESS' ? session.deepReview.reservedUsd ?? 0 : 0))).toFixed(4)}**`] : []),
+    `Automatic Claude budget remaining: **${claudeFallbackBudgetLeft(session).toFixed(2)}** of ${DEEP_REVIEW_PR_BUDGET_USD.toFixed(2)} per PR · manual review: up to ${DEEP_REVIEW_RUN_BUDGET_USD.toFixed(2)} per Claude call regardless of cumulative spend`,
     '',
     ...findingLines,
     ...(dismissalLines.length ? ['', 'Human-dismissed findings (cited, not machine-verified):', ...dismissalLines] : []),

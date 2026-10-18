@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { claudeFallbackBudgetLeft, knownIssuesPromptBlock, normalizeReviewResult, normalizeVerificationResult, openMaterialFindings } from './review-session-core.mjs';
+import { CLAUDE_AUTO_MIN_BUDGET_USD, claudeFallbackCallBudget, isManualBudgetExemptReview, knownIssuesPromptBlock, normalizeReviewResult, normalizeVerificationResult, openMaterialFindings } from './review-session-core.mjs';
 import {GeminiUnavailableError,isGeminiUnavailableStatus,runClaudeStructured} from './claude-fallback.mjs';
 
 // Moving alias: always resolves to Google's current Flash model. Override with GEMINI_MODEL to pin.
@@ -60,9 +60,16 @@ ${prJson}
 `;
 
   if(mode==='discovery'){
+    const unresolved=(session?.findings??[]).filter(f=>f.status==='UNCERTAIN'&&['P0','P1','P2'].includes(f.severity));
+    const carryPrompt=unresolved.length
+      ? 'PREVIOUS UNRESOLVED MATERIAL CANDIDATES (not confirmed bugs):\n'
+        +JSON.stringify(unresolved.slice(0,8).map(f=>({severity:f.severity,path:f.path,
+          title:f.title,reason:f.body,priorHead:f.lastCheckedHead})))
+        +'\nInspect these against this HEAD; omission alone does not prove a concern was refuted.\n'
+      : '';
     return {
       prompt:`${common}
-This is the ONE broad discovery pass for this review session. You may discover new material issues in the PR diff.
+${carryPrompt}This is the ONE broad discovery pass for this review session. You may discover new material issues in the PR diff.
 Do not try to exhaust every natural-language synonym or redesign intentionally documented scope limitations.
 Return at most 6 findings.
 
@@ -296,14 +303,18 @@ export async function runGeminiReview({env=process.env,fetchImpl=fetch,logImpl=c
   }
 
   if(unavailable){
-    const remaining=claudeFallbackBudgetLeft(plan.session);
-    const recordStop=(reason,spentUsd=0)=>{
+    // Only a manual review comment opts out of the per-PR cap; an automatic
+    // pull_request event cannot claim this exemption.
+    const manual=isManualBudgetExemptReview({sourceKind:env.SOURCE_KIND,requestedMode:plan.requestedMode});
+    const budget=claudeFallbackCallBudget(plan.session,{manual});
+    const recordStop=(reason,costCharges=[])=>{
       fs.writeFileSync(path.join(contextRoot,'fallback-unavailable.json'),
-        JSON.stringify({mode,headSha,reason,spentUsd})+'\n',{mode:0o600});
+        JSON.stringify({mode,headSha,reason,
+          spentUsd:costCharges.reduce((sum,c)=>sum+c.amount,0),costCharges})+'\n',{mode:0o600});
     };
-    if(remaining<0.05){
-      recordStop('Gemini HTTP '+unavailable.status+'; per-PR Claude fallback budget exhausted');
-      throw new Error('Claude fallback blocked: the per-PR Claude budget is exhausted; human judgment required');
+    if(!manual&&budget<CLAUDE_AUTO_MIN_BUDGET_USD){
+      recordStop('Gemini HTTP '+unavailable.status+'; automatic Claude budget exhausted or below minimum starting allowance');
+      throw new Error('Claude fallback blocked: automatic budget is exhausted or insufficient for a full review; human judgment required');
     }
     if(!env.CLAUDE_CODE_OAUTH_TOKEN){
       recordStop('Gemini HTTP '+unavailable.status+'; Claude fallback credential unavailable');
@@ -313,14 +324,14 @@ export async function runGeminiReview({env=process.env,fetchImpl=fetch,logImpl=c
     let fallback;
     try{
       fallback=await runClaudeStructured({prompt:built.prompt,schema:built.schema,timeoutMs,
-        maxBudgetUsd:remaining,env,logImpl,queryImpl});
+        maxBudgetUsd:budget,env,logImpl,queryImpl});
       // Validate before publication. Invalid output must never be declared READY.
       if(mode==='verification') normalizeVerificationResult(fallback.structured); else normalizeReviewResult(fallback.structured);
     }catch(error){
-      // If the SDK could not return usage, conservatively reserve its entire
-      // maxBudgetUsd. Repeating a failed paid call must not bypass the cap.
+      // Failed calls with missing SDK usage conservatively reserve the whole
+      // allotted call budget; manual calls remain visible in the same ledger.
       recordStop('Gemini HTTP '+unavailable.status+'; Claude fallback failed: '+String(error.message||error).slice(0,160),
-        fallback?.meta?.total_cost_usd??remaining);
+        [{amount:fallback?.meta?.total_cost_usd??budget,source:fallback?.meta?.cost_source??'reserve'}]);
       throw error;
     }
     return {

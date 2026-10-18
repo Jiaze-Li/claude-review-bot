@@ -210,7 +210,7 @@ test('confirmed material finding remains blocking after validation',async()=>{
   assert.equal(output._validation.validations[0].verdict,'CONFIRMED');
 });
 
-test('fabricated citation remains visible as UNCERTAIN rather than blocking',async()=>{
+test('fabricated citation remains UNCERTAIN for the publisher to block READY',async()=>{
   const root=tempRepo();
   const dir=contextDir({summary:'discovery',findings:[falsePositive]});
   const output=await validateMaterialFindings({
@@ -276,7 +276,7 @@ test('verified external Action absence remains eligible to block',async()=>{
   assert.match(output._validation.validations[0].reason,/both returned 404/);
 });
 
-test('omitted validator verdict becomes nonblocking UNCERTAIN rather than an invented confirmation',async()=>{
+test('omitted validator verdict requires adjudication, not a fabricated confirmation',async()=>{
   const root=tempRepo();
   const dir=contextDir({summary:'discovery',findings:[falsePositive]});
   const output=await validateMaterialFindings({
@@ -533,4 +533,62 @@ test('F001-F003 regression: genuine local P1 findings never undergo an external 
   assert.equal(output.findings.length,3);
   assert.deepEqual(output._validation.validations.map(v=>v.verdict),
     ['CONFIRMED','CONFIRMED','CONFIRMED']);
+});
+
+test('Claude finding validation shares remaining automatic cap, including primary review cost',async()=>{
+  const root=tempRepo();
+  const dir=contextDir({
+    summary:'provider fallback',findings:[falsePositive],
+    _meta:{provider:'claude',mode:'discovery',total_cost_usd:0.4,cost_source:'sdk'},
+  });
+  fs.writeFileSync(path.join(dir,'session-plan.json'),JSON.stringify({
+    requestedMode:'auto',decision:{mode:'discovery'},session:{deepSpendUsd:5},
+  }));
+  const calls=[];
+  const fakeQuery=async function* (args){
+    calls.push(args);
+    yield {type:'result',subtype:'success',total_cost_usd:0.2,usage:{input_tokens:1,output_tokens:1},
+      structured_output:{summary:'guard found',validations:[{candidateId:'D001',verdict:'REJECTED',
+        reason:'fingerprint guard filters stale entries',evidence:[],sourceAnchors:[]}]}};
+  };
+  const output=await validateMaterialFindings({
+    env:{GEMINI_API_KEY:'key',CLAUDE_CODE_OAUTH_TOKEN:'claude',TARGET_REPO:'a/b',PR_NUMBER:'7',
+      HEAD_SHA:HEAD,TARGET_REPO_DIR:root,REVIEW_CONTEXT_DIR:dir,
+      REVIEW_INPUT_PATH:path.join(dir,'review.json'),REVIEW_OUTPUT_PATH:path.join(dir,'out.json'),
+      SOURCE_KIND:'pull_request'},
+    queryImpl:fakeQuery,
+  });
+  assert.equal(calls.length,1);
+  assert.ok(Math.abs(calls[0].options.maxBudgetUsd-0.6)<1e-8);
+  assert.equal(output._validation._meta.total_cost_usd,0.2);
+});
+
+test('validator auto cap fails closed with a marker; manual call bypasses $6 at $2 per call',async()=>{
+  const root=tempRepo();
+  const review={summary:'provider fallback',findings:[falsePositive],
+    _meta:{provider:'claude',mode:'discovery',total_cost_usd:0.4,cost_source:'sdk'}};
+  const dir=contextDir(review);
+  fs.writeFileSync(path.join(dir,'session-plan.json'),JSON.stringify({
+    requestedMode:'auto',decision:{mode:'discovery'},session:{deepSpendUsd:5.4},
+  }));
+  const opts={GEMINI_API_KEY:'key',CLAUDE_CODE_OAUTH_TOKEN:'claude',TARGET_REPO:'a/b',
+    PR_NUMBER:'7',HEAD_SHA:HEAD,TARGET_REPO_DIR:root,REVIEW_CONTEXT_DIR:dir,
+    REVIEW_INPUT_PATH:path.join(dir,'review.json'),REVIEW_OUTPUT_PATH:path.join(dir,'out.json')};
+  let calls=0;
+  const fakeQuery=async function* (args){
+    calls++;
+    assert.equal(args.options.maxBudgetUsd,2);
+    yield {type:'result',subtype:'success',total_cost_usd:0.2,usage:{input_tokens:1,output_tokens:1},
+      structured_output:{summary:'guard found',validations:[{candidateId:'D001',verdict:'REJECTED',
+        reason:'fingerprint guard filters stale entries',evidence:[],sourceAnchors:[]}]}};
+  };
+  await assert.rejects(validateMaterialFindings({env:{...opts,SOURCE_KIND:'pull_request'},
+    queryImpl:fakeQuery}),/automatic budget is exhausted or insufficient/);
+  assert.equal(calls,0);
+  const marker=JSON.parse(fs.readFileSync(path.join(dir,'fallback-unavailable.json'),'utf8'));
+  assert.deepEqual(marker.costCharges,[{amount:0.4,source:'sdk'}]);
+  const output=await validateMaterialFindings({env:{...opts,SOURCE_KIND:'comment'},
+    queryImpl:fakeQuery});
+  assert.equal(calls,1);
+  assert.equal(output._validation._meta.provider,'claude');
 });

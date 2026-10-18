@@ -6,15 +6,20 @@ import path from 'node:path';
 import {
   applyAuditResult,
   applyDiscoveryResult,
+  applyFindingDismissal,
   applyOverride,
   applyVerificationResult,
   knownIssuesPromptBlock,
   normalizeReviewResult,
   openMaterialFindings,
+  unresolvedMaterialFindings,
   parseSessionComment,
   planReviewSession,
   recordDismissed,
+  recordUncertainFindings,
   renderSessionComment,
+  sessionCommitStatus,
+  matchesKnownDismissal,
   similarity,
 } from '../scripts/review-session-core.mjs';
 import { buildGeminiRequest } from '../scripts/run-gemini-review.mjs';
@@ -69,12 +74,12 @@ const dismissal = (over = {}) => ({
   path: 'src/a.js', line: 10, title: 'Lost update in save path', riskClass: 'state', ...over,
 });
 
-test('recordDismissed keeps only rejected/uncertain candidates and caps the list', () => {
+test('recordDismissed keeps only evidence-rejected candidates and caps the list', () => {
   const base = session();
   const s = recordDismissed(base, [
     dismissal(), dismissal({ verdict: 'CONFIRMED', title: 'other' }), dismissal({ verdict: 'UNCERTAIN', title: 'unsure thing here' }),
   ], A);
-  assert.deepEqual(s.dismissed.map((d) => d.verdict), ['REJECTED', 'UNCERTAIN']);
+  assert.deepEqual(s.dismissed.map((d) => d.verdict), ['REJECTED']);
   let big = base;
   for (let i = 0; i < 30; i += 1) big = recordDismissed(big, [dismissal({ title: `unique concern number ${i}` })], A);
   assert.equal(big.dismissed.length, 20);
@@ -262,4 +267,146 @@ test('validator drops known repeats before calling the model and reports them', 
   assert.equal(out._validation.status, 'SKIPPED');
   assert.equal(out._ledgerSuppressed.length, 1);
   assert.equal(out.findings.length, 0);
+});
+
+const uncertainCandidate = (over={}) => ({
+  candidateId:'D001',verdict:'UNCERTAIN',severity:'P2',title:'Possible lost update during save',
+  path:'src/a.js',line:10,riskClass:'state',reason:'Validator could not inspect the call site.',...over,
+});
+const adjudicate = (s,id='F001',head=A) => applyFindingDismissal({
+  session:s,findingId:id,headSha:head,by:'maintainer',
+  reason:'The changed caller has an exact-HEAD guard that prevents this write path.',
+  evidence:['https://github.com/Jiaze-Li/claude-review-bot/blob/main/README.md'],
+  sourceCommentId:'304',
+});
+
+test('UNCERTAIN P2 from targeted validation persists, blocks READY and is not suppressed',()=>{
+  const pending=recordUncertainFindings(session(),[uncertainCandidate()],A,'discovery');
+  assert.equal(pending.status,'HUMAN_REQUIRED');
+  assert.equal(openMaterialFindings(pending).length,0);
+  assert.equal(unresolvedMaterialFindings(pending).length,1);
+  assert.equal(unresolvedMaterialFindings(pending)[0].id,'F001');
+  assert.equal(sessionCommitStatus(pending,A).state,'error');
+  assert.equal(planReviewSession({session:pending,baseSha:BASE,headSha:A}).mode,'human_required');
+  assert.equal(planReviewSession({session:pending,baseSha:BASE,headSha:B}).mode,'discovery');
+  assert.equal(knownIssuesPromptBlock(pending),'');
+  assert.equal(matchesKnownDismissal(finding({title:'Possible lost update during save'}),pending),false);
+  const body=renderSessionComment(pending);
+  assert.match(body,/Unresolved material candidates: \*\*1\*\*/);
+  assert.match(body,/F001 \*\*P2 · UNCERTAIN \(not confirmed\)\*\*/);
+  assert.deepEqual(parseSessionComment(body),pending);
+  assert.equal(sessionCommitStatus({...pending,status:'READY'},A).state,'error');
+});
+
+test('an evidence-backed dismissal resolves UNCERTAIN; final audit is still required',()=>{
+  const pending=recordUncertainFindings(session(),[uncertainCandidate()],A,'discovery');
+  const decided=adjudicate(pending);
+  assert.equal(decided.status,'AUDIT_PENDING');
+  assert.equal(unresolvedMaterialFindings(decided).length,0);
+  assert.equal(decided.findings[0].status,'DISMISSED');
+  const audited=applyAuditResult({session:decided,headSha:A,result:{summary:'verified',findings:[]}});
+  assert.equal(audited.status,'READY');
+  assert.equal(sessionCommitStatus(audited,A).state,'success');
+  assert.match(renderSessionComment(audited),/dismissed by @maintainer/);
+});
+
+test('a confirmed bug may be fixed, but concurrent uncertainty must remain blocking',()=>{
+  const withBug=session([finding()]);
+  const mixed=recordUncertainFindings(withBug,[uncertainCandidate({title:'Separate uncertain error'})],A,'discovery');
+  assert.equal(mixed.status,'REWORK');
+  const fixed=applyVerificationResult({session:mixed,headSha:B,result:{
+    summary:'confirmed issue fixed',verifications:[{findingId:'F001',status:'FIXED',reason:'guard added'}],findings:[],
+  }});
+  assert.equal(fixed.status,'HUMAN_REQUIRED');
+  assert.equal(unresolvedMaterialFindings(fixed)[0].id,'F002');
+  assert.equal(sessionCommitStatus(fixed,B).state,'error');
+  assert.equal(adjudicate(fixed,'F002',B).status,'AUDIT_PENDING');
+});
+
+test('UNCERTAIN in final audit means audit did not pass, even when confirmed findings are zero',()=>{
+  const base=session();
+  const clean=applyAuditResult({session:base,headSha:A,result:{summary:'clean model output',findings:[]}});
+  const withheld=recordUncertainFindings(clean,[uncertainCandidate()],A,'audit');
+  assert.equal(withheld.status,'HUMAN_REQUIRED');
+  assert.equal(withheld.auditCompleted,false);
+  const decided=adjudicate(withheld);
+  assert.equal(decided.status,'AUDIT_PENDING');
+  assert.equal(applyAuditResult({session:decided,headSha:A,result:{summary:'audit clear',findings:[]}}).status,'READY');
+});
+
+test('old UNCERTAIN suppression markers must not hide later P2 claims',()=>{
+  const old={...session(),dismissed:[dismissal({verdict:'UNCERTAIN',title:'Lost update in save path'})]};
+  assert.equal(matchesKnownDismissal(finding({title:'Lost update in save path'}),old),false);
+  assert.doesNotMatch(knownIssuesPromptBlock(old),/UNCERTAIN/);
+});
+
+test('a manual explicit waiver of an uncertain candidate is recorded as human override',()=>{
+  const uncertain=recordUncertainFindings(session(),[uncertainCandidate()],A,'discovery');
+  const accepted=applyOverride({session:uncertain,headSha:A,by:'maintainer'});
+  assert.equal(accepted.status,'READY');
+  assert.equal(accepted.findings[0].status,'WAIVED');
+  assert.deepEqual(accepted.override.waived,['F001']);
+  assert.match(renderSessionComment(accepted),/manually overridden by @maintainer/);
+});
+
+test('manual scoped dismissal planner can select an UNCERTAIN finding without pretending it was confirmed',async()=>{
+  const pending=recordUncertainFindings(session(),[uncertainCandidate()],A,'discovery');
+  const result=await planSession({env:planEnv({HEAD_SHA:A,REQUESTED_MODE:'dismiss',SOURCE_KIND:'comment'}),
+    fetchImpl:listFetch([{id:5,user:{login:author},body:renderSessionComment(pending)}])});
+  assert.equal(result.decision.mode,'dismiss');
+});
+
+test('READY never passes for an unaudited tree or any unresolved material issue',()=>{
+  const clean=session();
+  const audited=applyAuditResult({session:clean,headSha:A,result:{summary:'clean',findings:[]}});
+  assert.equal(sessionCommitStatus(audited,A).state,'success');
+  for(const broken of [
+    {...audited,auditCompleted:false},
+    {...audited,findings:[{...finding(),id:'F001',status:'OPEN'}]},
+    {...audited,findings:[{...finding(),id:'F001',status:'UNCERTAIN'}]},
+  ]){
+    assert.equal(sessionCommitStatus(broken,A).state,'error');
+    assert.equal(planReviewSession({session:broken,baseSha:BASE,headSha:A}).mode,'human_required');
+  }
+});
+
+test('unresolved candidate survives an unrelated new HEAD when the reviewer omits it',()=>{
+  const prior=recordUncertainFindings(session(),[uncertainCandidate()],A,'discovery');
+  const next=applyDiscoveryResult({result:{summary:'new HEAD model silent',findings:[]},
+    baseSha:BASE,headSha:B,sourceCommentId:'20'});
+  const carried=recordUncertainFindings(next,[],B,'discovery',prior);
+  assert.equal(carried.status,'HUMAN_REQUIRED');
+  assert.equal(carried.auditCompleted,false);
+  assert.equal(unresolvedMaterialFindings(carried).length,1);
+  assert.equal(carried.findings[0].origin,'CARRIED_UNCERTAIN');
+  assert.equal(carried.findings[0].lastCheckedHead,A);
+  assert.equal(sessionCommitStatus(carried,B).state,'error');
+  const prompt=buildGeminiRequest({mode:'discovery',repo:'a/b',prNumber:1,
+    headSha:B,prJson:'{}',diff:'new changes',session:prior}).prompt;
+  assert.match(prompt,/PREVIOUS UNRESOLVED MATERIAL CANDIDATES/);
+  assert.match(prompt,/Possible lost update during save/);
+});
+
+test('new targeted verdict resolves the same carried candidate but silence never does',()=>{
+  const prior=recordUncertainFindings(session(),[uncertainCandidate()],A,'discovery');
+  const next=applyDiscoveryResult({result:{summary:'rerun',findings:[]},
+    baseSha:BASE,headSha:B,sourceCommentId:'22'});
+  const same={path:'src/a.js',title:'Possible lost update during save'};
+  const disproved=recordUncertainFindings(next,[{...same,verdict:'REJECTED'}],B,'discovery',prior);
+  assert.equal(disproved.status,'AUDIT_PENDING');
+  assert.equal(unresolvedMaterialFindings(disproved).length,0);
+  const found=recordUncertainFindings(next,[{...same,verdict:'CONFIRMED'}],B,'discovery',prior);
+  assert.equal(unresolvedMaterialFindings(found).length,0);
+  const repeated=recordUncertainFindings(next,[uncertainCandidate()],B,'discovery',prior);
+  assert.equal(unresolvedMaterialFindings(repeated).length,1);
+});
+
+test('explicit reset on an unchanged HEAD also preserves unresolved material evidence',()=>{
+  const prior=recordUncertainFindings(session(),[uncertainCandidate()],A,'discovery');
+  const reset=applyDiscoveryResult({result:{summary:'reset model silent',findings:[]},
+    baseSha:BASE,headSha:A,sourceCommentId:'45'});
+  const carried=recordUncertainFindings(reset,[],A,'discovery',prior);
+  assert.equal(carried.status,'HUMAN_REQUIRED');
+  assert.equal(unresolvedMaterialFindings(carried).length,1);
+  assert.equal(sessionCommitStatus(carried,A).state,'error');
 });

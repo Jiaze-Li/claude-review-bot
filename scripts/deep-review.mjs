@@ -6,7 +6,6 @@ import {
   DEEP_REVIEW_RUN_BUDGET_USD,
   beginDeepReview,
   completeDeepReview,
-  deepReviewBudgetLeft,
   failDeepReview,
   isDeepReviewStale,
   renderSessionComment,
@@ -25,27 +24,25 @@ export async function runDeepReviewCommand(command, { env = process.env, fetchIm
   if (command === 'begin') {
     if (ctx.plan.decision?.mode !== 'claude') throw new Error('begin requires an explicit Claude deep review plan');
     await assertHeadUnmoved(ctx, fetchImpl);
-    const left = deepReviewBudgetLeft(ctx.plan.session);
-    const exhausted = left < 0.05;
-    const runBudget = Math.min(DEEP_REVIEW_RUN_BUDGET_USD, left);
-    let session = beginDeepReview({
+    // This entry point is an explicit @claude review, not an automatic PR
+    // trigger. The caller deliberately authorizes a bounded $2 call even when
+    // the cumulative automatic $6 cap is exhausted.
+    const runBudget = DEEP_REVIEW_RUN_BUDGET_USD;
+    const session = beginDeepReview({
       session: ctx.plan.session, baseSha: ctx.baseSha, headSha: ctx.headSha, runId: env.GITHUB_RUN_ID,
-      reserveUsd: exhausted ? 0 : runBudget, now,
+      reserveUsd: runBudget, now,
     });
-    if (exhausted) session = failDeepReview({ session, headSha: ctx.headSha, reason: 'per-PR deep review budget exhausted', now });
     // Required status goes pending/error FIRST, so a failed durable write below can never leave an old green.
     await postCommitStatus({
       env, fetchImpl, target: ctx.target, headSha: ctx.headSha,
-      status: exhausted
-        ? { state: 'error', description: 'Claude deep review budget exhausted: human judgment required' }
-        : { state: 'pending', description: 'Claude deep review in progress' },
+      status: { state: 'pending', description: 'Claude deep review in progress' },
     });
-    const commentId = await upsertSession(ctx, session, [], fetchImpl, exhausted);
+    const commentId = await upsertSession(ctx, session, [], fetchImpl, false);
     fs.writeFileSync(stateFile, JSON.stringify({ session, sessionCommentId: commentId }) + '\n', { mode: 0o600 });
     output(env, 'began', 'true');
-    output(env, 'run', exhausted ? 'false' : 'true');
+    output(env, 'run', 'true');
     output(env, 'run_budget_usd', runBudget.toFixed(2));
-    console.log(exhausted ? 'Deep review skipped: per-PR budget exhausted; session is HUMAN_REQUIRED.' : `Deep review begun (budget $${runBudget.toFixed(2)}).`);
+    console.log(`Manually authorized Claude deep review begun (per-call budget ${runBudget.toFixed(2)}).`);
     return session;
   }
 
@@ -55,7 +52,7 @@ export async function runDeepReviewCommand(command, { env = process.env, fetchIm
     const usage = readUsage(ctx.contextRoot, allottedBudget(env));
     await assertHeadUnmoved(ctx, fetchImpl);
     const session = completeDeepReview({
-      session: state.session, result, headSha: ctx.headSha, spentUsd: usage.cost, now,
+      session: state.session, result, headSha: ctx.headSha, spentUsd: usage.cost, costSource: usage.source, now,
     });
     await upsertSession(ctx, session, [ctx.sourceCommentId], fetchImpl, false, state.sessionCommentId);
     fs.writeFileSync(stateFile, JSON.stringify({ session, sessionCommentId: state.sessionCommentId }) + '\n', { mode: 0o600 });
@@ -89,7 +86,7 @@ export async function runDeepReviewCommand(command, { env = process.env, fetchIm
       return null;
     }
     const failed = failDeepReview({
-      session, headSha: ctx.headSha, reason: env.DEEP_REVIEW_FAILURE_REASON || 'deep review did not complete', spentUsd: usage.cost, now,
+      session, headSha: ctx.headSha, reason: env.DEEP_REVIEW_FAILURE_REASON || 'deep review did not complete', spentUsd: usage.cost, costSource: usage.source, now,
     });
     await upsertSession(ctx, failed, [ctx.sourceCommentId], fetchImpl, true, commentId);
     console.log(`Deep review failed closed: ${failed.deepReview.reason}`);
@@ -119,11 +116,11 @@ function readContext(env) {
 function readUsage(contextRoot, fallbackCost) {
   try {
     const value = JSON.parse(fs.readFileSync(path.join(contextRoot, 'claude-usage.json'), 'utf8'));
-    if (typeof value.total_cost_usd === 'number' && value.total_cost_usd > 0) return { cost: value.total_cost_usd };
+    if (typeof value.total_cost_usd === 'number' && value.total_cost_usd > 0) return { cost: value.total_cost_usd, source: 'sdk' };
   } catch {
     // fall through
   }
-  return { cost: fallbackCost };
+  return { cost: fallbackCost, source: 'reserve' };
 }
 
 function allottedBudget(env) {

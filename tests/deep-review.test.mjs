@@ -6,7 +6,7 @@ import path from 'node:path';
 import {
   DEEP_REVIEW_PR_BUDGET_USD, DEEP_REVIEW_STALE_MS, applyDiscoveryResult, beginDeepReview, completeDeepReview,
   deepReviewBudgetLeft, failDeepReview, isDeepReviewStale, planReviewSession, renderSessionComment,
-  parseSessionComment, sessionCommitStatus,
+  parseSessionComment, sessionCommitStatus, stopUnavailableReviewSession,
 } from '../scripts/review-session-core.mjs';
 import { runDeepReviewCommand } from '../scripts/deep-review.mjs';
 import { syncCommitStatus } from '../scripts/sync-commit-status.mjs';
@@ -152,13 +152,15 @@ test('begin -> finalize writes IN_PROGRESS then READY into the same comment', as
   assert.match(gh.writes[1].body.body, /jiaze-review-source-comment:55/);
 });
 
-test('exhausted per-PR budget fails closed without running Claude', async () => {
+test('manual @claude review runs with $2 limit even after exhausting the automatic PR cap', async () => {
   const gh = fakeGitHub();
   const dir = ctxDir({ decision: { mode: 'claude' }, session: { ...readySession(), deepSpendUsd: 6 }, sessionCommentId: '300' });
   const env = cenv(dir, { GITHUB_OUTPUT: path.join(dir, 'out') });
   const s = await runDeepReviewCommand('begin', { env, fetchImpl: gh.fetchImpl, now: T0 });
-  assert.equal(s.status, 'HUMAN_REQUIRED');
-  assert.match(fs.readFileSync(path.join(dir, 'out'), 'utf8'), /run=false/);
+  assert.equal(s.status, 'REVIEW_IN_PROGRESS');
+  assert.equal(s.deepSpendUsd,8);
+  assert.match(fs.readFileSync(path.join(dir, 'out'), 'utf8'), /run=true/);
+  assert.match(fs.readFileSync(path.join(dir, 'out'), 'utf8'), /run_budget_usd=2.00/);
 });
 
 test('fail closes an in-progress run to HUMAN_REQUIRED and accounts the spend', async () => {
@@ -402,4 +404,31 @@ test('the Claude step is bounded below the whole job timeout so publish and clea
   assert.equal(stepMinutes, 20);
   assert.ok(stepMinutes + 5 <= jobMinutes);
   assert.equal(DEEP_REVIEW_STALE_MS, 20 * 60 * 1000);
+});
+
+test('successful manual Claude review recovers a provider-unavailable audited HEAD to READY',()=>{
+  const stopped=stopUnavailableReviewSession({session:readySession(),baseSha:BASE,headSha:A,
+    sourceCommentId:'40',mode:'incremental',reason:'providers unavailable'});
+  assert.equal(stopped.status,'HUMAN_REQUIRED');
+  const begun=beginDeepReview({session:stopped,baseSha:BASE,headSha:A,now:T0,reserveUsd:2});
+  const done=completeDeepReview({session:begun,result:{summary:'independent review clean',findings:[]},
+    headSha:A,spentUsd:0.7,costSource:'sdk'});
+  assert.equal(done.status,'READY');
+  assert.equal(done.reviewFailure,undefined);
+  assert.equal(done.deepSpendUsd,0.7);
+  assert.equal(done.claudeSdkSpendUsd,0.7);
+  assert.equal(sessionCommitStatus(done,A).state,'success');
+});
+
+test('manual Claude cannot turn an unfinished discovery/final audit or material bug directly READY',()=>{
+  const discovery=applyDiscoveryResult({result:{summary:'clean',findings:[]},
+    baseSha:BASE,headSha:A,sourceCommentId:'40'});
+  const stopped=stopUnavailableReviewSession({session:discovery,baseSha:BASE,headSha:A,
+    sourceCommentId:'42',mode:'audit',reason:'providers unavailable'});
+  const begun=beginDeepReview({session:stopped,baseSha:BASE,headSha:A,now:T0});
+  const clean=completeDeepReview({session:begun,result:{summary:'clean',findings:[]},headSha:A});
+  assert.equal(clean.status,'AUDIT_PENDING');
+  const found=completeDeepReview({session:begun,result:{summary:'bug',findings:[finding('P2')]},headSha:A});
+  assert.equal(found.status,'REWORK');
+  assert.equal(sessionCommitStatus(found,A).state,'failure');
 });
