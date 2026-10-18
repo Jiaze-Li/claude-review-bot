@@ -210,7 +210,7 @@ test('confirmed material finding remains blocking after validation',async()=>{
   assert.equal(output._validation.validations[0].verdict,'CONFIRMED');
 });
 
-test('fabricated citation remains visible as UNCERTAIN rather than blocking',async()=>{
+test('fabricated citation remains UNCERTAIN for the publisher to block READY',async()=>{
   const root=tempRepo();
   const dir=contextDir({summary:'discovery',findings:[falsePositive]});
   const output=await validateMaterialFindings({
@@ -276,7 +276,7 @@ test('verified external Action absence remains eligible to block',async()=>{
   assert.match(output._validation.validations[0].reason,/both returned 404/);
 });
 
-test('omitted validator verdict becomes nonblocking UNCERTAIN rather than an invented confirmation',async()=>{
+test('omitted validator verdict requires adjudication, not a fabricated confirmation',async()=>{
   const root=tempRepo();
   const dir=contextDir({summary:'discovery',findings:[falsePositive]});
   const output=await validateMaterialFindings({
