@@ -369,3 +369,34 @@ test('READY never passes for an unaudited tree or any unresolved material issue'
     assert.equal(planReviewSession({session:broken,baseSha:BASE,headSha:A}).mode,'human_required');
   }
 });
+
+test('unresolved candidate survives an unrelated new HEAD when the reviewer omits it',()=>{
+  const prior=recordUncertainFindings(session(),[uncertainCandidate()],A,'discovery');
+  const next=applyDiscoveryResult({result:{summary:'new HEAD model silent',findings:[]},
+    baseSha:BASE,headSha:B,sourceCommentId:'20'});
+  const carried=recordUncertainFindings(next,[],B,'discovery',prior);
+  assert.equal(carried.status,'HUMAN_REQUIRED');
+  assert.equal(carried.auditCompleted,false);
+  assert.equal(unresolvedMaterialFindings(carried).length,1);
+  assert.equal(carried.findings[0].origin,'CARRIED_UNCERTAIN');
+  assert.equal(carried.findings[0].lastCheckedHead,A);
+  assert.equal(sessionCommitStatus(carried,B).state,'error');
+  const prompt=buildGeminiRequest({mode:'discovery',repo:'a/b',prNumber:1,
+    headSha:B,prJson:'{}',diff:'new changes',session:prior}).prompt;
+  assert.match(prompt,/PREVIOUS UNRESOLVED MATERIAL CANDIDATES/);
+  assert.match(prompt,/Possible lost update during save/);
+});
+
+test('new targeted verdict resolves the same carried candidate but silence never does',()=>{
+  const prior=recordUncertainFindings(session(),[uncertainCandidate()],A,'discovery');
+  const next=applyDiscoveryResult({result:{summary:'rerun',findings:[]},
+    baseSha:BASE,headSha:B,sourceCommentId:'22'});
+  const same={path:'src/a.js',title:'Possible lost update during save'};
+  const disproved=recordUncertainFindings(next,[{...same,verdict:'REJECTED'}],B,'discovery',prior);
+  assert.equal(disproved.status,'AUDIT_PENDING');
+  assert.equal(unresolvedMaterialFindings(disproved).length,0);
+  const found=recordUncertainFindings(next,[{...same,verdict:'CONFIRMED'}],B,'discovery',prior);
+  assert.equal(unresolvedMaterialFindings(found).length,0);
+  const repeated=recordUncertainFindings(next,[uncertainCandidate()],B,'discovery',prior);
+  assert.equal(unresolvedMaterialFindings(repeated).length,1);
+});
