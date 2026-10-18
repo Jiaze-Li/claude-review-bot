@@ -53,6 +53,13 @@ export function planReviewSession({ session = null, baseSha, headSha, reset = fa
   }
 
   if (session.status === 'READY') {
+    // Fail closed on inconsistent durable state instead of treating a stale
+    // green status as authoritative for the reviewed HEAD.
+    if (session.auditCompleted !== true || openMaterialFindings(session).length > 0
+        || unresolvedMaterialFindings(session).length > 0) {
+      return { mode: 'human_required', previousHead: session.lastReviewedHead,
+        reason: 'inconsistent READY state: incomplete audit or unresolved material candidate' };
+    }
     if (session.lastReviewedHead === headSha) {
       return { mode: 'noop_ready', previousHead: session.lastReviewedHead, reason: 'current HEAD is already READY' };
     }
@@ -502,8 +509,9 @@ export function sessionCommitStatus(session, headSha) {
     return { state: 'pending', description: 'Independent review has not completed for this commit' };
   }
   switch (session.status) {
-    case 'READY': return unresolvedMaterialFindings(session).length > 0
-      ? { state: 'error', description: 'Material review candidates remain unresolved' }
+    case 'READY': return session.auditCompleted !== true || openMaterialFindings(session).length > 0
+      || unresolvedMaterialFindings(session).length > 0
+      ? { state: 'error', description: 'Review evidence incomplete or material candidates unresolved' }
       : { state: 'success', description: 'Independent review complete: READY' };
     case 'REVIEW_IN_PROGRESS': return { state: 'pending', description: 'Claude deep review in progress' };
     case 'AUDIT_PENDING': return { state: 'pending', description: 'Final audit pending' };
