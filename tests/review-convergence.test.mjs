@@ -355,3 +355,17 @@ test('manual scoped dismissal planner can select an UNCERTAIN finding without pr
     fetchImpl:listFetch([{id:5,user:{login:author},body:renderSessionComment(pending)}])});
   assert.equal(result.decision.mode,'dismiss');
 });
+
+test('READY never passes for an unaudited tree or any unresolved material issue',()=>{
+  const clean=session();
+  const audited=applyAuditResult({session:clean,headSha:A,result:{summary:'clean',findings:[]}});
+  assert.equal(sessionCommitStatus(audited,A).state,'success');
+  for(const broken of [
+    {...audited,auditCompleted:false},
+    {...audited,findings:[{...finding(),id:'F001',status:'OPEN'}]},
+    {...audited,findings:[{...finding(),id:'F001',status:'UNCERTAIN'}]},
+  ]){
+    assert.equal(sessionCommitStatus(broken,A).state,'error');
+    assert.equal(planReviewSession({session:broken,baseSha:BASE,headSha:A}).mode,'human_required');
+  }
+});
