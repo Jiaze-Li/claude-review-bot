@@ -24,8 +24,8 @@ The review session is intentionally stateful and simple:
 
 - First review of a PR/session: **latest Gemini Flash (`gemini-flash-latest` alias), medium thinking, one discovery pass**.
 - Any P0/P1/P2 discovery candidate gets one **targeted Gemini Flash / medium validation pass** over the candidate file, related symbols/guards, and matching tests.
-- Only **CONFIRMED** material findings block. **REJECTED** and **UNCERTAIN** candidates remain visible in the review audit but do not enter REWORK.
-- If confirmed material findings exist, push a repair; the new PR commit automatically triggers the next review step.
+- **CONFIRMED** P0–P2 findings enter REWORK. **REJECTED** candidates are resolved only when source/evidence checks refute the claim. **UNCERTAIN** P0–P2 candidates stay in the durable ledger with their own F-number and **block READY**: targeted validation has already run but could not establish a verdict. With no other confirmed blockers, status becomes **HUMAN_REQUIRED**. They are never added to the already-examined suppression ledger.
+- If confirmed material findings exist, push a repair; the new PR commit automatically triggers the next review step. For **UNCERTAIN** candidates, inspect their cited code and supply evidence via `@gemini dismiss F001` if disproven, or push a fix/new HEAD for a fresh full review. Neither "validator omitted a candidate" nor "source evidence insufficient" counts as a pass.
 - A REWORK repair becomes targeted **verification** plus checks for independent regressions introduced by that HEAD delta, not another full PR discovery.
 - At most **2 verification rounds** are allowed.
 - Once material findings converge, one independent final audit runs automatically on the final cumulative PR diff. It stays **Gemini Flash / low** for ordinary PRs; a deterministic state-integrity classifier escalates only shared-state/concurrency-sensitive PRs to **medium** with an explicit interleaving audit.
@@ -34,12 +34,28 @@ The review session is intentionally stateful and simple:
 - P3 findings are non-blocking.
 - A malformed/no-text structured Gemini review response is retried **once with the identical prompt, model, thinking level, and schema**; usage from both attempts is reported.
 - Re-running on the same unchanged HEAD spends **no reviewer model quota**.
-- If material findings remain after the verification budget, the session stops at **HUMAN_REQUIRED** instead of looping.
+- If material findings remain after the verification budget, or a material candidate remains **UNCERTAIN** after its targeted validator check, the session stops at **HUMAN_REQUIRED** instead of claiming success. An unresolved candidate cannot be cleared by an unrelated clean final audit or a free-form Claude answer.
 - If Gemini is unavailable (HTTP 402/429/5xx), Claude automatically takes over. **All automatic Claude calls**, including material-finding validation and final audit, share a **$6 cumulative cap per PR**; there is no separate $3 fallback pool. Each automatic call receives at most the remaining cap through SDK `maxBudgetUsd`, and does not start below a **$0.50** allowance.
 - An authorized writer's explicit `@gemini review`, `@jiaze-claude-review-bot reset review` or `@claude review` **may exceed the internal $6 automatic cap**. Each manual Claude call remains limited by SDK `maxBudgetUsd: 2`; actual provider credits/quota still apply. Automatic pull-request events can never opt out.
 - If Gemini is unavailable **and** fallback cannot run (budget, credential, or SDK failure), the bot records a durable **HUMAN_REQUIRED / reviewer unavailable** state for the exact HEAD. Comment `@gemini review` to retry even if HEAD advanced: unfinished verification keeps its prior repair baseline; other moved-head retries start a fresh discovery. The successful model review must still complete the required final audit and resolve all material findings before **READY**. A manual `@claude review` can also restore a provider-unavailable, already-audited exact-HEAD session to READY if it finds no P0–P2 bugs.
 - Costs remain cumulative across retries, pushes and manual reviews. The ledger distinguishes SDK-reported costs, conservative reservations when usage is unknown, and old unclassified amounts; reservations are not presented as confirmed charges. Normal model/publication failures still fail closed.
 - Session state is stored in a bot-authored GitHub PR comment, so it survives new ChatGPT conversations, different agents, and local restarts.
+
+
+### Meaning of READY
+
+**READY is an independent code-review clearance, not merely "no confirmed bugs yet".**
+For the reviewed HEAD, every P0/P1/P2 candidate must be resolved (confirmed and fixed,
+evidence-backed rejected, or explicitly human-adjudicated), the required audit must
+have passed, and no unresolved material uncertainty may remain. An explicit
+`override review` is marked **manually overridden** so it cannot be mistaken
+for machine clearance.
+
+**GitHub remains the final merge gate.** READY alone does not prove that
+independent CI, branch protection, required approvals, or conflict checks have
+passed. The PR is mergeable only when its review is READY *and* GitHub's
+other required checks succeed. This avoids a circular dependency on the
+review bot's own required status check.
 
 ### HEAD changes after READY
 
@@ -98,12 +114,12 @@ If you have read the open findings and decide the PR is fine to merge anyway (fo
 @jiaze-claude-review-bot override review
 ```
 
-This needs write access, spends no model quota, waives the open findings (they stay in the record as WAIVED), and marks the current HEAD READY. A later commit still starts a fresh bounded session.
+This needs write access, spends no model quota, waives both confirmed-open and unresolved-uncertain material findings (they stay in the record as WAIVED), and explicitly marks the current HEAD **READY (manually overridden)**. This is a human risk acceptance, *not* a claim that the bot disproved the concern. A later commit starts a fresh bounded session.
 
 ### Dismiss a disproven finding without skipping final audit
 
-An authorized repository writer can dismiss **one specific** false-positive P0/P1/P2
-finding on the **same exact reviewed HEAD** by posting a fresh PR comment:
+An authorized repository writer can dismiss **one specific** confirmed-open **or UNCERTAIN** P0/P1/P2
+candidate on the **same exact reviewed HEAD** by posting a fresh PR comment with 1–3 evidence links:
 
 ```text
 @gemini dismiss F001
@@ -199,7 +215,7 @@ Gemini DISCOVERY (once, medium)
                                      READY or HUMAN_REQUIRED
 ```
 
-Material validation is not a second discovery pass: it may only confirm, reject, or mark uncertain the candidates already produced by discovery, and must actively check downstream guards, fingerprints/scope filters, and relevant tests before confirming. Verification is likewise not allowed to reopen broad, unrelated discovery. A new finding is valid there only when it is a regression directly caused by the repair (except a catastrophic P0/security issue). After convergence, one independent final audit gets a fresh look at the final cumulative diff; it can run only once and any confirmed audit finding returns to targeted verification rather than reopening broad discovery. These bounds prevent the endless “review → fix → fresh full review → new edge case” loop.
+Material validation is not a second discovery pass: it may only confirm, reject, or mark uncertain the candidates already produced by discovery, and must actively check downstream guards, fingerprints/scope filters, and relevant tests before confirming. **UNCERTAIN is not REJECTED:** it is persisted as a review blocker (not a confirmed bug); an independent audit may not silently suppress it. After evidence-based human dismissal, the normal final-audit rule still applies. Verification is likewise not allowed to reopen broad, unrelated discovery. A new finding is valid there only when it is a regression directly caused by the repair (except a catastrophic P0/security issue). After convergence, one independent final audit gets a fresh look at the final cumulative diff; it can run only once and any confirmed audit finding returns to targeted verification rather than reopening broad discovery. These bounds prevent the endless “review → fix → fresh full review → new edge case” loop.
 
 Codex is deliberately **not automatic in v1**. At HUMAN_REQUIRED, use a targeted Codex or Claude review only when human judgment says the remaining issue is worth escalation. This keeps Codex and Claude usage low.
 
