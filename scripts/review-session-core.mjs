@@ -727,14 +727,29 @@ export function unresolvedMaterialFindings(session) {
 
 // The validator already performs a bounded, targeted evidence check. An
 // inconclusive material candidate is a durable blocker, not a confirmed defect.
-export function recordUncertainFindings(session, validations, headSha, mode) {
+export function recordUncertainFindings(session, validations, headSha, mode, previousSession = null) {
   validateSession(session);
   checkedSha(headSha, 'headSha');
   if (!['discovery', 'incremental', 'audit'].includes(mode)) throw new Error('invalid uncertain review mode');
-  const uncertain = (Array.isArray(validations) ? validations : []).filter(entry =>
+  const checked = Array.isArray(validations) ? validations : [];
+  const uncertain = checked.filter(entry =>
     entry?.verdict === 'UNCERTAIN' && MATERIAL_SEVERITIES.has(entry.severity));
-  if (!uncertain.length) return session;
-  if (session.findings.length + uncertain.length > 64) {
+  // A new HEAD and its fresh Discovery must not silently erase a prior
+  // inconclusive P2 merely because the model failed to repeat the claim.
+  // Only a new targeted CONFIRMED or REJECTED verdict for the *same*
+  // candidate establishes enough evidence to replace it.
+  const prior = mode === 'discovery' && previousSession?.lastReviewedHead !== headSha
+    ? unresolvedMaterialFindings(previousSession)
+    : [];
+  const key = entry => String(entry?.path ?? '').trim().toLowerCase()
+    + '\0' + String(entry?.title ?? '').trim().toLowerCase();
+  const resolved = new Set(checked.filter(entry =>
+    ['CONFIRMED','REJECTED'].includes(entry?.verdict)).map(key));
+  const repeated = new Set(uncertain.map(key));
+  const carried = prior.filter(entry => !resolved.has(key(entry)) && !repeated.has(key(entry)));
+  const count = uncertain.length + carried.length;
+  if (!count) return session;
+  if (session.findings.length + count > 64) {
     throw new Error('too many unresolved material candidates to persist safely');
   }
   const findings = [...session.findings];
@@ -756,6 +771,17 @@ export function recordUncertainFindings(session, validations, headSha, mode) {
       resolutionReason: null,
     });
   }
+  for (const entry of carried) {
+    findings.push({
+      ...entry,
+      id: findingId(nextFindingNumber++),
+      origin: 'CARRIED_UNCERTAIN',
+      status: 'UNCERTAIN',
+      // This prior concern has not been verified on the new HEAD.
+      lastCheckedHead: entry.lastCheckedHead ?? previousSession.lastReviewedHead,
+      resolutionReason: null,
+    });
+  }
   const confirmedOpen = findings.some(f => f.status === 'OPEN' && MATERIAL_SEVERITIES.has(f.severity));
   const status = confirmedOpen && (session.verificationRound ?? 0) < MAX_VERIFICATION_ROUNDS
     ? 'REWORK' : 'HUMAN_REQUIRED';
@@ -765,8 +791,9 @@ export function recordUncertainFindings(session, validations, headSha, mode) {
     nextFindingNumber,
     status,
     auditCompleted: mode === 'audit' ? false : session.auditCompleted,
-    lastSummary: compactText(session.lastSummary + ' | ' + uncertain.length
-      + ' unresolved material candidate(s) require evidence-based review.', 800),
+    lastSummary: compactText(session.lastSummary + ' | ' + count
+      + ' unresolved material candidate(s), including ' + carried.length
+      + ' carried from earlier HEAD, require evidence-based review.', 800),
   };
 }
 
