@@ -35,9 +35,10 @@ The review session is intentionally stateful and simple:
 - A malformed/no-text structured Gemini review response is retried **once with the identical prompt, model, thinking level, and schema**; usage from both attempts is reported.
 - Re-running on the same unchanged HEAD spends **no reviewer model quota**.
 - If material findings remain after the verification budget, the session stops at **HUMAN_REQUIRED** instead of looping.
-- If Gemini is unavailable (HTTP 402/429/5xx), Claude automatically takes over while both the fallback pool ($3 per PR) and shared Claude cap ($6 per PR) permit it. Explicit deep reviews retain access to the shared cap without spending the fallback pool. Claude calls use the remaining fallback budget as their SDK `maxBudgetUsd`.
-- If Gemini is unavailable **and** fallback cannot run (budget, credential, or SDK failure), the bot records a durable **HUMAN_REQUIRED / reviewer unavailable** state for the exact HEAD rather than leaving a misleading `AUDIT_PENDING`. Once Gemini quota is restored, comment `@gemini review` to retry that interrupted stage **on the same HEAD**, with no automatic budget reset. Model or publication failures unrelated to provider unavailability still fail closed.
-- Old sessions without separate fallback spending cannot distinguish which Claude calls consumed their budget; the prior combined spend is conservatively counted against the fallback pool. A prior PR's exhausted $6 limit is not reset by this change.
+- If Gemini is unavailable (HTTP 402/429/5xx), Claude automatically takes over. **All automatic Claude calls**, including material-finding validation and final audit, share a **$6 cumulative cap per PR**; there is no separate $3 fallback pool. Each automatic call receives at most the remaining cap through SDK `maxBudgetUsd`, and does not start below a **$0.50** allowance.
+- An authorized writer's explicit `@gemini review`, `@jiaze-claude-review-bot reset review` or `@claude review` **may exceed the internal $6 automatic cap**. Each manual Claude call remains limited by SDK `maxBudgetUsd: 2`; actual provider credits/quota still apply. Automatic pull-request events can never opt out.
+- If Gemini is unavailable **and** fallback cannot run (budget, credential, or SDK failure), the bot records a durable **HUMAN_REQUIRED / reviewer unavailable** state for the exact HEAD. Comment `@gemini review` to retry even if HEAD advanced: unfinished verification keeps its prior repair baseline; other moved-head retries start a fresh discovery. The successful model review must still complete the required final audit and resolve all material findings before **READY**. A manual `@claude review` can also restore a provider-unavailable, already-audited exact-HEAD session to READY if it finds no P0–P2 bugs.
+- Costs remain cumulative across retries, pushes and manual reviews. The ledger distinguishes SDK-reported costs, conservative reservations when usage is unknown, and old unclassified amounts; reservations are not presented as confirmed charges. Normal model/publication failures still fail closed.
 - Session state is stored in a bot-authored GitHub PR comment, so it survives new ChatGPT conversations, different agents, and local restarts.
 
 ### HEAD changes after READY
@@ -75,8 +76,8 @@ You do **not** need to remember discovery, verification, round numbers, or provi
 Manual commands (the first nonblank line must be exactly one of these):
 
 ```text
-@gemini review   # retry/resume the default Gemini session
-@claude review   # explicit Claude deep review (latest Sonnet, medium effort)
+@gemini review   # manual retry; allowed past automatic $6 cap, $2 per Claude call
+@claude review   # explicit Claude deep review (latest Sonnet, $2 per call)
 ```
 
 Gemini review already runs automatically when a PR is opened, marked ready, or updated, so `@gemini review` is only needed to retry a stopped/no-op path. `@claude review` is never automatic; it runs the explicit Claude deep review and does not replace the bounded Gemini session.
@@ -340,9 +341,9 @@ effort: medium
 maxTurns: 24
 ```
 
-It is not part of the normal automatic loop, preserving Claude quota for Worker
-tasks. Codex is also not called automatically; use targeted escalation only after
-the bounded session reaches HUMAN_REQUIRED.
+It is not part of the normal automatic loop. Explicit Claude calls are bounded
+to $2 each even if prior automatic fallback calls already reached the $6 PR cap.
+Codex is also not called automatically; use targeted escalation after HUMAN_REQUIRED.
 
 ## One-time setup
 
