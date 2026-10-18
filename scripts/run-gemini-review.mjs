@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { CLAUDE_AUTO_MIN_BUDGET_USD, claudeFallbackCallBudget, knownIssuesPromptBlock, normalizeReviewResult, normalizeVerificationResult, openMaterialFindings } from './review-session-core.mjs';
+import { CLAUDE_AUTO_MIN_BUDGET_USD, claudeFallbackCallBudget, isManualBudgetExemptReview, knownIssuesPromptBlock, normalizeReviewResult, normalizeVerificationResult, openMaterialFindings } from './review-session-core.mjs';
 import {GeminiUnavailableError,isGeminiUnavailableStatus,runClaudeStructured} from './claude-fallback.mjs';
 
 // Moving alias: always resolves to Google's current Flash model. Override with GEMINI_MODEL to pin.
@@ -298,7 +298,7 @@ export async function runGeminiReview({env=process.env,fetchImpl=fetch,logImpl=c
   if(unavailable){
     // Only a manual review comment opts out of the per-PR cap; an automatic
     // pull_request event cannot claim this exemption.
-    const manual=env.SOURCE_KIND==='comment'&&['auto','reset'].includes(plan.requestedMode);
+    const manual=isManualBudgetExemptReview({sourceKind:env.SOURCE_KIND,requestedMode:plan.requestedMode});
     const budget=claudeFallbackCallBudget(plan.session,{manual});
     const recordStop=(reason,costCharges=[])=>{
       fs.writeFileSync(path.join(contextRoot,'fallback-unavailable.json'),
