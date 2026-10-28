@@ -363,7 +363,7 @@ jobs:
 
       - name: Install Claude fallback dependencies
         continue-on-error: true # only needed if Gemini is out of credits; must never block a healthy Gemini review
-        if: steps.dedupe.outputs.duplicate != 'true' && (steps.plan.outputs.mode == 'discovery' || steps.plan.outputs.mode == 'incremental' || steps.plan.outputs.mode == 'verification' || steps.plan.outputs.mode == 'audit')
+        if: steps.dedupe.outputs.duplicate != 'true' && (steps.plan.outputs.mode == 'discovery' || steps.plan.outputs.mode == 'incremental' || steps.plan.outputs.mode == 'verification' || steps.plan.outputs.mode == 'audit' || steps.plan.outputs.mode == 'dismiss')
         shell: bash
         run: npm ci --legacy-peer-deps --ignore-scripts --no-audit --no-fund --omit=dev
 
