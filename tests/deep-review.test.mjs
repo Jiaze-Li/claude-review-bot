@@ -496,3 +496,15 @@ test('standalone review on a new HEAD starts fresh but keeps the PR spend ledger
   assert.equal(begun.findings.length, 0);
   assert.throws(() => beginDeepReview({ session: old, baseSha: BASE, headSha: A, now: T0 }), /requires an existing review session/);
 });
+
+test('a standalone review re-run after PARTIAL keeps its standalone marker and reaches READY', () => {
+  const first = beginDeepReview({ session: null, baseSha: BASE, headSha: A, standalone: true, now: T0 });
+  const partial = completeDeepReview({ session: first, headSha: A, result: { summary: 's', findings: [], coverage: { complete: false, unreviewedPaths: ['x'] } } });
+  assert.equal(partial.status, 'PARTIAL');
+  assert.equal(partial.auditCompleted, false);
+  const rerun = beginDeepReview({ session: partial, baseSha: BASE, headSha: A, now: T0 });
+  assert.equal(rerun.deepReview.standalone, true);
+  const done = completeDeepReview({ session: rerun, headSha: A, result: { summary: 's', findings: [], coverage: { complete: true, unreviewedPaths: [] } } });
+  assert.equal(done.status, 'READY');
+  assert.equal(done.auditCompleted, true);
+});

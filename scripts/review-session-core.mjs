@@ -443,7 +443,7 @@ export function beginDeepReview({
     // The run's allotted budget is charged up front and reconciled at finalize/fail, so a run
     // that is interrupted (new commit, kill, stale replacement) can never escape the PR cap.
     deepSpendUsd: roundUsd((session.deepSpendUsd ?? 0) + nonNegative(reserveUsd)),
-    deepReview: { head: headSha, startedAt: now, runId: runId == null ? null : String(runId), resumeStatus, state: 'IN_PROGRESS', reservedUsd: nonNegative(reserveUsd), ...(standaloneRun ? { standalone: true } : {}) },
+    deepReview: { head: headSha, startedAt: now, runId: runId == null ? null : String(runId), resumeStatus, state: 'IN_PROGRESS', reservedUsd: nonNegative(reserveUsd), ...(standaloneRun || session.deepReview?.standalone === true ? { standalone: true } : {}) },
     updatedAt: now,
   };
 }
