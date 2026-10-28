@@ -9,8 +9,8 @@ events and the current Worker is deployed:
 
 - opening a non-draft PR starts a bounded discovery session automatically;
 - moving a draft PR to **Ready for review** starts it automatically;
-- pushing a repair while the session is **REWORK** triggers targeted verification;
-- pushing a new commit after **READY** first classifies the exact delta from the last reviewed HEAD: small low-risk changes get an incremental review, while broad/high-risk changes get full discovery + audit;
+- commenting `@gemini review` after pushing a repair while the session is **REWORK** runs targeted verification;
+- commenting `@gemini review` after pushing a new commit on a **READY** session first classifies the exact delta from the last reviewed HEAD: small low-risk changes get an incremental review, while broad/high-risk changes get full discovery + audit;
 - webhook redelivery is idempotent, and an unchanged PR HEAD is a no-op at the durable session planner, so it does not spend another reviewer call.
 
 The manual commands remain available as a retry/escape hatch:
@@ -92,11 +92,11 @@ You do **not** need to remember discovery, verification, round numbers, or provi
 Manual commands (the first nonblank line must be exactly one of these):
 
 ```text
-@gemini review   # manual retry; allowed past automatic $6 cap, $2 per Claude call
-@claude review   # explicit Claude deep review (latest Sonnet, $2 per call)
+@gemini review   # manual retry; allowed past automatic $6 cap, $5 per Claude call
+@claude review   # explicit Claude deep review (latest Sonnet, $5 per call)
 ```
 
-Gemini review already runs automatically when a PR is opened, marked ready, or updated, so `@gemini review` is only needed to retry a stopped/no-op path. `@claude review` is never automatic; it runs the explicit Claude deep review and does not replace the bounded Gemini session.
+Gemini review runs automatically only when a PR is opened, reopened, or marked ready. **New pushes do not trigger a review**; comment `@gemini review` when you want the latest HEAD reviewed, and `@claude review` after that for the deep review (it needs a Gemini session for the exact HEAD). `@claude review` is never automatic; it runs the explicit Claude deep review and does not replace the bounded Gemini session.
 
 `@gemini review` is the same as the original `@jiaze-claude-review-bot review`, and `@jiaze-claude-review-bot claude review` is the same as `@claude review`; the longer forms keep working.
 
@@ -257,7 +257,7 @@ Cloudflare Worker by itself: after merging a trigger change, subscribe the App t
 ## Architecture
 
 ```text
-PR opened / ready / synchronized
+PR opened / reopened / ready
 or manual review command
         |
         v
@@ -403,9 +403,9 @@ PR to **Ready for review**.
 
 Expected behavior: the PR event automatically runs a Gemini discovery review and
 creates an **Independent Review Session** comment. If material findings exist,
-push a repair; the synchronize event automatically runs targeted verification.
+push a repair, then comment `@gemini review` to run targeted verification (pushes do not trigger it).
 After findings converge, the workflow automatically runs the one-time final audit
-before READY. A later commit after READY starts a fresh bounded discovery session.
+before READY. A later commit after READY is reviewed only when you comment `@gemini review`.
 
 The manual command remains useful for retrying a stopped/no-op path:
 

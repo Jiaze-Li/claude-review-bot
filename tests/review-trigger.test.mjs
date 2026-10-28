@@ -48,7 +48,7 @@ test('dedicated command maps to auto mode while Claude aliases remain explicit',
 });
 
 test('automatic PR trigger accepts review-ready lifecycle events but not draft work', () => {
-  for (const action of ['opened', 'ready_for_review', 'reopened', 'synchronize']) {
+  for (const action of ['opened', 'ready_for_review', 'reopened']) {
     const draft = action === 'ready_for_review' ? false : false;
     assert.deepEqual(
       parseAutomaticPullRequestTrigger('pull_request', {
@@ -185,7 +185,7 @@ for (const body of ['@claude review\n\nFocus on the runtime evidence.', '\n @jia
     assert.equal(calls.some((call) => /comments|reactions/.test(call.pathname) && call.method !== 'GET'), false);
   });
 }
-for (const action of ['opened', 'ready_for_review', 'reopened', 'synchronize']) {
+for (const action of ['opened', 'ready_for_review', 'reopened']) {
   test(`automatic PR ${action} event dispatches the exact current HEAD without collaborator gating`, async (t) => {
     const calls = fakeGithub(t, { permission: 'read' });
     const payload = {
@@ -220,6 +220,7 @@ for (const action of ['opened', 'ready_for_review', 'reopened', 'synchronize']) 
 
 for (const [name, payload, githubOptions] of [
   ['draft opened PR', { ...pullRequestPayload, pull_request: { ...pullRequestPayload.pull_request, draft: true } }, {}],
+  ['new push (synchronize) on a ready PR', { ...pullRequestPayload, action: 'synchronize', pull_request: { ...pullRequestPayload.pull_request, draft: false } }, {}],
   ['draft synchronize PR', { ...pullRequestPayload, action: 'synchronize', pull_request: { ...pullRequestPayload.pull_request, draft: true } }, {}],
   ['closed PR after webhook race', pullRequestPayload, { state: 'closed' }],
   ['still-draft PR after webhook race', pullRequestPayload, { draft: true }],

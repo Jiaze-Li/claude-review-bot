@@ -37,7 +37,9 @@ export function isReviewTrigger(body) {
   return parseReviewTrigger(body) !== null;
 }
 
-const AUTO_PR_ACTIONS = new Set(['opened', 'ready_for_review', 'reopened', 'synchronize']);
+// Pushes (synchronize) deliberately do not review: a PR is reviewed when it opens
+// and then again only on an explicit `@gemini review` / `@claude review`.
+const AUTO_PR_ACTIONS = new Set(['opened', 'ready_for_review', 'reopened']);
 
 export function parseAutomaticPullRequestTrigger(event, payload) {
   if (event !== 'pull_request' || !payload || typeof payload !== 'object') return null;
