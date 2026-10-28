@@ -96,7 +96,7 @@ Manual commands (the first nonblank line must be exactly one of these):
 @claude review   # explicit Claude deep review (latest Sonnet, $5 per call)
 ```
 
-Gemini review runs automatically only when a PR is opened, reopened, or marked ready. **New pushes do not trigger a review**; comment `@gemini review` or `@claude review` when you want the latest HEAD reviewed. The two are parallel reviewers: `@claude review` never needs a Gemini session. If the HEAD has none it starts its own, and a complete, clean Claude pass is READY by itself (partial coverage is PARTIAL, never READY). If a Gemini session already exists for the HEAD, `@claude review` joins it as an extra gate. `@claude review` is never automatic.
+Gemini review runs automatically only when a PR is opened, reopened, or marked ready. **New pushes do not trigger a review**; comment `@gemini review` or `@claude review` when you want the latest HEAD reviewed. The two are parallel reviewers: `@claude review` never needs a Gemini session. If the HEAD has none it starts its own, and a complete, clean Claude pass is READY by itself (partial coverage is PARTIAL, never READY). If a Gemini session already exists for the HEAD, `@claude review` joins it as an extra gate. `@claude review` is never automatic. A large PR (more than ~150 KB of diff) is reviewed as up to 6 independent shards, each with its own turn budget (14 turns) and a share of the $5 ceiling, run one after another within a 16-minute deadline. Files in shards that do not fit or fail are listed as not reviewed and the result is PARTIAL, never READY.
 
 `@gemini review` is the same as the original `@jiaze-claude-review-bot review`, and `@jiaze-claude-review-bot claude review` is the same as `@claude review`; the longer forms keep working.
 
