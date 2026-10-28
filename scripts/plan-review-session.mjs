@@ -57,12 +57,11 @@ export async function planSession({ env=process.env, fetchImpl=fetch }={}) {
     // Explicit deep review joins the durable session for this exact HEAD. A fresh
     // in-progress marker means a run is already going; a stale one is restartable.
     const waiting=session && session.lastReviewedHead===headSha && session.status==='REVIEW_IN_PROGRESS' && !isDeepReviewStale(session);
+    // Claude is an independent reviewer: with no session for this HEAD it starts its own.
     const hasSession=session && session.lastReviewedHead===headSha;
     const decision=waiting
       ?{mode:'noop_waiting',previousHead:headSha,reason:'a Claude deep review is already in progress for this HEAD'}
-      :!hasSession
-        ?{mode:'noop_waiting',previousHead:null,reason:'Your @claude review request was NOT queued and no Claude review ran: there is no completed automatic review for this exact commit yet. This commit is not READY for deep review purposes. After the automatic review finishes (or after you comment @gemini review), send @claude review again.'}
-        :{mode:'claude',previousHead:null,reason:'explicit Claude deep review bound to this HEAD'};
+      :{mode:'claude',previousHead:null,reason:hasSession?'explicit Claude deep review bound to this HEAD':'standalone Claude review of this HEAD'};
     return {requestedMode:requested,decision,session,sessionCommentId,pendingSession:null,pendingSourceCommentId:null,pendingReviewId:null};
   }
 

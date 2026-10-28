@@ -76,16 +76,17 @@ test('explicit Claude mode joins the durable session for this HEAD',async()=>{
   assert.equal(plan.session.lastReviewedHead,A);
 });
 
-test('explicit Claude mode waits instead of seeding a session when no review exists for this HEAD',async()=>{
+test('explicit Claude mode runs standalone when no session exists for this HEAD',async()=>{
   const none=await planSession({env:env({REQUESTED_MODE:'claude'}),fetchImpl:fetchState()});
-  assert.equal(none.decision.mode,'noop_waiting');
-  assert.match(none.decision.reason,/NOT queued.*send @claude review again/);
+  assert.equal(none.decision.mode,'claude');
+  assert.match(none.decision.reason,/standalone/);
   const old=applyDiscoveryResult({result:{summary:'clean',findings:[]},baseSha:BASE,headSha:C,sourceCommentId:'1'});
   const other=await planSession({
     env:env({REQUESTED_MODE:'claude'}),
     fetchImpl:fetchState({comments:[comment(7,renderSessionComment(old))]}),
   });
-  assert.equal(other.decision.mode,'noop_waiting');
+  assert.equal(other.decision.mode,'claude');
+  assert.equal(other.sessionCommentId,'7');
 });
 
 test('planner recovers a trusted pending current-HEAD review instead of rerunning Gemini',async()=>{

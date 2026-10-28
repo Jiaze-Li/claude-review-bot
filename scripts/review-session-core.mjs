@@ -406,16 +406,29 @@ export function stopUnavailableReviewSession({
   return charges.reduce((state, charge) => chargeClaudeFallback(state, charge.amount, charge.source), stopped);
 }
 
+// `@claude review` is a reviewer in its own right. When this exact HEAD has no session it
+// starts a standalone one, so Claude and Gemini run as parallel reviewers instead of
+// Claude gating on a Gemini session. Spend carries over from any earlier session.
+function seedStandaloneSession({ previous, baseSha, headSha, now }) {
+  const seed = applyDiscoveryResult({ result: { summary: 'Claude review started', findings: [] }, baseSha, headSha, sourceCommentId: 'claude', now });
+  const spend = {};
+  for (const key of ['deepSpendUsd', 'fallbackSpendUsd', 'claudeSdkSpendUsd', 'claudeUnknownReserveUsd']) {
+    if (Number.isFinite(previous?.[key]) && previous[key] > 0) spend[key] = previous[key];
+  }
+  return { ...seed, ...spend };
+}
+
 export function beginDeepReview({
-  session = null, baseSha, headSha, runId = null, reserveUsd = 0, now = new Date().toISOString(),
+  session = null, baseSha, headSha, runId = null, reserveUsd = 0, standalone = false, now = new Date().toISOString(),
 } = {}) {
   checkedSha(baseSha, 'baseSha');
   checkedSha(headSha, 'headSha');
   if (session) validateSession(session);
-  // Deep review is an additional gate on a Gemini session for this exact HEAD. Seeding a
-  // session from Claude alone would skip Gemini discovery/verification for the HEAD.
+  let standaloneRun = false;
   if (!session || session.lastReviewedHead !== headSha) {
-    throw new Error('deep review requires an existing review session for this exact HEAD');
+    if (!standalone) throw new Error('deep review requires an existing review session for this exact HEAD');
+    session = seedStandaloneSession({ previous: session, baseSha, headSha, now });
+    standaloneRun = true;
   }
   if (session.status === 'REVIEW_IN_PROGRESS' && !isDeepReviewStale(session, Date.parse(now))) {
     throw new Error('a deep review is already in progress for this HEAD');
@@ -430,7 +443,7 @@ export function beginDeepReview({
     // The run's allotted budget is charged up front and reconciled at finalize/fail, so a run
     // that is interrupted (new commit, kill, stale replacement) can never escape the PR cap.
     deepSpendUsd: roundUsd((session.deepSpendUsd ?? 0) + nonNegative(reserveUsd)),
-    deepReview: { head: headSha, startedAt: now, runId: runId == null ? null : String(runId), resumeStatus, state: 'IN_PROGRESS', reservedUsd: nonNegative(reserveUsd) },
+    deepReview: { head: headSha, startedAt: now, runId: runId == null ? null : String(runId), resumeStatus, state: 'IN_PROGRESS', reservedUsd: nonNegative(reserveUsd), ...(standaloneRun ? { standalone: true } : {}) },
     updatedAt: now,
   };
 }
@@ -479,12 +492,14 @@ export function completeDeepReview({
     && session.reviewFailure?.code === 'REVIEWER_UNAVAILABLE'
     && session.reviewFailure?.head === headSha;
   const coverage = normalizeCoverage(result.coverage);
+  // A standalone Claude session has no Gemini audit; a complete Claude pass is its full review.
+  const standalone = session.deepReview?.standalone === true;
   const status = open.length > 0
     ? verificationRound >= MAX_VERIFICATION_ROUNDS ? 'HUMAN_REQUIRED' : 'REWORK'
     : unresolvedMaterialFindings(session).length > 0 ? 'HUMAN_REQUIRED'
       : coverage && !coverage.complete ? 'PARTIAL'
       : resume === 'HUMAN_REQUIRED' && !providerRecovery ? 'HUMAN_REQUIRED'
-      : session.auditCompleted === true ? 'READY' : 'AUDIT_PENDING';
+      : session.auditCompleted === true || standalone ? 'READY' : 'AUDIT_PENDING';
   const completed = {
     ...session,
     ...reconcileDeepSpend(session, spentUsd, costSource),
@@ -496,6 +511,7 @@ export function completeDeepReview({
     updatedAt: now,
   };
   if (providerRecovery) delete completed.reviewFailure;
+  if (standalone && status === 'READY') completed.auditCompleted = true;
   // A complete pass clears an earlier partial record; a partial one is kept so the
   // comment can name exactly what no reviewer has seen yet.
   if (coverage && !coverage.complete) completed.coverage = { ...coverage, head: headSha };

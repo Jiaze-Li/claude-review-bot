@@ -31,7 +31,7 @@ export async function runDeepReviewCommand(command, { env = process.env, fetchIm
     const runBudget = DEEP_REVIEW_MANUAL_RUN_BUDGET_USD;
     const session = beginDeepReview({
       session: ctx.plan.session, baseSha: ctx.baseSha, headSha: ctx.headSha, runId: env.GITHUB_RUN_ID,
-      reserveUsd: runBudget, now,
+      reserveUsd: runBudget, standalone: true, now,
     });
     // Required status goes pending/error FIRST, so a failed durable write below can never leave an old green.
     await postCommitStatus({

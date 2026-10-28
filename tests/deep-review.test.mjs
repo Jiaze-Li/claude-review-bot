@@ -469,3 +469,30 @@ test('a model claiming complete while listing unreviewed files is still PARTIAL;
   });
   assert.equal(bug.status, 'REWORK');
 });
+
+test('standalone @claude review needs no Gemini session: complete pass is READY with the audit marked done', () => {
+  const begun = beginDeepReview({ session: null, baseSha: BASE, headSha: A, standalone: true, now: T0 });
+  assert.equal(begun.status, 'REVIEW_IN_PROGRESS');
+  assert.equal(begun.deepReview.standalone, true);
+  const done = completeDeepReview({
+    session: begun, headSha: A,
+    result: { summary: 'clean', findings: [], coverage: { complete: true, unreviewedPaths: [], note: '' } },
+  });
+  assert.equal(done.status, 'READY');
+  assert.equal(done.auditCompleted, true);
+  assert.equal(sessionCommitStatus(done, A).state, 'success');
+  // Partial coverage or a P2 still blocks a standalone review.
+  const partial = completeDeepReview({ session: begun, headSha: A, result: { summary: 's', findings: [], coverage: { complete: false, unreviewedPaths: ['x'] } } });
+  assert.equal(partial.status, 'PARTIAL');
+  assert.equal(completeDeepReview({ session: begun, headSha: A, result: { summary: 's', findings: [finding('P2')] } }).status, 'REWORK');
+});
+
+test('standalone review on a new HEAD starts fresh but keeps the PR spend ledger; non-standalone still requires a session', () => {
+  const old = { ...readySession(C), deepSpendUsd: 4, claudeSdkSpendUsd: 3 };
+  const begun = beginDeepReview({ session: old, baseSha: BASE, headSha: A, standalone: true, reserveUsd: 5, now: T0 });
+  assert.equal(begun.lastReviewedHead, A);
+  assert.equal(begun.deepSpendUsd, 9);
+  assert.equal(begun.claudeSdkSpendUsd, 3);
+  assert.equal(begun.findings.length, 0);
+  assert.throws(() => beginDeepReview({ session: old, baseSha: BASE, headSha: A, now: T0 }), /requires an existing review session/);
+});

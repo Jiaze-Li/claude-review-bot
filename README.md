@@ -96,7 +96,7 @@ Manual commands (the first nonblank line must be exactly one of these):
 @claude review   # explicit Claude deep review (latest Sonnet, $5 per call)
 ```
 
-Gemini review runs automatically only when a PR is opened, reopened, or marked ready. **New pushes do not trigger a review**; comment `@gemini review` when you want the latest HEAD reviewed, and `@claude review` after that for the deep review (it needs a Gemini session for the exact HEAD). `@claude review` is never automatic; it runs the explicit Claude deep review and does not replace the bounded Gemini session.
+Gemini review runs automatically only when a PR is opened, reopened, or marked ready. **New pushes do not trigger a review**; comment `@gemini review` or `@claude review` when you want the latest HEAD reviewed. The two are parallel reviewers: `@claude review` never needs a Gemini session. If the HEAD has none it starts its own, and a complete, clean Claude pass is READY by itself (partial coverage is PARTIAL, never READY). If a Gemini session already exists for the HEAD, `@claude review` joins it as an extra gate. `@claude review` is never automatic.
 
 `@gemini review` is the same as the original `@jiaze-claude-review-bot review`, and `@jiaze-claude-review-bot claude review` is the same as `@claude review`; the longer forms keep working.
 
