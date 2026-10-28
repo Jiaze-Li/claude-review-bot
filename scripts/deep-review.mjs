@@ -3,6 +3,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { postCommitStatus } from './sync-commit-status.mjs';
 import {
+  DEEP_REVIEW_MANUAL_RUN_BUDGET_USD,
   DEEP_REVIEW_RUN_BUDGET_USD,
   beginDeepReview,
   completeDeepReview,
@@ -25,9 +26,9 @@ export async function runDeepReviewCommand(command, { env = process.env, fetchIm
     if (ctx.plan.decision?.mode !== 'claude') throw new Error('begin requires an explicit Claude deep review plan');
     await assertHeadUnmoved(ctx, fetchImpl);
     // This entry point is an explicit @claude review, not an automatic PR
-    // trigger. The caller deliberately authorizes a bounded $2 call even when
+    // trigger. The caller deliberately authorizes a bounded $5 call even when
     // the cumulative automatic $6 cap is exhausted.
-    const runBudget = DEEP_REVIEW_RUN_BUDGET_USD;
+    const runBudget = DEEP_REVIEW_MANUAL_RUN_BUDGET_USD;
     const session = beginDeepReview({
       session: ctx.plan.session, baseSha: ctx.baseSha, headSha: ctx.headSha, runId: env.GITHUB_RUN_ID,
       reserveUsd: runBudget, now,
@@ -125,7 +126,7 @@ function readUsage(contextRoot, fallbackCost) {
 
 function allottedBudget(env) {
   const value = Number(env.DEEP_REVIEW_MAX_BUDGET_USD);
-  return Number.isFinite(value) && value > 0 ? value : DEEP_REVIEW_RUN_BUDGET_USD;
+  return Number.isFinite(value) && value > 0 ? value : DEEP_REVIEW_MANUAL_RUN_BUDGET_USD;
 }
 
 async function headUnmoved(ctx, fetchImpl) {

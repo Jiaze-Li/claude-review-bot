@@ -49,13 +49,13 @@ function prAPI(calls,{head=HEAD,commentId=123}={}){
   };
 }
 
-test('automatic fallback shares the full $6 ledger; manual requests have a $2 per-call ceiling',()=>{
+test('automatic fallback shares the full $6 ledger; manual requests have a $5 per-call ceiling',()=>{
   assert.equal(DEEP_REVIEW_PR_BUDGET_USD,6);
   assert.equal(CLAUDE_AUTO_MIN_BUDGET_USD,0.5);
   assert.equal(claudeFallbackBudgetLeft({fallbackSpendUsd:3,deepSpendUsd:3}),3);
   assert.equal(claudeFallbackBudgetLeft({fallbackSpendUsd:1,deepSpendUsd:5.5}),0.5);
   assert.equal(claudeFallbackBudgetLeft({deepSpendUsd:6.22}),0);
-  assert.equal(claudeFallbackCallBudget({deepSpendUsd:7},{manual:true}),2);
+  assert.equal(claudeFallbackCallBudget({deepSpendUsd:7},{manual:true}),5);
   assert.equal(claudeFallbackCallBudget({deepSpendUsd:5},{pendingUsd:0.4}),0.6);
   const charged=chargeClaudeFallback({version:1,baseSha:BASE,lastReviewedHead:HEAD,
     status:'AUDIT_PENDING',findings:[],fallbackSpendUsd:0,deepSpendUsd:0},0.4,'sdk');
@@ -191,7 +191,7 @@ test('low automatic allowance avoids a doomed Claude call, but a manual comment 
     fetchImpl:unavailable(),queryImpl:fakeClaude(calls),logImpl:()=>{}});
   assert.equal(result.summary,'No confirmed defect');
   assert.equal(calls.length,1);
-  assert.equal(calls[0].options.maxBudgetUsd,2);
+  assert.equal(calls[0].options.maxBudgetUsd,5);
   assert.equal(result._meta.cost_source,'sdk');
 });
 

@@ -152,15 +152,15 @@ test('begin -> finalize writes IN_PROGRESS then READY into the same comment', as
   assert.match(gh.writes[1].body.body, /jiaze-review-source-comment:55/);
 });
 
-test('manual @claude review runs with $2 limit even after exhausting the automatic PR cap', async () => {
+test('manual @claude review runs with $5 limit even after exhausting the automatic PR cap', async () => {
   const gh = fakeGitHub();
   const dir = ctxDir({ decision: { mode: 'claude' }, session: { ...readySession(), deepSpendUsd: 6 }, sessionCommentId: '300' });
   const env = cenv(dir, { GITHUB_OUTPUT: path.join(dir, 'out') });
   const s = await runDeepReviewCommand('begin', { env, fetchImpl: gh.fetchImpl, now: T0 });
   assert.equal(s.status, 'REVIEW_IN_PROGRESS');
-  assert.equal(s.deepSpendUsd,8);
+  assert.equal(s.deepSpendUsd, 11);
   assert.match(fs.readFileSync(path.join(dir, 'out'), 'utf8'), /run=true/);
-  assert.match(fs.readFileSync(path.join(dir, 'out'), 'utf8'), /run_budget_usd=2.00/);
+  assert.match(fs.readFileSync(path.join(dir, 'out'), 'utf8'), /run_budget_usd=5.00/);
 });
 
 test('fail closes an in-progress run to HUMAN_REQUIRED and accounts the spend', async () => {
@@ -270,8 +270,8 @@ test('the run budget is reserved at begin so an interrupted run still counts aga
   const gh = fakeGitHub();
   const dir = ctxDir({ decision: { mode: 'claude' }, session: { ...readySession(), deepSpendUsd: 3 }, sessionCommentId: '300' });
   const s = await runDeepReviewCommand('begin', { env: cenv(dir, { GITHUB_OUTPUT: path.join(dir, 'out') }), fetchImpl: gh.fetchImpl, now: T0 });
-  assert.equal(s.deepSpendUsd, 5); // 3 already spent + 2 reserved
-  assert.equal(parseSessionComment(gh.writes[0].body.body).deepSpendUsd, 5);
+  assert.equal(s.deepSpendUsd, 8); // 3 already spent + 5 reserved
+  assert.equal(parseSessionComment(gh.writes[0].body.body).deepSpendUsd, 8);
 });
 
 test('reservation is reconciled to actual spend on success and kept when actual is unknown', () => {
@@ -431,4 +431,41 @@ test('manual Claude cannot turn an unfinished discovery/final audit or material 
   const found=completeDeepReview({session:begun,result:{summary:'bug',findings:[finding('P2')]},headSha:A});
   assert.equal(found.status,'REWORK');
   assert.equal(sessionCommitStatus(found,A).state,'failure');
+});
+
+test('partial coverage never reaches READY, names the unreviewed files, and a complete re-run clears it', () => {
+  const begun = beginDeepReview({ session: readySession(), baseSha: BASE, headSha: A, now: T0 });
+  const partial = completeDeepReview({
+    session: begun, headSha: A,
+    result: { summary: 'ran out of budget', findings: [], coverage: { complete: false, unreviewedPaths: ['ui/Layout.swift'], note: 'budget' } },
+  });
+  assert.equal(partial.status, 'PARTIAL');
+  assert.equal(sessionCommitStatus(partial, A).state, 'error');
+  assert.deepEqual(partial.coverage.unreviewedPaths, ['ui/Layout.swift']);
+  const body = renderSessionComment(partial);
+  assert.match(body, /Review coverage: \*\*PARTIAL\*\*/);
+  assert.match(body, /ui\/Layout\.swift/);
+  // The same HEAD waits for a manual re-run; a new HEAD restarts bounded discovery.
+  assert.equal(planReviewSession({ session: partial, baseSha: BASE, headSha: A }).mode, 'noop_waiting');
+  assert.equal(planReviewSession({ session: partial, baseSha: BASE, headSha: C }).mode, 'discovery');
+  const rerun = completeDeepReview({
+    session: beginDeepReview({ session: partial, baseSha: BASE, headSha: A, now: T0 }), headSha: A,
+    result: { summary: 'all covered', findings: [], coverage: { complete: true, unreviewedPaths: [], note: '' } },
+  });
+  assert.equal(rerun.status, 'READY');
+  assert.equal(rerun.coverage, undefined);
+});
+
+test('a model claiming complete while listing unreviewed files is still PARTIAL; open findings outrank PARTIAL', () => {
+  const begun = beginDeepReview({ session: readySession(), baseSha: BASE, headSha: A, now: T0 });
+  const lying = completeDeepReview({
+    session: begun, headSha: A,
+    result: { summary: 's', findings: [], coverage: { complete: true, unreviewedPaths: ['x.swift'] } },
+  });
+  assert.equal(lying.status, 'PARTIAL');
+  const bug = completeDeepReview({
+    session: begun, headSha: A,
+    result: { summary: 's', findings: [finding('P2')], coverage: { complete: false, unreviewedPaths: ['x.swift'] } },
+  });
+  assert.equal(bug.status, 'REWORK');
 });

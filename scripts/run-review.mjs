@@ -15,9 +15,10 @@ const headSha = requireEnv('HEAD_SHA');
 // generation without pinning this repository to a specific release.
 const REVIEW_MODEL = 'sonnet';
 const REVIEW_EFFORT = 'medium';
-const REVIEW_MAX_TURNS = 8;
 // Per-run spend ceiling (SDK estimate; checked after each model response, so it can overshoot by one response).
 const REVIEW_MAX_BUDGET_USD = positiveNumberEnv('DEEP_REVIEW_MAX_BUDGET_USD', 2);
+// Turns scale with the allotted budget ($2 -> 8 turns, $5 -> 20) so extra budget is usable.
+const REVIEW_MAX_TURNS = Math.max(8, Math.round(REVIEW_MAX_BUDGET_USD * 4));
 const usagePath = path.join(contextRoot, 'claude-usage.json');
 
 const schema = {
@@ -41,8 +42,21 @@ const schema = {
         required: ['severity', 'title', 'body', 'path', 'line'],
       },
     },
+    // Self-reported scope. The host also adds any changed file the model named in
+    // neither list, so a file can never be dropped silently.
+    coverage: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        complete: { type: 'boolean' },
+        reviewedPaths: { type: 'array', maxItems: 500, items: { type: 'string', minLength: 1, maxLength: 1000 } },
+        unreviewedPaths: { type: 'array', maxItems: 500, items: { type: 'string', minLength: 1, maxLength: 1000 } },
+        note: { type: 'string', maxLength: 300 },
+      },
+      required: ['complete', 'reviewedPaths', 'unreviewedPaths', 'note'],
+    },
   },
-  required: ['summary', 'findings'],
+  required: ['summary', 'findings', 'coverage'],
 };
 
 const prompt = `You are reviewing pull request ${targetRepo}#${prNumber} at exact head SHA ${headSha}.
@@ -69,6 +83,8 @@ Focus only on actionable correctness bugs, security vulnerabilities, regressions
 You may only inspect files using the available Read, Glob, and Grep tools. Host-side policy restricts those tools to the sanitized repository snapshot and trusted review context. Do not attempt to access any other path.
 
 For each finding, use a repository-relative path. If it can be anchored to an added/modified RIGHT-side line in the PR, set line to that file line number. Otherwise set line to null.
+
+Your spend ceiling is $${REVIEW_MAX_BUDGET_USD.toFixed(2)}. Always report honest coverage: list in coverage.reviewedPaths every changed file you actually examined, and in coverage.unreviewedPaths every changed file you did not get to (set complete=false and say why in note). Never claim a file as reviewed because it appears in the diff. A partial review that says so is useful; one that implies full coverage is harmful.
 
 Severity: P0 catastrophic/release-blocking; P1 high-impact bug/security; P2 normal actionable bug/regression; P3 low-impact but concrete defect.`;
 
@@ -125,12 +141,32 @@ if (!resultSeen || !structuredOutput) {
 
 const reviewDocument = {
   ...structuredOutput,
+  coverage: reconcileCoverage(structuredOutput.coverage),
   _meta: runtimeMeta,
 };
 
 fs.mkdirSync(path.dirname(outputPath), { recursive: true, mode: 0o700 });
 fs.writeFileSync(outputPath, `${JSON.stringify(reviewDocument)}\n`, { mode: 0o600 });
 console.log(`Claude review produced structured output at ${path.relative(cwd, outputPath)}`);
+
+// Any changed file the model neither reviewed nor declared unreviewed is unreviewed.
+function reconcileCoverage(coverage) {
+  let changed = [];
+  try {
+    changed = fs.readFileSync(path.join(contextRoot, 'changed-files.txt'), 'utf8').split('\n').map((l) => l.trim()).filter(Boolean);
+  } catch {
+    // Without the trusted list we can only trust the model's own report.
+  }
+  const reviewed = new Set(coverage?.reviewedPaths ?? []);
+  const declared = new Set(coverage?.unreviewedPaths ?? []);
+  const unreviewed = [...new Set([...declared, ...changed.filter((file) => !reviewed.has(file))])];
+  return {
+    complete: coverage?.complete === true && unreviewed.length === 0,
+    reviewedPaths: [...reviewed],
+    unreviewedPaths: unreviewed,
+    note: coverage?.note ?? '',
+  };
+}
 
 async function authorizeTool(toolName, input) {
   if (toolName === 'Read') {

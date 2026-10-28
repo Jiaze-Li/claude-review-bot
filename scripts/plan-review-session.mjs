@@ -76,7 +76,7 @@ export async function planSession({ env=process.env, fetchImpl=fetch }={}) {
   }
 
   if(requested==='override'){
-    const overridable=session&&['REWORK','HUMAN_REQUIRED','AUDIT_PENDING'].includes(session.status);
+    const overridable=session&&['REWORK','HUMAN_REQUIRED','AUDIT_PENDING','PARTIAL'].includes(session.status);
     const decision=overridable
       ?{mode:'override',previousHead:null,reason:'manual override by a repository writer'}
       :{mode:'noop_waiting',previousHead:null,reason:'nothing to override: no unfinished review session for this PR'};
