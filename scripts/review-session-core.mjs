@@ -8,7 +8,11 @@ const MAX_DISMISSED = 20;
 // Automatic Claude calls share one conservative per-PR ledger. An explicitly
 // requested review may exceed this cap, but each Claude call stays bounded.
 export const DEEP_REVIEW_RUN_BUDGET_USD = 2;
+// An explicit `@claude review` gets a larger single-call ceiling so big PRs can
+// be covered in one pass. It still bypasses nothing else: provider quota applies.
+export const DEEP_REVIEW_MANUAL_RUN_BUDGET_USD = 5;
 export const DEEP_REVIEW_PR_BUDGET_USD = 6;
+const MAX_UNREVIEWED_PATHS = 20;
 export const CLAUDE_AUTO_MIN_BUDGET_USD = 0.5;
 // An IN_PROGRESS session older than this belongs to a run that died without
 // reporting; it must resolve instead of waiting forever.
@@ -76,6 +80,14 @@ export function planReviewSession({ session = null, baseSha, headSha, reset = fa
       return { mode: 'human_required', previousHead: session.lastReviewedHead, reason: 'verification budget exhausted' };
     }
     return { mode: 'verification', previousHead: session.lastReviewedHead, reason: 'verify the repair against open findings' };
+  }
+
+  // The model reported it could not cover every changed file. Never READY; a new
+  // HEAD starts a fresh bounded discovery, the same HEAD waits for a manual re-run.
+  if (session.status === 'PARTIAL') {
+    return session.lastReviewedHead === headSha
+      ? { mode: 'noop_waiting', previousHead: session.lastReviewedHead, reason: 'review coverage was partial; comment `@claude review` to cover the remaining files' }
+      : { mode: 'discovery', previousHead: null, reason: 'new HEAD after partial-coverage review; run a fresh bounded review' };
   }
 
   if (session.status === 'HUMAN_REQUIRED') {
@@ -341,7 +353,7 @@ export function isManualBudgetExemptReview({ sourceKind, requestedMode } = {}) {
 }
 
 export function claudeFallbackCallBudget(session, { manual = false, pendingUsd = 0 } = {}) {
-  return manual ? DEEP_REVIEW_RUN_BUDGET_USD
+  return manual ? DEEP_REVIEW_MANUAL_RUN_BUDGET_USD
     : Math.max(0, roundUsd(claudeFallbackBudgetLeft(session) - nonNegative(pendingUsd)));
 }
 
@@ -394,22 +406,42 @@ export function stopUnavailableReviewSession({
   return charges.reduce((state, charge) => chargeClaudeFallback(state, charge.amount, charge.source), stopped);
 }
 
+// `@claude review` is a reviewer in its own right. When this exact HEAD has no session it
+// starts a standalone one, so Claude and Gemini run as parallel reviewers instead of
+// Claude gating on a Gemini session. Spend carries over from any earlier session.
+function seedStandaloneSession({ previous, baseSha, headSha, now }) {
+  const seed = applyDiscoveryResult({ result: { summary: 'Claude review started', findings: [] }, baseSha, headSha, sourceCommentId: 'claude', now });
+  const spend = {};
+  for (const key of ['deepSpendUsd', 'fallbackSpendUsd', 'claudeSdkSpendUsd', 'claudeUnknownReserveUsd']) {
+    if (Number.isFinite(previous?.[key]) && previous[key] > 0) spend[key] = previous[key];
+  }
+  return { ...seed, ...spend };
+}
+
 export function beginDeepReview({
-  session = null, baseSha, headSha, runId = null, reserveUsd = 0, now = new Date().toISOString(),
+  session = null, baseSha, headSha, runId = null, reserveUsd = 0, standalone = false, now = new Date().toISOString(),
 } = {}) {
   checkedSha(baseSha, 'baseSha');
   checkedSha(headSha, 'headSha');
   if (session) validateSession(session);
-  // Deep review is an additional gate on a Gemini session for this exact HEAD. Seeding a
-  // session from Claude alone would skip Gemini discovery/verification for the HEAD.
+  let standaloneRun = false;
   if (!session || session.lastReviewedHead !== headSha) {
-    throw new Error('deep review requires an existing review session for this exact HEAD');
+    if (!standalone) throw new Error('deep review requires an existing review session for this exact HEAD');
+    session = seedStandaloneSession({ previous: session, baseSha, headSha, now });
+    standaloneRun = true;
   }
   if (session.status === 'REVIEW_IN_PROGRESS' && !isDeepReviewStale(session, Date.parse(now))) {
     throw new Error('a deep review is already in progress for this HEAD');
   }
   // A stale in-progress marker is replaced; the status it interrupted is remembered.
-  const resumeStatus = session.status === 'REVIEW_IN_PROGRESS' ? (session.deepReview?.resumeStatus ?? 'AUDIT_PENDING') : session.status;
+  // A deep review that failed closed is the only reason for that HUMAN_REQUIRED (no findings,
+  // no provider failure), so a retry resumes the status the failed run interrupted instead
+  // of making the stop permanent.
+  const retryingFailedRun = session.status === 'HUMAN_REQUIRED' && session.deepReview?.state === 'FAILED'
+    && session.deepReview.head === headSha && !session.reviewFailure
+    && openMaterialFindings(session).length === 0 && unresolvedMaterialFindings(session).length === 0;
+  const resumeStatus = session.status === 'REVIEW_IN_PROGRESS' || retryingFailedRun
+    ? (session.deepReview?.resumeStatus ?? 'AUDIT_PENDING') : session.status;
   const base = session;
   return {
     ...base,
@@ -418,7 +450,7 @@ export function beginDeepReview({
     // The run's allotted budget is charged up front and reconciled at finalize/fail, so a run
     // that is interrupted (new commit, kill, stale replacement) can never escape the PR cap.
     deepSpendUsd: roundUsd((session.deepSpendUsd ?? 0) + nonNegative(reserveUsd)),
-    deepReview: { head: headSha, startedAt: now, runId: runId == null ? null : String(runId), resumeStatus, state: 'IN_PROGRESS', reservedUsd: nonNegative(reserveUsd) },
+    deepReview: { head: headSha, startedAt: now, runId: runId == null ? null : String(runId), resumeStatus, state: 'IN_PROGRESS', reservedUsd: nonNegative(reserveUsd), ...(standaloneRun || session.deepReview?.standalone === true ? { standalone: true } : {}) },
     updatedAt: now,
   };
 }
@@ -466,11 +498,15 @@ export function completeDeepReview({
   const providerRecovery = resume === 'HUMAN_REQUIRED'
     && session.reviewFailure?.code === 'REVIEWER_UNAVAILABLE'
     && session.reviewFailure?.head === headSha;
+  const coverage = normalizeCoverage(result.coverage);
+  // A standalone Claude session has no Gemini audit; a complete Claude pass is its full review.
+  const standalone = session.deepReview?.standalone === true;
   const status = open.length > 0
     ? verificationRound >= MAX_VERIFICATION_ROUNDS ? 'HUMAN_REQUIRED' : 'REWORK'
     : unresolvedMaterialFindings(session).length > 0 ? 'HUMAN_REQUIRED'
+      : coverage && !coverage.complete ? 'PARTIAL'
       : resume === 'HUMAN_REQUIRED' && !providerRecovery ? 'HUMAN_REQUIRED'
-      : session.auditCompleted === true ? 'READY' : 'AUDIT_PENDING';
+      : session.auditCompleted === true || standalone ? 'READY' : 'AUDIT_PENDING';
   const completed = {
     ...session,
     ...reconcileDeepSpend(session, spentUsd, costSource),
@@ -482,7 +518,28 @@ export function completeDeepReview({
     updatedAt: now,
   };
   if (providerRecovery) delete completed.reviewFailure;
+  if (standalone && status === 'READY') completed.auditCompleted = true;
+  // A complete pass clears an earlier partial record; a partial one is kept so the
+  // comment can name exactly what no reviewer has seen yet.
+  if (coverage && !coverage.complete) completed.coverage = { ...coverage, head: headSha };
+  else delete completed.coverage;
   return completed;
+}
+
+// Absent coverage means a legacy result that predates the field and is treated as
+// complete; run-review.mjs always supplies it for new deep reviews.
+function normalizeCoverage(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const unreviewed = Array.isArray(value.unreviewedPaths)
+    ? [...new Set(value.unreviewedPaths.filter((p) => typeof p === 'string' && p).map((p) => compactText(p, 200)))]
+    : [];
+  const complete = value.complete === true && unreviewed.length === 0;
+  return {
+    complete,
+    unreviewedCount: unreviewed.length,
+    unreviewedPaths: unreviewed.slice(0, MAX_UNREVIEWED_PATHS),
+    ...(value.note ? { note: compactText(value.note, 300) } : {}),
+  };
 }
 
 export function failDeepReview({
@@ -516,6 +573,7 @@ export function sessionCommitStatus(session, headSha) {
     case 'REVIEW_IN_PROGRESS': return { state: 'pending', description: 'Claude deep review in progress' };
     case 'AUDIT_PENDING': return { state: 'pending', description: 'Final audit pending' };
     case 'REWORK': return { state: 'failure', description: 'Open material findings: rework needed' };
+    case 'PARTIAL': return { state: 'error', description: 'Review coverage partial: some changed files were not reviewed' };
     default: return { state: 'error', description: 'Automatic review stopped: human judgment required' };
   }
 }
@@ -804,9 +862,11 @@ export function renderSessionComment(session, { sourceCommentIds = [] } = {}) {
   const verification = `${session.verificationRound ?? 0}/${session.maxVerificationRounds ?? MAX_VERIFICATION_ROUNDS}`;
   const audit = session.auditCompleted === true ? 'complete' : session.status === 'AUDIT_PENDING' ? 'pending' : 'not run';
   const next = session.reviewFailure?.code === 'REVIEWER_UNAVAILABLE'
-    ? 'Provider review did not complete. Comment `@gemini review` to retry the latest HEAD, or `@claude review` for an existing exact-HEAD session. A manual request bypasses the automatic $6 cap but not provider quota or the $2 per-call ceiling.'
+    ? 'Provider review did not complete. Comment `@gemini review` to retry the latest HEAD, or `@claude review` for an existing exact-HEAD session. A manual request bypasses the automatic $6 cap but not provider quota or the $5 per-call ceiling.'
     : unresolved.length > 0
     ? 'Inconclusive material candidate(s): inspect the cited code. If disproven, use `@gemini dismiss F001` with Reason and Evidence links; otherwise fix and push for a fresh review. Manual override explicitly accepts risk.'
+    : session.status === 'PARTIAL'
+    ? 'Some changed files were NOT reviewed (listed above), so this HEAD is not READY. Comment `@claude review` to cover them, or split the PR.'
     : session.status === 'READY'
     ? 'Review is clear on this HEAD; confirm separate CI checks and GitHub merge requirements before merging.'
     : session.status === 'REVIEW_IN_PROGRESS'
@@ -850,7 +910,12 @@ export function renderSessionComment(session, { sourceCommentIds = [] } = {}) {
     ...(session.reviewFailure ? [`Review stopped: **${cleanInline(session.reviewFailure.mode)}** · ${cleanInline(session.reviewFailure.reason)}`] : []),
     ...(session.deepSpendUsd > 0 ? [`Claude charged ledger (SDK cost + conservative reserves): **${session.deepSpendUsd.toFixed(2)}** · automatic per-PR cap ${DEEP_REVIEW_PR_BUDGET_USD.toFixed(2)} · automatic remaining ${deepReviewBudgetLeft(session).toFixed(2)}`] : []),
     ...(session.deepSpendUsd > 0 ? [`Cost breakdown: SDK-reported **${(session.claudeSdkSpendUsd ?? 0).toFixed(4)}** · unknown-usage reserve **${(session.claudeUnknownReserveUsd ?? 0).toFixed(4)}** · historical/unclassified **${Math.max(0, roundUsd(session.deepSpendUsd - (session.claudeSdkSpendUsd ?? 0) - (session.claudeUnknownReserveUsd ?? 0) - (session.deepReview?.state === 'IN_PROGRESS' ? session.deepReview.reservedUsd ?? 0 : 0))).toFixed(4)}**`] : []),
-    `Automatic Claude budget remaining: **${claudeFallbackBudgetLeft(session).toFixed(2)}** of ${DEEP_REVIEW_PR_BUDGET_USD.toFixed(2)} per PR · manual review: up to ${DEEP_REVIEW_RUN_BUDGET_USD.toFixed(2)} per Claude call regardless of cumulative spend`,
+    `Automatic Claude budget remaining: **${claudeFallbackBudgetLeft(session).toFixed(2)}** of ${DEEP_REVIEW_PR_BUDGET_USD.toFixed(2)} per PR · manual review: up to ${DEEP_REVIEW_MANUAL_RUN_BUDGET_USD.toFixed(2)} per Claude call regardless of cumulative spend`,
+    ...(session.coverage && !session.coverage.complete ? [
+      `Review coverage: **PARTIAL** — ${session.coverage.unreviewedCount} changed file(s) not reviewed${session.coverage.note ? ` (${cleanInline(session.coverage.note)})` : ''}`,
+      ...session.coverage.unreviewedPaths.map((p) => `  - \`${cleanInline(p).replace(/`/g, '')}\``),
+      ...(session.coverage.unreviewedCount > session.coverage.unreviewedPaths.length ? [`  - …and ${session.coverage.unreviewedCount - session.coverage.unreviewedPaths.length} more`] : []),
+    ] : []),
     '',
     ...findingLines,
     ...(dismissalLines.length ? ['', 'Human-dismissed findings (cited, not machine-verified):', ...dismissalLines] : []),
@@ -938,7 +1003,7 @@ function validateSession(session) {
   }
   checkedSha(session.baseSha, 'session.baseSha');
   checkedSha(session.lastReviewedHead, 'session.lastReviewedHead');
-  if (!['AUDIT_PENDING', 'READY', 'REWORK', 'HUMAN_REQUIRED', 'REVIEW_IN_PROGRESS'].includes(session.status)) throw new Error('invalid review session status');
+  if (!['AUDIT_PENDING', 'READY', 'REWORK', 'HUMAN_REQUIRED', 'REVIEW_IN_PROGRESS', 'PARTIAL'].includes(session.status)) throw new Error('invalid review session status');
   if (session.auditCompleted != null && typeof session.auditCompleted !== 'boolean') throw new Error('invalid final audit state');
   if (!Array.isArray(session.findings) || session.findings.length > 64) throw new Error('invalid review session findings');
 }

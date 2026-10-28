@@ -563,7 +563,7 @@ test('Claude finding validation shares remaining automatic cap, including primar
   assert.equal(output._validation._meta.total_cost_usd,0.2);
 });
 
-test('validator auto cap fails closed with a marker; manual call bypasses $6 at $2 per call',async()=>{
+test('validator auto cap fails closed with a marker; manual call bypasses $6 at $5 per call',async()=>{
   const root=tempRepo();
   const review={summary:'provider fallback',findings:[falsePositive],
     _meta:{provider:'claude',mode:'discovery',total_cost_usd:0.4,cost_source:'sdk'}};
@@ -577,7 +577,7 @@ test('validator auto cap fails closed with a marker; manual call bypasses $6 at 
   let calls=0;
   const fakeQuery=async function* (args){
     calls++;
-    assert.equal(args.options.maxBudgetUsd,2);
+    assert.equal(args.options.maxBudgetUsd,5);
     yield {type:'result',subtype:'success',total_cost_usd:0.2,usage:{input_tokens:1,output_tokens:1},
       structured_output:{summary:'guard found',validations:[{candidateId:'D001',verdict:'REJECTED',
         reason:'fingerprint guard filters stale entries',evidence:[],sourceAnchors:[]}]}};

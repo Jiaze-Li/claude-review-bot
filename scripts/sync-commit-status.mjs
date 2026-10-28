@@ -23,7 +23,7 @@ export async function syncCommitStatus({ env = process.env, fetchImpl = fetch } 
   // A deep review that was attempted but whose job failed must never leave an old green or a
   // forever-pending status, even if persisting the failure to the session comment itself failed.
   if (env.DEEP_REVIEW_ATTEMPTED === 'true' && env.JOB_FAILED === 'true'
-    && !(session && session.lastReviewedHead === headSha && ['REWORK', 'HUMAN_REQUIRED'].includes(session.status))) {
+    && !(session && session.lastReviewedHead === headSha && ['REWORK', 'HUMAN_REQUIRED', 'PARTIAL'].includes(session.status))) {
     status = { state: 'error', description: 'Claude deep review did not complete: human judgment required' };
   }
   return postCommitStatus({ env, fetchImpl, target, headSha, status });
