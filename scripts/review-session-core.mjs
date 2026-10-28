@@ -434,7 +434,14 @@ export function beginDeepReview({
     throw new Error('a deep review is already in progress for this HEAD');
   }
   // A stale in-progress marker is replaced; the status it interrupted is remembered.
-  const resumeStatus = session.status === 'REVIEW_IN_PROGRESS' ? (session.deepReview?.resumeStatus ?? 'AUDIT_PENDING') : session.status;
+  // A deep review that failed closed is the only reason for that HUMAN_REQUIRED (no findings,
+  // no provider failure), so a retry resumes the status the failed run interrupted instead
+  // of making the stop permanent.
+  const retryingFailedRun = session.status === 'HUMAN_REQUIRED' && session.deepReview?.state === 'FAILED'
+    && session.deepReview.head === headSha && !session.reviewFailure
+    && openMaterialFindings(session).length === 0 && unresolvedMaterialFindings(session).length === 0;
+  const resumeStatus = session.status === 'REVIEW_IN_PROGRESS' || retryingFailedRun
+    ? (session.deepReview?.resumeStatus ?? 'AUDIT_PENDING') : session.status;
   const base = session;
   return {
     ...base,

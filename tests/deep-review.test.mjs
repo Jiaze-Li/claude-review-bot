@@ -508,3 +508,18 @@ test('a standalone review re-run after PARTIAL keeps its standalone marker and r
   assert.equal(done.status, 'READY');
   assert.equal(done.auditCompleted, true);
 });
+
+test('a deep review that failed closed can be retried and recovers; findings-based HUMAN_REQUIRED stays sticky', () => {
+  const failed = failDeepReview({
+    session: beginDeepReview({ session: null, baseSha: BASE, headSha: A, standalone: true, now: T0 }),
+    headSha: A, reason: 'timed out',
+  });
+  assert.equal(failed.status, 'HUMAN_REQUIRED');
+  const retry = beginDeepReview({ session: failed, baseSha: BASE, headSha: A, now: T0 });
+  assert.equal(retry.deepReview.resumeStatus, 'AUDIT_PENDING');
+  const done = completeDeepReview({ session: retry, headSha: A, result: { summary: 's', findings: [], coverage: { complete: true, unreviewedPaths: [] } } });
+  assert.equal(done.status, 'READY');
+  // A HUMAN_REQUIRED that came from elsewhere (here a provider failure) is not cleared by this path.
+  const other = { ...failed, reviewFailure: { code: 'REVIEWER_UNAVAILABLE', mode: 'discovery', head: A, reason: 'x' } };
+  assert.equal(beginDeepReview({ session: other, baseSha: BASE, headSha: A, now: T0 }).deepReview.resumeStatus, 'HUMAN_REQUIRED');
+});
