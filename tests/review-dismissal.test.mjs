@@ -225,3 +225,10 @@ test('workflow wires dismissal into the existing bounded automatic audit', () =>
     yml.indexOf('- name: Run Gemini bounded review'));
   assert.doesNotMatch(block, /GEMINI_API_KEY|CLAUDE_CODE_OAUTH_TOKEN/);
 });
+
+test('a dismissal-triggered final audit installs the Claude fallback dependencies',()=>{
+  const workflow=fs.readFileSync(new URL('../.github/workflows/review-v2.yml',import.meta.url),'utf8');
+  const step=workflow.split('- name: ').find((block)=>block.startsWith('Install Claude fallback dependencies'));
+  assert.ok(step,'install step exists');
+  assert.match(step,/steps\.plan\.outputs\.mode == 'dismiss'/);
+});
