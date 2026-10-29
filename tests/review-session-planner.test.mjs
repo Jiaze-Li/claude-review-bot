@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { planSession } from '../scripts/plan-review-session.mjs';
 import { applyDiscoveryResult, pendingSessionMarker, renderSessionComment } from '../scripts/review-session-core.mjs';
 
@@ -147,4 +150,17 @@ test('explicit Claude request recovers a newer published-but-unpersisted session
   assert.equal(plan.decision.mode,'recover');
   assert.match(plan.decision.reason,/NOT run; send it again/);
   assert.equal(plan.pendingSession.findings[0].id,'F001');
+});
+
+test('a fresh review of a diff over Gemini\'s context limit is planned for Claude, not Gemini',async()=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'plan-big-'));
+  fs.writeFileSync(path.join(dir,'pr.diff'),'x'.repeat(1_600_000));
+  fs.writeFileSync(path.join(dir,'pr.json'),'{}');
+  const big=await planSession({env:env({REVIEW_CONTEXT_DIR:dir}),fetchImpl:fetchState()});
+  assert.equal(big.decision.mode,'claude');
+  assert.match(big.decision.reason,/over Gemini's 1\.5 MB limit/);
+  // The explicit command and a normal-size diff are unaffected.
+  fs.writeFileSync(path.join(dir,'pr.diff'),'x'.repeat(100_000));
+  const small=await planSession({env:env({REVIEW_CONTEXT_DIR:dir}),fetchImpl:fetchState()});
+  assert.equal(small.decision.mode,'discovery');
 });

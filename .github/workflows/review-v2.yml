@@ -315,6 +315,7 @@ jobs:
           BASE_SHA: ${{ inputs.base_sha }}
           HEAD_SHA: ${{ inputs.head_sha }}
           SOURCE_COMMENT_ID: ${{ inputs.source_comment_id }}
+          SOURCE_KIND: ${{ inputs.source_kind }}
           REVIEW_CONTEXT_DIR: .review-context
         run: node scripts/deep-review.mjs begin
 

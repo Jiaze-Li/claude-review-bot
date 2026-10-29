@@ -12,6 +12,14 @@ export const DEEP_REVIEW_RUN_BUDGET_USD = 2;
 // be covered in one pass. It still bypasses nothing else: provider quota applies.
 export const DEEP_REVIEW_MANUAL_RUN_BUDGET_USD = 5;
 export const DEEP_REVIEW_PR_BUDGET_USD = 6;
+// Gemini is sent the whole diff in one request and refuses (rather than truncates) above this.
+// A PR over it is reviewed by Claude in shards instead of failing before any model is called.
+export const GEMINI_MAX_CONTEXT_BYTES = 1_500_000;
+const GEMINI_CONTEXT_MARGIN_BYTES = 20_000;
+export function geminiContextTooLarge({ diffBytes = 0, prJsonBytes = 0, session = null } = {}) {
+  const sessionBytes = session ? Buffer.byteLength(JSON.stringify(session), 'utf8') : 0;
+  return diffBytes + prJsonBytes + sessionBytes + GEMINI_CONTEXT_MARGIN_BYTES > GEMINI_MAX_CONTEXT_BYTES;
+}
 const MAX_UNREVIEWED_PATHS = 20;
 export const CLAUDE_AUTO_MIN_BUDGET_USD = 0.5;
 // An IN_PROGRESS session older than this belongs to a run that died without

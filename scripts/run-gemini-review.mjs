@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { CLAUDE_AUTO_MIN_BUDGET_USD, claudeFallbackCallBudget, isManualBudgetExemptReview, knownIssuesPromptBlock, normalizeReviewResult, normalizeVerificationResult, openMaterialFindings } from './review-session-core.mjs';
+import { CLAUDE_AUTO_MIN_BUDGET_USD, GEMINI_MAX_CONTEXT_BYTES, claudeFallbackCallBudget, isManualBudgetExemptReview, knownIssuesPromptBlock, normalizeReviewResult, normalizeVerificationResult, openMaterialFindings } from './review-session-core.mjs';
 import {GeminiUnavailableError,isGeminiUnavailableStatus,runClaudeStructured} from './claude-fallback.mjs';
 
 // Moving alias: always resolves to Google's current Flash model. Override with GEMINI_MODEL to pin.
@@ -13,7 +13,7 @@ export const GEMINI_TIMEOUT_DEFAULT_MS=180_000;
 export const GEMINI_DISCOVERY_TIMEOUT_DEFAULT_MS=480_000;
 export const GEMINI_AUDIT_TIMEOUT_DEFAULT_MS=480_000;
 export const GEMINI_TIMEOUT_MAX_MS=600_000;
-const MAX_CONTEXT_BYTES=1_500_000;
+const MAX_CONTEXT_BYTES=GEMINI_MAX_CONTEXT_BYTES;
 
 export function resolveGeminiTimeoutMs({mode,env=process.env}={}){
   const raw = mode==='audit'
@@ -396,5 +396,19 @@ if(process.argv[1] && import.meta.url===pathToFileURL(process.argv[1]).href){
     fs.writeFileSync(output,JSON.stringify(result)+'\n',{mode:0o600});
     const u=result._meta?.usage;
     console.log(`Gemini ${result._meta.mode} review complete: model=${result._meta.resolved_model} effort=${result._meta.effort} input=${u?.input_tokens??'?'} output=${u?.output_tokens??'?'} thoughts=${u?.thoughts_tokens??'?'}`);
-  }catch(error){console.error(error.message);process.exitCode=1;}
+  }catch(error){
+    console.error(error.message);
+    writeFailureReason(error.message);
+    process.exitCode=1;
+  }
+}
+
+// The status comment shows this, so a failed run says why instead of only "not confirmed".
+function writeFailureReason(message){
+  try{
+    const dir=path.resolve(process.env.REVIEW_CONTEXT_DIR||'.review-context');
+    fs.writeFileSync(path.join(dir,'failure-reason.txt'),String(message).slice(0,400),{mode:0o600});
+  }catch{
+    // best effort
+  }
 }
