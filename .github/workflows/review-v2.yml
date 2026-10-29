@@ -70,6 +70,7 @@ on:
 
 permissions:
   contents: read
+  actions: write # only to start the next run of this same workflow when a big review has work left
 
 concurrency:
   # Serialize one PR's durable review session. A second trigger waits for the
@@ -639,6 +640,27 @@ jobs:
           EXPECTED_REVIEW_AUTHOR: ${{ steps.app-token.outputs.app-slug }}[bot]
           REVIEW_MODE: ${{ steps.plan.outputs.mode }}
         run: node scripts/sync-review-threads.mjs
+
+      - name: Continue a big review in the next run
+        if: always() && steps.dedupe.outputs.duplicate != 'true' && job.status == 'success' && inputs.source_kind != '' && steps.plan.outputs.mode != 'noop_waiting'
+        continue-on-error: true # best effort: the next run can always be started by hand
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          DISPATCH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          CONTROL_REF: ${{ github.ref_name }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          BASE_SHA: ${{ inputs.base_sha }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          TRIGGER_USER: ${{ inputs.trigger_user }}
+          SOURCE_COMMENT_ID: ${{ inputs.source_comment_id }}
+          SOURCE_KIND: ${{ inputs.source_kind }}
+          REQUESTED_MODE: ${{ inputs.requested_mode }}
+          REVIEW_MODE: ${{ steps.plan.outputs.mode }}
+          EXPECTED_REVIEW_AUTHOR: ${{ steps.app-token.outputs.app-slug }}[bot]
+          REVIEW_CONTEXT_DIR: .review-context
+        run: node scripts/continue-review.mjs
 
       - name: Finalize workflow status
         if: always() && steps.review-status.outputs.comment_id != ''

@@ -75,7 +75,7 @@ export async function planSession({ env=process.env, fetchImpl=fetch }={}) {
         const threads=await fetchReviewThreads({owner,repo:repoName,number:Number(pr),token:env.GH_TOKEN,fetchImpl});
         const claims=blockingClaims({session,byFinding:threadsByFinding({session,threads,botLogin}),botLogin});
         if(claims.allClaimed){
-          const resolvers=new Set(threads.flatMap(t=>t.isResolved&&t.resolvedBy&&t.resolvedBy!==botLogin?[t.resolvedBy]:[]));
+          const resolvers=new Set(threads.flatMap(t=>t.isResolved&&t.resolvedBy?.login&&t.resolvedBy.login!==botLogin?[t.resolvedBy.login]:[]));
           let allWriters=resolvers.size>0;
           for(const login of resolvers) if(!(await isWriter({target,login,token:env.GH_TOKEN,fetchImpl}))) allWriters=false;
           const planned=allWriters?planReviewSession({session,baseSha,headSha,reset:false,retryUnavailable:false}):null;

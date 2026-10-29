@@ -95,7 +95,10 @@ export async function publishRunStatus({ env = process.env, fetchImpl = fetch } 
   }
 
   const completedNoop = stage === 'finished' && ['recover', 'noop_ready', 'noop_waiting', 'human_required', 'deep_review_stale'].includes(mode);
-  const sourceReference = sourceKind === 'comment'
+  const isContinuation = /^8[0-9]\d{11}$/.test(sourceId);
+  const sourceReference = isContinuation
+    ? 'Trigger: automatic continuation of the previous run'
+    : sourceKind === 'comment'
     ? '[Source comment](https://github.com/' + repo + '/pull/' + pr + '#issuecomment-' + sourceId + ')'
     : 'Trigger: automatic pull request event';
 
