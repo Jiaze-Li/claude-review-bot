@@ -12,6 +12,12 @@ import { latestSession } from './sync-commit-status.mjs';
 export const MAX_CONTINUATIONS = 3;
 const CHAIN_ID = /^8([0-9])\d{11}$/; // 13 digits: '8', continuation number, run id; real comment ids never look like this
 
+// A continuation resumes; it must never repeat a one-shot command (reset, override, dismiss, threads).
+// Only `claude` (Claude alone) is carried over, so the model choice holds for the whole chain.
+export function continuationMode(requestedMode) {
+  return requestedMode === 'claude' ? 'claude' : 'auto';
+}
+
 export function chainIndex(sourceCommentId) {
   const match = CHAIN_ID.exec(String(sourceCommentId ?? ''));
   return match ? Number(match[1]) : 0;
@@ -57,7 +63,7 @@ export async function continueReview({ env = process.env, fetchImpl = fetch, log
       inputs: {
         target_repo: target, pr_number: need('PR_NUMBER'), base_sha: need('BASE_SHA'), head_sha: headSha,
         trigger_user: need('TRIGGER_USER'), source_comment_id: next,
-        source_kind: env.SOURCE_KIND || 'comment', requested_mode: env.REQUESTED_MODE || 'auto',
+        source_kind: env.SOURCE_KIND || 'comment', requested_mode: continuationMode(env.REQUESTED_MODE),
       },
     }),
     signal: AbortSignal.timeout(15000),

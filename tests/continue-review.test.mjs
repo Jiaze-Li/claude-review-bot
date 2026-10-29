@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { chainIndex, continueReview, decideContinuation, nextChainId, MAX_CONTINUATIONS } from '../scripts/continue-review.mjs';
+import { chainIndex, continuationMode, continueReview, decideContinuation, nextChainId, MAX_CONTINUATIONS } from '../scripts/continue-review.mjs';
 import { applyDiscoveryResult, renderSessionComment } from '../scripts/review-session-core.mjs';
 
 const BASE = 'b'.repeat(40), HEAD = 'a'.repeat(40);
@@ -69,4 +69,9 @@ test('the workflow starts the next run only after a successful job, never fails 
   assert.match(block, /job\.status == 'success'/);
   assert.doesNotMatch(block, /GEMINI_API_KEY|CLAUDE_CODE_OAUTH_TOKEN/);
   assert.match(yml, /^permissions:\n  contents: read\n  actions: write/m);
+});
+
+test('a continuation never repeats a one-shot command: reset, override, dismiss and threads continue as auto; claude stays claude', async () => {
+  assert.equal(continuationMode('claude'), 'claude');
+  for (const mode of ['reset', 'override', 'dismiss', 'threads', 'auto', undefined]) assert.equal(continuationMode(mode), 'auto');
 });
