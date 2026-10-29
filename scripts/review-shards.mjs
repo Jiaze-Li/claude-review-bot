@@ -1,8 +1,8 @@
 // Pure helpers that split a large PR diff into independently reviewable shards and
 // merge the per-shard results back into one review with honest coverage.
 
-export const SHARD_TARGET_BYTES = 150_000;
-export const MAX_SHARDS = 6;
+export const SHARD_TARGET_BYTES = 100_000;
+export const MAX_SHARDS = 10;
 // Findings recorded in the durable session are capped; material ones are kept first.
 export const MAX_MERGED_FINDINGS = 6;
 const SEVERITY_ORDER = { P0: 0, P1: 1, P2: 2, P3: 3 };
@@ -95,15 +95,18 @@ export function mergeShardResults({ shards, results, deferred = [], allFiles }) 
   const findings = new Map();
   const summaries = [];
   let failedShards = 0;
+  const shardStats = [];
 
   shards.forEach((shard, index) => {
     const result = results[index];
     if (!result?.ok) {
       failedShards += 1;
+      shardStats.push(`${index + 1}: ${result ? 'failed' : 'not run'} 0/${shard.files.length}`);
       notes.push(`shard ${index + 1}/${shards.length} ${result ? `failed (${String(result.error).slice(0, 80)})` : 'did not run'}`);
       return;
     }
     const coverage = reconcileCoverage(result.structured.coverage, shard.files);
+    shardStats.push(`${index + 1}: ok ${coverage.reviewedPaths.length}/${shard.files.length}`);
     coverage.reviewedPaths.forEach((p) => reviewed.add(p));
     if (!coverage.complete && coverage.note) notes.push(coverage.note);
     if (result.structured.summary) summaries.push(String(result.structured.summary).trim());
@@ -123,6 +126,7 @@ export function mergeShardResults({ shards, results, deferred = [], allFiles }) 
 
   const header = `Reviewed ${reviewed.size} of ${allFiles.length} changed file(s) in ${shards.length} shard(s)${complete ? '' : ' — PARTIAL'}.`;
   const extra = [
+    ...(shards.length > 1 || deferred.length ? [`Shards (reviewed/assigned): ${shardStats.join(' · ')}${deferred.length ? ` · deferred beyond limit: ${deferred.length} file(s)` : ''}.`] : []),
     ...(droppedMaterial ? [`${droppedMaterial} more material finding(s) were omitted to fit the session limit; fix the listed ones and re-review.`] : []),
     ...(complete ? [] : [`Not reviewed: ${unreviewedPaths.slice(0, 15).join(', ')}${unreviewedPaths.length > 15 ? `, … (+${unreviewedPaths.length - 15})` : ''}.`]),
   ];
@@ -132,6 +136,7 @@ export function mergeShardResults({ shards, results, deferred = [], allFiles }) 
 
   return {
     summary,
+    shardStats,
     findings: kept,
     coverage: {
       complete,

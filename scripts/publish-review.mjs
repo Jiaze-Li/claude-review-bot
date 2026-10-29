@@ -152,6 +152,12 @@ function formatRuntimeSection(value) {
   }
   if (effort) details.push(`effort ${effort}`);
   if (numTurns !== null) details.push(`turns ${numTurns}${maxTurns !== null ? `/${maxTurns}` : ''}`);
+  const shards = nonnegativeInteger(value.shards);
+  const shardsRun = nonnegativeInteger(value.shards_run);
+  const deferredFiles = nonnegativeInteger(value.deferred_files);
+  if (shards !== null && shards > 1) {
+    details.push(`shards ${shardsRun !== null ? `${shardsRun}/` : ''}${shards}${deferredFiles ? ` (+${deferredFiles} file(s) deferred)` : ''}`);
+  }
 
   if (usage) {
     const input = nonnegativeNumber(usage.input_tokens);
