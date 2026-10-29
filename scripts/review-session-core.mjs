@@ -435,7 +435,7 @@ function seedStandaloneSession({ previous, baseSha, headSha, now }) {
 }
 
 export function beginDeepReview({
-  session = null, baseSha, headSha, runId = null, reserveUsd = 0, standalone = false, now = new Date().toISOString(),
+  session = null, baseSha, headSha, runId = null, reserveUsd = 0, standalone = false, audit = false, now = new Date().toISOString(),
 } = {}) {
   checkedSha(baseSha, 'baseSha');
   checkedSha(headSha, 'headSha');
@@ -459,6 +459,8 @@ export function beginDeepReview({
   const resumeStatus = session.status === 'REVIEW_IN_PROGRESS' || retryingFailedRun
     ? (session.deepReview?.resumeStatus ?? 'AUDIT_PENDING') : session.status;
   const base = session;
+  // A final audit that ran out of room (PARTIAL) is still the audit when it is continued.
+  const auditRun = audit || (session.status === 'PARTIAL' && session.deepReview?.audit === true);
   return {
     ...base,
     lastReviewedHead: headSha,
@@ -466,7 +468,7 @@ export function beginDeepReview({
     // The run's allotted budget is charged up front and reconciled at finalize/fail, so a run
     // that is interrupted (new commit, kill, stale replacement) can never escape the PR cap.
     deepSpendUsd: roundUsd((session.deepSpendUsd ?? 0) + nonNegative(reserveUsd)),
-    deepReview: { head: headSha, startedAt: now, runId: runId == null ? null : String(runId), resumeStatus, state: 'IN_PROGRESS', reservedUsd: nonNegative(reserveUsd), ...(standaloneRun || session.deepReview?.standalone === true ? { standalone: true } : {}) },
+    deepReview: { head: headSha, startedAt: now, runId: runId == null ? null : String(runId), resumeStatus, state: 'IN_PROGRESS', reservedUsd: nonNegative(reserveUsd), ...(standaloneRun || session.deepReview?.standalone === true ? { standalone: true } : {}), ...(auditRun ? { audit: true } : {}) },
     updatedAt: now,
   };
 }
@@ -517,12 +519,14 @@ export function completeDeepReview({
   const coverage = normalizeCoverage(result.coverage);
   // A standalone Claude session has no Gemini audit; a complete Claude pass is its full review.
   const standalone = session.deepReview?.standalone === true;
+  // A complete sharded pass that was started as the final audit is that audit.
+  const auditRun = session.deepReview?.audit === true;
   const status = open.length > 0
     ? verificationRound >= MAX_VERIFICATION_ROUNDS ? 'HUMAN_REQUIRED' : 'REWORK'
     : unresolvedMaterialFindings(session).length > 0 ? 'HUMAN_REQUIRED'
       : coverage && !coverage.complete ? 'PARTIAL'
       : resume === 'HUMAN_REQUIRED' && !providerRecovery ? 'HUMAN_REQUIRED'
-      : session.auditCompleted === true || standalone ? 'READY' : 'AUDIT_PENDING';
+      : session.auditCompleted === true || standalone || auditRun ? 'READY' : 'AUDIT_PENDING';
   const completed = {
     ...session,
     ...reconcileDeepSpend(session, spentUsd, costSource),
@@ -534,7 +538,7 @@ export function completeDeepReview({
     updatedAt: now,
   };
   if (providerRecovery) delete completed.reviewFailure;
-  if (standalone && status === 'READY') completed.auditCompleted = true;
+  if ((standalone || auditRun) && status === 'READY') completed.auditCompleted = true;
   // A complete pass clears an earlier partial record; a partial one is kept so the
   // comment can name exactly what no reviewer has seen yet.
   if (coverage && !coverage.complete) completed.coverage = { ...coverage, head: headSha };

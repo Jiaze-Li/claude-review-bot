@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { isDeepReviewStale, parsePendingSessionReview, parseSessionComment, planReviewSession } from './review-session-core.mjs';
+import { stagedDiffFits } from './review-shards.mjs';
 import { blockingClaims, fetchReviewThreads, isWriter, threadsByFinding } from './review-threads.mjs';
 import { prepareIncrementalDelta } from './select-incremental-review.mjs';
 
@@ -120,7 +121,21 @@ export async function planSession({ env=process.env, fetchImpl=fetch }={}) {
     decision={mode:'claude',previousHead:null,
       reason:`${decision.reason}: reviewing the ${Math.max(1,Math.round(diffBytes/1000))} KB diff in shards: ${requested==='claude'?'Claude only':'Gemini first, Claude continues if Gemini cannot'}`};
   }
+  // A final audit has to see the whole PR in one staged run. When the diff is too big for that, the sharded engine
+  // does the audit instead: it can continue over several runs, and a complete pass of it counts as the audit.
+  if(decision.mode==='audit'){
+    const contextRoot=path.resolve(env.REVIEW_CONTEXT_DIR||'.review-context');
+    const diffFile=path.join(contextRoot,'pr.diff');
+    if(fs.existsSync(diffFile) && !stagedDiffFits(fs.readFileSync(diffFile,'utf8'),readOptional(path.join(contextRoot,'ignore-patterns.txt')))){
+      decision={mode:'claude',audit:true,previousHead:null,
+        reason:`final audit of a large diff, in shards: ${requested==='claude'?'Claude only':'Gemini first, Claude continues if Gemini cannot'}; continues over several runs if needed`};
+    }
+  }
   return {requestedMode:requested,decision,session,sessionCommentId,pendingSession:null,pendingSourceCommentId:null,pendingReviewId:null};
+}
+
+function readOptional(file){
+  try{return fs.readFileSync(file,'utf8');}catch{return '';}
 }
 
 function fileBytes(file){

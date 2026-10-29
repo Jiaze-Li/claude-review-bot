@@ -236,3 +236,22 @@ test('resolved threads do not start a review when nothing is pushed, a resolver 
   assert.equal((await run({HEAD_SHA:C},{resolvedBy:null})).decision.mode,'threads');
   assert.equal((await run({HEAD_SHA:C},{resolvedBy:author.replace('[bot]','')})).decision.mode,'threads');
 });
+
+test('a final audit too big for one staged run goes to the sharded engine as the audit; a small one stays staged',async()=>{
+  const awaiting=applyDiscoveryResult({result:{summary:'clean',findings:[]},baseSha:BASE,headSha:A,sourceCommentId:'1'});
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'plan-audit-'));
+  fs.writeFileSync(path.join(dir,'pr.json'),'{}');
+  const file=(i,bytes)=>`diff --git a/src/f${i}.js b/src/f${i}.js\n--- a/src/f${i}.js\n+++ b/src/f${i}.js\n@@ -1 +1 @@\n+${'x'.repeat(bytes)}\n`;
+  const plan=(mode='auto')=>planSession({env:env({REVIEW_CONTEXT_DIR:dir,REQUESTED_MODE:mode,SOURCE_KIND:'comment'}),fetchImpl:fetchState({comments:[comment(7,renderSessionComment(awaiting))]})});
+  fs.writeFileSync(path.join(dir,'pr.diff'),file(0,100));
+  assert.equal((await plan()).decision.mode,'audit');
+  fs.writeFileSync(path.join(dir,'pr.diff'),Array.from({length:30},(_,i)=>file(i,90_000)).join(''));
+  const big=await plan();
+  assert.equal(big.decision.mode,'claude');
+  assert.equal(big.decision.audit,true);
+  assert.match(big.decision.reason,/Gemini first/);
+  assert.match((await plan('claude')).decision.reason,/Claude only/);
+  // files the reviews skip do not count toward the limit
+  fs.writeFileSync(path.join(dir,'ignore-patterns.txt'),'src/*\n');
+  assert.equal((await plan()).decision.mode,'audit');
+});
