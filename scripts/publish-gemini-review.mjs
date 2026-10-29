@@ -1,3 +1,4 @@
+import { addPatch, chooseAnchor, findingMarker, snapNote } from './review-anchors.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -93,7 +94,7 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
 
   const sessionBody = renderSessionComment(session, { sourceCommentIds: [sourceCommentId] });
   const pendingMarker = pendingSessionMarker(session, sourceCommentId);
-  const addedLines = await loadAddedLines({ owner, repo, prNumber, token: env.GH_TOKEN, fetchImpl });
+  const anchors = await loadAnchors({ owner, repo, prNumber, token: env.GH_TOKEN, fetchImpl });
   const newFindings = mode === 'discovery'
     ? session.findings
     : session.findings.slice(plan.session.findings.length);
@@ -102,8 +103,10 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
   for (const finding of newFindings) {
     const text = '**[' + finding.id + ' · ' + finding.severity + '] ' + finding.title + '**\n\n'
       + finding.body + '\n\nRisk class: ' + finding.riskClass;
-    if (Number.isInteger(finding.line) && addedLines.has(finding.path + ':' + finding.line)) {
-      inline.push({ path: finding.path, line: finding.line, side: 'RIGHT', body: text });
+    const anchor = chooseAnchor(anchors, finding);
+    if (anchor) {
+      inline.push({ path: finding.path, line: anchor.line, side: 'RIGHT',
+        body: text + snapNote(anchor) + '\n\n' + findingMarker(finding.path, finding.title) });
     } else {
       unanchored.push(finding);
     }
@@ -229,41 +232,16 @@ async function upsertSessionComment({ owner, repo, prNumber, existingId, body, t
   return String(result.id);
 }
 
-async function loadAddedLines({ owner, repo, prNumber, token, fetchImpl }) {
-  const set = new Set();
+async function loadAnchors({ owner, repo, prNumber, token, fetchImpl }) {
+  const anchors = new Map();
   for (let page = 1; page <= 100; page += 1) {
     const url = 'https://api.github.com/repos/' + owner + '/' + repo + '/pulls/' + prNumber + '/files?per_page=100&page=' + page;
     const files = await githubJson(url, token, fetchImpl);
     if (!Array.isArray(files)) throw new Error('GitHub pull files response was not an array');
-    for (const file of files) {
-      if (typeof file.filename !== 'string' || typeof file.patch !== 'string') continue;
-      for (const line of parseAddedLineNumbers(file.patch)) set.add(file.filename + ':' + line);
-    }
-    if (files.length < 100) return set;
+    for (const file of files) addPatch(anchors, file.filename, file.patch);
+    if (files.length < 100) return anchors;
   }
   throw new Error('Pull request file pagination exceeded safety limit');
-}
-
-function parseAddedLineNumbers(patch) {
-  const lines = new Set();
-  let newLine = 0;
-  let inHunk = false;
-  for (const text of patch.split('\n')) {
-    const hunk = text.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
-    if (hunk) {
-      newLine = Number(hunk[1]);
-      inHunk = true;
-      continue;
-    }
-    if (!inHunk || text.startsWith('\\ No newline')) continue;
-    if (text.startsWith('+')) {
-      lines.add(newLine);
-      newLine += 1;
-    } else if (!text.startsWith('-')) {
-      newLine += 1;
-    }
-  }
-  return lines;
 }
 
 async function githubJson(url, token, fetchImpl, init = {}) {

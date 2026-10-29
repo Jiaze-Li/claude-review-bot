@@ -260,3 +260,39 @@ test('publisher refuses READY after an uncertain final-audit verdict',async()=>{
   assert.equal(out.session.auditCompleted,false);
   assert.equal(sessionCommitStatus(out.session,A).state,'error');
 });
+
+test('a finding whose line is outside the diff is still pinned as a resolvable thread, with its marker; a file outside the PR stays in the body', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'publish-gemini-anchor-'));
+  fs.writeFileSync(path.join(dir, 'session-plan.json'), JSON.stringify({ decision: { mode: 'discovery' }, session: null, sessionCommentId: null }));
+  const reviewPath = path.join(dir, 'review.json');
+  fs.writeFileSync(reviewPath, JSON.stringify({
+    summary: 'Found three.',
+    findings: [
+      { severity: 'P2', title: 'Line far from the change', body: 'b1', path: 'a.js', line: 534, riskClass: 'state' },
+      { severity: 'P3', title: 'No line given', body: 'b2', path: 'a.js', line: null, riskClass: 'state' },
+      { severity: 'P3', title: 'In a file the PR does not touch', body: 'b3', path: 'untouched.js', line: 5, riskClass: 'state' },
+    ],
+    _meta: { resolved_model: 'gemini-x', effort: 'low', usage: { input_tokens: 1, output_tokens: 1, thoughts_tokens: 0 } },
+  }));
+  const calls = [];
+  const fetchImpl = async (url, init = {}) => {
+    calls.push({ url, method: init.method || 'GET', body: init.body ? JSON.parse(init.body) : null });
+    if (url.endsWith('/pulls/7')) return Response.json({ base: { sha: BASE }, head: { sha: A } });
+    if (url.includes('/pulls/7/files')) return Response.json([{ filename: 'a.js', patch: '@@ -1,2 +1,3 @@\n keep\n+new line\n keep too' }]);
+    if (url.endsWith('/issues/7/comments')) return Response.json({ id: 101 });
+    if (url.endsWith('/pulls/7/reviews')) return Response.json({ id: 202, html_url: 'https://example/review' });
+    assert.fail('unexpected URL ' + url);
+  };
+  await publishGeminiReview({
+    env: { GH_TOKEN: 'token', TARGET_REPO: 'acme/project', PR_NUMBER: '7', BASE_SHA: BASE, HEAD_SHA: A, SOURCE_COMMENT_ID: '99', REVIEW_PATH: reviewPath, REVIEW_CONTEXT_DIR: dir },
+    fetchImpl,
+  });
+  const review = calls.find((call) => call.url.endsWith('/pulls/7/reviews') && call.method === 'POST').body;
+  assert.equal(review.comments.length, 2);
+  assert.ok(review.comments.every((c) => c.path === 'a.js' && c.line === 2 && c.side === 'RIGHT'));
+  assert.match(review.comments[0].body, /Pinned to the nearest changed line: line 534 is outside the changed lines/);
+  assert.match(review.comments[1].body, /file-level finding/);
+  assert.ok(review.comments.every((c) => /<!-- jiaze-finding:[0-9a-f]{10} -->/.test(c.body)));
+  assert.match(review.body, /Findings without an inline anchor[\s\S]*In a file the PR does not touch/);
+  assert.doesNotMatch(review.body, /Line far from the change<\/b>|Line far from the change.*untouched/);
+});
