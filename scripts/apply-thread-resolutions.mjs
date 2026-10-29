@@ -1,22 +1,18 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { findingKey, markerKey } from './review-anchors.mjs';
+import { fetchReviewThreads, isWriter, replyToThread, threadsByFinding, unresolveThread, blockingClaims } from './review-threads.mjs';
 import { applyThreadDecisions, renderSessionComment } from './review-session-core.mjs';
 
-// A person resolving the bot's review thread for a finding closes that finding; unresolving it reopens it.
-// No model call. This reconciles the threads' current state with the session (rather than trusting a single
-// event), so a missed or repeated event cannot leave them out of step. Only a repository writer's resolve
-// counts, and only threads the bot started (first comment by the bot, carrying its finding marker).
-const THREADS_QUERY = `query($owner:String!,$repo:String!,$number:Int!,$after:String){
-  repository(owner:$owner,name:$repo){pullRequest(number:$number){
-    reviewThreads(first:100,after:$after){
-      pageInfo{hasNextPage endCursor}
-      nodes{id isResolved resolvedBy{login} comments(first:1){nodes{body author{login}}}}
-    }
-  }}
-}`;
-
+// A person resolving or reopening the bot's review threads. No model call here (when a review of the changes is
+// needed the planner picks the verification mode instead; see planSession). This reconciles what is left:
+//
+// - A non-blocking finding (P3) whose thread a writer resolved is closed and never re-raised; unresolving the
+//   thread reopens it.
+// - Blocking findings that a person has now ALL resolved, when nothing has been pushed since the review, cannot be
+//   checked: there is no change to look at. Their threads are reopened with a reply saying what to do.
+// - Anything else (some blocking threads still unresolved) is left alone, so a person can work through them.
+// The threads' current state is what is applied, so a missed or repeated event cannot leave things out of step.
 export async function applyThreadResolutions({ env = process.env, fetchImpl = fetch, log = console } = {}) {
   const target = required(env, 'TARGET_REPO');
   if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(target)) throw new Error('Invalid TARGET_REPO');
@@ -38,78 +34,54 @@ export async function applyThreadResolutions({ env = process.env, fetchImpl = fe
   const pr = await rest(`https://api.github.com/repos/${target}/pulls/${prNumber}`, token, fetchImpl);
   if (pr.base?.sha !== baseSha || pr.head?.sha !== headSha) throw new Error('PR moved before thread decisions; refusing stale update');
 
-  const idsByKey = new Map();
-  for (const finding of session.findings) {
-    const key = findingKey(finding.path, finding.title);
-    if (!idsByKey.has(key)) idsByKey.set(key, []);
-    idsByKey.get(key).push(finding);
-  }
+  const threads = await fetchReviewThreads({ owner, repo, number: Number(prNumber), token, fetchImpl });
+  const byFinding = threadsByFinding({ session, threads, botLogin });
+  const writers = new Map();
+  const writer = async (login) => {
+    if (!writers.has(login)) writers.set(login, await isWriter({ target, login, token, fetchImpl }));
+    return writers.get(login);
+  };
 
-  const threads = await fetchThreads({ owner, repo, number: Number(prNumber), token, fetchImpl });
-  const candidates = [];
+  const closed = [];
   const reopened = [];
-  for (const thread of threads) {
-    const first = thread.comments?.nodes?.[0];
-    if (!first || first.author?.login !== botLogin) continue;
-    const findings = idsByKey.get(markerKey(first.body)) ?? [];
-    if (!findings.length) continue;
-    if (thread.isResolved) {
-      const resolver = thread.resolvedBy?.login;
-      if (!resolver || resolver === botLogin) continue; // the bot's own tidy-up is not a decision
-      for (const finding of findings) candidates.push({ id: finding.id, by: resolver });
-    } else {
-      for (const finding of findings) if (finding.status === 'WAIVED' && finding.resolvedVia === 'thread') reopened.push(finding.id);
+  for (const finding of session.findings) {
+    const own = byFinding.get(finding.id) ?? [];
+    if (!own.length) continue;
+    if (finding.status === 'DEFERRED' && own.every((thread) => thread.isResolved)) {
+      const by = own.map((thread) => thread.resolvedBy).find((login) => login && login !== botLogin);
+      if (by && await writer(by)) closed.push({ id: finding.id, by });
+    } else if (finding.status === 'WAIVED' && finding.resolvedVia === 'thread' && own.some((thread) => !thread.isResolved)) {
+      reopened.push(finding.id);
     }
   }
 
-  const permissions = new Map();
-  const closed = [];
-  for (const candidate of candidates) {
-    if (!permissions.has(candidate.by)) permissions.set(candidate.by, await isWriter({ target, login: candidate.by, token, fetchImpl }));
-    if (permissions.get(candidate.by)) closed.push(candidate);
-    else log.warn?.(`@${candidate.by} resolved a thread but does not have write access; ignoring it.`);
+  // Everything blocking is resolved but nothing new was pushed: there is nothing to verify. Put the threads back.
+  let bounced = 0;
+  const claims = blockingClaims({ session, byFinding, botLogin });
+  if (claims.allClaimed && session.lastReviewedHead === headSha) {
+    for (const finding of claims.claimed) {
+      for (const thread of byFinding.get(finding.id)) {
+        try {
+          await unresolveThread({ token, fetchImpl, id: thread.id });
+          if (thread.commentId) {
+            await replyToThread({ target, prNumber, commentId: thread.commentId, token, fetchImpl,
+              body: `Reopened: nothing has been pushed since I reported this, so there is no change for me to check.\n\nPush a fix and resolve the thread again, or, if it is not a bug, comment \`@gemini dismiss ${finding.id}\` with a Reason and Evidence link.` });
+          }
+          bounced += 1;
+        } catch (error) {
+          log.warn?.(`Could not reopen a thread: ${String(error.message).slice(0, 200)}`);
+        }
+      }
+    }
   }
 
   const next = applyThreadDecisions({ session, headSha, closed, reopened });
-  if (next === session) {
-    log.log?.('Review threads agree with the session; nothing to change.');
-    return session;
+  if (next !== session) {
+    const body = renderSessionComment(next, { sourceCommentIds: [sourceCommentId] });
+    await rest(`https://api.github.com/repos/${target}/issues/comments/${plan.sessionCommentId}`, token, fetchImpl, { method: 'PATCH', body: JSON.stringify({ body }) });
   }
-  const body = renderSessionComment(next, { sourceCommentIds: [sourceCommentId] });
-  await rest(`https://api.github.com/repos/${target}/issues/comments/${plan.sessionCommentId}`, token, fetchImpl, { method: 'PATCH', body: JSON.stringify({ body }) });
-  log.log?.(`Review-thread decisions applied: ${closed.length} closed, ${reopened.length} reopened; status ${next.status}.`);
-  return next;
-}
-
-async function isWriter({ target, login, token, fetchImpl }) {
-  try {
-    const result = await rest(`https://api.github.com/repos/${target}/collaborators/${encodeURIComponent(login)}/permission`, token, fetchImpl);
-    return ['admin', 'maintain', 'write'].includes(result.permission);
-  } catch {
-    return false;
-  }
-}
-
-async function fetchThreads({ owner, repo, number, token, fetchImpl }) {
-  const threads = [];
-  let after = null;
-  for (let page = 0; page < 20; page += 1) {
-    const response = await fetchImpl('https://api.github.com/graphql', {
-      method: 'POST',
-      headers: { Accept: 'application/vnd.github+json', Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', 'User-Agent': 'jiaze-review-bot' },
-      body: JSON.stringify({ query: THREADS_QUERY, variables: { owner, repo, number, after } }),
-      signal: AbortSignal.timeout(15000),
-    });
-    if (!response.ok) throw new Error(`GitHub GraphQL failed (HTTP ${response.status})`);
-    const payload = await response.json();
-    if (payload.errors?.length) throw new Error(`GitHub GraphQL error: ${payload.errors.map((e) => e.message).join('; ')}`);
-    const connection = payload.data?.repository?.pullRequest?.reviewThreads;
-    if (!connection) throw new Error('GitHub returned no review threads for this pull request');
-    threads.push(...(connection.nodes ?? []));
-    if (!connection.pageInfo?.hasNextPage) break;
-    after = connection.pageInfo.endCursor;
-  }
-  return threads;
+  log.log?.(`Review-thread decisions: ${closed.length} non-blocking finding(s) closed, ${reopened.length} reopened, ${bounced} thread(s) put back (nothing to verify).`);
+  return { session: next, closed, reopened, bounced };
 }
 
 async function rest(url, token, fetchImpl, init = {}) {

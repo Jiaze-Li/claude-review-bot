@@ -364,7 +364,8 @@ export function claudeFallbackBudgetLeft(session) {
 // the automatic cap. A dismiss/override command is human-initiated, but it is
 // NOT authorization to spend beyond the limit during its follow-on audit.
 export function isManualBudgetExemptReview({ sourceKind, requestedMode } = {}) {
-  return sourceKind === 'comment' && ['auto', 'reset', 'claude'].includes(requestedMode);
+  // A review-thread decision is a writer's action too (the Worker only forwards a writer's resolve).
+  return (sourceKind === 'comment' && ['auto', 'reset', 'claude'].includes(requestedMode)) || requestedMode === 'threads';
 }
 
 export function claudeFallbackCallBudget(session, { manual = false, pendingUsd = 0 } = {}) {
@@ -587,9 +588,7 @@ export function sessionCommitStatus(session, headSha) {
     case 'READY': return session.auditCompleted !== true || openMaterialFindings(session).length > 0
       || unresolvedMaterialFindings(session).length > 0
       ? { state: 'error', description: 'Review evidence incomplete or material candidates unresolved' }
-      : session.override?.via === 'review thread'
-        ? { state: 'success', description: `READY: findings resolved by @${String(session.override.by).slice(0, 39)} via review threads (HEAD not re-reviewed)` }
-        : { state: 'success', description: 'Independent review complete: READY' };
+      : { state: 'success', description: 'Independent review complete: READY' };
     case 'REVIEW_IN_PROGRESS': return { state: 'pending', description: 'Claude deep review in progress' };
     case 'AUDIT_PENDING': return { state: 'pending', description: 'Final audit pending' };
     case 'REWORK': return { state: 'failure', description: 'Open material findings: rework needed' };
@@ -793,69 +792,39 @@ export function applyOverride({ session, headSha, by, now = new Date().toISOStri
   };
 }
 
-// A person resolving the bot's review thread for a finding is a decision about that finding, so it closes
-// it without another review; unresolving the thread reopens it. Closing the last blocking finding on a
-// session that was waiting on findings makes the current HEAD READY by that person's decision (recorded as
-// an override, so it is never reused as an audited baseline), unless files are still unreviewed (PARTIAL).
-// `closed` is [{ id, by }] for threads a writer resolved; `reopened` is finding ids whose thread was unresolved.
+// A person resolving the thread of a NON-blocking finding (a P3, status DEFERRED) closes it: it is recorded as
+// waived by that person and never re-raised, and unresolving the thread reopens it. Blocking findings are not
+// closed this way: resolving one is a claim that it is fixed, which a review has to check (see the planner's
+// `threads` decision), so they are left alone here. Nothing about the session's status changes.
+// `closed` is [{ id, by }]; `reopened` is finding ids whose thread was unresolved.
 export function applyThreadDecisions({ session, headSha, closed = [], reopened = [], now = new Date().toISOString() } = {}) {
   validateSession(session);
   checkedSha(headSha, 'headSha');
   if (session.status === 'REVIEW_IN_PROGRESS') throw new Error('a review is running; thread decisions wait for it');
   const findings = session.findings.map((finding) => ({ ...finding }));
-  const closedBy = new Map();
+  let changed = false;
   for (const { id, by } of closed) {
     if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/.test(String(by ?? ''))) continue;
     const finding = findings.find((item) => item.id === id);
-    if (!finding || !['OPEN', 'UNCERTAIN', 'DEFERRED'].includes(finding.status)) continue;
+    if (!finding || finding.status !== 'DEFERRED') continue;
     finding.status = 'WAIVED';
     finding.resolvedVia = 'thread';
     finding.resolvedBy = by;
     finding.lastCheckedHead = headSha;
     finding.resolutionReason = compactText(`Resolved by @${by} (review thread)`, 300);
-    closedBy.set(id, by);
+    changed = true;
   }
-  const reopenedIds = [];
   for (const id of reopened) {
     const finding = findings.find((item) => item.id === id);
     if (!finding || finding.status !== 'WAIVED' || finding.resolvedVia !== 'thread') continue;
-    finding.status = MATERIAL_SEVERITIES.has(finding.severity) ? 'OPEN' : 'DEFERRED';
+    finding.status = 'DEFERRED';
     delete finding.resolvedVia;
     delete finding.resolvedBy;
     finding.resolutionReason = null;
     finding.lastCheckedHead = headSha;
-    reopenedIds.push(id);
+    changed = true;
   }
-  if (!closedBy.size && !reopenedIds.length) return session;
-
-  let next = { ...session, findings, updatedAt: now };
-  const blocking = findings.some((finding) => MATERIAL_SEVERITIES.has(finding.severity) && ['OPEN', 'UNCERTAIN'].includes(finding.status));
-  const unreviewed = session.coverage?.complete === false && session.coverage.head === session.lastReviewedHead;
-  if (closedBy.size && !blocking && !session.reviewFailure && ['REWORK', 'HUMAN_REQUIRED'].includes(session.status)) {
-    const by = [...new Set(closedBy.values())];
-    next = unreviewed
-      ? { ...next, status: 'PARTIAL', lastSummary: compactText(`Findings resolved by @${by.join(', @')}; some files are still unreviewed.`, 800) }
-      : {
-        ...next,
-        status: 'READY',
-        auditCompleted: true,
-        lastReviewedHead: headSha,
-        // What was true before this decision, so reopening a thread puts it back instead of leaving an audit
-        // flag set that no audit earned.
-        override: { by: by[0], at: now, head: headSha, waived: [...closedBy.keys()], via: 'review thread', priorHead: session.lastReviewedHead, priorAudit: session.auditCompleted === true },
-        lastSummary: compactText(`Open findings resolved by @${by.join(', @')} via review threads; HEAD not re-reviewed.`, 800),
-      };
-  } else if (reopenedIds.length && blocking && next.status === 'READY') {
-    const { override, ...rest } = next;
-    const byThread = override?.via === 'review thread';
-    next = {
-      ...rest,
-      status: 'REWORK',
-      ...(byThread ? { auditCompleted: override.priorAudit === true, lastReviewedHead: override.priorHead ?? rest.lastReviewedHead } : { override }),
-      lastSummary: compactText('A resolved review thread was reopened; a finding is open again.', 800),
-    };
-  }
-  return next;
+  return changed ? { ...session, findings, updatedAt: now } : session;
 }
 
 export function openMaterialFindings(session) {
@@ -990,7 +959,7 @@ export function renderSessionComment(session, { sourceCommentIds = [] } = {}) {
     '<!-- jiaze-review-session:v1 -->',
     ...processedMarkers,
     '### Independent Review Session',
-    `Status: **${session.status}**${session.override ? (session.override.via === 'review thread' ? ` (findings resolved by @${cleanInline(session.override.by)} via review threads; this HEAD was not re-reviewed)` : ` (manually overridden by @${cleanInline(session.override.by)})`) : ''}`,
+    `Status: **${session.status}**${session.override ? ` (manually overridden by @${cleanInline(session.override.by)})` : ''}`,
     `Default reviewer: **Gemini Flash (latest) / medium thinking**`,
     `Discovery: **${session.reviewFailure?.mode === 'discovery' ? 'not completed' : 'complete'}** · Final audit: **${audit}** · Verification: **${verification}**`,
     ...(session.incrementalReviewCount ? [`Incremental reviews since full audit: **${session.incrementalReviewCount}** (full-audit HEAD: ${cleanInline((session.fullAuditHead ?? session.discoveryHead ?? '').slice(0, 12))})`] : []),

@@ -19,113 +19,29 @@ function reworkSession(extra = {}, head = HEAD) {
 }
 const byId = (session) => Object.fromEntries(session.findings.map((finding) => [finding.id, finding]));
 
-test('resolving some blocking findings keeps the session in REWORK; resolving the last makes READY by that person, without a review', () => {
+test('resolving a P3 thread closes it for good without touching the status; reopening the thread reopens it', () => {
   const session = reworkSession();
-  assert.equal(session.status, 'REWORK');
-  assert.deepEqual(session.findings.map((x) => [x.id, x.status]), [['F001', 'OPEN'], ['F002', 'OPEN'], ['F003', 'DEFERRED']]);
-  const one = applyThreadDecisions({ session, headSha: HEAD, closed: [{ id: 'F001', by: 'jiaze-li' }] });
-  assert.equal(one.status, 'REWORK');
-  assert.equal(byId(one).F001.status, 'WAIVED');
-  assert.equal(byId(one).F001.resolvedBy, 'jiaze-li');
-  assert.equal(sessionCommitStatus(one, HEAD).state, 'failure');
-  const all = applyThreadDecisions({ session: one, headSha: HEAD, closed: [{ id: 'F002', by: 'jiaze-li' }] });
-  assert.equal(all.status, 'READY');
-  assert.equal(all.auditCompleted, true);
-  assert.equal(all.override.via, 'review thread');
-  assert.deepEqual(all.override.waived, ['F002']);
-  assert.equal(sessionCommitStatus(all, HEAD).state, 'success');
-  // the P3 is not a blocker, so it did not have to be resolved
-  assert.equal(byId(all).F003.status, 'DEFERRED');
+  const closed = applyThreadDecisions({ session, headSha: HEAD, closed: [{ id: 'F003', by: 'jiaze-li' }] });
+  assert.equal(byId(closed).F003.status, 'WAIVED');
+  assert.equal(byId(closed).F003.resolvedVia, 'thread');
+  assert.equal(closed.status, 'REWORK');
+  assert.match(renderSessionComment(closed), /Closed by people \(review thread resolved\):\n- F003 resolved by @jiaze-li/);
+  const reopened = applyThreadDecisions({ session: closed, headSha: HEAD, reopened: ['F003'] });
+  assert.equal(byId(reopened).F003.status, 'DEFERRED');
+  assert.equal(applyThreadDecisions({ session, headSha: HEAD }), session);
 });
 
-test('a P3 thread resolved by a person is closed too, and is never re-raised', () => {
-  const next = applyThreadDecisions({ session: reworkSession(), headSha: HEAD, closed: [{ id: 'F003', by: 'jiaze-li' }] });
-  assert.equal(byId(next).F003.status, 'WAIVED');
-  assert.equal(next.status, 'REWORK'); // the two blockers are still open
-});
-
-test('on a HEAD pushed after the review, resolving the last finding makes the current HEAD READY by that person\'s decision', () => {
-  const session = reworkSession({}, OLD);
-  const next = applyThreadDecisions({ session, headSha: HEAD, closed: [{ id: 'F001', by: 'a' }, { id: 'F002', by: 'b' }] });
-  assert.equal(next.status, 'READY');
-  assert.equal(next.lastReviewedHead, HEAD);
-  assert.deepEqual(next.override.waived.sort(), ['F001', 'F002']);
-  assert.equal(sessionCommitStatus(next, HEAD).state, 'success');
-});
-
-test('files still unreviewed keep the session PARTIAL even when every finding is resolved', () => {
-  const session = reworkSession({ coverage: { complete: false, head: HEAD, unreviewedCount: 2, unreviewedPaths: ['x', 'y'], reviewedKeys: [] } });
-  const next = applyThreadDecisions({ session, headSha: HEAD, closed: [{ id: 'F001', by: 'a' }, { id: 'F002', by: 'a' }] });
-  assert.equal(next.status, 'PARTIAL');
-  assert.equal(next.override, undefined);
-  assert.equal(sessionCommitStatus(next, HEAD).state, 'error');
-});
-
-test('a provider failure, an invalid login, an already-closed finding and a running review are not turned into READY', () => {
-  const failed = reworkSession({ status: 'HUMAN_REQUIRED', reviewFailure: { code: 'REVIEWER_UNAVAILABLE', mode: 'discovery', head: HEAD, reason: 'x' } });
-  assert.equal(applyThreadDecisions({ session: failed, headSha: HEAD, closed: [{ id: 'F001', by: 'a' }, { id: 'F002', by: 'a' }] }).status, 'HUMAN_REQUIRED');
+test('a resolved blocking finding is never closed by the click alone: no READY, no waiver', () => {
   const session = reworkSession();
-  assert.equal(applyThreadDecisions({ session, headSha: HEAD, closed: [{ id: 'F001', by: 'not a login!' }] }), session);
-  const fixed = { ...session, findings: session.findings.map((x) => (x.id === 'F001' ? { ...x, status: 'FIXED' } : x)) };
-  assert.equal(applyThreadDecisions({ session: fixed, headSha: HEAD, closed: [{ id: 'F001', by: 'a' }] }), fixed);
-  assert.throws(() => applyThreadDecisions({ session: { ...session, status: 'REVIEW_IN_PROGRESS' }, headSha: HEAD, closed: [{ id: 'F001', by: 'a' }] }), /a review is running/);
+  const next = applyThreadDecisions({ session, headSha: HEAD, closed: [{ id: 'F001', by: 'jiaze-li' }, { id: 'F002', by: 'jiaze-li' }] });
+  assert.equal(next.status, 'REWORK');
+  assert.deepEqual(['F001', 'F002'].map((id) => byId(next)[id].status), ['OPEN', 'OPEN']);
+  assert.equal(sessionCommitStatus(next, HEAD).state, 'failure');
 });
 
-test('reopening a thread a person resolved reopens the finding and takes READY away; other waivers are untouched', () => {
-  const closed = applyThreadDecisions({ session: reworkSession(), headSha: HEAD, closed: [{ id: 'F001', by: 'a' }, { id: 'F002', by: 'a' }] });
-  assert.equal(closed.status, 'READY');
-  const reopened = applyThreadDecisions({ session: closed, headSha: HEAD, reopened: ['F002'] });
-  assert.equal(reopened.status, 'REWORK');
-  assert.equal(byId(reopened).F002.status, 'OPEN');
-  assert.equal(byId(reopened).F002.resolvedVia, undefined);
-  assert.equal(reopened.override, undefined);
-  assert.equal(sessionCommitStatus(reopened, HEAD).state, 'failure');
-  // a finding waived by a manual override is not a thread decision and is never reopened by a thread
-  const waived = { ...closed, findings: closed.findings.map((x) => (x.id === 'F001' ? { ...x, resolvedVia: undefined } : x)) };
-  assert.equal(applyThreadDecisions({ session: waived, headSha: HEAD, reopened: ['F001'] }), waived);
-  // reopening a P3 does not block anything
-  const nit = applyThreadDecisions({ session: closed, headSha: HEAD, closed: [{ id: 'F003', by: 'a' }] });
-  const nitOpen = applyThreadDecisions({ session: nit, headSha: HEAD, reopened: ['F003'] });
-  assert.equal(nitOpen.status, 'READY');
-  assert.equal(byId(nitOpen).F003.status, 'DEFERRED');
-});
-
-test('reopening restores what was true before the decision: no audit flag earned by a click, and the reviewed HEAD', () => {
-  const session = reworkSession({}, OLD); // reviewed at OLD, audit never ran
-  assert.equal(session.auditCompleted, false);
-  const ready = applyThreadDecisions({ session, headSha: HEAD, closed: [{ id: 'F001', by: 'a' }, { id: 'F002', by: 'a' }] });
-  assert.equal(ready.auditCompleted, true);
-  assert.equal(ready.lastReviewedHead, HEAD);
-  const back = applyThreadDecisions({ session: ready, headSha: HEAD, reopened: ['F001'] });
-  assert.equal(back.status, 'REWORK');
-  assert.equal(back.auditCompleted, false);
-  assert.equal(back.lastReviewedHead, OLD);
-  assert.equal(back.override, undefined);
-  // so the repair on the current HEAD is verified (from the reviewed HEAD) rather than waved through
-  assert.equal(planReviewSession({ session: back, baseSha: BASE, headSha: HEAD }).mode, 'verification');
-  // a session that really had its audit keeps that fact
-  const audited = reworkSession({ auditCompleted: true });
-  const readyAudited = applyThreadDecisions({ session: audited, headSha: HEAD, closed: [{ id: 'F001', by: 'a' }, { id: 'F002', by: 'a' }] });
-  assert.equal(applyThreadDecisions({ session: readyAudited, headSha: HEAD, reopened: ['F001'] }).auditCompleted, true);
-});
-
-test('the commit status says it was a person\'s decision, not an independent review', () => {
-  const ready = applyThreadDecisions({ session: reworkSession(), headSha: HEAD, closed: [{ id: 'F001', by: 'jiaze-li' }, { id: 'F002', by: 'jiaze-li' }] });
-  const status = sessionCommitStatus(ready, HEAD);
-  assert.equal(status.state, 'success');
-  assert.match(status.description, /READY: findings resolved by @jiaze-li via review threads \(HEAD not re-reviewed\)/);
-  assert.ok(status.description.length <= 140); // GitHub's limit for a status description
-  assert.equal(sessionCommitStatus({ ...ready, override: undefined }, HEAD).description, 'Independent review complete: READY');
-});
-
-test('the session comment says who resolved what and that the HEAD was not re-reviewed, and round-trips', () => {
-  const next = applyThreadDecisions({ session: reworkSession(), headSha: HEAD, closed: [{ id: 'F001', by: 'jiaze-li' }, { id: 'F002', by: 'jiaze-li' }] });
-  const body = renderSessionComment(next);
-  assert.match(body, /Status: \*\*READY\*\* \(findings resolved by @jiaze-li via review threads; this HEAD was not re-reviewed\)/);
-  assert.match(body, /Closed by people \(review thread resolved\):\n- F001 resolved by @jiaze-li\n- F002 resolved by @jiaze-li/);
-  const back = parseSessionComment(body);
-  assert.equal(back.status, 'READY');
-  assert.equal(byId(back).F001.resolvedBy, 'jiaze-li');
+test('a thread decision cannot be applied while a review is running', () => {
+  const running = reworkSession({ status: 'REVIEW_IN_PROGRESS' });
+  assert.throws(() => applyThreadDecisions({ session: running, headSha: HEAD, closed: [{ id: 'F003', by: 'a' }] }));
 });
 
 // ---- the workflow script: reconcile the threads with the session ----
@@ -133,7 +49,7 @@ test('the session comment says who resolved what and that the HEAD was not re-re
 function threadNode(id, finding, { resolvedBy = null, author = BOT } = {}) {
   return {
     id, isResolved: Boolean(resolvedBy), resolvedBy: resolvedBy ? { login: resolvedBy } : null,
-    comments: { nodes: [{ author: { login: author }, body: `**[P2] ${finding.title}**\n\nbody\n\n${findingMarker(finding.path, finding.title)}` }] },
+    comments: { nodes: [{ databaseId: 1000 + Number(id.replace(/\D/g, '')), author: { login: author }, body: `**[P2] ${finding.title}**\n\nbody\n\n${findingMarker(finding.path, finding.title)}` }] },
   };
 }
 
@@ -156,50 +72,69 @@ function setup(session, threads, { permission = {}, head = HEAD } = {}) {
 }
 const quiet = { log() {}, warn() {} };
 
-test('a writer resolving the last blocking threads writes READY into the session comment, with no model involved', async () => {
+test('a writer resolving a P3 thread writes it into the session comment, with no model involved', async () => {
   const session = reworkSession();
-  const [one, two] = session.findings;
-  const { env, fetchImpl, patches } = setup(session, [threadNode('T1', one, { resolvedBy: 'jiaze-li' }), threadNode('T2', two, { resolvedBy: 'jiaze-li' })]);
-  const next = await applyThreadResolutions({ env, fetchImpl, log: quiet });
-  assert.equal(next.status, 'READY');
+  const [, , nit] = session.findings;
+  const { env, fetchImpl, patches } = setup(session, [threadNode('T3', nit, { resolvedBy: 'jiaze-li' }), threadNode('T1', session.findings[0])]);
+  const out = await applyThreadResolutions({ env, fetchImpl, log: quiet });
+  assert.deepEqual(out.closed, [{ id: 'F003', by: 'jiaze-li' }]);
+  assert.equal(out.session.status, 'REWORK');
   assert.equal(patches.length, 1);
-  assert.match(patches[0], /Status: \*\*READY\*\*/);
   assert.match(patches[0], /jiaze-review-source-comment:99/);
 });
 
 test('only writers\' resolves count; the bot\'s own resolves, marker-less threads and other authors\' threads do not', async () => {
   const session = reworkSession();
-  const [one, two] = session.findings;
+  const nit = session.findings[2];
   const { env, fetchImpl, patches } = setup(session, [
-    threadNode('T1', one, { resolvedBy: 'stranger' }),
-    threadNode('T2', two, { resolvedBy: BOT }),
-    { ...threadNode('T3', two, { resolvedBy: 'jiaze-li' }), comments: { nodes: [{ author: { login: BOT }, body: 'no marker' }] } },
-    threadNode('T4', two, { resolvedBy: 'jiaze-li', author: 'jiaze-li' }),
+    threadNode('T1', nit, { resolvedBy: 'stranger' }),
   ], { permission: { stranger: 'read' } });
-  const next = await applyThreadResolutions({ env, fetchImpl, log: quiet });
-  assert.equal(next.status, 'REWORK');
-  assert.equal(patches.length, 0);
+  assert.deepEqual((await applyThreadResolutions({ env, fetchImpl, log: quiet })).closed, []);
+  const bot = setup(session, [threadNode('T2', nit, { resolvedBy: BOT }), threadNode('T4', nit, { resolvedBy: 'jiaze-li', author: 'jiaze-li' }),
+    { ...threadNode('T3', nit, { resolvedBy: 'jiaze-li' }), comments: { nodes: [{ author: { login: BOT }, body: 'no marker' }] } }]);
+  assert.deepEqual((await applyThreadResolutions({ env: bot.env, fetchImpl: bot.fetchImpl, log: quiet })).closed, []);
+  assert.equal(patches.length + bot.patches.length, 0);
 });
 
-test('unresolving a thread a person had resolved reopens it and withdraws READY', async () => {
+test('unresolving a closed P3 thread reopens the finding', async () => {
+  const session = reworkSession();
+  const nit = session.findings[2];
+  const closed = applyThreadDecisions({ session, headSha: HEAD, closed: [{ id: nit.id, by: 'jiaze-li' }] });
+  const { env, fetchImpl, patches } = setup(closed, [threadNode('T3', nit)]);
+  const out = await applyThreadResolutions({ env, fetchImpl, log: quiet });
+  assert.equal(byId(out.session).F003.status, 'DEFERRED');
+  assert.equal(patches.length, 1);
+});
+
+test('all blocking threads resolved but nothing pushed since the review: the threads are put back with a reply, status unchanged', async () => {
   const session = reworkSession();
   const [one, two] = session.findings;
-  const closed = applyThreadDecisions({ session, headSha: HEAD, closed: [{ id: one.id, by: 'jiaze-li' }, { id: two.id, by: 'jiaze-li' }] });
-  assert.equal(closed.status, 'READY');
-  const { env, fetchImpl, patches } = setup(closed, [threadNode('T1', one, { resolvedBy: 'jiaze-li' }), threadNode('T2', two)]);
-  const next = await applyThreadResolutions({ env, fetchImpl, log: quiet });
-  assert.equal(next.status, 'REWORK');
-  assert.equal(byId(next).F002.status, 'OPEN');
-  assert.match(patches[0], /Status: \*\*REWORK\*\*/);
+  const gh = setup(session, [threadNode('T1', one, { resolvedBy: 'jiaze-li' }), threadNode('T2', two, { resolvedBy: 'jiaze-li' })]);
+  const calls = [];
+  const inner = gh.fetchImpl;
+  const fetchImpl = async (url, init = {}) => {
+    if (url.endsWith('/graphql') && /unresolveReviewThread/.test(init.body)) { calls.push(['unresolve', JSON.parse(init.body).variables.id]); return Response.json({ data: {} }); }
+    if (/\/comments\/\d+\/replies$/.test(url)) { calls.push(['reply', url]); return Response.json({ id: 1 }); }
+    return inner(url, init);
+  };
+  const out = await applyThreadResolutions({ env: gh.env, fetchImpl, log: quiet });
+  assert.equal(out.bounced, 2);
+  assert.deepEqual(calls.filter((c) => c[0] === 'unresolve').map((c) => c[1]).sort(), ['T1', 'T2']);
+  assert.equal(calls.filter((c) => c[0] === 'reply').length, 2);
+  assert.equal(out.session.status, 'REWORK');
+  assert.equal(gh.patches.length, 0);
 });
 
-test('the same threads again change nothing, and a PR that moved is refused', async () => {
+test('some blocking threads still unresolved: nothing is bounced, the person is still working', async () => {
   const session = reworkSession();
-  const closed = applyThreadDecisions({ session, headSha: HEAD, closed: session.findings.slice(0, 2).map((x) => ({ id: x.id, by: 'jiaze-li' })) });
-  const threads = session.findings.slice(0, 2).map((x, i) => threadNode(`T${i}`, x, { resolvedBy: 'jiaze-li' }));
-  const again = setup(closed, threads);
-  await applyThreadResolutions({ env: again.env, fetchImpl: again.fetchImpl, log: quiet });
-  assert.equal(again.patches.length, 0);
-  const moved = setup(session, threads, { head: 'd'.repeat(40) });
+  const [one, two] = session.findings;
+  const gh = setup(session, [threadNode('T1', one, { resolvedBy: 'jiaze-li' }), threadNode('T2', two)]);
+  const out = await applyThreadResolutions({ env: gh.env, fetchImpl: gh.fetchImpl, log: quiet });
+  assert.equal(out.bounced, 0);
+});
+
+test('a PR that moved is refused', async () => {
+  const session = reworkSession();
+  const moved = setup(session, [], { head: 'd'.repeat(40) });
   await assert.rejects(applyThreadResolutions({ env: moved.env, fetchImpl: moved.fetchImpl, log: quiet }), /PR moved/);
 });

@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { planSession } from '../scripts/plan-review-session.mjs';
+import { findingMarker } from '../scripts/review-anchors.mjs';
 import { applyDiscoveryResult, pendingSessionMarker, renderSessionComment } from '../scripts/review-session-core.mjs';
 
 const BASE='b'.repeat(40), A='a'.repeat(40), C='c'.repeat(40);
@@ -202,4 +203,36 @@ test('a thread decision does not bypass recovery of a review that was published 
   assert.equal(plan.decision.mode,'recover');
   assert.match(plan.decision.reason,/review-thread decision was NOT applied yet/);
   assert.equal(plan.pendingSession.findings.length,1);
+});
+
+function threadFetch({session,findings,resolvedBy='jiaze-li',permission='write'}){
+  return async(url,init={})=>{
+    if(/issues\/7\/comments/.test(url)) return Response.json([comment(7,renderSessionComment(session))]);
+    if(/pulls\/7\/reviews/.test(url)) return Response.json([]);
+    if(url.endsWith('/graphql')) return Response.json({data:{repository:{pullRequest:{reviewThreads:{pageInfo:{hasNextPage:false},nodes:findings.map((f,i)=>({
+      id:'T'+i,isResolved:resolvedBy!==null,resolvedBy:resolvedBy?{login:resolvedBy}:null,
+      comments:{nodes:[{databaseId:i+1,author:{login:author.replace('[bot]','')},body:'x\n\n'+findingMarker(f.path,f.title)}]},
+    }))}}}}});
+    if(url.includes('/collaborators/')) return Response.json({permission});
+    assert.fail('unexpected URL '+url);
+  };
+}
+const bug={severity:'P1',title:'Bug',body:'Trigger X causes Y; expected Z.',path:'a.js',line:1,riskClass:'state'};
+
+test('resolving every blocking thread after new commits runs the normal verification review; only its result decides READY',async()=>{
+  const session=applyDiscoveryResult({result:{summary:'bug',findings:[bug]},baseSha:BASE,headSha:A,sourceCommentId:'1'});
+  const plan=await planSession({env:env({REQUESTED_MODE:'threads',SOURCE_KIND:'pull_request',HEAD_SHA:C}),
+    fetchImpl:threadFetch({session,findings:session.findings})});
+  assert.equal(plan.decision.mode,'verification');
+  assert.equal(plan.decision.previousHead,A);
+  assert.match(plan.decision.reason,/resolved by a person/);
+});
+
+test('resolved threads do not start a review when nothing is pushed, a resolver is not a writer, or a thread is still open',async()=>{
+  const session=applyDiscoveryResult({result:{summary:'bug',findings:[bug]},baseSha:BASE,headSha:A,sourceCommentId:'1'});
+  const run=(extra,opts)=>planSession({env:env({REQUESTED_MODE:'threads',SOURCE_KIND:'pull_request',...extra}),fetchImpl:threadFetch({session,findings:session.findings,...opts})});
+  assert.equal((await run({HEAD_SHA:A},{})).decision.mode,'threads');
+  assert.equal((await run({HEAD_SHA:C},{permission:'read'})).decision.mode,'threads');
+  assert.equal((await run({HEAD_SHA:C},{resolvedBy:null})).decision.mode,'threads');
+  assert.equal((await run({HEAD_SHA:C},{resolvedBy:author.replace('[bot]','')})).decision.mode,'threads');
 });

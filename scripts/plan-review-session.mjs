@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { isDeepReviewStale, parsePendingSessionReview, parseSessionComment, planReviewSession } from './review-session-core.mjs';
+import { blockingClaims, fetchReviewThreads, isWriter, threadsByFinding } from './review-threads.mjs';
 import { prepareIncrementalDelta } from './select-incremental-review.mjs';
 
 const repoPattern=/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
@@ -55,14 +56,32 @@ export async function planSession({ env=process.env, fetchImpl=fetch }={}) {
     };
   }
 
-  // A person resolved or reopened one of the bot's review threads: reconcile the session with the threads.
-  // No model call. If a review is running right now its own run will write the session; leave it be.
+  // A person resolved or reopened one of the bot's review threads. Resolving is a claim ("I fixed this"), not a
+  // verdict: once every blocking finding has been resolved by a writer and there are new commits to look at, the
+  // normal verification review runs (Gemini first, Claude continues) and only its result decides READY. Anything
+  // else is reconciled without a model call (non-blocking threads; threads put back when nothing was pushed).
+  // If a review is running right now its own run will write the session; leave it be.
   if(requested==='threads'){
-    const decision=!session
-      ?{mode:'noop_waiting',previousHead:null,reason:'there is no review session for this PR yet'}
-      :session.status==='REVIEW_IN_PROGRESS'
-        ?{mode:'noop_waiting',previousHead:session.lastReviewedHead,reason:'a review is running; resolve the thread again, or comment @gemini review, once it has finished'}
-        :{mode:'threads',previousHead:null,reason:'a person resolved or reopened a review thread; reconciling the session with the threads'};
+    const wait=(reason)=>({mode:'noop_waiting',previousHead:session?.lastReviewedHead??null,reason});
+    let decision;
+    if(!session) decision=wait('there is no review session for this PR yet');
+    else if(session.status==='REVIEW_IN_PROGRESS') decision=wait('a review is running; resolve the thread again, or comment @gemini review, once it has finished');
+    else{
+      decision={mode:'threads',previousHead:null,reason:'a person resolved or reopened a review thread; reconciling the session with the threads'};
+      if(session.lastReviewedHead!==headSha && env.GH_TOKEN){
+        const [owner,repoName]=target.split('/');
+        const botLogin=expectedAuthor.replace(/\[bot\]$/,'');
+        const threads=await fetchReviewThreads({owner,repo:repoName,number:Number(pr),token:env.GH_TOKEN,fetchImpl});
+        const claims=blockingClaims({session,byFinding:threadsByFinding({session,threads,botLogin}),botLogin});
+        if(claims.allClaimed){
+          const resolvers=new Set(threads.flatMap(t=>t.isResolved&&t.resolvedBy&&t.resolvedBy!==botLogin?[t.resolvedBy]:[]));
+          let allWriters=resolvers.size>0;
+          for(const login of resolvers) if(!(await isWriter({target,login,token:env.GH_TOKEN,fetchImpl}))) allWriters=false;
+          const planned=allWriters?planReviewSession({session,baseSha,headSha,reset:false,retryUnavailable:false}):null;
+          if(planned?.mode==='verification') decision={...planned,reason:`every blocking finding was resolved by a person; ${planned.reason}`};
+        }
+      }
+    }
     return {requestedMode:requested,decision,session,sessionCommentId,pendingSession:null,pendingSourceCommentId:null,pendingReviewId:null};
   }
 

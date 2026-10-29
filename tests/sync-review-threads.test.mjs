@@ -19,17 +19,20 @@ function session(statuses) {
 }
 const thread = (id, title, { resolved = false, author = BOT, marker = true } = {}) => ({
   id, isResolved: resolved,
-  comments: { nodes: [{ author: { login: author }, body: `**[P2] ${title}**\n\nbody${marker ? `\n\n${findingMarker(`${title.replace(/\W+/g, '-')}.swift`, title)}` : ''}` }] },
+  comments: { nodes: [{ databaseId: 77, author: { login: author }, body: `**[P2] ${title}**\n\nbody${marker ? `\n\n${findingMarker(`${title.replace(/\W+/g, '-')}.swift`, title)}` : ''}` }] },
 });
 
 function fakeGitHub(sess, threads, { failResolve = [] } = {}) {
   const resolved = [];
+  const reopened = [];
+  const replies = [];
   const fetchImpl = async (url, init = {}) => {
     if (url.includes('/issues/7/comments')) {
       return Response.json(sess ? [{ id: 5, user: { login: `${BOT}[bot]` }, body: renderSessionComment(sess) }] : []);
     }
     if (url === 'https://api.github.com/graphql') {
       const { query, variables } = JSON.parse(init.body);
+      if (query.includes('unresolveReviewThread')) { reopened.push(variables.id); return Response.json({ data: {} }); }
       if (query.includes('resolveReviewThread')) {
         if (failResolve.includes(variables.id)) return Response.json({ errors: [{ message: 'Resource not accessible by integration' }] });
         resolved.push(variables.id);
@@ -37,9 +40,10 @@ function fakeGitHub(sess, threads, { failResolve = [] } = {}) {
       }
       return Response.json({ data: { repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: threads } } } } });
     }
+    if (/\/comments\/\d+\/replies$/.test(url)) { replies.push(JSON.parse(init.body).body); return Response.json({ id: 1 }); }
     assert.fail('unexpected URL ' + url);
   };
-  return { fetchImpl, resolved };
+  return { fetchImpl, resolved, reopened, replies };
 }
 const quiet = { log() {}, warn() {} };
 
@@ -94,4 +98,19 @@ test('the workflow runs the thread sync last and never lets it fail a review', a
   assert.match(block, /continue-on-error: true/);
   assert.match(block, /if: always\(\)/);
   assert.doesNotMatch(block, /GEMINI_API_KEY|CLAUDE_CODE_OAUTH_TOKEN/);
+});
+
+test('after a verification run, a still-open finding whose thread a person resolved is put back with the reason', async () => {
+  const sess = session({ 'Open bug': 'OPEN', 'Fixed bug': 'FIXED' });
+  sess.findings[0].resolutionReason = 'The guard was added on the wrong branch.';
+  const resolvedByPerson = (id, title) => ({ ...thread(id, title, { resolved: true }), resolvedBy: { login: 'jiaze-li' } });
+  const gh = fakeGitHub(sess, [resolvedByPerson('T1', 'Open bug'), resolvedByPerson('T2', 'Fixed bug')]);
+  const out = await syncReviewThreads({ env: { ...env, REVIEW_MODE: 'verification' }, fetchImpl: gh.fetchImpl, log: quiet });
+  assert.deepEqual(gh.reopened, ['T1']);
+  assert.equal(out.reopened, 1);
+  assert.match(gh.replies[0], /wrong branch/);
+  // outside a verification run nothing is put back
+  const plain = fakeGitHub(sess, [resolvedByPerson('T1', 'Open bug')]);
+  await syncReviewThreads({ env, fetchImpl: plain.fetchImpl, log: quiet });
+  assert.deepEqual(plain.reopened, []);
 });

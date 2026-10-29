@@ -478,7 +478,7 @@ jobs:
           # Preserve the authenticated initiating command. In particular,
           # @gemini dismiss MUST NOT turn into a cap-exempt @gemini review.
           requested_mode="$(jq -r '.requestedMode // empty' .review-context/session-plan.json)"
-          [[ "$requested_mode" == "auto" || "$requested_mode" == "claude" || "$requested_mode" == "reset" || "$requested_mode" == "dismiss" ]] || { echo "Invalid original review command" >&2; exit 1; }
+          [[ "$requested_mode" == "auto" || "$requested_mode" == "claude" || "$requested_mode" == "reset" || "$requested_mode" == "dismiss" || "$requested_mode" == "threads" ]] || { echo "Invalid original review command" >&2; exit 1; }
           jq --arg requested_mode "$requested_mode" '{
             requestedMode: $requested_mode,
             decision: {
@@ -631,6 +631,7 @@ jobs:
           TARGET_REPO: ${{ inputs.target_repo }}
           PR_NUMBER: ${{ inputs.pr_number }}
           EXPECTED_REVIEW_AUTHOR: ${{ steps.app-token.outputs.app-slug }}[bot]
+          REVIEW_MODE: ${{ steps.plan.outputs.mode }}
         run: node scripts/sync-review-threads.mjs
 
       - name: Finalize workflow status
