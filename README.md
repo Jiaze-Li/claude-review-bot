@@ -116,6 +116,10 @@ If you have read the open findings and decide the PR is fine to merge anyway (fo
 
 This needs write access, spends no model quota, waives both confirmed-open and unresolved-uncertain material findings (they stay in the record as WAIVED), and explicitly marks the current HEAD **READY (manually overridden)**. This is a human risk acceptance, *not* a claim that the bot disproved the concern. A later commit starts a fresh bounded session.
 
+### Findings as review threads
+
+Every finding is posted as an inline review thread you can resolve. A finding is pinned to its own line when that line is part of the PR's diff (changed or an unchanged line inside a hunk); otherwise to the nearest changed line of the same file, with a note saying so. Only a finding about a file the PR does not touch (or a file GitHub gives no patch for) stays in the review body under "Findings without an inline anchor". Each thread carries a hidden marker, and at the end of every review run the bot resolves the threads of findings that are now **FIXED**, **DISMISSED** or **WAIVED** (an override), so the PR's unresolved-thread count is the number of problems still open. It only ever resolves threads it opened itself, never reopens one, and never undoes a person's own resolve or unresolve; if the GitHub App lacks permission to resolve threads the step warns and the review is unaffected. Threads posted before this feature have no marker and are left for you to resolve by hand.
+
 ### Dismiss a disproven finding without skipping final audit
 
 An authorized repository writer can dismiss **one specific** confirmed-open **or UNCERTAIN** P0/P1/P2

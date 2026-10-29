@@ -62,7 +62,7 @@ export async function postCommitStatus({ env = process.env, fetchImpl = fetch, t
   return null;
 }
 
-async function latestSession({ target, prNumber, author, token, fetchImpl }) {
+export async function latestSession({ target, prNumber, author, token, fetchImpl }) {
   let latest = null;
   for (let page = 1; page <= 100; page += 1) {
     const response = await fetchImpl(`https://api.github.com/repos/${target}/issues/${prNumber}/comments?per_page=100&page=${page}`, {

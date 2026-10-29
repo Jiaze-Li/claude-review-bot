@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { addPatch, chooseAnchor, findingMarker, snapNote } from './review-anchors.mjs';
 
 const REVIEW_BODY_MAX_BYTES = 60_000;
 const required = ['GH_TOKEN', 'TARGET_REPO', 'PR_NUMBER', 'BASE_SHA', 'HEAD_SHA', 'SOURCE_COMMENT_ID', 'REVIEW_PATH'];
@@ -34,21 +35,20 @@ if (pr.head?.sha !== process.env.HEAD_SHA) {
   throw new Error(`PR head moved from ${process.env.HEAD_SHA} to ${pr.head?.sha ?? 'unknown'} before publish; refusing stale review`);
 }
 
-const addedLines = await loadAddedLinesFromGitHub();
+const anchors = await loadAnchorsFromGitHub();
 const inlineComments = [];
 const unanchored = [];
 
 for (const finding of review.findings) {
-  const key = `${finding.path}:${finding.line}`;
-  const canAnchor = Number.isInteger(finding.line) && addedLines.has(key);
+  const anchor = chooseAnchor(anchors, finding);
   const text = `**[${finding.severity}] ${finding.title}**\n\n${finding.body}`;
 
-  if (canAnchor) {
+  if (anchor) {
     inlineComments.push({
       path: finding.path,
-      line: finding.line,
+      line: anchor.line,
       side: 'RIGHT',
-      body: text,
+      body: `${text}${snapNote(anchor)}\n\n${findingMarker(finding.path, finding.title)}`,
     });
   } else {
     unanchored.push(finding);
@@ -202,54 +202,21 @@ function formatInteger(value) {
   return Math.trunc(value).toLocaleString('en-US');
 }
 
-async function loadAddedLinesFromGitHub() {
-  const set = new Set();
+async function loadAnchorsFromGitHub() {
+  const anchors = new Map();
   let page = 1;
 
   while (page <= 100) {
     const files = await githubJson(`https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}/files?per_page=100&page=${page}`);
     if (!Array.isArray(files)) throw new Error('GitHub pull files response was not an array');
 
-    for (const file of files) {
-      if (typeof file.filename !== 'string' || typeof file.patch !== 'string') continue;
-      for (const line of parseAddedLineNumbers(file.patch)) {
-        set.add(`${file.filename}:${line}`);
-      }
-    }
+    for (const file of files) addPatch(anchors, file.filename, file.patch);
 
-    if (files.length < 100) return set;
+    if (files.length < 100) return anchors;
     page += 1;
   }
 
   throw new Error('Pull request file pagination exceeded safety limit');
-}
-
-function parseAddedLineNumbers(patch) {
-  const lines = new Set();
-  let newLine = 0;
-  let inHunk = false;
-
-  for (const text of patch.split('\n')) {
-    const hunk = text.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
-    if (hunk) {
-      newLine = Number(hunk[1]);
-      inHunk = true;
-      continue;
-    }
-
-    if (!inHunk || text.startsWith('\\ No newline at end of file')) continue;
-
-    if (text.startsWith('+')) {
-      lines.add(newLine);
-      newLine += 1;
-    } else if (text.startsWith('-')) {
-      // Removed line: RIGHT-side line number does not advance.
-    } else {
-      newLine += 1;
-    }
-  }
-
-  return lines;
 }
 
 async function githubJson(url, init = {}) {
