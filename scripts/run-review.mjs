@@ -4,7 +4,7 @@ import path from 'node:path';
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import { knownIssuesPromptBlock, matchesKnownDismissal, pathKey } from './review-session-core.mjs';
 import { GEMINI_SHARD_MAX_BYTES, GEMINI_SHARD_TIMEOUT_MS, runGeminiShard } from './gemini-shard.mjs';
-import { DEFAULT_IGNORE, matchesIgnore, mergeShardResults, parseIgnorePatterns, planShards, splitDiffByFile } from './review-shards.mjs';
+import { DEFAULT_IGNORE, matchesIgnore, mergeShardResults, parseIgnorePatterns, planShards, reconcileCoverage, splitDiffByFile } from './review-shards.mjs';
 
 const cwd = process.cwd();
 const safeRoot = realDir(process.env.SAFE_REPO_DIR ?? 'safe-target');
@@ -254,28 +254,77 @@ async function tryClaude(index, makePrompt) {
   }
 }
 
-async function reviewShard(index) {
-  const shard = shards[index];
-  const diffPath = `.review-context/shards/shard-${index + 1}.diff`;
-  fs.writeFileSync(path.resolve(cwd, diffPath), shard.diff, { mode: 0o600 });
-  const common = { shard, index, count: shards.length, diffPath, knownIssues };
-  // Each provider that could not review this shard leaves a note, so the result says who fell back and why.
+// A provider that answers but credits fewer files than it was assigned has not finished: the next
+// provider takes exactly the files it left, and the two results are combined.
+async function reviewUnit(index, unit, providers, suffix = '') {
+  const diffPath = `.review-context/shards/shard-${index + 1}${suffix}.diff`;
+  fs.writeFileSync(path.resolve(cwd, diffPath), unit.diff, { mode: 0o600 });
+  const common = { shard: unit, index, count: shards.length, diffPath, knownIssues };
+  // Each provider that could not review this unit leaves a note, so the result says who fell back and why.
   const notes = [];
-  for (const provider of PROVIDERS) {
+  for (let position = 0; position < providers.length; position += 1) {
+    const provider = providers[position];
     let result;
     if (provider === 'gemini') {
-      if (gemini.off || shard.bytes > GEMINI_SHARD_MAX_BYTES) {
+      if (gemini.off || unit.bytes > GEMINI_SHARD_MAX_BYTES) {
         notes.push(`gemini: ${gemini.off ?? 'shard too large for Gemini'}`);
         continue;
       }
-      result = await tryGemini(index, buildPrompt({ ...common, inlineDiff: shard.diff }));
+      result = await tryGemini(index, buildPrompt({ ...common, inlineDiff: unit.diff }));
     } else {
       result = await tryClaude(index, (budgetUsd) => buildPrompt({ ...common, maxTurns: SHARD_MAX_TURNS, budgetUsd }));
     }
-    if (result.ok) return notes.length ? { ...result, fellBackFrom: notes.join('; ') } : result;
-    notes.push(`${provider}: ${result.error}`);
+    if (!result.ok) {
+      notes.push(`${provider}: ${result.error}`);
+      continue;
+    }
+    const coverage = reconcileCoverage(result.structured.coverage, unit.files);
+    const later = providers.slice(position + 1);
+    if (coverage.unreviewedPaths.length && later.length) {
+      const rest = unitFor(coverage.unreviewedPaths);
+      const continued = await reviewUnit(index, rest, later, `${suffix}-rest`);
+      const why = `${provider}: ${coverage.unreviewedPaths.length} of ${unit.files.length} file(s) not covered${coverage.note ? ` (${coverage.note.slice(0, 80)})` : ''}`;
+      return combineUnits(result, coverage, continued, [...notes, why], rest.files);
+    }
+    return notes.length ? { ...result, fellBackFrom: notes.join('; ') } : result;
   }
   return { ok: false, error: notes.join('; ') || 'no provider available', provider: null };
+}
+
+function unitFor(files) {
+  const wanted = new Set(files);
+  const diff = chunks.filter((chunk) => wanted.has(chunk.path)).map((chunk) => chunk.text).join('');
+  return { files, diff, bytes: Buffer.byteLength(diff, 'utf8') };
+}
+
+function combineUnits(first, firstCoverage, second, notes, restFiles) {
+  if (!second.ok) {
+    // Keep what the first provider did; the files it left stay unreviewed and the reason is recorded.
+    return { ...first, fellBackFrom: [...notes, second.error].join('; ') };
+  }
+  // What the second provider credits is judged against exactly the files it was handed.
+  const secondReviewed = (second.structured.coverage?.reviewedPaths ?? []).filter((file) => restFiles.includes(file));
+  const reviewedPaths = [...new Set([...firstCoverage.reviewedPaths, ...secondReviewed])];
+  const unreviewedPaths = restFiles.filter((file) => !secondReviewed.includes(file));
+  return {
+    ok: true,
+    provider: `${first.provider}+${second.provider}`,
+    fellBackFrom: notes.join('; '),
+    structured: {
+      summary: [first.structured.summary, second.structured.summary].filter(Boolean).join('\n\n').slice(0, 5900) || 'combined review',
+      findings: [...(first.structured.findings ?? []), ...(second.structured.findings ?? [])],
+      coverage: {
+        complete: unreviewedPaths.length === 0 && second.structured.coverage?.complete === true,
+        reviewedPaths,
+        unreviewedPaths,
+        note: [firstCoverage.note, second.structured.coverage?.note].filter(Boolean).join('; ').slice(0, 300),
+      },
+    },
+  };
+}
+
+async function reviewShard(index) {
+  return reviewUnit(index, shards[index], PROVIDERS);
 }
 
 async function worker() {

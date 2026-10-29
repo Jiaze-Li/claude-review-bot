@@ -291,7 +291,7 @@ test('Gemini out of credits (402): Claude reviews every shard, and the review sa
     assert.deepEqual(out.calls.flatMap((c) => c.files).sort(), Object.keys(BIG));
     assert.equal(out.review.coverage.complete, true);
     assert.deepEqual(out.review._meta.providers, { claude: 4 });
-    assert.match(out.review.summary, /Gemini could not review 4 shard\(s\) \(gemini: Gemini HTTP 402/);
+    assert.match(out.review.summary, /Gemini could not finish 4 shard\(s\) \(gemini: Gemini HTTP 402/);
     assert.ok(out.usage.total_cost_usd > 0);
   });
 });
@@ -314,7 +314,7 @@ test('a bad Gemini key (401) is not retried shard after shard: Claude takes over
     assert.equal(out.status, 0, out.stderr);
     assert.equal(requests.length, 1);
     assert.equal(out.review.coverage.complete, true);
-    assert.match(out.review.summary, /Gemini could not review/);
+    assert.match(out.review.summary, /Gemini could not finish/);
   });
 });
 
@@ -367,5 +367,56 @@ test('known issues reach Gemini shards too', async () => {
     const out = await runAsync(root, base);
     assert.equal(out.status, 0, out.stderr);
     assert.ok(requests.every((r) => r.hasKnown));
+  });
+});
+
+test('a Gemini shard that credits fewer files than assigned is not accepted: Claude takes exactly the files it left', async () => {
+  const geminiLeavesLast = (n, files) => ({
+    text: JSON.stringify({
+      summary: 'gemini part',
+      findings: [{ severity: 'P3', title: 'Gemini nit', body: 'b', path: files[0], line: null, failurePath: '' }],
+      coverage: { complete: false, reviewedPaths: files.slice(0, -1), unreviewedPaths: files.slice(-1), note: 'cannot see the callers' },
+    }),
+  });
+  await withGemini(geminiLeavesLast, async ({ requests, base }) => {
+    // one shard holding three small files
+    const root = setup({ 'a/1.swift': 100, 'a/2.swift': 100, 'a/3.swift': 100 });
+    const out = await runAsync(root, base);
+    assert.equal(out.status, 0, out.stderr);
+    assert.equal(requests.length, 1);
+    assert.deepEqual(out.calls.flatMap((c) => c.files), ['a/3.swift']); // only what Gemini left
+    assert.equal(out.review.coverage.complete, true);
+    assert.deepEqual(out.review.coverage.reviewedPaths.sort(), ['a/1.swift', 'a/2.swift', 'a/3.swift']);
+    assert.match(out.review.summary, /1: gemini\+claude ok 3\/3/);
+    assert.match(out.review.summary, /Gemini could not finish 1 shard\(s\) \(gemini: 1 of 3 file\(s\) not covered/);
+    assert.deepEqual(out.review._meta.providers, { 'gemini+claude': 1 });
+    assert.ok(out.review.findings.some((f) => f.title === 'Gemini nit'));
+    assert.ok(fs.existsSync(path.join(root, '.review-context/shards/shard-1-rest.diff')));
+  });
+});
+
+test('if Claude cannot take what Gemini left, the shard keeps Gemini\'s work and the files stay unreviewed', async () => {
+  await withGemini((n, files) => ({
+    text: JSON.stringify({ summary: 'g', findings: [], coverage: { complete: false, reviewedPaths: files.slice(0, 1), unreviewedPaths: files.slice(1), note: '' } }),
+  }), async ({ base }) => {
+    const root = setup({ 'a/1.swift': 100, 'a/2.swift': 100 });
+    const out = await runAsync(root, base, { FAKE_MODE: 'all-fail' });
+    assert.equal(out.status, 0, out.stderr);
+    assert.equal(out.review.coverage.complete, false);
+    assert.deepEqual(out.review.coverage.unreviewedPaths, ['a/2.swift']);
+    assert.match(out.review.summary, /PARTIAL/);
+  });
+});
+
+test('with no later provider, incomplete coverage from the only provider stays partial', async () => {
+  await withGemini((n, files) => ({
+    text: JSON.stringify({ summary: 'g', findings: [], coverage: { complete: false, reviewedPaths: files.slice(0, 1), unreviewedPaths: files.slice(1), note: '' } }),
+  }), async ({ base }) => {
+    const root = setup({ 'a/1.swift': 100, 'a/2.swift': 100 });
+    const out = await runAsync(root, base, { REVIEW_PROVIDERS: 'gemini' });
+    assert.equal(out.status, 0, out.stderr);
+    assert.equal(out.calls.length, 0);
+    assert.equal(out.review.coverage.complete, false);
+    assert.deepEqual(out.review.coverage.unreviewedPaths, ['a/2.swift']);
   });
 });
