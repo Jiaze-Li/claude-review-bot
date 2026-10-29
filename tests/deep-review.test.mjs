@@ -574,3 +574,22 @@ test('a partial review remembers the files it covered in compact keys, and a com
   assert.equal(done.status, 'READY');
   assert.equal(done.coverage, undefined);
 });
+
+test('a sharded pass begun as the final audit reaches READY with the audit done; a partial one stays PARTIAL and continues as the audit', async () => {
+  const { beginDeepReview, completeDeepReview, applyDiscoveryResult } = await import('../scripts/review-session-core.mjs');
+  const B = 'b'.repeat(40), H = 'a'.repeat(40);
+  const awaiting = applyDiscoveryResult({ result: { summary: 'clean', findings: [] }, baseSha: B, headSha: H, sourceCommentId: '1' });
+  assert.equal(awaiting.status, 'AUDIT_PENDING');
+  const plain = completeDeepReview({ session: beginDeepReview({ session: awaiting, baseSha: B, headSha: H }), result: { summary: 's', findings: [], coverage: { complete: true, unreviewedPaths: [], reviewedPaths: [] } }, headSha: H });
+  assert.equal(plain.status, 'AUDIT_PENDING'); // an ordinary pass is not the audit
+  const begun = beginDeepReview({ session: awaiting, baseSha: B, headSha: H, audit: true });
+  const partial = completeDeepReview({ session: begun, result: { summary: 's', findings: [], coverage: { complete: false, unreviewedPaths: ['x'], reviewedPaths: ['y'] } }, headSha: H });
+  assert.equal(partial.status, 'PARTIAL');
+  const again = beginDeepReview({ session: partial, baseSha: B, headSha: H });
+  assert.equal(again.deepReview.audit, true);
+  const done = completeDeepReview({ session: again, result: { summary: 's', findings: [], coverage: { complete: true, unreviewedPaths: [], reviewedPaths: ['x'] } }, headSha: H });
+  assert.equal(done.status, 'READY');
+  assert.equal(done.auditCompleted, true);
+  const bug = completeDeepReview({ session: beginDeepReview({ session: awaiting, baseSha: B, headSha: H, audit: true }), result: { summary: 's', findings: [{ severity: 'P1', title: 'Bug', body: 'Trigger X causes wrong result Y.', path: 'a.js', line: 1, riskClass: 'state' }], coverage: { complete: true, unreviewedPaths: [] } }, headSha: H });
+  assert.equal(bug.status, 'REWORK');
+});

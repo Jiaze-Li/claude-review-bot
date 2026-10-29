@@ -475,6 +475,12 @@ jobs:
             echo "run=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          # A diff too big for one staged run is audited by the sharded engine on the next review command instead.
+          if ! node scripts/staged-fits.mjs .review-context; then
+            echo "Audit diff is too large for the staged audit; the next review command runs it in shards."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           # Preserve the authenticated initiating command. In particular,
           # @gemini dismiss MUST NOT turn into a cap-exempt @gemini review.
           requested_mode="$(jq -r '.requestedMode // empty' .review-context/session-plan.json)"

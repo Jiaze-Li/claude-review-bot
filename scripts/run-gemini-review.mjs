@@ -4,7 +4,7 @@ import { pathToFileURL } from 'node:url';
 import { CLAUDE_AUTO_MIN_BUDGET_USD, DEEP_REVIEW_MANUAL_RUN_BUDGET_USD, GEMINI_MAX_CONTEXT_BYTES, claudeFallbackCallBudget, isManualBudgetExemptReview, knownIssuesPromptBlock, normalizeReviewResult, normalizeVerificationResult, openMaterialFindings } from './review-session-core.mjs';
 import {isGeminiUnavailableStatus,runClaudeStructured} from './claude-fallback.mjs';
 import {geminiBaseUrl} from './gemini-config.mjs';
-import {DEFAULT_IGNORE,MAX_SHARDS,matchesIgnore,parseIgnorePatterns,planShards,splitDiffByFile} from './review-shards.mjs';
+import {MAX_SHARDS,dropIgnoredFiles,planShards,splitDiffByFile} from './review-shards.mjs';
 
 // Moving alias: always resolves to Google's current Flash model. Override with GEMINI_MODEL to pin.
 export const GEMINI_MODEL='gemini-flash-latest';
@@ -230,8 +230,7 @@ export async function runGeminiReview({env=process.env,fetchImpl=fetch,logImpl=c
   // from the base commit), so a later delta or the final audit never has to carry what the first review skipped.
   const rawDiff=fs.readFileSync(path.join(contextRoot,diffName),'utf8');
   const ignoreFile=path.join(contextRoot,'ignore-patterns.txt');
-  const ignorePatterns=[...DEFAULT_IGNORE,...parseIgnorePatterns(fs.existsSync(ignoreFile)?fs.readFileSync(ignoreFile,'utf8'):'')];
-  const diff=splitDiffByFile(rawDiff).filter((chunk)=>!matchesIgnore(chunk.path,ignorePatterns)).map((chunk)=>chunk.text).join('');
+  const diff=dropIgnoredFiles(rawDiff,fs.existsSync(ignoreFile)?fs.readFileSync(ignoreFile,'utf8'):'');
   const prJson=fs.readFileSync(path.join(contextRoot,'pr.json'),'utf8');
   const session=plan.session;
   const riskPath=path.join(contextRoot,'risk-profile.json');
@@ -248,7 +247,7 @@ export async function runGeminiReview({env=process.env,fetchImpl=fetch,logImpl=c
 
   const chunks=splitDiffByFile(diff);
   const {shards:parts,deferred}=planShards({files:chunks.map((chunk)=>chunk.path),chunks});
-  if(deferred.length||!parts.length) throw new Error(`The ${mode} diff spans too many parts (${parts.length+(deferred.length?'+':'')}) for one staged review even after skipping ignored files; add generated or bulk files to .reviewbotignore`);
+  if(deferred.length||!parts.length) throw new Error(`The ${mode} diff spans too many parts (${parts.length+(deferred.length?'+':'')}) for one staged review even after skipping ignored files; add generated or bulk files to .reviewbotignore, or ask for a sharded review`);
   shared.perCallCap=PART_CLAUDE_CAP_USD;
   logImpl(`Large ${mode} diff: reviewing ${chunks.length} file(s) in ${parts.length} part(s)`);
   const startedAt=Date.now();
