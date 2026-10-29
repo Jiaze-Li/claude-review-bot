@@ -1,6 +1,7 @@
 import {
   automaticSourceId,
   parseAutomaticPullRequestTrigger,
+  parseReviewThreadTrigger,
   parseReviewTrigger,
 } from './review-trigger.js';
 
@@ -67,6 +68,19 @@ export default {
         prNumber: payload.issue?.number,
         triggerUser: payload.comment?.user?.login,
         sourceId: payload.comment?.id ? String(payload.comment.id) : null,
+        requireWritePermission: true,
+      };
+    } else if (event === 'pull_request_review_thread') {
+      const thread = parseReviewThreadTrigger(event, payload);
+      if (!thread) return json({ ignored: true, reason: 'review thread event needs no decision' });
+      const deliveryId = request.headers.get('x-github-delivery');
+      if (!deliveryId) return new Response('Missing GitHub webhook delivery id', { status: 400 });
+      trigger = {
+        requestedMode: thread.requestedMode,
+        sourceKind: thread.sourceKind,
+        prNumber: payload.pull_request.number,
+        triggerUser: payload.sender.login,
+        sourceId: automaticSourceId(deliveryId),
         requireWritePermission: true,
       };
     } else {

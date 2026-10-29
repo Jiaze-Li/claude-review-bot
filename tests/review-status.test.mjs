@@ -246,3 +246,15 @@ test('a failed run shows the recorded reason in the status comment',async()=>{
   assert.match(bodies[0],/not confirmed/);
   assert.match(bodies[0],/Reason: Gemini review context exceeds 1500000 bytes second line/);
 });
+
+test('thread decisions are announced as needing no model, and the outcome is stated honestly',async()=>{
+  const sent=[];
+  const fetchImpl=async(url,init)=>{sent.push(JSON.parse(init.body).body);return Response.json({id:7});};
+  const base={...baseEnv,REVIEW_MODE:'threads',REVIEW_REASON:'r',STATUS_COMMENT_ID:'7'};
+  await publishRunStatus({env:{...base,STATUS_STAGE:'started'},fetchImpl});
+  await publishRunStatus({env:{...base,STATUS_STAGE:'finished',THREADS_OUTCOME:'success'},fetchImpl});
+  await publishRunStatus({env:{...base,STATUS_STAGE:'finished',THREADS_OUTCOME:'failure'},fetchImpl});
+  assert.match(sent[0],/Applying review-thread decisions \(no model call\)/);
+  assert.match(sent[1],/Review-thread decisions applied\. No model quota was spent/);
+  assert.match(sent[2],/not confirmed/);
+});

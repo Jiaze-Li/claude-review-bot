@@ -791,6 +791,63 @@ export function applyOverride({ session, headSha, by, now = new Date().toISOStri
   };
 }
 
+// A person resolving the bot's review thread for a finding is a decision about that finding, so it closes
+// it without another review; unresolving the thread reopens it. Closing the last blocking finding on a
+// session that was waiting on findings makes the current HEAD READY by that person's decision (recorded as
+// an override, so it is never reused as an audited baseline), unless files are still unreviewed (PARTIAL).
+// `closed` is [{ id, by }] for threads a writer resolved; `reopened` is finding ids whose thread was unresolved.
+export function applyThreadDecisions({ session, headSha, closed = [], reopened = [], now = new Date().toISOString() } = {}) {
+  validateSession(session);
+  checkedSha(headSha, 'headSha');
+  if (session.status === 'REVIEW_IN_PROGRESS') throw new Error('a review is running; thread decisions wait for it');
+  const findings = session.findings.map((finding) => ({ ...finding }));
+  const closedBy = new Map();
+  for (const { id, by } of closed) {
+    if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/.test(String(by ?? ''))) continue;
+    const finding = findings.find((item) => item.id === id);
+    if (!finding || !['OPEN', 'UNCERTAIN', 'DEFERRED'].includes(finding.status)) continue;
+    finding.status = 'WAIVED';
+    finding.resolvedVia = 'thread';
+    finding.resolvedBy = by;
+    finding.lastCheckedHead = headSha;
+    finding.resolutionReason = compactText(`Resolved by @${by} (review thread)`, 300);
+    closedBy.set(id, by);
+  }
+  const reopenedIds = [];
+  for (const id of reopened) {
+    const finding = findings.find((item) => item.id === id);
+    if (!finding || finding.status !== 'WAIVED' || finding.resolvedVia !== 'thread') continue;
+    finding.status = MATERIAL_SEVERITIES.has(finding.severity) ? 'OPEN' : 'DEFERRED';
+    delete finding.resolvedVia;
+    delete finding.resolvedBy;
+    finding.resolutionReason = null;
+    finding.lastCheckedHead = headSha;
+    reopenedIds.push(id);
+  }
+  if (!closedBy.size && !reopenedIds.length) return session;
+
+  let next = { ...session, findings, updatedAt: now };
+  const blocking = findings.some((finding) => MATERIAL_SEVERITIES.has(finding.severity) && ['OPEN', 'UNCERTAIN'].includes(finding.status));
+  const unreviewed = session.coverage?.complete === false && session.coverage.head === session.lastReviewedHead;
+  if (closedBy.size && !blocking && !session.reviewFailure && ['REWORK', 'HUMAN_REQUIRED'].includes(session.status)) {
+    const by = [...new Set(closedBy.values())];
+    next = unreviewed
+      ? { ...next, status: 'PARTIAL', lastSummary: compactText(`Findings resolved by @${by.join(', @')}; some files are still unreviewed.`, 800) }
+      : {
+        ...next,
+        status: 'READY',
+        auditCompleted: true,
+        lastReviewedHead: headSha,
+        override: { by: by[0], at: now, head: headSha, waived: [...closedBy.keys()], via: 'review thread' },
+        lastSummary: compactText(`Open findings resolved by @${by.join(', @')} via review threads; HEAD not re-reviewed.`, 800),
+      };
+  } else if (reopenedIds.length && blocking && next.status === 'READY') {
+    const { override, ...rest } = next;
+    next = { ...rest, status: 'REWORK', ...(override?.via === 'review thread' ? {} : { override }), lastSummary: compactText('A resolved review thread was reopened; a finding is open again.', 800) };
+  }
+  return next;
+}
+
 export function openMaterialFindings(session) {
   validateSession(session);
   return session.findings.filter((finding) => finding.status === 'OPEN' && MATERIAL_SEVERITIES.has(finding.severity));
@@ -900,6 +957,10 @@ export function renderSessionComment(session, { sourceCommentIds = [] } = {}) {
       + ' — ' + cleanInline(finding.dismissal?.reason ?? ''),
     '  - Evidence: ' + (finding.dismissal?.evidence ?? []).map(cleanInline).join(' · '),
   ]);
+  const threadLines = session.findings
+    .filter((finding) => finding.status === 'WAIVED' && finding.resolvedVia === 'thread')
+    .slice(-6)
+    .map((finding) => '- ' + finding.id + ' resolved by @' + cleanInline(finding.resolvedBy ?? 'unknown'));
   const findingLines = [
     ...open.slice(0, 8).flatMap(finding => [
       `- ${finding.id} **${finding.severity}** — ${cleanInline(finding.title)}`,
@@ -919,7 +980,7 @@ export function renderSessionComment(session, { sourceCommentIds = [] } = {}) {
     '<!-- jiaze-review-session:v1 -->',
     ...processedMarkers,
     '### Independent Review Session',
-    `Status: **${session.status}**${session.override ? ` (manually overridden by @${cleanInline(session.override.by)})` : ''}`,
+    `Status: **${session.status}**${session.override ? (session.override.via === 'review thread' ? ` (findings resolved by @${cleanInline(session.override.by)} via review threads; this HEAD was not re-reviewed)` : ` (manually overridden by @${cleanInline(session.override.by)})`) : ''}`,
     `Default reviewer: **Gemini Flash (latest) / medium thinking**`,
     `Discovery: **${session.reviewFailure?.mode === 'discovery' ? 'not completed' : 'complete'}** · Final audit: **${audit}** · Verification: **${verification}**`,
     ...(session.incrementalReviewCount ? [`Incremental reviews since full audit: **${session.incrementalReviewCount}** (full-audit HEAD: ${cleanInline((session.fullAuditHead ?? session.discoveryHead ?? '').slice(0, 12))})`] : []),
@@ -937,6 +998,7 @@ export function renderSessionComment(session, { sourceCommentIds = [] } = {}) {
     '',
     ...findingLines,
     ...(dismissalLines.length ? ['', 'Human-dismissed findings (cited, not machine-verified):', ...dismissalLines] : []),
+    ...(threadLines.length ? ['', 'Closed by people (review thread resolved):', ...threadLines] : []),
     '',
     `Next: ${next}`,
     '',

@@ -18,8 +18,8 @@ export function parseReviewTrigger(body) {
   if (/^ {0,3}@jiaze-claude-review-bot[ \t]+override[ \t]+review[ \t]*$/i.test(firstLine)) {
     return { requestedMode: 'override' };
   }
-  // The workflow re-fetches the original issue comment for a reason and citations.
-  // Merely resolving an inline review thread never changes durable state.
+  // The workflow re-fetches the original issue comment for a reason and citations. (Resolving a review
+  // thread is a separate path: see parseReviewThreadTrigger.)
   if (/^ {0,3}@(gemini|jiaze-claude-review-bot)[ \t]+dismiss[ \t]+F[0-9]{3,}[ \t]*$/i.test(firstLine)) {
     return { requestedMode: 'dismiss' };
   }
@@ -51,6 +51,18 @@ export function parseAutomaticPullRequestTrigger(event, payload) {
   if (pr.draft === true && payload.action !== 'ready_for_review') return null;
 
   return { requestedMode: 'auto', sourceKind: 'pull_request' };
+}
+
+// A person resolving or reopening one of the bot's review threads is a decision about that finding. The
+// webhook is only a nudge: the workflow reads the threads themselves, and checks that the resolver has write
+// access, so this only filters out events that can never matter (the bot's own tidy-up, other actions).
+export function parseReviewThreadTrigger(event, payload) {
+  if (event !== 'pull_request_review_thread' || !payload || typeof payload !== 'object') return null;
+  if (!['resolved', 'unresolved'].includes(payload.action)) return null;
+  const sender = payload.sender;
+  if (!sender?.login || sender.type === 'Bot' || /\[bot\]$/i.test(sender.login)) return null;
+  if (!payload.pull_request?.number) return null;
+  return { requestedMode: 'threads', sourceKind: 'pull_request' };
 }
 
 // Existing review-session markers require a positive decimal identifier. GitHub

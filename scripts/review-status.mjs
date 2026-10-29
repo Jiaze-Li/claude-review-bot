@@ -3,7 +3,7 @@ import { pathToFileURL } from 'node:url';
 
 const repoPattern = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const positiveId = /^[1-9]\d*$/;
-const reviewModes = new Set(['discovery', 'incremental', 'verification', 'audit', 'recover', 'claude', 'noop_ready', 'noop_waiting', 'human_required', 'deep_review_stale', 'override', 'dismiss']);
+const reviewModes = new Set(['discovery', 'incremental', 'verification', 'audit', 'recover', 'claude', 'noop_ready', 'noop_waiting', 'human_required', 'deep_review_stale', 'override', 'dismiss', 'threads']);
 const sourceKinds = new Set(['comment', 'pull_request']);
 
 function checked(value, pattern, name) {
@@ -63,8 +63,13 @@ export async function publishRunStatus({ env = process.env, fetchImpl = fetch } 
     else if (mode === 'claude') state = 'Exact-HEAD preflight passed. Sharded deep review is running (Gemini first, Claude where Gemini cannot). ' + reason;
     else if (mode === 'override') state = 'Exact-HEAD preflight passed. Applying manual override.';
     else if (mode === 'dismiss') state = 'Exact-HEAD preflight passed. Checking evidence for one finding (no model call).';
+    else if (mode === 'threads') state = 'Exact-HEAD preflight passed. Applying review-thread decisions (no model call).';
     else if (mode === 'recover') state = 'A paid review is already published. Recovering durable session state with no model call.';
     else state = 'No model call is required for this trigger. ' + reason;
+  } else if (mode === 'threads') {
+    state = env.THREADS_OUTCOME === 'success'
+      ? 'Review-thread decisions applied. No model quota was spent.'
+      : 'Review-thread decisions were not confirmed. Check the workflow run.';
   } else if (mode === 'dismiss') {
     state = env.DISMISS_OUTCOME !== 'success'
       ? 'Finding dismissal was not confirmed; durable session did not acknowledge it.'

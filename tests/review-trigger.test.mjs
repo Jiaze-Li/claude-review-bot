@@ -321,3 +321,47 @@ test('deployed Worker config routes normal triggers to review-v2 workflow', () =
   assert.match(toml,/CONTROL_WORKFLOW\s*=\s*"review-v2\.yml"/);
   assert.doesNotMatch(toml,/CONTROL_WORKFLOW\s*=\s*"review\.yml"/);
 });
+
+// ---- a person resolving or reopening the bot's review thread ----
+
+const threadPayload = (action, sender = { login: 'maintainer', type: 'User' }) => ({
+  action, installation: { id: 11 }, repository: { full_name: 'acme/project' },
+  sender,
+  pull_request: { number: 7, state: 'open', draft: false, head: { sha: 'a'.repeat(40) }, base: { sha: 'b'.repeat(40) } },
+  thread: { node_id: 'PRRT_x', comments: [{ id: 5 }] },
+});
+
+for (const action of ['resolved', 'unresolved']) {
+  test(`a writer's ${action} review thread dispatches a threads run for the exact HEAD, with no model mode`, async (t) => {
+    const calls = fakeGithub(t);
+    const response = await worker.fetch(request(threadPayload(action), {}, 'pull_request_review_thread'), env);
+    assert.equal(response.status, 202);
+    const dispatches = calls.filter((call) => call.pathname.endsWith('/dispatches'));
+    assert.equal(dispatches.length, 1);
+    assert.equal(dispatches[0].body.inputs.requested_mode, 'threads');
+    assert.equal(dispatches[0].body.inputs.source_kind, 'pull_request');
+    assert.equal(dispatches[0].body.inputs.trigger_user, 'maintainer');
+    assert.equal(dispatches[0].body.inputs.head_sha, 'a'.repeat(40));
+    assert.match(dispatches[0].body.inputs.source_comment_id, /^[1-9]\d*$/);
+  });
+}
+
+test('the bot\'s own resolve (a tidy-up) and other thread actions never trigger anything', async (t) => {
+  const calls = fakeGithub(t);
+  for (const payload of [
+    threadPayload('resolved', { login: 'jiaze-claude-review-bot[bot]', type: 'Bot' }),
+    threadPayload('resolved', { login: 'someone', type: 'Bot' }),
+    threadPayload('created'),
+  ]) {
+    const response = await worker.fetch(request(payload, {}, 'pull_request_review_thread'), env);
+    assert.equal((await response.json()).ignored, true);
+  }
+  assert.equal(calls.length, 0);
+});
+
+test('a person without write access resolving a thread is ignored', async (t) => {
+  const calls = fakeGithub(t, { permission: 'read' });
+  const response = await worker.fetch(request(threadPayload('resolved'), {}, 'pull_request_review_thread'), env);
+  assert.equal((await response.json()).ignored, true);
+  assert.equal(calls.some((call) => call.pathname.endsWith('/dispatches')), false);
+});

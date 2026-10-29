@@ -177,3 +177,16 @@ test('every fresh full review goes through the sharded engine, whatever its size
     assert.match(plan.decision.reason,/in shards: Gemini first, Claude continues/);
   }
 });
+
+test('a resolved or reopened review thread is reconciled with the session without any model call',async()=>{
+  const rework=applyDiscoveryResult({result:{summary:'bug',findings:[{severity:'P1',title:'Bug',body:'Trigger X causes Y; expected Z.',path:'a.js',line:1,riskClass:'state'}]},baseSha:BASE,headSha:A,sourceCommentId:'1'});
+  const plan=(session)=>planSession({env:env({REQUESTED_MODE:'threads',SOURCE_KIND:'pull_request'}),fetchImpl:fetchState({comments:session?[comment(7,renderSessionComment(session))]:[]})});
+  const withSession=await plan(rework);
+  assert.equal(withSession.decision.mode,'threads');
+  assert.equal(withSession.sessionCommentId,'7');
+  assert.equal((await plan(null)).decision.mode,'noop_waiting');
+  const running={...rework,status:'REVIEW_IN_PROGRESS',deepReview:{head:A,startedAt:new Date().toISOString(),state:'IN_PROGRESS',resumeStatus:'REWORK'}};
+  const waiting=await plan(running);
+  assert.equal(waiting.decision.mode,'noop_waiting');
+  assert.match(waiting.decision.reason,/a review is running/);
+});

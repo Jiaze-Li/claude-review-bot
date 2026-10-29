@@ -16,7 +16,7 @@ export async function planSession({ env=process.env, fetchImpl=fetch }={}) {
   const headSha=required(env,'HEAD_SHA');
   if(!shaPattern.test(baseSha)||!shaPattern.test(headSha)) throw new Error('Invalid PR SHA');
   const requested=(env.REQUESTED_MODE||'auto').toLowerCase();
-  if(!['auto','claude','reset','override','dismiss'].includes(requested)) throw new Error('Invalid REQUESTED_MODE');
+  if(!['auto','claude','reset','override','dismiss','threads'].includes(requested)) throw new Error('Invalid REQUESTED_MODE');
 
   const expectedAuthor=required(env,'EXPECTED_REVIEW_AUTHOR');
   const comments=await loadComments(target,pr,env.GH_TOKEN,fetchImpl);
@@ -31,6 +31,17 @@ export async function planSession({ env=process.env, fetchImpl=fetch }={}) {
     sessionCommentId=String(candidates[0].id);
     session=parseSessionComment(candidates[0].body);
     if(!session) throw new Error('Latest bot-authored review session comment is unreadable; refusing to discard durable state');
+  }
+
+  // A person resolved or reopened one of the bot's review threads: reconcile the session with the threads.
+  // No model call. If a review is running right now its own run will write the session; leave it be.
+  if(requested==='threads'){
+    const decision=!session
+      ?{mode:'noop_waiting',previousHead:null,reason:'there is no review session for this PR yet'}
+      :session.status==='REVIEW_IN_PROGRESS'
+        ?{mode:'noop_waiting',previousHead:session.lastReviewedHead,reason:'a review is running; resolve the thread again, or comment @gemini review, once it has finished'}
+        :{mode:'threads',previousHead:null,reason:'a person resolved or reopened a review thread; reconciling the session with the threads'};
+    return {requestedMode:requested,decision,session,sessionCommentId,pendingSession:null,pendingSourceCommentId:null,pendingReviewId:null};
   }
 
   const pendingCandidates=reviews
