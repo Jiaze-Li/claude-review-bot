@@ -266,3 +266,12 @@ test('a delta that needs a full look becomes a full review in the engine, with t
   assert.match(gemini.reason,/high-risk path.*5 KB diff in shards: Gemini first, Claude continues/);
   assert.match(fullReviewDecision({REVIEW_CONTEXT_DIR:dir},'claude','x').reason,/Claude only/);
 });
+
+test('a PARTIAL review continues for a person\'s command or for the run that continues it, not for an unrelated automatic event',async()=>{
+  const partial={...applyDiscoveryResult({result:{summary:'clean',findings:[]},baseSha:BASE,headSha:A,sourceCommentId:'1'}),status:'PARTIAL',
+    coverage:{complete:false,head:A,reviewedKeys:[],unreviewedPaths:['x'],unreviewedCount:1}};
+  const plan=(extra)=>planSession({env:env(extra),fetchImpl:fetchState({comments:[comment(7,renderSessionComment(partial))]})});
+  assert.equal((await plan({SOURCE_KIND:'comment'})).decision.mode,'claude');
+  assert.equal((await plan({SOURCE_KIND:'pull_request',SOURCE_COMMENT_ID:'8140844152995'})).decision.mode,'claude'); // the continuation run
+  assert.equal((await plan({SOURCE_KIND:'pull_request',SOURCE_COMMENT_ID:'263171400319958021003132'})).decision.mode,'noop_waiting'); // a reopened PR
+});

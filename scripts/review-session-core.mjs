@@ -33,7 +33,7 @@ export const DEEP_REVIEW_STALE_MS = 20 * 60 * 1000;
 // worse than letting a reworded repeat through for one more validation.
 const KNOWN_MATCH_THRESHOLD = 0.8;
 
-export function planReviewSession({ session = null, baseSha, headSha, reset = false, retryUnavailable = false, now = Date.now() } = {}) {
+export function planReviewSession({ session = null, baseSha, headSha, reset = false, retryUnavailable = false, continuation = false, now = Date.now() } = {}) {
   checkedSha(baseSha, 'baseSha');
   checkedSha(headSha, 'headSha');
 
@@ -95,11 +95,15 @@ export function planReviewSession({ session = null, baseSha, headSha, reset = fa
 
   // The reviewers could not cover every changed file. Never READY.
   if (session.status === 'PARTIAL') {
-    // Any review request on the same HEAD (a command, or the run that continues a big review) takes the files not
-    // yet covered; a new HEAD starts a fresh review.
-    return session.lastReviewedHead === headSha
+    // A person's command, or the run that continues a big review by itself, takes the files not yet covered. An
+    // unrelated automatic event on the same HEAD (a reopened PR, a re-run) does not start paid work; a new HEAD
+    // starts a fresh review.
+    if (session.lastReviewedHead !== headSha) {
+      return { mode: 'full_review', previousHead: null, reason: 'new HEAD after partial-coverage review; run a fresh bounded review' };
+    }
+    return retryUnavailable || continuation
       ? { mode: 'claude', previousHead: null, reason: 'continue the partial review with the files not yet covered' }
-      : { mode: 'full_review', previousHead: null, reason: 'new HEAD after partial-coverage review; run a fresh bounded review' };
+      : { mode: 'noop_waiting', previousHead: session.lastReviewedHead, reason: 'review coverage was partial; comment `@gemini review` to cover the remaining files' };
   }
 
   if (session.status === 'HUMAN_REQUIRED') {

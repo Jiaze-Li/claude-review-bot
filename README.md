@@ -39,7 +39,7 @@ A full review is used for: a PR's first review, the review after a big or risky 
 * **READY** needs a complete pass over every changed file with no open P0/P1/P2 and nothing uncertain. It is the
   *review's* clearance; CI, approvals and branch protection still decide whether the PR can merge.
 * **PARTIAL** means some files were not reached (time, budget). It is never READY. It continues by itself, up to
-  3 more runs; `@gemini review` continues it by hand.
+  3 more runs, and `@gemini review` continues it by hand; an unrelated event (a reopened PR) does not.
 * **HUMAN_REQUIRED** means a person must decide: verification budget spent, an UNCERTAIN material candidate, or
   both providers unavailable. Use `@gemini dismiss F001` (with evidence) or `override review`.
 * A new commit never inherits an old READY. A READY PR with a small, low-risk new commit gets an *incremental*

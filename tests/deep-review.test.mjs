@@ -478,7 +478,9 @@ test('partial coverage never reaches READY, names the unreviewed files, and a co
   assert.match(body, /Review coverage: \*\*PARTIAL\*\*/);
   assert.match(body, /ui\/Layout\.swift/);
   // The same HEAD continues with the files not yet covered (by a command or by the run that continues it); a new HEAD starts a fresh review.
-  assert.equal(planReviewSession({ session: partial, baseSha: BASE, headSha: A }).mode, 'claude');
+  assert.equal(planReviewSession({ session: partial, baseSha: BASE, headSha: A, retryUnavailable: true }).mode, 'claude');
+  assert.equal(planReviewSession({ session: partial, baseSha: BASE, headSha: A, continuation: true }).mode, 'claude');
+  assert.equal(planReviewSession({ session: partial, baseSha: BASE, headSha: A }).mode, 'noop_waiting'); // an unrelated automatic event spends nothing
   assert.equal(planReviewSession({ session: partial, baseSha: BASE, headSha: C }).mode, 'full_review');
   const rerun = completeDeepReview({
     session: beginDeepReview({ session: partial, baseSha: BASE, headSha: A, now: T0 }), headSha: A,

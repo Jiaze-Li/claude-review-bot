@@ -4,6 +4,7 @@ import { pathToFileURL } from 'node:url';
 import { isDeepReviewStale, parsePendingSessionReview, parseSessionComment, planReviewSession } from './review-session-core.mjs';
 import { blockingClaims, fetchReviewThreads, isWriter, threadsByFinding } from './review-threads.mjs';
 import { prepareIncrementalDelta } from './select-incremental-review.mjs';
+import { chainIndex } from './continue-review.mjs';
 
 const repoPattern=/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const shaPattern=/^[0-9a-f]{40}$/i;
@@ -111,7 +112,8 @@ export async function planSession({ env=process.env, fetchImpl=fetch }={}) {
   }
 
   let decision=planReviewSession({session,baseSha,headSha,reset:requested==='reset',
-    retryUnavailable:['auto','claude'].includes(requested) && env.SOURCE_KIND==='comment'});
+    retryUnavailable:['auto','claude'].includes(requested) && env.SOURCE_KIND==='comment',
+    continuation:chainIndex(env.SOURCE_COMMENT_ID)>0});
   // One route for every full review, whatever its size, provider or purpose (a first review, a review after a big
   // or risky change, the final review before READY): the sharded engine, Gemini first, Claude continuing what Gemini
   // cannot. Only delta reviews (incremental, verification) use the staged pipeline.
