@@ -58,7 +58,7 @@ export async function publishRunStatus({ env = process.env, fetchImpl = fetch } 
     else if (mode === 'incremental') state = 'Exact-HEAD preflight passed. Gemini delta review is running.';
     else if (mode === 'verification') state = 'Exact-HEAD preflight passed. Gemini targeted verification is running.';
     else if (mode === 'audit') state = 'Exact-HEAD preflight passed. Gemini one-time final audit is running.';
-    else if (mode === 'claude') state = 'Exact-HEAD preflight passed. Claude deep review is running. ' + reason;
+    else if (mode === 'claude') state = 'Exact-HEAD preflight passed. Sharded deep review is running (Gemini first, Claude where Gemini cannot). ' + reason;
     else if (mode === 'override') state = 'Exact-HEAD preflight passed. Applying manual override.';
     else if (mode === 'dismiss') state = 'Exact-HEAD preflight passed. Checking evidence for one finding (no model call).';
     else if (mode === 'recover') state = 'A paid review is already published. Recovering durable session state with no model call.';

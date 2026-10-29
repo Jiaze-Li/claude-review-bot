@@ -55,7 +55,9 @@ for (const finding of review.findings) {
   }
 }
 
-let body = `## Claude Code Review\n\n${review.summary.trim()}`;
+const providerCounts = review._meta?.providers && typeof review._meta.providers === 'object' ? review._meta.providers : {};
+const heading = providerCounts.gemini > 0 ? (providerCounts.claude > 0 ? 'Gemini + Claude Code Review' : 'Gemini Code Review') : 'Claude Code Review';
+let body = `## ${heading}\n\n${review.summary.trim()}`;
 if (review.findings.length === 0) {
   body += '\n\n✅ No actionable issues found.';
 } else {
@@ -155,8 +157,13 @@ function formatRuntimeSection(value) {
   const shards = nonnegativeInteger(value.shards);
   const shardsRun = nonnegativeInteger(value.shards_run);
   const deferredFiles = nonnegativeInteger(value.deferred_files);
+  const providers = value.providers && typeof value.providers === 'object' && !Array.isArray(value.providers)
+    ? Object.entries(value.providers).filter(([name, count]) => ['gemini', 'claude'].includes(name) && nonnegativeInteger(count)).map(([name, count]) => `${name} ${count}`)
+    : [];
   if (shards !== null && shards > 1) {
-    details.push(`shards ${shardsRun !== null ? `${shardsRun}/` : ''}${shards}${deferredFiles ? ` (+${deferredFiles} file(s) deferred)` : ''}`);
+    details.push(`shards ${shardsRun !== null ? `${shardsRun}/` : ''}${shards}${deferredFiles ? ` (+${deferredFiles} file(s) deferred)` : ''}${providers.length ? ` by ${providers.join(', ')}` : ''}`);
+  } else if (providers.length) {
+    details.push(`by ${providers.join(', ')}`);
   }
 
   if (usage) {

@@ -30,14 +30,18 @@ export async function runDeepReviewCommand(command, { env = process.env, fetchIm
     // An explicit @claude review (or a manual @gemini review comment) deliberately authorizes a
     // bounded $5 call even when the cumulative automatic $6 cap is exhausted. The same mode is
     // also chosen automatically when a PR is too large for Gemini; that run obeys the cap.
-    const manual = ctx.plan.requestedMode === 'claude' || env.SOURCE_KIND === 'comment';
-    const runBudget = manual
+    const explicitClaude = ctx.plan.requestedMode === 'claude';
+    const manual = explicitClaude || env.SOURCE_KIND === 'comment';
+    let runBudget = manual
       ? DEEP_REVIEW_MANUAL_RUN_BUDGET_USD
       : Math.min(DEEP_REVIEW_MANUAL_RUN_BUDGET_USD, claudeFallbackCallBudget(ctx.plan.session, { manual: false }));
+    // Gemini first (it is cheaper and billed to its own key); Claude takes over what Gemini cannot
+    // finish. An explicit @claude review asks for Claude only. When this PR's automatic Claude
+    // allowance is spent, Gemini alone can still review; it is not charged to that ledger.
+    let providers = explicitClaude ? 'claude' : 'gemini,claude';
     if (!manual && runBudget < CLAUDE_AUTO_MIN_BUDGET_USD) {
-      const reason = 'automatic Claude budget for this PR is exhausted; comment `@claude review` to run the review manually';
-      writeFailureReason(ctx.contextRoot, reason);
-      throw new Error(reason);
+      providers = 'gemini';
+      runBudget = 0;
     }
     const session = beginDeepReview({
       session: ctx.plan.session, baseSha: ctx.baseSha, headSha: ctx.headSha, runId: env.GITHUB_RUN_ID,
@@ -53,7 +57,8 @@ export async function runDeepReviewCommand(command, { env = process.env, fetchIm
     output(env, 'began', 'true');
     output(env, 'run', 'true');
     output(env, 'run_budget_usd', runBudget.toFixed(2));
-    console.log(`Manually authorized Claude deep review begun (per-call budget ${runBudget.toFixed(2)}).`);
+    output(env, 'providers', providers);
+    console.log(`Deep review begun (providers: ${providers.replace(',', ' then ')}; Claude per-call budget ${runBudget.toFixed(2)}).`);
     return session;
   }
 
@@ -107,14 +112,6 @@ export async function runDeepReviewCommand(command, { env = process.env, fetchIm
   throw new Error(`Unknown deep-review command: ${command}`);
 }
 
-function writeFailureReason(contextRoot, message) {
-  try {
-    fs.writeFileSync(path.join(contextRoot, 'failure-reason.txt'), String(message).slice(0, 400), { mode: 0o600 });
-  } catch {
-    // best effort
-  }
-}
-
 function readContext(env) {
   const target = required(env, 'TARGET_REPO');
   if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(target)) throw new Error('Invalid TARGET_REPO');
@@ -136,6 +133,8 @@ function readUsage(contextRoot, fallbackCost) {
   try {
     const value = JSON.parse(fs.readFileSync(path.join(contextRoot, 'claude-usage.json'), 'utf8'));
     if (typeof value.total_cost_usd === 'number' && value.total_cost_usd > 0) return { cost: value.total_cost_usd, source: 'sdk' };
+    // A finished run that never needed Claude (Gemini reviewed everything) really cost the ledger nothing.
+    if (value.total_cost_usd === 0 && value.subtype === 'success') return { cost: 0, source: 'sdk' };
   } catch {
     // fall through
   }
@@ -143,8 +142,9 @@ function readUsage(contextRoot, fallbackCost) {
 }
 
 function allottedBudget(env) {
+  if (env.DEEP_REVIEW_MAX_BUDGET_USD === undefined || env.DEEP_REVIEW_MAX_BUDGET_USD === '') return DEEP_REVIEW_MANUAL_RUN_BUDGET_USD;
   const value = Number(env.DEEP_REVIEW_MAX_BUDGET_USD);
-  return Number.isFinite(value) && value > 0 ? value : DEEP_REVIEW_MANUAL_RUN_BUDGET_USD;
+  return Number.isFinite(value) && value >= 0 ? value : DEEP_REVIEW_MANUAL_RUN_BUDGET_USD;
 }
 
 async function headUnmoved(ctx, fetchImpl) {
