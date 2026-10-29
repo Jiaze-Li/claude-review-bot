@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { planSession } from '../scripts/plan-review-session.mjs';
+import { planSession, routeFullReviewToShards } from '../scripts/plan-review-session.mjs';
 import { findingMarker } from '../scripts/review-anchors.mjs';
 import { applyDiscoveryResult, pendingSessionMarker, renderSessionComment } from '../scripts/review-session-core.mjs';
 
@@ -258,4 +258,15 @@ test('a final audit too big for one staged run goes to the sharded engine as the
   // files the reviews skip do not count toward the limit
   fs.writeFileSync(path.join(dir,'ignore-patterns.txt'),'src/*\n');
   assert.equal((await plan()).decision.mode,'audit');
+});
+
+test('an incremental candidate that falls back to full discovery is routed to the sharded engine',()=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'route-'));
+  fs.writeFileSync(path.join(dir,'pr.diff'),'x'.repeat(5000));
+  const env={REVIEW_CONTEXT_DIR:dir};
+  const routed=routeFullReviewToShards({mode:'discovery',previousHead:null,reason:'Full review: durable finding ledger is nearing its size limit'},'auto',env);
+  assert.equal(routed.mode,'claude');
+  assert.match(routed.reason,/in shards/);
+  const incremental={mode:'incremental',previousHead:A,reason:'small delta'};
+  assert.deepEqual(routeFullReviewToShards(incremental,'auto',env),incremental);
 });

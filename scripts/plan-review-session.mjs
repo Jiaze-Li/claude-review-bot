@@ -116,11 +116,7 @@ export async function planSession({ env=process.env, fetchImpl=fetch }={}) {
   // One route for every full review, whatever its size or provider: the sharded engine (a small PR is
   // a single shard). It tries Gemini first and lets Claude continue what Gemini cannot finish. Delta
   // reviews (incremental, verification) and the final audit still use the staged Gemini pipeline.
-  if(decision.mode==='discovery'){
-    const diffBytes=fileBytes(path.join(path.resolve(env.REVIEW_CONTEXT_DIR||'.review-context'),'pr.diff'));
-    decision={mode:'claude',previousHead:null,
-      reason:`${decision.reason}: reviewing the ${Math.max(1,Math.round(diffBytes/1000))} KB diff in shards: ${requested==='claude'?'Claude only':'Gemini first, Claude continues if Gemini cannot'}`};
-  }
+  decision=routeFullReviewToShards(decision,requested,env);
   // A final audit has to see the whole PR in one staged run. When the diff is too big for that, the sharded engine
   // does the audit instead: it can continue over several runs, and a complete pass of it counts as the audit.
   if(decision.mode==='audit'){
@@ -132,6 +128,15 @@ export async function planSession({ env=process.env, fetchImpl=fetch }={}) {
     }
   }
   return {requestedMode:requested,decision,session,sessionCommentId,pendingSession:null,pendingSourceCommentId:null,pendingReviewId:null};
+}
+
+// Every full review goes to the sharded engine. This also applies to an incremental candidate that
+// fell back to full review, otherwise a large PR would reach the staged pipeline and fail on part count.
+export function routeFullReviewToShards(decision,requested,env=process.env){
+  if(decision.mode!=='discovery') return decision;
+  const diffBytes=fileBytes(path.join(path.resolve(env.REVIEW_CONTEXT_DIR||'.review-context'),'pr.diff'));
+  return {mode:'claude',previousHead:null,
+    reason:`${decision.reason}: reviewing the ${Math.max(1,Math.round(diffBytes/1000))} KB diff in shards: ${requested==='claude'?'Claude only':'Gemini first, Claude continues if Gemini cannot'}`};
 }
 
 function readOptional(file){
@@ -206,11 +211,11 @@ if(process.argv[1] && import.meta.url===pathToFileURL(process.argv[1]).href){
         session: plan.session,
         token: process.env.GH_TOKEN,
       });
-      plan.decision = {
+      plan.decision = routeFullReviewToShards({
         mode: scope.mode,
         previousHead: scope.mode === 'incremental' ? previousHead : null,
         reason: scope.reason,
-      };
+      }, plan.requestedMode);
       console.log('Review scope: ' + scope.mode + ' — ' + scope.reason
         + (scope.changedLines == null ? '' : ' (' + scope.files + ' files, ' + scope.changedLines + ' lines)'));
     }
