@@ -14,13 +14,8 @@ export const DEEP_REVIEW_RUN_BUDGET_USD = 2;
 export const DEEP_REVIEW_MANUAL_RUN_BUDGET_USD = 5;
 export const DEEP_REVIEW_PR_BUDGET_USD = 6;
 // Gemini is sent the whole diff in one request and refuses (rather than truncates) above this.
-// A PR over it is reviewed by Claude in shards instead of failing before any model is called.
+// The staged delta/audit pipeline still sends one request; full reviews are sharded and not bound by it.
 export const GEMINI_MAX_CONTEXT_BYTES = 1_500_000;
-const GEMINI_CONTEXT_MARGIN_BYTES = 20_000;
-export function geminiContextTooLarge({ diffBytes = 0, prJsonBytes = 0, session = null } = {}) {
-  const sessionBytes = session ? Buffer.byteLength(JSON.stringify(session), 'utf8') : 0;
-  return diffBytes + prJsonBytes + sessionBytes + GEMINI_CONTEXT_MARGIN_BYTES > GEMINI_MAX_CONTEXT_BYTES;
-}
 const MAX_UNREVIEWED_PATHS = 20;
 const MAX_REVIEWED_KEYS = 400;
 
@@ -101,6 +96,10 @@ export function planReviewSession({ session = null, baseSha, headSha, reset = fa
   // The model reported it could not cover every changed file. Never READY; a new
   // HEAD starts a fresh bounded discovery, the same HEAD waits for a manual re-run.
   if (session.status === 'PARTIAL') {
+    // A manual `@gemini review` / `@claude review` continues with the files not yet covered.
+    if (session.lastReviewedHead === headSha && retryUnavailable) {
+      return { mode: 'claude', previousHead: null, reason: 'continue the partial review with the files not yet covered' };
+    }
     return session.lastReviewedHead === headSha
       ? { mode: 'noop_waiting', previousHead: session.lastReviewedHead, reason: 'review coverage was partial; comment `@claude review` to cover the remaining files' }
       : { mode: 'discovery', previousHead: null, reason: 'new HEAD after partial-coverage review; run a fresh bounded review' };

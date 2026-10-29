@@ -133,17 +133,20 @@ export function mergeShardResults({ shards, results, deferred = [], allFiles, pr
   const summaries = [];
   let failedShards = 0;
   const shardStats = [];
+  const fellBack = [];
 
   shards.forEach((shard, index) => {
     const result = results[index];
     if (!result?.ok) {
       failedShards += 1;
       shardStats.push(`${index + 1}: ${result ? 'failed' : 'not run'} 0/${shard.files.length}`);
+      if (result?.error) fellBack.push(null);
       notes.push(`shard ${index + 1}/${shards.length} ${result ? `failed (${String(result.error).slice(0, 80)})` : 'did not run'}`);
       return;
     }
     const coverage = reconcileCoverage(result.structured.coverage, shard.files);
-    shardStats.push(`${index + 1}: ok ${coverage.reviewedPaths.length}/${shard.files.length}`);
+    shardStats.push(`${index + 1}: ${result.provider ? `${result.provider} ` : ''}ok ${coverage.reviewedPaths.length}/${shard.files.length}`);
+    if (result.fellBackFrom) fellBack.push(result.fellBackFrom);
     coverage.reviewedPaths.forEach((p) => reviewed.add(p));
     if (!coverage.complete && coverage.note) notes.push(coverage.note);
     if (result.structured.summary) summaries.push(String(result.structured.summary).trim());
@@ -165,7 +168,8 @@ export function mergeShardResults({ shards, results, deferred = [], allFiles, pr
   const ignored = ignoredCount ? ` ${ignoredCount} more file(s) skipped by ignore rules.` : '';
   const header = `Reviewed ${reviewed.size} of ${allFiles.length} changed file(s) in ${shards.length} shard(s)${prior}${complete ? '' : ' — PARTIAL'}.${ignored}`;
   const extra = [
-    ...(shards.length > 1 || deferred.length ? [`Shards (reviewed/assigned): ${shardStats.join(' · ')}${deferred.length ? ` · deferred beyond limit: ${deferred.length} file(s)` : ''}.`] : []),
+    ...(fellBack.some(Boolean) ? [`Gemini could not finish ${fellBack.filter(Boolean).length} shard(s) (${String(fellBack.find(Boolean)).slice(0, 120)}); Claude took over what it left.`] : []),
+    ...(shards.length > 1 || deferred.length || fellBack.some(Boolean) ? [`Shards (reviewed/assigned): ${shardStats.join(' · ')}${deferred.length ? ` · deferred beyond limit: ${deferred.length} file(s)` : ''}.`] : []),
     ...(droppedMaterial ? [`${droppedMaterial} more material finding(s) were omitted to fit the session limit; fix the listed ones and re-review.`] : []),
     ...(complete ? [] : [`Not reviewed: ${unreviewedPaths.slice(0, 15).join(', ')}${unreviewedPaths.length > 15 ? `, … (+${unreviewedPaths.length - 15})` : ''}.`]),
   ];

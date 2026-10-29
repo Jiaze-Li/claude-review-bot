@@ -524,7 +524,7 @@ test('a deep review that failed closed can be retried and recovers; findings-bas
   assert.equal(beginDeepReview({ session: other, baseSha: BASE, headSha: A, now: T0 }).deepReview.resumeStatus, 'HUMAN_REQUIRED');
 });
 
-test('a Claude review chosen automatically (PR too large for Gemini) obeys the automatic cap, not the manual exemption', async () => {
+test('an automatic review tries Gemini first and its Claude part obeys the automatic cap; a manual one is exempt', async () => {
   const auto = (extra, env = {}) => {
     const dir = ctxDir({ requestedMode: 'auto', decision: { mode: 'claude' }, session: extra, sessionCommentId: '300' });
     return { dir, env: cenv(dir, { GITHUB_OUTPUT: path.join(dir, 'out'), SOURCE_KIND: 'pull_request', ...env }) };
@@ -533,18 +533,27 @@ test('a Claude review chosen automatically (PR too large for Gemini) obeys the a
   const fresh = auto({ ...readySession(), deepSpendUsd: 0 });
   await runDeepReviewCommand('begin', { env: fresh.env, fetchImpl: fakeGitHub().fetchImpl, now: T0 });
   assert.match(fs.readFileSync(path.join(fresh.dir, 'out'), 'utf8'), /run_budget_usd=5.00/);
+  assert.match(fs.readFileSync(path.join(fresh.dir, 'out'), 'utf8'), /providers=gemini,claude/);
   // Only $2.50 left of the automatic $6: that is the call budget.
   const some = auto({ ...readySession(), deepSpendUsd: 3.5 });
   await runDeepReviewCommand('begin', { env: some.env, fetchImpl: fakeGitHub().fetchImpl, now: T0 });
   assert.match(fs.readFileSync(path.join(some.dir, 'out'), 'utf8'), /run_budget_usd=2.50/);
-  // Exhausted: refuses, and records a reason the status comment shows.
+  // Claude's automatic allowance spent: Gemini alone may still review (it is not charged to the ledger).
   const spent = auto({ ...readySession(), deepSpendUsd: 6 });
-  await assert.rejects(runDeepReviewCommand('begin', { env: spent.env, fetchImpl: fakeGitHub().fetchImpl, now: T0 }), /automatic Claude budget for this PR is exhausted/);
-  assert.match(fs.readFileSync(path.join(spent.dir, 'failure-reason.txt'), 'utf8'), /comment `@claude review`/);
-  // The same plan from a manual comment is exempt.
+  const began = await runDeepReviewCommand('begin', { env: spent.env, fetchImpl: fakeGitHub().fetchImpl, now: T0 });
+  const spentOut = fs.readFileSync(path.join(spent.dir, 'out'), 'utf8');
+  assert.match(spentOut, /providers=gemini\n/);
+  assert.match(spentOut, /run_budget_usd=0.00/);
+  assert.equal(began.deepSpendUsd, 6); // nothing extra reserved against the Claude ledger
+  // The same plan from a manual comment is exempt and may use Claude.
   const manual = auto({ ...readySession(), deepSpendUsd: 6 }, { SOURCE_KIND: 'comment' });
   await runDeepReviewCommand('begin', { env: manual.env, fetchImpl: fakeGitHub().fetchImpl, now: T0 });
   assert.match(fs.readFileSync(path.join(manual.dir, 'out'), 'utf8'), /run_budget_usd=5.00/);
+  assert.match(fs.readFileSync(path.join(manual.dir, 'out'), 'utf8'), /providers=gemini,claude/);
+  // An explicit @claude review asks for Claude only.
+  const explicit = ctxDir({ requestedMode: 'claude', decision: { mode: 'claude' }, session: readySession(), sessionCommentId: '300' });
+  await runDeepReviewCommand('begin', { env: cenv(explicit, { GITHUB_OUTPUT: path.join(explicit, 'out'), SOURCE_KIND: 'comment' }), fetchImpl: fakeGitHub().fetchImpl, now: T0 });
+  assert.match(fs.readFileSync(path.join(explicit, 'out'), 'utf8'), /providers=claude\n/);
 });
 
 test('a partial review remembers the files it covered in compact keys, and a complete re-run clears them', () => {

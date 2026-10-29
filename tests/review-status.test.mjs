@@ -72,7 +72,7 @@ for (const mode of ['verification', 'audit', 'recover', 'claude', 'noop_ready', 
         : mode === 'recover'
         ? 'Recovering durable session state'
         : mode === 'claude'
-          ? 'Claude deep review'
+          ? 'Sharded deep review is running'
           : 'No model call'));
   });
 }

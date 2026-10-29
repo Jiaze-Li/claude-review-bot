@@ -555,6 +555,8 @@ jobs:
         if: steps.dedupe.outputs.duplicate != 'true' && steps.plan.outputs.mode == 'claude' && steps.begin-deep.outputs.run == 'true'
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          REVIEW_PROVIDERS: ${{ steps.begin-deep.outputs.providers }}
           DEEP_REVIEW_MAX_BUDGET_USD: ${{ steps.begin-deep.outputs.run_budget_usd }}
           TARGET_REPO: ${{ inputs.target_repo }}
           PR_NUMBER: ${{ inputs.pr_number }}

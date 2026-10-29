@@ -26,7 +26,7 @@ function fetchState({comments=[],reviews=[]}={}){
 
 test('planner starts discovery when no durable bot session exists',async()=>{
   const plan=await planSession({env:env(),fetchImpl:fetchState()});
-  assert.equal(plan.decision.mode,'discovery');
+  assert.equal(plan.decision.mode,'claude');
   assert.equal(plan.session,null);
 });
 
@@ -63,9 +63,9 @@ test('explicit reset starts a fresh discovery while preserving session comment l
     env:env({REQUESTED_MODE:'reset'}),
     fetchImpl:fetchState({comments:[comment(7,renderSessionComment(session))]}),
   });
-  assert.equal(plan.decision.mode,'discovery');
+  assert.equal(plan.decision.mode,'claude');
   assert.equal(plan.sessionCommentId,'7');
-  assert.equal(plan.decision.reason,'explicit reset');
+  assert.match(plan.decision.reason,/^explicit reset: /);
 });
 
 test('explicit Claude mode joins the durable session for this HEAD',async()=>{
@@ -119,7 +119,7 @@ test('planner ignores pending state from another author',async()=>{
       id:50,user:{login:'attacker'},body:pendingSessionMarker(pending,'11'),
     }]}),
   });
-  assert.equal(plan.decision.mode,'discovery');
+  assert.equal(plan.decision.mode,'claude');
 });
 
 
@@ -131,8 +131,8 @@ test('explicit reset ignores a recoverable pending review and starts fresh disco
       id:50,user:{login:author},body:'review body\n'+pendingSessionMarker(pending,'11'),
     }]}),
   });
-  assert.equal(plan.decision.mode,'discovery');
-  assert.equal(plan.decision.reason,'explicit reset');
+  assert.equal(plan.decision.mode,'claude');
+  assert.match(plan.decision.reason,/^explicit reset: /);
 });
 
 test('explicit Claude request recovers a newer published-but-unpersisted session first and says it did not run',async()=>{
@@ -152,15 +152,13 @@ test('explicit Claude request recovers a newer published-but-unpersisted session
   assert.equal(plan.pendingSession.findings[0].id,'F001');
 });
 
-test('a fresh review of a diff over Gemini\'s context limit is planned for Claude, not Gemini',async()=>{
-  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'plan-big-'));
-  fs.writeFileSync(path.join(dir,'pr.diff'),'x'.repeat(1_600_000));
+test('every fresh full review goes through the sharded engine, whatever its size',async()=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'plan-size-'));
   fs.writeFileSync(path.join(dir,'pr.json'),'{}');
-  const big=await planSession({env:env({REVIEW_CONTEXT_DIR:dir}),fetchImpl:fetchState()});
-  assert.equal(big.decision.mode,'claude');
-  assert.match(big.decision.reason,/over Gemini's 1\.5 MB limit/);
-  // The explicit command and a normal-size diff are unaffected.
-  fs.writeFileSync(path.join(dir,'pr.diff'),'x'.repeat(100_000));
-  const small=await planSession({env:env({REVIEW_CONTEXT_DIR:dir}),fetchImpl:fetchState()});
-  assert.equal(small.decision.mode,'discovery');
+  for(const bytes of [1_000,100_000,1_600_000]){
+    fs.writeFileSync(path.join(dir,'pr.diff'),'x'.repeat(bytes));
+    const plan=await planSession({env:env({REVIEW_CONTEXT_DIR:dir}),fetchImpl:fetchState()});
+    assert.equal(plan.decision.mode,'claude',`${bytes} bytes`);
+    assert.match(plan.decision.reason,/in shards: Gemini first, Claude continues/);
+  }
 });

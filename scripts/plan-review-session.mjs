@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { geminiContextTooLarge, isDeepReviewStale, parsePendingSessionReview, parseSessionComment, planReviewSession } from './review-session-core.mjs';
+import { isDeepReviewStale, parsePendingSessionReview, parseSessionComment, planReviewSession } from './review-session-core.mjs';
 import { prepareIncrementalDelta } from './select-incremental-review.mjs';
 
 const repoPattern=/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
@@ -84,15 +84,13 @@ export async function planSession({ env=process.env, fetchImpl=fetch }={}) {
 
   let decision=planReviewSession({session,baseSha,headSha,reset:requested==='reset',
     retryUnavailable:requested==='auto' && env.SOURCE_KIND==='comment'});
-  // Gemini cannot take a diff this large. Hand a fresh full review to Claude (in shards)
-  // up front rather than failing before any model runs.
+  // One route for every full review, whatever its size or provider: the sharded engine (a small PR is
+  // a single shard). It tries Gemini first and lets Claude continue what Gemini cannot finish. Delta
+  // reviews (incremental, verification) and the final audit still use the staged Gemini pipeline.
   if(decision.mode==='discovery'){
-    const contextDir=path.resolve(env.REVIEW_CONTEXT_DIR||'.review-context');
-    const diffBytes=fileBytes(path.join(contextDir,'pr.diff'));
-    if(geminiContextTooLarge({diffBytes,prJsonBytes:fileBytes(path.join(contextDir,'pr.json')),session})){
-      decision={mode:'claude',previousHead:null,
-        reason:`the diff is ${(diffBytes/1_000_000).toFixed(1)} MB, over Gemini's 1.5 MB limit, so Claude reviews it in shards instead`};
-    }
+    const diffBytes=fileBytes(path.join(path.resolve(env.REVIEW_CONTEXT_DIR||'.review-context'),'pr.diff'));
+    decision={mode:'claude',previousHead:null,
+      reason:`${decision.reason}: reviewing the ${Math.max(1,Math.round(diffBytes/1000))} KB diff in shards: Gemini first, Claude continues if Gemini cannot`};
   }
   return {requestedMode:requested,decision,session,sessionCommentId,pendingSession:null,pendingSourceCommentId:null,pendingReviewId:null};
 }
