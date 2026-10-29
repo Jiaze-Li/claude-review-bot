@@ -124,6 +124,8 @@ Every finding is posted as an inline review thread you can resolve. A finding is
 
 **Very large PRs and the final audit.** The final audit normally runs as one staged request (or up to 20 parts). If the diff is bigger than that even after the ignore rules, the audit is run by the sharded engine instead (Gemini first, Claude continues): it can continue over several runs, a PARTIAL result is continued by the next review command, and a complete pass with no blocking finding counts as the audit and makes the HEAD READY.
 
+**A big review finishes by itself.** When a run ends with work left (the sharded engine ran out of room and the review is PARTIAL, or the final audit is too large for one run), the workflow starts the next run on the same HEAD with the same inputs, up to 3 times, so nobody has to type the command again. Each run still obeys its Claude budget (a manual command $5 per call; an automatic review the $6 per-PR allowance). The chain stops as soon as a run leaves nothing of that kind behind or fails; `@gemini review` continues by hand at any time. The workflow's `actions: write` permission is used only to start this same workflow.
+
 ### Dismiss a disproven finding without skipping final audit
 
 An authorized repository writer can dismiss **one specific** confirmed-open **or UNCERTAIN** P0/P1/P2
