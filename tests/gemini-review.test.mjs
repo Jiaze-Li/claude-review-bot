@@ -119,34 +119,35 @@ test('Gemini discovery sends medium thinking on the latest-Flash alias and struc
   assert.doesNotMatch(logs.join('\n'),/secret/);
 });
 
-test('Gemini request timeout explains the failure and does not spend an automatic retry',async()=>{
+test('Gemini request timeout is not retried: Claude takes the review and the reason is recorded',async()=>{
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'gemini-timeout-'));
   fs.writeFileSync(path.join(dir,'pr.json'),'{}');
   fs.writeFileSync(path.join(dir,'pr.diff'),'diff --git a/a b/a\n');
   fs.writeFileSync(path.join(dir,'session-plan.json'),JSON.stringify({decision:{mode:'discovery'},session:null}));
   const logs=[];
   let calls=0;
-  await assert.rejects(
-    runGeminiReview({
-      env:{GEMINI_API_KEY:'secret',TARGET_REPO:'a/b',PR_NUMBER:'1',HEAD_SHA:A,REVIEW_CONTEXT_DIR:dir},
-      logImpl:message=>logs.push(message),
-      fetchImpl:async()=>{
-        calls+=1;
-        throw new DOMException('The operation was aborted due to timeout','TimeoutError');
-      },
-    }),
-    error=>{
-      assert.match(error.message,/Gemini discovery request timed out/);
-      assert.match(error.message,/timeout_ms=480000/);
-      assert.match(error.message,/context_bytes=\d+/);
-      assert.match(error.message,/request_bytes=\d+/);
-      assert.match(error.message,/No review was published/);
-      assert.equal(error.cause?.name,'TimeoutError');
-      return true;
-    }
-  );
+  const fetchImpl=async()=>{
+    calls+=1;
+    throw new DOMException('The operation was aborted due to timeout','TimeoutError');
+  };
+  const baseEnv={GEMINI_API_KEY:'secret',TARGET_REPO:'a/b',PR_NUMBER:'1',HEAD_SHA:A,REVIEW_CONTEXT_DIR:dir};
+  // Without a Claude credential the review fails and says so.
+  await assert.rejects(runGeminiReview({env:baseEnv,logImpl:message=>logs.push(message),fetchImpl}),/CLAUDE_CODE_OAUTH_TOKEN/);
   assert.equal(calls,1);
-  assert.equal(logs.length,1);
+  // With one, Claude takes over and the timeout is the recorded reason.
+  const claudeCalls=[];
+  const result=await runGeminiReview({
+    env:{...baseEnv,CLAUDE_CODE_OAUTH_TOKEN:'t'},logImpl:message=>logs.push(message),fetchImpl,
+    queryImpl:async function*(args){
+      claudeCalls.push(args);
+      yield {type:'system',subtype:'init',model:'claude-x'};
+      yield {type:'result',subtype:'success',structured_output:{summary:'from claude',findings:[]},usage:{input_tokens:1,output_tokens:1}};
+    },
+  });
+  assert.equal(calls,2);
+  assert.equal(claudeCalls.length,1);
+  assert.equal(result._meta.provider,'claude');
+  assert.match(result._meta.fallback_reason,/timed out after/);
   assert.doesNotMatch(logs.join('\n'),/secret/);
 });
 

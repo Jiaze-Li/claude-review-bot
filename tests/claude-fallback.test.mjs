@@ -50,18 +50,18 @@ test('Gemini HTTP 402 falls back to Claude with no tools and the same output sha
   assert.equal(calls[0].options.outputFormat.type, 'json_schema');
 });
 
-test('Gemini auth errors do not silently fall back to Claude', async () => {
+test('Gemini auth errors also hand the review to Claude, and say why', async () => {
   const calls = [];
-  await assert.rejects(
-    runGeminiReview({
-      env: env(ctx(), { CLAUDE_CODE_OAUTH_TOKEN: 't' }),
-      logImpl: () => {},
-      fetchImpl: async () => new Response('bad key', { status: 403 }),
-      queryImpl: fakeQuery(calls),
-    }),
-    /HTTP 403/,
-  );
-  assert.equal(calls.length, 0);
+  const result = await runGeminiReview({
+    env: env(ctx(), { CLAUDE_CODE_OAUTH_TOKEN: 't' }),
+    logImpl: () => {},
+    fetchImpl: async () => new Response('bad key', { status: 403 }),
+    queryImpl: fakeQuery(calls),
+  });
+  assert.equal(calls.length, 1);
+  assert.equal(result._meta.provider, 'claude');
+  assert.equal(result._meta.fallback_from, 'gemini');
+  assert.equal(result._meta.fallback_reason, 'HTTP 403');
 });
 
 test('fallback without a Claude token fails clearly', async () => {

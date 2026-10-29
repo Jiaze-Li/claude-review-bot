@@ -20,7 +20,7 @@ export async function* query({ prompt, options }) {
   const mode = process.env.FAKE_MODE || 'ok';
   let files = [...prompt.matchAll(/^- (\\S+)$/gm)].map((m) => m[1]).filter((f) => f !== 'pr.diff' && f !== 'changed-files.txt' && f !== 'diff-stat.txt' && f !== 'pr.json' && f !== 'skipped-files.txt');
   if (!files.length) files = fs.readFileSync('.review-context/changed-files.txt', 'utf8').split('\\n').filter(Boolean);
-  fs.appendFileSync(process.env.FAKE_LOG, JSON.stringify({ call: myCall, turns: options.maxTurns, budget: options.maxBudgetUsd, files, known: prompt.includes('ALREADY EXAMINED') }) + '\\n');
+  fs.appendFileSync(process.env.FAKE_LOG, JSON.stringify({ call: myCall, turns: options.maxTurns, budget: options.maxBudgetUsd, files, known: prompt.includes('ALREADY EXAMINED'), chunked: prompt.includes('offset and limit') }) + '\\n');
   cur += 1;
   max = Math.max(max, cur);
   fs.writeFileSync(process.env.FAKE_LOG + '.max', String(max));
@@ -29,6 +29,12 @@ export async function* query({ prompt, options }) {
   yield { type: 'system', subtype: 'init', model: 'claude-fake' };
   if (mode === 'all-fail' || (mode === 'second-fails' && myCall === 2)) {
     yield { type: 'result', subtype: 'error_max_turns', num_turns: options.maxTurns, total_cost_usd: 0.4, errors: ['turn limit'] };
+    return;
+  }
+  if (mode === 'one-at-a-time' || mode === 'no-progress' || mode === 'ran-out') {
+    const credited = mode === 'one-at-a-time' ? files.slice(0, 1) : [];
+    yield { type: 'result', subtype: 'success', num_turns: mode === 'ran-out' ? 14 : 2, total_cost_usd: 0.1, usage: {},
+      structured_output: { summary: 'partial pass ' + myCall, findings: [], coverage: { complete: false, reviewedPaths: credited, unreviewedPaths: files.filter((f) => !credited.includes(f)), note: 'stopped early' } } };
     return;
   }
   yield { type: 'result', subtype: 'success', num_turns: 5, total_cost_usd: 0.25, usage: { input_tokens: 10, output_tokens: 5 },
@@ -40,7 +46,7 @@ export async function* query({ prompt, options }) {
 function setup(fileSizes, session = null, ignore = null) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'run-review-'));
   fs.mkdirSync(path.join(root, 'scripts'));
-  for (const name of ['run-review.mjs', 'review-shards.mjs', 'review-session-core.mjs', 'gemini-shard.mjs', 'run-gemini-review.mjs', 'claude-fallback.mjs']) fs.copyFileSync(new URL(`../scripts/${name}`, import.meta.url), path.join(root, 'scripts', name));
+  for (const name of ['run-review.mjs', 'review-shards.mjs', 'review-session-core.mjs', 'gemini-shard.mjs', 'gemini-config.mjs', 'run-gemini-review.mjs', 'claude-fallback.mjs']) fs.copyFileSync(new URL(`../scripts/${name}`, import.meta.url), path.join(root, 'scripts', name));
   const sdk = path.join(root, 'node_modules/@anthropic-ai/claude-agent-sdk');
   fs.mkdirSync(sdk, { recursive: true });
   fs.writeFileSync(path.join(sdk, 'package.json'), JSON.stringify({ name: '@anthropic-ai/claude-agent-sdk', type: 'module', main: 'index.js', exports: './index.js' }));
@@ -408,15 +414,58 @@ test('if Claude cannot take what Gemini left, the shard keeps Gemini\'s work and
   });
 });
 
-test('with no later provider, incomplete coverage from the only provider stays partial', async () => {
+test('with no later provider, a provider that makes no progress leaves the files unreviewed (PARTIAL)', async () => {
   await withGemini((n, files) => ({
-    text: JSON.stringify({ summary: 'g', findings: [], coverage: { complete: false, reviewedPaths: files.slice(0, 1), unreviewedPaths: files.slice(1), note: '' } }),
-  }), async ({ base }) => {
+    text: JSON.stringify({ summary: 'g', findings: [], coverage: { complete: false, reviewedPaths: [], unreviewedPaths: files, note: 'saw nothing useful' } }),
+  }), async ({ requests, base }) => {
     const root = setup({ 'a/1.swift': 100, 'a/2.swift': 100 });
     const out = await runAsync(root, base, { REVIEW_PROVIDERS: 'gemini' });
     assert.equal(out.status, 0, out.stderr);
     assert.equal(out.calls.length, 0);
+    assert.equal(requests.length, 1); // no progress, so no second ask
     assert.equal(out.review.coverage.complete, false);
-    assert.deepEqual(out.review.coverage.unreviewedPaths, ['a/2.swift']);
+    assert.deepEqual(out.review.coverage.unreviewedPaths, ['a/1.swift', 'a/2.swift']);
   });
+});
+
+test('a provider that stops early is asked to continue with exactly the files it left, while it makes progress', () => {
+  const root = setup({ 'a/1.swift': 100, 'a/2.swift': 100, 'a/3.swift': 100 });
+  const { result, calls, review } = run(root, 'one-at-a-time');
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(calls.map((c) => c.files), [['a/1.swift', 'a/2.swift', 'a/3.swift'], ['a/2.swift', 'a/3.swift'], ['a/3.swift']]);
+  assert.equal(review.coverage.complete, true);
+  assert.doesNotMatch(review.summary, /Gemini could not finish/);
+});
+
+test('continuation is limited to two extra passes, and the files still left are reported', () => {
+  const root = setup({ 'a/1.swift': 100, 'a/2.swift': 100, 'a/3.swift': 100, 'a/4.swift': 100, 'a/5.swift': 100 });
+  const { result, calls, review } = run(root, 'one-at-a-time');
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(calls.length, 3);
+  assert.equal(review.coverage.complete, false);
+  assert.deepEqual(review.coverage.unreviewedPaths, ['a/4.swift', 'a/5.swift']);
+  // The note carries the bot's own account of how the reviewer stopped, not only the reviewer's words.
+  assert.match(review.coverage.note, /reviewer said: stopped early — Claude stopped after 2\/14 turns, \$0\.10 of \$[\d.]+ allowed — no limit was reached/);
+});
+
+test('a reviewer that really hit its turn limit is not told it "reached no limit"', () => {
+  const root = setup({ 'a/1.swift': 100, 'a/2.swift': 100 });
+  const { result, review } = run(root, 'ran-out');
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(review.coverage.note, /Claude stopped after 14\/14 turns/);
+  assert.doesNotMatch(review.coverage.note, /no limit was reached/);
+});
+
+test('the Claude prompt tells the reviewer to page through its diff and not to invent a budget excuse', () => {
+  const root = setup({ 'a.swift': 100 });
+  const { calls } = run(root);
+  assert.equal(calls[0].chunked, true);
+});
+
+test('a provider that makes no progress is not asked again', () => {
+  const root = setup({ 'a/1.swift': 100, 'a/2.swift': 100 });
+  const { result, calls, review } = run(root, 'no-progress');
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(calls.length, 1);
+  assert.equal(review.coverage.complete, false);
 });

@@ -99,7 +99,9 @@ A sanitized snapshot of the target repository is in safe-target/. It contains on
 `
     : '';
   const effort = inlineDiff === null
-    ? `Start from the diff. Do NOT read every changed file or scan the whole repository by default. Read complete files and related unchanged code only when needed to prove or disprove a concrete failure mode. Prefer targeted Grep/Read operations and batch independent tool calls in the same turn when possible.
+    ? `Your assigned diff file can be longer than one Read returns. Read it in successive chunks (offset and limit) until you reach its end before you report coverage, and never list a file as unreviewed just because you stopped reading. Do not say you ran out of budget or turns unless a tool or the system actually told you so.
+
+Start from the diff. Do NOT read every changed file or scan the whole repository by default. Read complete files and related unchanged code only when needed to prove or disprove a concrete failure mode. Prefer targeted Grep/Read operations and batch independent tool calls in the same turn when possible.
 
 You have a strict ${maxTurns}-turn agent budget. Spend the early turns on the highest-risk changes first. By turn ${Math.max(1, Math.floor(maxTurns * 0.75))}, stop broad exploration and use the remaining budget to produce the final structured review. A focused completed review is better than an exhaustive search that hits the turn limit and returns nothing.
 
@@ -243,7 +245,7 @@ async function tryClaude(index, makePrompt) {
     charged = run.meta?.total_cost_usd ?? cap; // unknown spend is charged at the allotted cap
     if (run.meta) metas.push(run.meta);
     return run.subtype === 'success' && run.structured
-      ? { ok: true, structured: run.structured, provider: 'claude' }
+      ? { ok: true, structured: run.structured, provider: 'claude', facts: claudeFacts(run.meta, SHARD_MAX_TURNS, cap) }
       : { ok: false, error: run.subtype ? `${run.subtype}${run.errors ? `: ${run.errors}` : ''}` : 'no structured output', provider: 'claude' };
   } catch (error) {
     return { ok: false, error: error?.message ?? String(error), provider: 'claude' };
@@ -256,7 +258,7 @@ async function tryClaude(index, makePrompt) {
 
 // A provider that answers but credits fewer files than it was assigned has not finished: the next
 // provider takes exactly the files it left, and the two results are combined.
-async function reviewUnit(index, unit, providers, suffix = '') {
+async function reviewUnit(index, unit, providers, suffix = '', retries = 2) {
   const diffPath = `.review-context/shards/shard-${index + 1}${suffix}.diff`;
   fs.writeFileSync(path.resolve(cwd, diffPath), unit.diff, { mode: 0o600 });
   const common = { shard: unit, index, count: shards.length, diffPath, knownIssues };
@@ -286,9 +288,26 @@ async function reviewUnit(index, unit, providers, suffix = '') {
       const why = `${provider}: ${coverage.unreviewedPaths.length} of ${unit.files.length} file(s) not covered${coverage.note ? ` (${coverage.note.slice(0, 80)})` : ''}`;
       return combineUnits(result, coverage, continued, [...notes, why], rest.files);
     }
+    // The last provider left files but did make progress: it may simply have stopped early, so let the
+    // same provider continue with exactly the files left (a few times at most, only while it advances).
+    if (coverage.unreviewedPaths.length && !later.length && retries > 0 && coverage.reviewedPaths.length > 0 && timeLeftMs() > 120_000) {
+      const rest = unitFor(coverage.unreviewedPaths);
+      const continued = await reviewUnit(index, rest, [provider], `${suffix}-more`, retries - 1);
+      return combineUnits(result, coverage, continued, notes, rest.files);
+    }
     return notes.length ? { ...result, fellBackFrom: notes.join('; ') } : result;
   }
   return { ok: false, error: notes.join('; ') || 'no provider available', provider: null };
+}
+
+// What actually happened, written by the bot rather than the model: a reviewer that stops early says "out of
+// budget" or "out of turns" whatever the truth is, and that explanation is what a person reads.
+function claudeFacts(meta, maxTurns, capUsd) {
+  if (!meta) return null;
+  const turns = meta.num_turns;
+  const cost = meta.total_cost_usd;
+  const limitHit = (Number.isFinite(turns) && turns >= maxTurns) || (Number.isFinite(cost) && cost >= capUsd * 0.9);
+  return `Claude stopped after ${turns ?? '?'}/${maxTurns} turns, $${Number.isFinite(cost) ? cost.toFixed(2) : '?'} of $${capUsd.toFixed(2)} allowed${limitHit ? '' : ' — no limit was reached'}`;
 }
 
 function unitFor(files) {
@@ -308,8 +327,9 @@ function combineUnits(first, firstCoverage, second, notes, restFiles) {
   const unreviewedPaths = restFiles.filter((file) => !secondReviewed.includes(file));
   return {
     ok: true,
-    provider: `${first.provider}+${second.provider}`,
-    fellBackFrom: notes.join('; '),
+    provider: [...new Set(`${first.provider}+${second.provider}`.split('+'))].join('+'),
+    ...(notes.length ? { fellBackFrom: notes.join('; ') } : {}),
+    ...((second.facts ?? first.facts) ? { facts: second.facts ?? first.facts } : {}),
     structured: {
       summary: [first.structured.summary, second.structured.summary].filter(Boolean).join('\n\n').slice(0, 5900) || 'combined review',
       findings: [...(first.structured.findings ?? []), ...(second.structured.findings ?? [])],
@@ -317,7 +337,7 @@ function combineUnits(first, firstCoverage, second, notes, restFiles) {
         complete: unreviewedPaths.length === 0 && second.structured.coverage?.complete === true,
         reviewedPaths,
         unreviewedPaths,
-        note: [firstCoverage.note, second.structured.coverage?.note].filter(Boolean).join('; ').slice(0, 300),
+        note: [...new Set([firstCoverage.note, ...String(second.structured.coverage?.note ?? '').split('; ')].filter(Boolean))].join('; ').slice(0, 300),
       },
     },
   };

@@ -1,8 +1,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { CLAUDE_AUTO_MIN_BUDGET_USD, GEMINI_MAX_CONTEXT_BYTES, claudeFallbackCallBudget, isManualBudgetExemptReview, knownIssuesPromptBlock, normalizeReviewResult, normalizeVerificationResult, openMaterialFindings } from './review-session-core.mjs';
-import {GeminiUnavailableError,isGeminiUnavailableStatus,runClaudeStructured} from './claude-fallback.mjs';
+import { CLAUDE_AUTO_MIN_BUDGET_USD, DEEP_REVIEW_MANUAL_RUN_BUDGET_USD, GEMINI_MAX_CONTEXT_BYTES, claudeFallbackCallBudget, isManualBudgetExemptReview, knownIssuesPromptBlock, normalizeReviewResult, normalizeVerificationResult, openMaterialFindings } from './review-session-core.mjs';
+import {isGeminiUnavailableStatus,runClaudeStructured} from './claude-fallback.mjs';
+import {geminiBaseUrl} from './gemini-config.mjs';
+import {MAX_SHARDS,planShards,splitDiffByFile} from './review-shards.mjs';
 
 // Moving alias: always resolves to Google's current Flash model. Override with GEMINI_MODEL to pin.
 export const GEMINI_MODEL='gemini-flash-latest';
@@ -199,6 +201,20 @@ ${diff}`,
   };
 }
 
+// The staged pipeline's model call (incremental, verification, audit; discovery when asked) uses the
+// same provider chain as the sharded engine: Gemini first, Claude for whatever Gemini cannot do. A
+// diff above SINGLE_REQUEST_MAX_BYTES is split by file into parts reviewed independently, so a large
+// delta or final audit no longer fails for size. A small diff is exactly one request, as before.
+export const SINGLE_REQUEST_MAX_BYTES=300_000;
+const PART_CONCURRENCY=3;
+// Parts run side by side, so each Claude call is capped well below the whole run budget; together they still
+// stay inside it (the per-call reservations are counted before the next part starts).
+const PART_CLAUDE_CAP_USD=1.0;
+const PARTS_DEADLINE_MS=20*60*1000;
+const MAX_REVIEW_FINDINGS=6;
+const MAX_REPAIR_FINDINGS=3;
+const VERDICT_RANK={FIXED:1,UNCERTAIN:2,STILL_OPEN:3};
+
 export async function runGeminiReview({env=process.env,fetchImpl=fetch,logImpl=console.log,queryImpl=null}={}){
   const apiKey=required(env,'GEMINI_API_KEY');
   const repo=required(env,'TARGET_REPO');
@@ -215,6 +231,61 @@ export async function runGeminiReview({env=process.env,fetchImpl=fetch,logImpl=c
   const riskProfile=fs.existsSync(riskPath)
     ? JSON.parse(fs.readFileSync(riskPath,'utf8'))
     : {version:1,stateIntegrity:false,signals:{synchronization:[],durableState:[],multiActor:[]}};
+  const ctx={env,fetchImpl,logImpl,queryImpl,apiKey,repo,prNumber,headSha,contextRoot,plan,mode,prJson,session,riskProfile};
+  const shared={geminiOff:null,geminiFailures:0,charges:[],inflight:0,perCallCap:null};
+
+  const fixedBytes=Buffer.byteLength(prJson,'utf8')+Buffer.byteLength(JSON.stringify(session??{}),'utf8')+Buffer.byteLength(JSON.stringify(riskProfile),'utf8');
+  if(Buffer.byteLength(diff,'utf8')+fixedBytes<=SINGLE_REQUEST_MAX_BYTES){
+    return reviewPart(ctx,diff,shared);
+  }
+
+  const chunks=splitDiffByFile(diff);
+  const {shards:parts,deferred}=planShards({files:chunks.map((chunk)=>chunk.path),chunks});
+  if(deferred.length||!parts.length) throw new Error(`The ${mode} diff spans too many parts (${parts.length+(deferred.length?'+':'')}) for one staged review; use @claude review for a sharded review`);
+  shared.perCallCap=PART_CLAUDE_CAP_USD;
+  logImpl(`Large ${mode} diff: reviewing ${chunks.length} file(s) in ${parts.length} part(s)`);
+  const startedAt=Date.now();
+  const results=new Array(parts.length);
+  let next=0;
+  async function worker(){
+    while(next<parts.length){
+      if(Date.now()-startedAt>PARTS_DEADLINE_MS) return;
+      const index=next;
+      next+=1;
+      results[index]=await reviewPart(ctx,parts[index].diff,shared);
+    }
+  }
+  try{
+    await Promise.all(Array.from({length:Math.min(PART_CONCURRENCY,parts.length)},()=>worker()));
+  }catch(error){
+    recordParts(ctx,shared,`part review failed: ${String(error.message||error).slice(0,160)}`);
+    throw error;
+  }
+  const missing=results.filter((result)=>!result).length;
+  if(missing){
+    recordParts(ctx,shared,`${missing} of ${parts.length} part(s) were not reviewed before the time limit`);
+    throw new Error(`The ${mode} review ran out of time with ${missing} of ${parts.length} part(s) unreviewed; use @claude review to continue`);
+  }
+  return mergeParts({ctx,parts,results});
+}
+
+// Persist what Claude already cost, so a failure part-way never makes spent allowance disappear.
+function recordParts(ctx,shared,reason){
+  if(!shared.charges.length) return;
+  // A stop already recorded with its own reason is more specific than this summary.
+  if(fs.existsSync(path.join(ctx.contextRoot,'fallback-unavailable.json'))) return;
+  try{
+    fs.writeFileSync(path.join(ctx.contextRoot,'fallback-unavailable.json'),
+      JSON.stringify({mode:ctx.mode,headSha:ctx.headSha,reason,spentUsd:shared.charges.reduce((sum,c)=>sum+c.amount,0),costCharges:shared.charges})+'\n',{mode:0o600});
+  }catch{
+    // best effort
+  }
+}
+
+// One model request for one diff: Gemini, then Claude when Gemini cannot do it. `shared` carries what an
+// earlier part learned (Gemini unavailable) and what Claude has already cost.
+async function reviewPart(ctx,diff,shared){
+  const {env,fetchImpl,logImpl,queryImpl,apiKey,repo,prNumber,headSha,contextRoot,plan,mode,prJson,session,riskProfile}=ctx;
   const contextBytes=Buffer.byteLength(diff,'utf8')+Buffer.byteLength(prJson,'utf8')+Buffer.byteLength(JSON.stringify(session??{}),'utf8')+Buffer.byteLength(JSON.stringify(riskProfile),'utf8');
   if(contextBytes>MAX_CONTEXT_BYTES) throw new Error(`Gemini review context exceeds ${MAX_CONTEXT_BYTES} bytes; use targeted human/Codex review rather than silently truncating`);
 
@@ -251,16 +322,17 @@ export async function runGeminiReview({env=process.env,fetchImpl=fetch,logImpl=c
   let attempts=0;
   let servedModel=null;
   let lastStructuredError=null;
-  let unavailable=null;
+  // Why Gemini could not do this request, when it could not: { status, message }.
+  let failed=shared.geminiOff?{status:shared.geminiOff.status,message:shared.geminiOff.message,carried:true}:null;
 
-  for(let attempt=1;attempt<=2;attempt+=1){
+  for(let attempt=1;!failed&&attempt<=2;attempt+=1){
     attempts=attempt;
     const startedAt=Date.now();
     const signal=AbortSignal.timeout(timeoutMs);
     logImpl(`Gemini request started: mode=${mode} attempt=${attempt} model=${model} thinking=${thinking} timeout_ms=${timeoutMs} context_bytes=${contextBytes} request_bytes=${requestBytes}`);
     let payload;
     try{
-      const response=await fetchImpl(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,{
+      const response=await fetchImpl(`${geminiBaseUrl(env)}/v1beta/models/${encodeURIComponent(model)}:generateContent`,{
         method:'POST',
         headers:{'Content-Type':'application/json','x-goog-api-key':apiKey},
         body:requestBody,
@@ -269,19 +341,22 @@ export async function runGeminiReview({env=process.env,fetchImpl=fetch,logImpl=c
       if(!response.ok){
         const body=await response.text();
         const message=`Gemini API failed (HTTP ${response.status}): ${body.slice(0,500)}`;
-        if(isGeminiUnavailableStatus(response.status)) throw new GeminiUnavailableError(message,response.status);
-        throw new Error(message);
+        // Out of credits, rate limited, down, or a wrong key/model: Gemini will not work for the rest
+        // of this review either, so every later part goes straight to Claude.
+        if(isGeminiUnavailableStatus(response.status)||[400,401,403,404].includes(response.status)){
+          shared.geminiOff={status:response.status,message};
+        }
+        failed={status:response.status,message};
+        break;
       }
       payload=await response.json();
     }catch(error){
-      if(error instanceof GeminiUnavailableError){
-        unavailable=error;
-        break;
-      }
-      if(error?.name==='TimeoutError' || (signal.aborted && signal.reason?.name==='TimeoutError')){
-        throw new Error(`Gemini ${mode} request timed out after ${Date.now()-startedAt}ms (timeout_ms=${timeoutMs}, context_bytes=${contextBytes}, request_bytes=${requestBytes}, attempt=${attempt}). No review was published.`,{cause:error});
-      }
-      throw error;
+      const timedOut=error?.name==='TimeoutError' || (signal.aborted && signal.reason?.name==='TimeoutError');
+      const message=timedOut
+        ? `Gemini ${mode} request timed out after ${Date.now()-startedAt}ms (timeout_ms=${timeoutMs}, context_bytes=${contextBytes}, request_bytes=${requestBytes}, attempt=${attempt})`
+        : `Gemini request failed: ${error?.message??error}`;
+      failed={status:0,message};
+      break;
     }
     logImpl(`Gemini request completed: mode=${mode} attempt=${attempt} elapsed_ms=${Date.now()-startedAt}`);
     if(typeof payload.modelVersion==='string'&&payload.modelVersion) servedModel=payload.modelVersion;
@@ -301,53 +376,71 @@ export async function runGeminiReview({env=process.env,fetchImpl=fetch,logImpl=c
       }
     }
   }
+  if(!failed&&!result){
+    failed={status:0,message:`Gemini structured output is invalid after one retry: ${lastStructuredError?.message||'unknown error'}`};
+  }
+  // Two failures that are not credit/config problems (timeouts, malformed output) also stop trying Gemini.
+  if(failed&&!failed.carried&&!shared.geminiOff&&++shared.geminiFailures>=2) shared.geminiOff={status:failed.status,message:failed.message};
 
-  if(unavailable){
-    // Only a manual review comment opts out of the per-PR cap; an automatic
-    // pull_request event cannot claim this exemption.
+  if(failed){
+    // Any Gemini failure hands the work to Claude, loudly: the review records why. Only a manual review
+    // comment opts out of the per-PR cap; an automatic pull_request event cannot claim this exemption.
+    const reasonText=failed.status?`HTTP ${failed.status}`:failed.message.slice(0,120);
     const manual=isManualBudgetExemptReview({sourceKind:env.SOURCE_KIND,requestedMode:plan.requestedMode});
-    const budget=claudeFallbackCallBudget(plan.session,{manual});
-    const recordStop=(reason,costCharges=[])=>{
+    // Budget that is merely reserved by Claude calls still running comes back when they finish, so a part
+    // that finds too little waits for them instead of failing; only a real shortage stops the review.
+    let budget=0;
+    for(;;){
+      const spentSoFar=shared.charges.reduce((sum,c)=>sum+c.amount,0);
+      const budgetBase=claudeFallbackCallBudget(plan.session,{manual,pendingUsd:spentSoFar});
+      const wholeRun=manual?Math.min(budgetBase,Math.max(0,DEEP_REVIEW_MANUAL_RUN_BUDGET_USD-spentSoFar)):budgetBase;
+      budget=shared.perCallCap?Math.min(wholeRun,shared.perCallCap):wholeRun;
+      if(budget>=CLAUDE_AUTO_MIN_BUDGET_USD||shared.inflight===0) break;
+      await new Promise((resolve)=>setTimeout(resolve,250));
+    }
+    const recordStop=(reason)=>{
       fs.writeFileSync(path.join(contextRoot,'fallback-unavailable.json'),
         JSON.stringify({mode,headSha,reason,
-          spentUsd:costCharges.reduce((sum,c)=>sum+c.amount,0),costCharges})+'\n',{mode:0o600});
+          spentUsd:shared.charges.reduce((sum,c)=>sum+c.amount,0),costCharges:shared.charges})+'\n',{mode:0o600});
     };
-    if(!manual&&budget<CLAUDE_AUTO_MIN_BUDGET_USD){
-      recordStop('Gemini HTTP '+unavailable.status+'; automatic Claude budget exhausted or below minimum starting allowance');
+    if(budget<CLAUDE_AUTO_MIN_BUDGET_USD){
+      recordStop(`Gemini ${reasonText}; Claude budget exhausted or below minimum starting allowance`);
       throw new Error('Claude fallback blocked: automatic budget is exhausted or insufficient for a full review; human judgment required');
     }
     if(!env.CLAUDE_CODE_OAUTH_TOKEN){
-      recordStop('Gemini HTTP '+unavailable.status+'; Claude fallback credential unavailable');
+      recordStop(`Gemini ${reasonText}; Claude fallback credential unavailable`);
       throw new Error('Claude fallback unavailable: CLAUDE_CODE_OAUTH_TOKEN is not set');
     }
-    logImpl(`Gemini unavailable (HTTP ${unavailable.status}); falling back to Claude for this ${mode} review`);
+    logImpl(`Gemini could not do this ${mode} review (${reasonText}); falling back to Claude`);
     let fallback;
+    // The call's whole budget is reserved while it runs (parts run side by side), then replaced by what it
+    // actually cost. Failed calls with missing SDK usage keep the whole allotted budget.
+    const charge={amount:budget,source:'reserve'};
+    shared.charges.push(charge);
+    shared.inflight+=1;
     try{
       fallback=await runClaudeStructured({prompt:built.prompt,schema:built.schema,timeoutMs,
         maxBudgetUsd:budget,env,logImpl,queryImpl});
+      if(Number.isFinite(fallback.meta?.total_cost_usd)){ charge.amount=fallback.meta.total_cost_usd; charge.source=fallback.meta.cost_source??'reserve'; }
       // Validate before publication. Invalid output must never be declared READY.
       if(mode==='verification') normalizeVerificationResult(fallback.structured); else normalizeReviewResult(fallback.structured);
     }catch(error){
-      // Failed calls with missing SDK usage conservatively reserve the whole
-      // allotted call budget; manual calls remain visible in the same ledger.
-      recordStop('Gemini HTTP '+unavailable.status+'; Claude fallback failed: '+String(error.message||error).slice(0,160),
-        [{amount:fallback?.meta?.total_cost_usd??budget,source:fallback?.meta?.cost_source??'reserve'}]);
+      recordStop(`Gemini ${reasonText}; Claude fallback failed: `+String(error.message||error).slice(0,160));
       throw error;
+    }finally{
+      shared.inflight-=1;
     }
     return {
       ...fallback.structured,
       _meta:{
         ...fallback.meta,
         mode,attempts,
-        fallback_from:'gemini',fallback_reason:`HTTP ${unavailable.status}`,
+        fallback_from:'gemini',fallback_reason:reasonText,
         max_output_tokens:null,
         timeout_ms:timeoutMs,
         risk_profile:riskProfile,
       },
     };
-  }
-  if(!result){
-    throw new Error(`Gemini structured output is invalid after one retry: ${lastStructuredError?.message||'unknown error'}`);
   }
   result._meta={
     provider:'gemini',requested_model:model,resolved_model:servedModel||model,effort:thinking,mode,attempts,
@@ -362,6 +455,81 @@ export async function runGeminiReview({env=process.env,fetchImpl=fetch,logImpl=c
     },
   };
   return result;
+}
+
+// ---- Merging the parts of a large diff back into one result of the usual shape ----
+
+function mergeParts({ctx,parts,results}){
+  const {mode,session}=ctx;
+  const summary=results.map((result,index)=>`Part ${index+1}/${results.length}: ${String(result.summary??'').trim()}`).join('\n').slice(0,3900);
+  const metas=results.map((result)=>result._meta);
+  const claudeMetas=metas.filter((meta)=>meta?.provider==='claude');
+  const lead=claudeMetas[0]??metas[0];
+  const sumUsage=(key)=>metas.reduce((total,meta)=>total+(nonnegative(meta?.usage?.[key])??0),0);
+  const claudeCost=claudeMetas.reduce((total,meta)=>total+(nonnegative(meta.total_cost_usd)??0),0);
+  const _meta={
+    ...lead,
+    mode,
+    attempts:Math.max(...metas.map((meta)=>meta?.attempts??1)),
+    parts:parts.length,
+    parts_by_claude:claudeMetas.length,
+    usage:{
+      input_tokens:sumUsage('input_tokens'),
+      output_tokens:sumUsage('output_tokens'),
+      thoughts_tokens:sumUsage('thoughts_tokens'),
+      total_tokens:sumUsage('total_tokens'),
+    },
+    ...(claudeMetas.length?{
+      provider:'claude',
+      fallback_from:'gemini',
+      fallback_reason:`${claudeMetas.length} of ${parts.length} part(s): ${claudeMetas[0].fallback_reason??'Gemini unavailable'}`,
+      total_cost_usd:Number(claudeCost.toFixed(4)),
+      cost_source:claudeMetas.some((meta)=>meta.cost_source==='reserve')?'reserve':'sdk',
+    }:{}),
+  };
+  if(mode==='verification'){
+    const merged=mergeVerifications({session,parts,results});
+    normalizeVerificationResult(merged);
+    return {...merged,summary:summary||merged.summary,_meta};
+  }
+  const findings=dedupeFindings(results.flatMap((result)=>result.findings??[])).slice(0,MAX_REVIEW_FINDINGS);
+  const droppedMaterial=dedupeFindings(results.flatMap((result)=>result.findings??[])).slice(MAX_REVIEW_FINDINGS).filter((finding)=>['P0','P1','P2'].includes(finding.severity)).length;
+  const out={summary:droppedMaterial?`${summary}\n${droppedMaterial} more material finding(s) were omitted to fit the session limit; fix the listed ones and re-review.`.slice(0,3990):summary,findings,_meta};
+  normalizeReviewResult(out);
+  return out;
+}
+
+function dedupeFindings(findings){
+  const seen=new Map();
+  for(const finding of findings){
+    const key=`${finding.path}\0${String(finding.title).trim().toLowerCase()}`;
+    if(!seen.has(key)) seen.set(key,finding);
+  }
+  const order={P0:0,P1:1,P2:2,P3:3};
+  return [...seen.values()].sort((a,b)=>(order[a.severity]??9)-(order[b.severity]??9));
+}
+
+// A finding's verdict comes from the parts that actually contain its file (the worst of them); a finding
+// whose file is in no part is FIXED only if every part that rules on it says FIXED.
+export function mergeVerifications({session,parts,results}){
+  const byId=new Map();
+  results.forEach((result,index)=>{
+    for(const entry of result.verifications??[]){
+      const id=String(entry.findingId);
+      if(!byId.has(id)) byId.set(id,[]);
+      byId.get(id).push({index,status:String(entry.status).toUpperCase(),reason:entry.reason});
+    }
+  });
+  const verifications=[];
+  for(const [findingId,rulings] of byId){
+    const finding=(session?.findings??[]).find((item)=>item.id===findingId);
+    const own=finding?rulings.filter((ruling)=>parts[ruling.index].files.includes(finding.path)):[];
+    const pool=own.length?own:rulings;
+    const worst=pool.reduce((best,ruling)=>((VERDICT_RANK[ruling.status]??2)>(VERDICT_RANK[best.status]??2)?ruling:best));
+    verifications.push({findingId,status:worst.status,reason:worst.reason});
+  }
+  const findings=dedupeFindings(results.flatMap((result)=>result.findings??[])).slice(0,MAX_REPAIR_FINDINGS);
+  return {summary:'verification across parts',verifications,findings};
 }
 
 const GEMINI_JSON_SCHEMA_KEYS=new Set([
