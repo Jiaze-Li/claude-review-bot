@@ -2,7 +2,6 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { isDeepReviewStale, parsePendingSessionReview, parseSessionComment, planReviewSession } from './review-session-core.mjs';
-import { stagedDiffFits } from './review-shards.mjs';
 import { blockingClaims, fetchReviewThreads, isWriter, threadsByFinding } from './review-threads.mjs';
 import { prepareIncrementalDelta } from './select-incremental-review.mjs';
 
@@ -113,29 +112,21 @@ export async function planSession({ env=process.env, fetchImpl=fetch }={}) {
 
   let decision=planReviewSession({session,baseSha,headSha,reset:requested==='reset',
     retryUnavailable:['auto','claude'].includes(requested) && env.SOURCE_KIND==='comment'});
-  // One route for every full review, whatever its size or provider: the sharded engine (a small PR is
-  // a single shard). It tries Gemini first and lets Claude continue what Gemini cannot finish. Delta
-  // reviews (incremental, verification) and the final audit still use the staged Gemini pipeline.
-  if(decision.mode==='discovery'){
-    const diffBytes=fileBytes(path.join(path.resolve(env.REVIEW_CONTEXT_DIR||'.review-context'),'pr.diff'));
-    decision={mode:'claude',previousHead:null,
-      reason:`${decision.reason}: reviewing the ${Math.max(1,Math.round(diffBytes/1000))} KB diff in shards: ${requested==='claude'?'Claude only':'Gemini first, Claude continues if Gemini cannot'}`};
-  }
-  // A final audit has to see the whole PR in one staged run. When the diff is too big for that, the sharded engine
-  // does the audit instead: it can continue over several runs, and a complete pass of it counts as the audit.
-  if(decision.mode==='audit'){
-    const contextRoot=path.resolve(env.REVIEW_CONTEXT_DIR||'.review-context');
-    const diffFile=path.join(contextRoot,'pr.diff');
-    if(fs.existsSync(diffFile) && !stagedDiffFits(fs.readFileSync(diffFile,'utf8'),readOptional(path.join(contextRoot,'ignore-patterns.txt')))){
-      decision={mode:'claude',audit:true,previousHead:null,
-        reason:`final audit of a large diff, in shards: ${requested==='claude'?'Claude only':'Gemini first, Claude continues if Gemini cannot'}; continues over several runs if needed`};
-    }
+  // One route for every full review, whatever its size, provider or purpose (a first review, a review after a big
+  // or risky change, the final review before READY): the sharded engine, Gemini first, Claude continuing what Gemini
+  // cannot. Only delta reviews (incremental, verification) use the staged pipeline.
+  if(decision.mode==='full_review'){
+    decision=fullReviewDecision(env,requested,decision.reason);
   }
   return {requestedMode:requested,decision,session,sessionCommentId,pendingSession:null,pendingSourceCommentId:null,pendingReviewId:null};
 }
 
-function readOptional(file){
-  try{return fs.readFileSync(file,'utf8');}catch{return '';}
+
+// The one decision for any review of the whole PR.
+export function fullReviewDecision(env,requested,why){
+  const diffBytes=fileBytes(path.join(path.resolve(env.REVIEW_CONTEXT_DIR||'.review-context'),'pr.diff'));
+  return {mode:'claude',previousHead:null,
+    reason:`${why}: reviewing the ${Math.max(1,Math.round(diffBytes/1000))} KB diff in shards: ${requested==='claude'?'Claude only':'Gemini first, Claude continues if Gemini cannot'}`};
 }
 
 function fileBytes(file){
@@ -206,11 +197,9 @@ if(process.argv[1] && import.meta.url===pathToFileURL(process.argv[1]).href){
         session: plan.session,
         token: process.env.GH_TOKEN,
       });
-      plan.decision = {
-        mode: scope.mode,
-        previousHead: scope.mode === 'incremental' ? previousHead : null,
-        reason: scope.reason,
-      };
+      plan.decision = scope.mode === 'incremental'
+        ? { mode: 'incremental', previousHead, reason: scope.reason }
+        : fullReviewDecision(process.env, plan.requestedMode, scope.reason);
       console.log('Review scope: ' + scope.mode + ' — ' + scope.reason
         + (scope.changedLines == null ? '' : ' (' + scope.files + ' files, ' + scope.changedLines + ' lines)'));
     }

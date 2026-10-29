@@ -15,10 +15,10 @@ function bigDiff(count, bytes = 60_000) {
   }).join('');
 }
 
-function setup({ mode = 'audit', diff, session = null, files = 8 }) {
+function setup({ mode = 'incremental', diff, session = null, files = 8 }) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'staged-parts-'));
   fs.writeFileSync(path.join(dir, 'pr.json'), '{}');
-  fs.writeFileSync(path.join(dir, mode === 'verification' || mode === 'incremental' ? 'repair.diff' : 'pr.diff'), diff ?? bigDiff(files));
+  fs.writeFileSync(path.join(dir, 'repair.diff'), diff ?? bigDiff(files));
   fs.writeFileSync(path.join(dir, 'session-plan.json'), JSON.stringify({ decision: { mode }, session, requestedMode: 'auto' }));
   return dir;
 }
@@ -40,8 +40,8 @@ function claudeQuery(calls, reply = () => ({ summary: 'from claude', findings: [
   };
 }
 
-test('a large final-audit diff is split into parts, each reviewed by Gemini, and merged into one result', async () => {
-  const dir = setup({ mode: 'audit' });
+test('a large delta diff is split into parts, each reviewed by Gemini, and merged into one result', async () => {
+  const dir = setup({ mode: 'incremental' });
   const prompts = [];
   const result = await runGeminiReview({
     env: env(dir), logImpl: () => {},
@@ -64,7 +64,7 @@ test('a large final-audit diff is split into parts, each reviewed by Gemini, and
 });
 
 test('Gemini out of credits partway: the rest of the parts go straight to Claude, with costs recorded', async () => {
-  const dir = setup({ mode: 'audit' });
+  const dir = setup({ mode: 'incremental' });
   let fetches = 0;
   const calls = [];
   const result = await runGeminiReview({
@@ -97,8 +97,8 @@ test('every part falls to Claude when Gemini is down from the first request', as
 });
 
 test('an automatic review cannot spend past the Claude allowance across parts, and what was spent is recorded', async () => {
-  const dir = setup({ mode: 'audit', session: { version: 1, deepSpendUsd: 5.6, findings: [] } });
-  fs.writeFileSync(path.join(dir, 'session-plan.json'), JSON.stringify({ decision: { mode: 'audit' }, session: { version: 1, deepSpendUsd: 5.6, findings: [] }, requestedMode: 'auto' }));
+  const dir = setup({ mode: 'incremental', session: { version: 1, deepSpendUsd: 5.6, findings: [] } });
+  fs.writeFileSync(path.join(dir, 'session-plan.json'), JSON.stringify({ decision: { mode: 'incremental' }, session: { version: 1, deepSpendUsd: 5.6, findings: [] }, requestedMode: 'auto' }));
   await assert.rejects(runGeminiReview({
     env: env(dir, { CLAUDE_CODE_OAUTH_TOKEN: 't', SOURCE_KIND: 'pull_request' }), logImpl: () => {},
     fetchImpl: geminiReply({ status: 402 }), queryImpl: claudeQuery([]),
@@ -108,7 +108,7 @@ test('an automatic review cannot spend past the Claude allowance across parts, a
 });
 
 test('a manual review keeps the whole run within one $5 Claude budget across parts, however many parts there are', async () => {
-  const dir = setup({ mode: 'audit', files: 12 });
+  const dir = setup({ mode: 'incremental', files: 12 });
   const budgets = [];
   const result = await runGeminiReview({
     env: env(dir, { CLAUDE_CODE_OAUTH_TOKEN: 't' }), logImpl: () => {},
@@ -146,7 +146,7 @@ test('a delta too large for the part limit fails with a pointer to .reviewbotign
 });
 
 test('a small diff is still one request over the original diff, untouched', async () => {
-  const dir = setup({ mode: 'audit', diff: bigDiff(2, 1_000) });
+  const dir = setup({ mode: 'incremental', diff: bigDiff(2, 1_000) });
   let requests = 0;
   const result = await runGeminiReview({ env: env(dir), logImpl: () => {}, fetchImpl: async (url, init) => { requests += 1; return geminiReply({ summary: 'one', findings: [] })(url, init); } });
   assert.equal(requests, 1);

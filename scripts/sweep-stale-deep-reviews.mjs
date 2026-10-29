@@ -1,3 +1,4 @@
+import { saveSessionComment } from './session-comment.mjs';
 import { pathToFileURL } from 'node:url';
 import {
   DEEP_REVIEW_RUN_BUDGET_USD, failDeepReview, isDeepReviewStale, parseSessionComment, renderSessionComment,
@@ -55,8 +56,9 @@ export async function closeStaleDeepReview({ repo, prNumber, env = process.env, 
     session, headSha: session.lastReviewedHead, reason: 'deep review never reported back (swept after timeout)',
     spentUsd: session.deepReview?.reservedUsd ?? DEEP_REVIEW_RUN_BUDGET_USD, now: new Date(now).toISOString(),
   });
-  await github(`https://api.github.com/repos/${repo}/issues/comments/${latest.id}`, env.GH_TOKEN, fetchImpl, {
-    method: 'PATCH', body: JSON.stringify({ body: renderSessionComment(closed) }),
+  await saveSessionComment({
+    target: repo, prNumber, token: env.GH_TOKEN, fetchImpl, existingId: String(latest.id), previous: session, session: closed,
+    body: renderSessionComment(closed),
   });
   await postCommitStatus({
     env, fetchImpl, target: repo, headSha: session.lastReviewedHead,

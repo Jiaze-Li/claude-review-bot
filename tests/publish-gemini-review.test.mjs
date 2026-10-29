@@ -4,16 +4,21 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { publishGeminiReview } from '../scripts/publish-gemini-review.mjs';
-import { applyDiscoveryResult, sessionCommitStatus } from '../scripts/review-session-core.mjs';
+import { applyDiscoveryResult, beginDeepReview, completeDeepReview, sessionCommitStatus } from '../scripts/review-session-core.mjs';
 
 const A = 'a'.repeat(40);
 const BASE = 'b'.repeat(40);
+// The staged publisher only handles deltas on top of a reviewed state: here, a READY baseline for the previous HEAD.
+const OLD = 'd'.repeat(40);
+function readyBaseline() {
+  const first = applyDiscoveryResult({ result: { summary: 'clean', findings: [] }, baseSha: BASE, headSha: OLD, sourceCommentId: '1' });
+  return completeDeepReview({ session: beginDeepReview({ session: first, baseSha: BASE, headSha: OLD }), result: { summary: 'clean', findings: [], coverage: { complete: true, unreviewedPaths: [] } }, headSha: OLD });
+}
+const incrementalPlan = (extra = {}) => JSON.stringify({ decision: { mode: 'incremental', previousHead: OLD }, session: readyBaseline(), sessionCommentId: null, ...extra });
 
 test('publisher writes durable session and exact-head PR review', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'publish-gemini-'));
-  fs.writeFileSync(path.join(dir, 'session-plan.json'), JSON.stringify({
-    decision: { mode: 'discovery' }, session: null, sessionCommentId: null,
-  }));
+  fs.writeFileSync(path.join(dir, 'session-plan.json'), incrementalPlan());
   const reviewPath = path.join(dir, 'review.json');
   fs.writeFileSync(reviewPath, JSON.stringify({
     summary: 'Found one bug.',
@@ -47,7 +52,7 @@ test('publisher writes durable session and exact-head PR review', async () => {
   assert.match(sessionCall.body.body, /F001/);
   const reviewCall = calls.find((call) => call.url.endsWith('/pulls/7/reviews') && call.method === 'POST');
   assert.equal(reviewCall.body.commit_id, A);
-  assert.match(reviewCall.body.body, /Gemini Discovery Review/);
+  assert.match(reviewCall.body.body, /Gemini Incremental Review/);
   assert.match(reviewCall.body.body, /jiaze-review-pending-session:v1:99:/);
   assert.doesNotMatch(reviewCall.body.body, /jiaze-review-source-comment:99/);
   assert.match(sessionCall.body.body, /jiaze-review-source-comment:99/);
@@ -56,9 +61,7 @@ test('publisher writes durable session and exact-head PR review', async () => {
 
 test('publisher refuses stale HEAD before any write', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'publish-gemini-stale-'));
-  fs.writeFileSync(path.join(dir, 'session-plan.json'), JSON.stringify({
-    decision: { mode: 'discovery' }, session: null, sessionCommentId: null,
-  }));
+  fs.writeFileSync(path.join(dir, 'session-plan.json'), incrementalPlan());
   const reviewPath = path.join(dir, 'review.json');
   fs.writeFileSync(reviewPath, JSON.stringify({ summary: 'clean', findings: [] }));
   const calls = [];
@@ -78,7 +81,7 @@ test('publisher refuses stale HEAD before any write', async () => {
 
 test('publisher does not advance durable session if HEAD moves after review publication', async () => {
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'publish-gemini-race-'));
-  fs.writeFileSync(path.join(dir,'session-plan.json'),JSON.stringify({decision:{mode:'discovery'},session:null,sessionCommentId:null}));
+  fs.writeFileSync(path.join(dir,'session-plan.json'),incrementalPlan());
   const reviewPath=path.join(dir,'review.json');
   fs.writeFileSync(reviewPath,JSON.stringify({summary:'clean',findings:[]}));
   let prReads=0;
@@ -107,7 +110,7 @@ test('publisher does not advance durable session if HEAD moves after review publ
 
 test('review publication followed by session-write failure remains recoverable without processed marker', async () => {
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'publish-gemini-partial-'));
-  fs.writeFileSync(path.join(dir,'session-plan.json'),JSON.stringify({decision:{mode:'discovery'},session:null,sessionCommentId:null}));
+  fs.writeFileSync(path.join(dir,'session-plan.json'),incrementalPlan());
   const reviewPath=path.join(dir,'review.json');
   fs.writeFileSync(reviewPath,JSON.stringify({summary:'clean',findings:[]}));
   let reviewBody='';
@@ -132,42 +135,6 @@ test('review publication followed by session-write failure remains recoverable w
 });
 
 
-test('publisher completes the one-time final audit and marks the session READY', async () => {
-  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'publish-gemini-audit-'));
-  const pending=applyDiscoveryResult({result:{summary:'clean discovery',findings:[]},baseSha:BASE,headSha:A,sourceCommentId:'99'});
-  fs.writeFileSync(path.join(dir,'session-plan.json'),JSON.stringify({
-    decision:{mode:'audit'},session:pending,sessionCommentId:'101',
-  }));
-  const reviewPath=path.join(dir,'audit.json');
-  fs.writeFileSync(reviewPath,JSON.stringify({
-    summary:'Final audit found no material bug.',findings:[],
-    _meta:{resolved_model:'gemini-3.8-flash',effort:'low',mode:'audit',usage:{input_tokens:90,output_tokens:4,thoughts_tokens:0}},
-  }));
-  const calls=[];
-  const out=await publishGeminiReview({
-    env:{
-      GH_TOKEN:'token',TARGET_REPO:'acme/project',PR_NUMBER:'7',BASE_SHA:BASE,HEAD_SHA:A,
-      SOURCE_COMMENT_ID:'99',REVIEW_PATH:reviewPath,REVIEW_CONTEXT_DIR:dir,
-    },
-    fetchImpl:async(url,init={})=>{
-      calls.push({url,method:init.method||'GET',body:init.body?JSON.parse(init.body):null});
-      if(url.endsWith('/pulls/7')) return Response.json({base:{sha:BASE},head:{sha:A}});
-      if(url.includes('/pulls/7/files')) return Response.json([]);
-      if(url.endsWith('/pulls/7/reviews')) return Response.json({id:202,html_url:'https://example/audit'});
-      if(url.endsWith('/issues/comments/101')) return Response.json({id:101});
-      assert.fail('unexpected URL '+url);
-    },
-  });
-  assert.equal(out.session.status,'READY');
-  assert.equal(out.session.auditCompleted,true);
-  const reviewCall=calls.find(c=>c.url.endsWith('/pulls/7/reviews'));
-  assert.match(reviewCall.body.body,/Gemini Final Audit Review/);
-  const sessionCall=calls.find(c=>c.url.endsWith('/issues/comments/101'));
-  assert.match(sessionCall.body.body,/Status: \*\*READY\*\*/);
-  const persisted=JSON.parse(fs.readFileSync(path.join(dir,'published-session.json'),'utf8'));
-  assert.equal(persisted.session.auditCompleted,true);
-});
-
 test('droppedFindings tells apart same-title findings in different files', async () => {
   const { droppedFindings } = await import('../scripts/publish-gemini-review.mjs');
   const reported = [
@@ -179,11 +146,9 @@ test('droppedFindings tells apart same-title findings in different files', async
   assert.deepEqual(droppedFindings(reported, reported), []);
 });
 
-test('publisher preserves material UNCERTAIN candidate and never marks an inconclusive review READY', async()=>{
+test('publisher preserves a material UNCERTAIN candidate and never leaves an inconclusive review READY', async()=>{
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'publish-uncertain-'));
-  fs.writeFileSync(path.join(dir,'session-plan.json'),JSON.stringify({
-    requestedMode:'auto',decision:{mode:'discovery'},session:null,sessionCommentId:null,
-  }));
+  fs.writeFileSync(path.join(dir,'session-plan.json'),incrementalPlan({requestedMode:'auto'}));
   const reviewPath=path.join(dir,'review.json');
   fs.writeFileSync(reviewPath,JSON.stringify({
     summary:'Possible budget authorization bug',findings:[],
@@ -215,7 +180,6 @@ test('publisher preserves material UNCERTAIN candidate and never marks an inconc
     },
   });
   assert.equal(out.session.status,'HUMAN_REQUIRED');
-  assert.equal(out.session.auditCompleted,false);
   assert.equal(out.session.findings[0].status,'UNCERTAIN');
   assert.equal(out.session.findings[0].id,'F001');
   assert.equal(out.session.dismissed.length,0);
@@ -228,42 +192,9 @@ test('publisher preserves material UNCERTAIN candidate and never marks an inconc
     'HUMAN_REQUIRED');
 });
 
-test('publisher refuses READY after an uncertain final-audit verdict',async()=>{
-  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'publish-audit-uncertain-'));
-  const pending=applyDiscoveryResult({result:{summary:'discovery clean',findings:[]},
-    baseSha:BASE,headSha:A,sourceCommentId:'99'});
-  fs.writeFileSync(path.join(dir,'session-plan.json'),JSON.stringify({
-    decision:{mode:'audit'},session:pending,sessionCommentId:'101',
-  }));
-  const reviewPath=path.join(dir,'audit.json');
-  fs.writeFileSync(reviewPath,JSON.stringify({
-    summary:'No confirmed defects',findings:[],
-    _validation:{status:'VALIDATED',validations:[{
-      candidateId:'D001',verdict:'UNCERTAIN',severity:'P1',
-      title:'Potential state corruption',path:'src/model.js',
-      line:4,riskClass:'state',reason:'Targeted source evidence was inconclusive.',
-    }]},
-  }));
-  const out=await publishGeminiReview({
-    env:{GH_TOKEN:'token',TARGET_REPO:'acme/project',PR_NUMBER:'7',
-      BASE_SHA:BASE,HEAD_SHA:A,SOURCE_COMMENT_ID:'100',
-      REVIEW_PATH:reviewPath,REVIEW_CONTEXT_DIR:dir},
-    fetchImpl:async(url,init={})=>{
-      if(url.endsWith('/pulls/7')) return Response.json({base:{sha:BASE},head:{sha:A}});
-      if(url.includes('/pulls/7/files')) return Response.json([]);
-      if(url.endsWith('/pulls/7/reviews')) return Response.json({id:202});
-      if(url.endsWith('/issues/comments/101')) return Response.json({id:101});
-      assert.fail('unexpected '+url);
-    },
-  });
-  assert.equal(out.session.status,'HUMAN_REQUIRED');
-  assert.equal(out.session.auditCompleted,false);
-  assert.equal(sessionCommitStatus(out.session,A).state,'error');
-});
-
 test('a finding whose line is outside the diff is still pinned as a resolvable thread, with its marker; a file outside the PR stays in the body', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'publish-gemini-anchor-'));
-  fs.writeFileSync(path.join(dir, 'session-plan.json'), JSON.stringify({ decision: { mode: 'discovery' }, session: null, sessionCommentId: null }));
+  fs.writeFileSync(path.join(dir, 'session-plan.json'), incrementalPlan());
   const reviewPath = path.join(dir, 'review.json');
   fs.writeFileSync(reviewPath, JSON.stringify({
     summary: 'Found three.',

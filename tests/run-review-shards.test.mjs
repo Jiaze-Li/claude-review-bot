@@ -46,7 +46,7 @@ export async function* query({ prompt, options }) {
 function setup(fileSizes, session = null, ignore = null) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'run-review-'));
   fs.mkdirSync(path.join(root, 'scripts'));
-  for (const name of ['run-review.mjs', 'review-shards.mjs', 'review-session-core.mjs', 'gemini-shard.mjs', 'gemini-config.mjs', 'run-gemini-review.mjs', 'claude-fallback.mjs']) fs.copyFileSync(new URL(`../scripts/${name}`, import.meta.url), path.join(root, 'scripts', name));
+  for (const name of ['run-review.mjs', 'review-shards.mjs', 'review-session-core.mjs', 'gemini-shard.mjs', 'gemini-config.mjs', 'review-prompts.mjs', 'run-gemini-review.mjs', 'claude-fallback.mjs']) fs.copyFileSync(new URL(`../scripts/${name}`, import.meta.url), path.join(root, 'scripts', name));
   const sdk = path.join(root, 'node_modules/@anthropic-ai/claude-agent-sdk');
   fs.mkdirSync(sdk, { recursive: true });
   fs.writeFileSync(path.join(sdk, 'package.json'), JSON.stringify({ name: '@anthropic-ai/claude-agent-sdk', type: 'module', main: 'index.js', exports: './index.js' }));
@@ -217,7 +217,7 @@ async function withGemini(behavior, fn) {
     req.on('end', () => {
       const prompt = JSON.parse(body).contents[0].parts[0].text;
       const files = [...(prompt.split('Assigned files:')[1] ?? '').split('\n\n')[0].matchAll(/^- (\S+)$/gm)].map((m) => m[1]);
-      requests.push({ files, hasKnown: prompt.includes('ALREADY EXAMINED'), inlineDiff: /<<<DIFF-/.test(prompt) });
+      requests.push({ files, hasKnown: prompt.includes('ALREADY EXAMINED'), hasStateRisk: prompt.includes('STATE-INTEGRITY RISK'), inlineDiff: /<<<DIFF-/.test(prompt) });
       const answer = behavior(requests.length, files);
       if (answer.status) {
         res.writeHead(answer.status, { 'Content-Type': 'application/json' });
@@ -373,6 +373,20 @@ test('known issues reach Gemini shards too', async () => {
     const out = await runAsync(root, base);
     assert.equal(out.status, 0, out.stderr);
     assert.ok(requests.every((r) => r.hasKnown));
+  });
+});
+
+test('a state-integrity PR gets the concurrency procedure in every shard prompt; an ordinary PR does not', async () => {
+  await withGemini(() => ({}), async ({ requests, base }) => {
+    const risky = setup({ 'a.swift': 100 });
+    fs.writeFileSync(path.join(risky, '.review-context/risk-profile.json'), JSON.stringify({ version: 1, stateIntegrity: true, signals: { synchronization: ['lock'], durableState: ['state'], multiActor: [] } }));
+    assert.equal((await runAsync(risky, base)).status, 0);
+    assert.ok(requests.length > 0 && requests.every((r) => r.hasStateRisk));
+    requests.length = 0;
+    const plain = setup({ 'a.swift': 100 });
+    fs.writeFileSync(path.join(plain, '.review-context/risk-profile.json'), JSON.stringify({ version: 1, stateIntegrity: false, signals: {} }));
+    assert.equal((await runAsync(plain, base)).status, 0);
+    assert.ok(requests.length > 0 && requests.every((r) => !r.hasStateRisk));
   });
 });
 

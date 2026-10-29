@@ -11,8 +11,8 @@ const A = 'a'.repeat(40);
 function ctx() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-fallback-'));
   fs.writeFileSync(path.join(dir, 'pr.json'), '{}');
-  fs.writeFileSync(path.join(dir, 'pr.diff'), 'diff --git a/a b/a\n');
-  fs.writeFileSync(path.join(dir, 'session-plan.json'), JSON.stringify({ decision: { mode: 'discovery' }, session: null }));
+  fs.writeFileSync(path.join(dir, 'repair.diff'), 'diff --git a/a b/a\n');
+  fs.writeFileSync(path.join(dir, 'session-plan.json'), JSON.stringify({ decision: { mode: 'incremental' }, session: null }));
   return dir;
 }
 const env = (dir, extra = {}) => ({ GEMINI_API_KEY: 'k', TARGET_REPO: 'a/b', PR_NUMBER: '1', HEAD_SHA: A, REVIEW_CONTEXT_DIR: dir, ...extra });
@@ -43,7 +43,7 @@ test('Gemini HTTP 402 falls back to Claude with no tools and the same output sha
   assert.equal(result._meta.provider, 'claude');
   assert.equal(result._meta.resolved_model, 'claude-sonnet-x');
   assert.equal(result._meta.fallback_from, 'gemini');
-  assert.equal(result._meta.mode, 'discovery');
+  assert.equal(result._meta.mode, 'incremental');
   assert.equal(calls.length, 1);
   assert.deepEqual(calls[0].options.tools, []);
   assert.deepEqual(Object.keys(calls[0].options.env).sort(), ['CLAUDE_CODE_OAUTH_TOKEN', 'HOME', 'PATH', 'TMPDIR']);

@@ -41,7 +41,7 @@ export function planReviewSession({ session = null, baseSha, headSha, reset = fa
   // HEAD and repair delta drive review progress; baseSha is retained as audit
   // metadata from discovery, not as a reason to spend another discovery call.
   if (reset || !session || session.version !== SESSION_VERSION) {
-    return { mode: 'discovery', previousHead: null, reason: reset ? 'explicit reset' : 'new review session' };
+    return { mode: 'full_review', previousHead: null, reason: reset ? 'explicit reset' : 'new review session' };
   }
 
   // A push during a deep review must not wipe the session: plan as if the deep review had
@@ -62,9 +62,9 @@ export function planReviewSession({ session = null, baseSha, headSha, reset = fa
 
   if (session.status === 'AUDIT_PENDING') {
     if (session.lastReviewedHead === headSha) {
-      return { mode: 'audit', previousHead: null, reason: 'run one final independent audit before READY' };
+      return { mode: 'full_review', previousHead: null, reason: 'run the final full review before READY' };
     }
-    return { mode: 'discovery', previousHead: null, reason: 'PR changed before final audit; start a fresh bounded session' };
+    return { mode: 'full_review', previousHead: null, reason: 'PR changed before final audit; start a fresh bounded session' };
   }
 
   if (session.status === 'READY') {
@@ -80,7 +80,7 @@ export function planReviewSession({ session = null, baseSha, headSha, reset = fa
     }
     return session.auditCompleted === true && !session.override
       ? { mode: 'incremental_candidate', previousHead: session.lastReviewedHead, reason: 'classify new delta before deciding review scope' }
-      : { mode: 'discovery', previousHead: null, reason: 'no reusable full-audit baseline' };
+      : { mode: 'full_review', previousHead: null, reason: 'no reusable full-review baseline' };
   }
 
   if (session.status === 'REWORK') {
@@ -93,16 +93,13 @@ export function planReviewSession({ session = null, baseSha, headSha, reset = fa
     return { mode: 'verification', previousHead: session.lastReviewedHead, reason: 'verify the repair against open findings' };
   }
 
-  // The model reported it could not cover every changed file. Never READY; a new
-  // HEAD starts a fresh bounded discovery, the same HEAD waits for a manual re-run.
+  // The reviewers could not cover every changed file. Never READY.
   if (session.status === 'PARTIAL') {
-    // A manual `@gemini review` / `@claude review` continues with the files not yet covered.
-    if (session.lastReviewedHead === headSha && retryUnavailable) {
-      return { mode: 'claude', previousHead: null, reason: 'continue the partial review with the files not yet covered' };
-    }
+    // Any review request on the same HEAD (a command, or the run that continues a big review) takes the files not
+    // yet covered; a new HEAD starts a fresh review.
     return session.lastReviewedHead === headSha
-      ? { mode: 'noop_waiting', previousHead: session.lastReviewedHead, reason: 'review coverage was partial; comment `@claude review` to cover the remaining files' }
-      : { mode: 'discovery', previousHead: null, reason: 'new HEAD after partial-coverage review; run a fresh bounded review' };
+      ? { mode: 'claude', previousHead: null, reason: 'continue the partial review with the files not yet covered' }
+      : { mode: 'full_review', previousHead: null, reason: 'new HEAD after partial-coverage review; run a fresh bounded review' };
   }
 
   if (session.status === 'HUMAN_REQUIRED') {
@@ -111,7 +108,7 @@ export function planReviewSession({ session = null, baseSha, headSha, reset = fa
     if (session.lastReviewedHead !== headSha
         && unresolvedMaterialFindings(session).length > 0
         && !session.findings.some(f => f.status === 'OPEN' && MATERIAL_SEVERITIES.has(f.severity))) {
-      return { mode: 'discovery', previousHead: null, reason: 'new HEAD after unresolved material candidate; run a fresh full review' };
+      return { mode: 'full_review', previousHead: null, reason: 'new HEAD after unresolved material candidate; run a fresh full review' };
     }
     // Only an explicit manual retry can resume a provider-unavailable stop. Never
     // reopen ordinary human findings, verification exhaustion, or a moved HEAD.
@@ -124,16 +121,16 @@ export function planReviewSession({ session = null, baseSha, headSha, reset = fa
         if (failedMode === 'verification' && previousHead) {
           return { mode: 'verification', previousHead, reason: 'manually retry provider-unavailable verification on the latest HEAD' };
         }
-        return { mode: 'discovery', previousHead: null, reason: 'manually review the latest HEAD after provider unavailability' };
+        return { mode: 'full_review', previousHead: null, reason: 'manually review the latest HEAD after provider unavailability' };
       }
-      return { mode: failedMode,
+      return { mode: ['discovery', 'audit'].includes(failedMode) ? 'full_review' : failedMode,
         previousHead: ['verification', 'incremental'].includes(failedMode) ? previousHead : null,
         reason: 'manually retry provider-unavailable review on the same HEAD' };
     }
     return { mode: 'human_required', previousHead: session.lastReviewedHead ?? null, reason: 'session already requires human judgment' };
   }
 
-  return { mode: 'discovery', previousHead: null, reason: 'unrecognized session state; restart bounded discovery' };
+  return { mode: 'full_review', previousHead: null, reason: 'unrecognized session state; restart bounded discovery' };
 }
 
 export function applyDiscoveryResult({
@@ -293,56 +290,6 @@ export function applyVerificationResult({
   };
 }
 
-export function applyAuditResult({
-  session, result, headSha, now = new Date().toISOString(),
-} = {}) {
-  validateSession(session);
-  checkedSha(headSha, 'headSha');
-  const providerRetry = session.status === 'HUMAN_REQUIRED'
-    && session.reviewFailure?.code === 'REVIEWER_UNAVAILABLE'
-    && session.reviewFailure?.mode === 'audit'
-    && session.reviewFailure?.head === headSha;
-  if (session.status !== 'AUDIT_PENDING' && !providerRetry) throw new Error('final audit requires AUDIT_PENDING session');
-  if (session.auditCompleted === true) throw new Error('final audit already completed for this session');
-  const normalized = normalizeReviewResult(result);
-  const findings = session.findings.map((finding) => ({ ...finding }));
-  let nextFindingNumber = Number.isInteger(session.nextFindingNumber) ? session.nextFindingNumber : findings.length + 1;
-  for (const finding of dropKnownRepeats(normalized.findings, session)) {
-    findings.push({
-      id: findingId(nextFindingNumber++),
-      ...compactFinding(finding),
-      status: MATERIAL_SEVERITIES.has(finding.severity) ? 'OPEN' : 'DEFERRED',
-      origin: 'FINAL_AUDIT',
-      introducedHead: headSha,
-      lastCheckedHead: headSha,
-      resolutionReason: null,
-    });
-  }
-  const open = findings.filter((finding) => finding.status === 'OPEN');
-  const verificationRound = session.verificationRound ?? 0;
-  const status = open.length === 0
-    ? 'READY'
-    : verificationRound >= MAX_VERIFICATION_ROUNDS
-      ? 'HUMAN_REQUIRED'
-      : 'REWORK';
-  return {
-    ...session,
-    lastReviewedHead: headSha,
-    status,
-    auditCompleted: true,
-    fullAuditHead: headSha,
-    incrementalReviewCount: 0,
-    nextFindingNumber,
-    findings,
-    lastSummary: compactText(normalized.summary, 800),
-    updatedAt: now,
-  };
-}
-
-// ---- Explicit Claude deep review inside the session ----------------------
-// The deep review is bound to one exact HEAD. While it runs the session is
-// REVIEW_IN_PROGRESS (never READY); success merges its findings into the same
-// ledger Gemini uses; any failure ends in HUMAN_REQUIRED.
 export function isDeepReviewStale(session, now = Date.now()) {
   if (session?.status !== 'REVIEW_IN_PROGRESS') return false;
   const started = Date.parse(session.deepReview?.startedAt ?? '');
@@ -396,7 +343,7 @@ export function stopUnavailableReviewSession({
 } = {}) {
   checkedSha(baseSha, 'baseSha');
   checkedSha(headSha, 'headSha');
-  if (!['discovery', 'verification', 'incremental', 'audit'].includes(mode)) throw new Error('invalid failed review mode');
+  if (!['verification', 'incremental'].includes(mode)) throw new Error('invalid failed review mode');
   const base = session ?? applyDiscoveryResult({
     result: { summary: 'Automated review could not run.', findings: [] },
     baseSha, headSha, sourceCommentId, now,
@@ -407,7 +354,6 @@ export function stopUnavailableReviewSession({
     ...base,
     status: 'HUMAN_REQUIRED',
     lastReviewedHead: headSha,
-    auditCompleted: mode === 'discovery' ? false : base.auditCompleted,
     reviewFailure: {
       code: 'REVIEWER_UNAVAILABLE', mode, head: headSha,
       sourceCommentId: String(sourceCommentId ?? ''),
@@ -425,26 +371,37 @@ export function stopUnavailableReviewSession({
 // `@claude review` is a reviewer in its own right. When this exact HEAD has no session it
 // starts a standalone one, so Claude and Gemini run as parallel reviewers instead of
 // Claude gating on a Gemini session. Spend carries over from any earlier session.
-function seedStandaloneSession({ previous, baseSha, headSha, now }) {
+function seedSession({ previous, baseSha, headSha, now }) {
   const seed = applyDiscoveryResult({ result: { summary: 'Claude review started', findings: [] }, baseSha, headSha, sourceCommentId: 'claude', now });
   const spend = {};
   for (const key of ['deepSpendUsd', 'fallbackSpendUsd', 'claudeSdkSpendUsd', 'claudeUnknownReserveUsd']) {
     if (Number.isFinite(previous?.[key]) && previous[key] > 0) spend[key] = previous[key];
   }
-  return { ...seed, ...spend };
+  // A material concern nobody has settled is not forgotten because the PR moved on or the review started over:
+  // silence from a new review never resolves it, only a human decision does.
+  const carried = unresolvedMaterialFindings(previous).slice(0, 8);
+  let nextFindingNumber = seed.nextFindingNumber ?? 1;
+  const findings = carried.map((entry) => ({
+    ...entry, id: findingId(nextFindingNumber++), origin: 'CARRIED_UNCERTAIN', status: 'UNCERTAIN',
+    lastCheckedHead: entry.lastCheckedHead ?? previous.lastReviewedHead, resolutionReason: null,
+  }));
+  return { ...seed, ...spend, findings, nextFindingNumber };
 }
 
 export function beginDeepReview({
-  session = null, baseSha, headSha, runId = null, reserveUsd = 0, standalone = false, audit = false, now = new Date().toISOString(),
+  session = null, baseSha, headSha, runId = null, reserveUsd = 0, now = new Date().toISOString(),
 } = {}) {
   checkedSha(baseSha, 'baseSha');
   checkedSha(headSha, 'headSha');
   if (session) validateSession(session);
-  let standaloneRun = false;
+  const priorHead = session?.lastReviewedHead ?? null;
+  // A review that begins from an existing session waiting for its final review (AUDIT_PENDING) IS that final review:
+  // it is owed once, so findings it adds are verified and the PR then needs no second full review. A review that
+  // starts a session of its own is not (a clean one is simply READY).
+  const settledAndWaiting = Boolean(session) && session.lastReviewedHead === headSha && session.status === 'AUDIT_PENDING';
+  // A full review of a HEAD that has no session yet starts one; spend carries over from an earlier session.
   if (!session || session.lastReviewedHead !== headSha) {
-    if (!standalone) throw new Error('deep review requires an existing review session for this exact HEAD');
-    session = seedStandaloneSession({ previous: session, baseSha, headSha, now });
-    standaloneRun = true;
+    session = seedSession({ previous: session, baseSha, headSha, now });
   }
   if (session.status === 'REVIEW_IN_PROGRESS' && !isDeepReviewStale(session, Date.parse(now))) {
     throw new Error('a deep review is already in progress for this HEAD');
@@ -458,9 +415,12 @@ export function beginDeepReview({
     && openMaterialFindings(session).length === 0 && unresolvedMaterialFindings(session).length === 0;
   const resumeStatus = session.status === 'REVIEW_IN_PROGRESS' || retryingFailedRun
     ? (session.deepReview?.resumeStatus ?? 'AUDIT_PENDING') : session.status;
+  const resuming = session.status === 'REVIEW_IN_PROGRESS' || retryingFailedRun
+    || (session.status === 'PARTIAL' && session.deepReview?.head === headSha);
+  const resumeHead = session.status === 'REVIEW_IN_PROGRESS' || retryingFailedRun
+    ? (session.deepReview?.resumeHead ?? priorHead) : priorHead;
+  const final = settledAndWaiting || (resuming && session.deepReview?.final === true);
   const base = session;
-  // A final audit that ran out of room (PARTIAL) is still the audit when it is continued.
-  const auditRun = audit || (session.status === 'PARTIAL' && session.deepReview?.audit === true);
   return {
     ...base,
     lastReviewedHead: headSha,
@@ -468,7 +428,7 @@ export function beginDeepReview({
     // The run's allotted budget is charged up front and reconciled at finalize/fail, so a run
     // that is interrupted (new commit, kill, stale replacement) can never escape the PR cap.
     deepSpendUsd: roundUsd((session.deepSpendUsd ?? 0) + nonNegative(reserveUsd)),
-    deepReview: { head: headSha, startedAt: now, runId: runId == null ? null : String(runId), resumeStatus, state: 'IN_PROGRESS', reservedUsd: nonNegative(reserveUsd), ...(standaloneRun || session.deepReview?.standalone === true ? { standalone: true } : {}), ...(auditRun ? { audit: true } : {}) },
+    deepReview: { head: headSha, startedAt: now, runId: runId == null ? null : String(runId), resumeStatus, resumeHead, ...(final ? { final: true } : {}), state: 'IN_PROGRESS', reservedUsd: nonNegative(reserveUsd) },
     updatedAt: now,
   };
 }
@@ -517,16 +477,12 @@ export function completeDeepReview({
     && session.reviewFailure?.code === 'REVIEWER_UNAVAILABLE'
     && session.reviewFailure?.head === headSha;
   const coverage = normalizeCoverage(result.coverage);
-  // A standalone Claude session has no Gemini audit; a complete Claude pass is its full review.
-  const standalone = session.deepReview?.standalone === true;
-  // A complete sharded pass that was started as the final audit is that audit.
-  const auditRun = session.deepReview?.audit === true;
   const status = open.length > 0
     ? verificationRound >= MAX_VERIFICATION_ROUNDS ? 'HUMAN_REQUIRED' : 'REWORK'
     : unresolvedMaterialFindings(session).length > 0 ? 'HUMAN_REQUIRED'
       : coverage && !coverage.complete ? 'PARTIAL'
       : resume === 'HUMAN_REQUIRED' && !providerRecovery ? 'HUMAN_REQUIRED'
-      : session.auditCompleted === true || standalone || auditRun ? 'READY' : 'AUDIT_PENDING';
+      : 'READY';
   const completed = {
     ...session,
     ...reconcileDeepSpend(session, spentUsd, costSource),
@@ -538,7 +494,14 @@ export function completeDeepReview({
     updatedAt: now,
   };
   if (providerRecovery) delete completed.reviewFailure;
-  if ((standalone || auditRun) && status === 'READY') completed.auditCompleted = true;
+  // A complete pass over every file with nothing blocking is the full independent review.
+  // READY from a complete pass is the full independent review. The one final review also counts as done when it
+  // found something: those findings are verified, and no second full review is owed.
+  if (status === 'READY' || (session.deepReview?.final === true && ['REWORK', 'HUMAN_REQUIRED'].includes(status) && !(coverage && !coverage.complete))) {
+    completed.auditCompleted = true;
+    completed.fullAuditHead = headSha;
+    completed.incrementalReviewCount = 0;
+  }
   // A complete pass clears an earlier partial record; a partial one is kept so the
   // comment can name exactly what no reviewer has seen yet.
   if (coverage && !coverage.complete) completed.coverage = { ...coverage, head: headSha };
@@ -843,27 +806,13 @@ export function unresolvedMaterialFindings(session) {
 
 // The validator already performs a bounded, targeted evidence check. An
 // inconclusive material candidate is a durable blocker, not a confirmed defect.
-export function recordUncertainFindings(session, validations, headSha, mode, previousSession = null) {
+export function recordUncertainFindings(session, validations, headSha) {
   validateSession(session);
   checkedSha(headSha, 'headSha');
-  if (!['discovery', 'incremental', 'audit'].includes(mode)) throw new Error('invalid uncertain review mode');
   const checked = Array.isArray(validations) ? validations : [];
   const uncertain = checked.filter(entry =>
     entry?.verdict === 'UNCERTAIN' && MATERIAL_SEVERITIES.has(entry.severity));
-  // A fresh Discovery (after new code OR an explicit reset) must not erase
-  // a prior inconclusive P2 just because the model failed to repeat it.
-  // Only a new targeted CONFIRMED or REJECTED verdict for the *same*
-  // candidate establishes enough evidence to replace it.
-  const prior = mode === 'discovery'
-    ? unresolvedMaterialFindings(previousSession)
-    : [];
-  const key = entry => String(entry?.path ?? '').trim().toLowerCase()
-    + '\0' + String(entry?.title ?? '').trim().toLowerCase();
-  const resolved = new Set(checked.filter(entry =>
-    ['CONFIRMED','REJECTED'].includes(entry?.verdict)).map(key));
-  const repeated = new Set(uncertain.map(key));
-  const carried = prior.filter(entry => !resolved.has(key(entry)) && !repeated.has(key(entry)));
-  const count = uncertain.length + carried.length;
+  const count = uncertain.length;
   if (!count) return session;
   if (session.findings.length + count > 64) {
     throw new Error('too many unresolved material candidates to persist safely');
@@ -887,17 +836,6 @@ export function recordUncertainFindings(session, validations, headSha, mode, pre
       resolutionReason: null,
     });
   }
-  for (const entry of carried) {
-    findings.push({
-      ...entry,
-      id: findingId(nextFindingNumber++),
-      origin: 'CARRIED_UNCERTAIN',
-      status: 'UNCERTAIN',
-      // This prior concern has not been verified on the new HEAD.
-      lastCheckedHead: entry.lastCheckedHead ?? previousSession.lastReviewedHead,
-      resolutionReason: null,
-    });
-  }
   const confirmedOpen = findings.some(f => f.status === 'OPEN' && MATERIAL_SEVERITIES.has(f.severity));
   const status = confirmedOpen && (session.verificationRound ?? 0) < MAX_VERIFICATION_ROUNDS
     ? 'REWORK' : 'HUMAN_REQUIRED';
@@ -906,10 +844,8 @@ export function recordUncertainFindings(session, validations, headSha, mode, pre
     findings,
     nextFindingNumber,
     status,
-    auditCompleted: mode === 'audit' ? false : session.auditCompleted,
     lastSummary: compactText(session.lastSummary + ' | ' + count
-      + ' unresolved material candidate(s), including ' + carried.length
-      + ' carried from earlier HEAD, require evidence-based review.', 800),
+      + ' unresolved material candidate(s) require evidence-based review.', 800),
   };
 }
 
@@ -930,7 +866,7 @@ export function renderSessionComment(session, { sourceCommentIds = [] } = {}) {
     : session.status === 'REVIEW_IN_PROGRESS'
       ? 'Claude deep review is running for this exact commit; the PR is not READY until it finishes. If it stops, comment `@claude review` to restart.'
     : session.status === 'AUDIT_PENDING'
-      ? 'The one-time final Gemini audit will run automatically. If the workflow stops, comment `@gemini review` to resume it.'
+      ? 'The final full review runs automatically (Gemini first, Claude continues). If the workflow stops, comment `@gemini review` to resume it.'
       : session.status === 'REWORK'
         ? 'Push a repair for real bugs; for a disproven finding post `@gemini dismiss F001` with Reason and Evidence lines. Dismissal does not change product code.'
         : 'Automatic review budget is exhausted. Use human judgment or a targeted Codex/Claude review; do not restart full discovery automatically.';
@@ -965,7 +901,7 @@ export function renderSessionComment(session, { sourceCommentIds = [] } = {}) {
     '### Independent Review Session',
     `Status: **${session.status}**${session.override ? ` (manually overridden by @${cleanInline(session.override.by)})` : ''}`,
     `Default reviewer: **Gemini Flash (latest) / medium thinking**`,
-    `Discovery: **${session.reviewFailure?.mode === 'discovery' ? 'not completed' : 'complete'}** · Final audit: **${audit}** · Verification: **${verification}**`,
+    `Discovery: **complete** · Final audit: **${audit}** · Verification: **${verification}**`,
     ...(session.incrementalReviewCount ? [`Incremental reviews since full audit: **${session.incrementalReviewCount}** (full-audit HEAD: ${cleanInline((session.fullAuditHead ?? session.discoveryHead ?? '').slice(0, 12))})`] : []),
     `Open confirmed material findings: **${open.length}**`,
     `Unresolved material candidates: **${unresolved.length}**`,

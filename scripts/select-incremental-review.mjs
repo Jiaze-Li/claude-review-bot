@@ -16,7 +16,7 @@ const SAFE_DELTA_EXTENSION = /\.(?:swift|js|mjs|cjs|jsx|ts|tsx|py|go|rs|java|kt|
 const HIGH_RISK_CHANGE = /\b(?:mutex|semaphore|atomic|lock|unlock|deadlock|race|concurren\w*|transaction|rollback|commitTransaction|compareAndSwap|compare[-_]?and[-_]?swap|thread|actor|dispatchQueue|TaskGroup|Promise\.all|database|migration|schema|credential|secret|password|permission|authorization|authentication|encrypt|decrypt|signature|jwt|webhook|token|sessionCookie)\b/i;
 
 function full(reason) {
-  return { mode: 'discovery', reason: 'Full review: ' + reason };
+  return { mode: 'full', reason: 'Full review: ' + reason };
 }
 
 function parseStatusEntries(raw) {

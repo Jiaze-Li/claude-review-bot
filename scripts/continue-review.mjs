@@ -1,21 +1,27 @@
-import fs from 'node:fs';
-import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { stagedDiffFits } from './review-shards.mjs';
 import { latestSession } from './sync-commit-status.mjs';
 
-// A review that has to be finished in several runs (a PR too big for one) continues by itself: when a run ends
-// with work left, the next run is started with the same inputs, so nobody has to type the command again.
+// A review that is not finished when a run ends continues by itself: the next run is started on the same HEAD,
+// so nobody has to type the command again.
 // - the engine ran out of room (PARTIAL coverage on this HEAD): run again, it picks up the files left;
-// - the review is done except for a final audit too big for one staged request: the audit runs in shards.
+// - every finding is settled (fixed, dismissed) and only the final full review is left (AUDIT_PENDING).
 // The chain is capped and stops at the first run that did not leave exactly that kind of work behind.
 export const MAX_CONTINUATIONS = 3;
+const REVIEW_WORK = new Set(['verification', 'incremental', 'claude', 'dismiss', 'recover']);
 const CHAIN_ID = /^8([0-9])\d{11}$/; // 13 digits: '8', continuation number, run id; real comment ids never look like this
 
 // A continuation resumes; it must never repeat a one-shot command (reset, override, dismiss, threads).
 // Only `claude` (Claude alone) is carried over, so the model choice holds for the whole chain.
 export function continuationMode(requestedMode) {
   return requestedMode === 'claude' ? 'claude' : 'auto';
+}
+
+// Money rules follow who asked. A person's review command (and a resolved-threads verification) keeps its manual
+// $5-per-call allowance for the whole chain; a dismissal or override is not a request for more review, so what
+// follows it is an automatic review under the per-PR allowance.
+export function continuationSourceKind(requestedMode, sourceKind) {
+  if (['dismiss', 'override'].includes(requestedMode)) return 'pull_request';
+  return requestedMode === 'threads' ? 'comment' : (sourceKind || 'comment');
 }
 
 export function chainIndex(sourceCommentId) {
@@ -29,14 +35,16 @@ export function nextChainId(sourceCommentId, runId) {
 }
 
 // -> { continue: boolean, reason }
-export function decideContinuation({ session, headSha, sourceCommentId, planMode, stagedFits }) {
+export function decideContinuation({ session, headSha, sourceCommentId, planMode }) {
   if (!session || session.lastReviewedHead !== headSha) return { continue: false, reason: 'no review of this HEAD to continue' };
   if (chainIndex(sourceCommentId) >= MAX_CONTINUATIONS) return { continue: false, reason: 'continuation limit reached' };
   if (session.status === 'PARTIAL' && session.coverage?.head === headSha && planMode === 'claude') {
     return { continue: true, reason: `${session.coverage.unreviewedCount ?? 'some'} file(s) are still unreviewed` };
   }
-  if (session.status === 'AUDIT_PENDING' && !session.coverage && stagedFits === false) {
-    return { continue: true, reason: 'the final audit is too large for one run and continues in shards' };
+  // Only a run that did review work leads straight into the final review; a bookkeeping run (a closed P3 thread,
+  // an override) does not start paid work on its own.
+  if (session.status === 'AUDIT_PENDING' && !session.coverage && REVIEW_WORK.has(planMode)) {
+    return { continue: true, reason: 'only the final full review is left' };
   }
   return { continue: false, reason: 'nothing left to continue' };
 }
@@ -46,12 +54,9 @@ export async function continueReview({ env = process.env, fetchImpl = fetch, log
   const target = need('TARGET_REPO');
   const headSha = need('HEAD_SHA');
   const sourceCommentId = need('SOURCE_COMMENT_ID');
-  const contextRoot = path.resolve(env.REVIEW_CONTEXT_DIR || '.review-context');
-  const read = (name) => { try { return fs.readFileSync(path.join(contextRoot, name), 'utf8'); } catch { return ''; } };
   const session = await latestSession({ target, prNumber: need('PR_NUMBER'), author: need('EXPECTED_REVIEW_AUTHOR'), token: need('GH_TOKEN'), fetchImpl });
   const decision = decideContinuation({
     session, headSha, sourceCommentId, planMode: env.REVIEW_MODE,
-    stagedFits: stagedDiffFits(read('pr.diff'), read('ignore-patterns.txt')),
   });
   if (!decision.continue) { log.log?.(`No continuation: ${decision.reason}.`); return decision; }
   const next = nextChainId(sourceCommentId, env.GITHUB_RUN_ID);
@@ -63,7 +68,7 @@ export async function continueReview({ env = process.env, fetchImpl = fetch, log
       inputs: {
         target_repo: target, pr_number: need('PR_NUMBER'), base_sha: need('BASE_SHA'), head_sha: headSha,
         trigger_user: need('TRIGGER_USER'), source_comment_id: next,
-        source_kind: env.SOURCE_KIND || 'comment', requested_mode: continuationMode(env.REQUESTED_MODE),
+        source_kind: continuationSourceKind(env.REQUESTED_MODE, env.SOURCE_KIND), requested_mode: continuationMode(env.REQUESTED_MODE),
       },
     }),
     signal: AbortSignal.timeout(15000),

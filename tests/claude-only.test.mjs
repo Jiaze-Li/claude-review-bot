@@ -8,10 +8,10 @@ import { publishRunStatus } from '../scripts/review-status.mjs';
 
 const A = 'a'.repeat(40);
 
-function setup({ requestedMode, mode = 'audit', diff = 'diff --git a/a.js b/a.js\n--- a/a.js\n+++ b/a.js\n@@ -1 +1 @@\n+x\n' }) {
+function setup({ requestedMode, mode = 'incremental', diff = 'diff --git a/a.js b/a.js\n--- a/a.js\n+++ b/a.js\n@@ -1 +1 @@\n+x\n' }) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-only-'));
   fs.writeFileSync(path.join(dir, 'pr.json'), '{}');
-  fs.writeFileSync(path.join(dir, 'pr.diff'), diff);
+  fs.writeFileSync(path.join(dir, 'repair.diff'), diff);
   fs.writeFileSync(path.join(dir, 'session-plan.json'), JSON.stringify({ decision: { mode }, session: null, requestedMode }));
   return dir;
 }
@@ -28,7 +28,7 @@ test('@claude review runs the same review with Claude alone: no Gemini key neede
   const result = await runGeminiReview({ env: env(setup({ requestedMode: 'claude' })), logImpl: () => {}, fetchImpl: neverGemini, queryImpl: claude(calls) });
   assert.equal(calls.length, 1);
   assert.equal(result._meta.provider, 'claude');
-  assert.equal(result._meta.mode, 'audit');
+  assert.equal(result._meta.mode, 'incremental');
   assert.equal(result._meta.fallback_from, undefined);
   assert.equal(result._meta.fallback_reason, undefined);
 });
@@ -63,9 +63,4 @@ test('the status comment names the model that was asked for', async () => {
   await publishRunStatus({ env: { ...base, REQUESTED_MODE: 'auto' }, fetchImpl });
   assert.match(bodies[0], /Claude targeted verification is running/);
   assert.match(bodies[1], /Gemini targeted verification is running/);
-});
-
-test('the workflow lets the automatic final audit keep an @claude review command', () => {
-  const yml = fs.readFileSync(new URL('../.github/workflows/review-v2.yml', import.meta.url), 'utf8');
-  assert.match(yml, /"\$requested_mode" == "claude"/);
 });

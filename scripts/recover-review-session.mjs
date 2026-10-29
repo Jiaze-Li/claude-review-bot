@@ -1,3 +1,4 @@
+import { saveSessionComment } from './session-comment.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -32,15 +33,12 @@ export async function recoverReviewSession({ env = process.env, fetchImpl = fetc
 
   const sourceIds = [plan.pendingSourceCommentId, currentSourceId].filter(Boolean);
   const body = renderSessionComment(plan.pendingSession, { sourceCommentIds: sourceIds });
-  const endpoint = plan.sessionCommentId
-    ? 'https://api.github.com/repos/' + owner + '/' + repo + '/issues/comments/' + plan.sessionCommentId
-    : 'https://api.github.com/repos/' + owner + '/' + repo + '/issues/' + prNumber + '/comments';
-  const result = await githubJson(endpoint, env.GH_TOKEN, fetchImpl, {
-    method: plan.sessionCommentId ? 'PATCH' : 'POST',
-    body: JSON.stringify({ body }),
+  const savedId = await saveSessionComment({
+    target: owner + '/' + repo, prNumber, token: env.GH_TOKEN, fetchImpl, existingId: plan.sessionCommentId,
+    previous: plan.session, session: plan.pendingSession, body,
   });
-  console.log('Recovered durable review session ' + result.id + ' from pending review ' + (plan.pendingReviewId || 'unknown') + '.');
-  return { session: plan.pendingSession, sessionCommentId: String(result.id) };
+  console.log('Recovered durable review session ' + savedId + ' from pending review ' + (plan.pendingReviewId || 'unknown') + '.');
+  return { session: plan.pendingSession, sessionCommentId: savedId };
 }
 
 async function githubJson(url, token, fetchImpl, init = {}) {

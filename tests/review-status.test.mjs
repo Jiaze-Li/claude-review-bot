@@ -17,8 +17,8 @@ const baseEnv = {
   HEAD_SHA: 'a'.repeat(40),
   STATUS_STAGE: 'started',
   PREFLIGHT_OUTCOME: 'success',
-  REVIEW_MODE: 'discovery',
-  REVIEW_REASON: 'new review session',
+  REVIEW_MODE: 'incremental',
+  REVIEW_REASON: 'small delta on a reviewed state',
 };
 
 function fakeFetch() {
@@ -32,7 +32,7 @@ function fakeFetch() {
   };
 }
 
-test('verified workflow posts generic run-linked discovery status', async () => {
+test('verified workflow posts generic run-linked delta-review status', async () => {
   const fake = fakeFetch();
   assert.equal(await publishRunStatus({ env: baseEnv, fetchImpl: fake.fetchImpl }), '5678');
   assert.equal(fake.calls.length, 1);
@@ -42,7 +42,7 @@ test('verified workflow posts generic run-linked discovery status', async () => 
   assert.match(call.body, /actions\/runs\/1234\/attempts\/2/);
   assert.match(call.body, /issuecomment-99/);
   assert.ok(call.body.includes(baseEnv.HEAD_SHA));
-  assert.match(call.body, /Gemini discovery review is running/);
+  assert.match(call.body, /Gemini delta review is running/);
   assert.match(call.body, /Independent review/);
   assert.doesNotMatch(call.body, /👀|synthetic-test-token/);
 });
@@ -58,7 +58,7 @@ test('automatic PR trigger status does not invent a source-comment link', async 
 });
 
 
-for (const mode of ['verification', 'audit', 'recover', 'claude', 'noop_ready', 'noop_waiting', 'human_required']) {
+for (const mode of ['verification', 'recover', 'claude', 'noop_ready', 'noop_waiting', 'human_required']) {
   test(`status renders supported review mode ${mode}`, async () => {
     const fake = fakeFetch();
     await publishRunStatus({
@@ -67,9 +67,7 @@ for (const mode of ['verification', 'audit', 'recover', 'claude', 'noop_ready', 
     });
     assert.match(fake.calls[0].body, new RegExp(mode === 'verification'
       ? 'Gemini targeted verification'
-      : mode === 'audit'
-        ? 'Gemini one-time final audit'
-        : mode === 'recover'
+      : mode === 'recover'
         ? 'Recovering durable session state'
         : mode === 'claude'
           ? 'Sharded deep review is running'
@@ -120,21 +118,6 @@ for (const outcome of ['success', 'failure', 'cancelled', 'skipped', undefined])
   });
 }
 
-test('skipped final audit does not mask a successful Gemini publication', async () => {
-  const fake = fakeFetch();
-  await publishRunStatus({
-    env: {
-      ...baseEnv,
-      STATUS_STAGE: 'finished',
-      STATUS_COMMENT_ID: '5678',
-      GEMINI_PUBLISH_OUTCOME: 'success',
-      FINAL_AUDIT_PUBLISH_OUTCOME: 'skipped',
-    },
-    fetchImpl: fake.fetchImpl,
-  });
-  assert.match(fake.calls[0].body, /publication completed/);
-});
-
 test('bounded no-op final status explicitly says zero model quota', async () => {
   const fake = fakeFetch();
   await publishRunStatus({
@@ -177,29 +160,23 @@ test('v2 workflow isolates provider credentials and serializes durable PR sessio
   const started = yml.indexOf('- name: Announce verified workflow start');
   const recover = yml.indexOf('- name: Recover published session without model spend');
   const gemini = yml.indexOf('- name: Run Gemini bounded review');
-  const stopGemini = yml.indexOf('- name: Record provider-unavailable discovery or verification');
+  const stopGemini = yml.indexOf('- name: Record provider-unavailable delta review');
   const validator = yml.indexOf('- name: Validate Gemini material findings');
   const publishGemini = yml.indexOf('- name: Publish Gemini review and durable session');
-  const autoAudit = yml.indexOf('- name: Prepare automatic final audit');
-  const runFinalAudit = yml.indexOf('- name: Run automatic Gemini final audit');
-  const stopFinalAudit = yml.indexOf('- name: Record provider-unavailable final audit');
-  const validateFinalAudit = yml.indexOf('- name: Validate automatic final audit findings');
-  const publishFinalAudit = yml.indexOf('- name: Publish automatic final audit');
   const claude = yml.indexOf('- name: Run Claude explicit deep review');
   const finished = yml.indexOf('- name: Finalize workflow status');
 
-  assert.ok(context < plan && plan < started && started < recover && recover < gemini && gemini < validator && validator < publishGemini && publishGemini < autoAudit && autoAudit < runFinalAudit && runFinalAudit < validateFinalAudit && validateFinalAudit < publishFinalAudit && publishFinalAudit < claude && claude < finished);
+  assert.ok(context < plan && plan < started && started < recover && recover < gemini && gemini < validator && validator < publishGemini && publishGemini < claude && claude < finished);
   assert.match(yml, /group: independent-review-\$\{\{ inputs\.target_repo \}\}-\$\{\{ inputs\.pr_number \}\}/);
   assert.match(yml, /GEMINI_API_KEY: \$\{\{ secrets\.GEMINI_API_KEY \}\}/);
   const recoverBlock = yml.slice(recover, gemini);
   assert.doesNotMatch(recoverBlock, /GEMINI_API_KEY|CLAUDE_CODE_OAUTH_TOKEN/);
   assert.match(yml, /CLAUDE_CODE_OAUTH_TOKEN: \$\{\{ secrets\.CLAUDE_CODE_OAUTH_TOKEN \}\}/);
   // Only the trusted external-fact validator receives the scoped GitHub token.
-  // The Gemini provider step and final-audit model step remain isolated.
+  // The Gemini provider step remains isolated.
   const geminiBlock = yml.slice(gemini, stopGemini);
   assert.doesNotMatch(geminiBlock, /GH_TOKEN|app-token\.outputs\.token/);
-  // Failure persistence is a separate GitHub-only step, never part of the
-  // provider's execution environment.
+  // Failure persistence is a separate GitHub-only step, never part of the provider's execution environment.
   const stopBlock = yml.slice(stopGemini, validator);
   assert.match(stopBlock, /GH_TOKEN: \$\{\{ steps\.app-token\.outputs\.token \}\}/);
   assert.doesNotMatch(stopBlock, /GEMINI_API_KEY|CLAUDE_CODE_OAUTH_TOKEN/);
@@ -208,20 +185,15 @@ test('v2 workflow isolates provider credentials and serializes durable PR sessio
   assert.match(validatorBlock, /GH_TOKEN: \$\{\{ steps\.app-token\.outputs\.token \}\}/);
   // Claude fallback validates when Gemini is out of credits; the fallback subprocess is tool-less and gets a scrubbed env (see claude-fallback tests).
   assert.match(validatorBlock, /CLAUDE_CODE_OAUTH_TOKEN/);
-  const finalAuditBlock = yml.slice(runFinalAudit, stopFinalAudit);
-  assert.doesNotMatch(finalAuditBlock, /GH_TOKEN|app-token\.outputs\.token/);
-  const stopAuditBlock = yml.slice(stopFinalAudit, validateFinalAudit);
-  assert.match(stopAuditBlock, /GH_TOKEN: \$\{\{ steps\.app-token\.outputs\.token \}\}/);
-  assert.doesNotMatch(stopAuditBlock, /GEMINI_API_KEY|CLAUDE_CODE_OAUTH_TOKEN/);
-  const finalValidatorBlock = yml.slice(validateFinalAudit, publishFinalAudit);
-  assert.match(finalValidatorBlock, /GH_TOKEN: \$\{\{ steps\.app-token\.outputs\.token \}\}/);
-  assert.match(finalValidatorBlock, /CLAUDE_CODE_OAUTH_TOKEN/);
   const publishClaude = yml.indexOf('- name: Publish Claude explicit deep review');
   const claudeBlock = yml.slice(claude, publishClaude);
   assert.doesNotMatch(claudeBlock, /GH_TOKEN|app-token\.outputs\.token/);
   assert.match(yml, /permission-issues: read/);
   assert.match(yml, /permission-pull-requests: write/);
   assert.doesNotMatch(yml, /permission-contents: write/);
+  // Every full review (first, after a big change, the final one) is the sharded engine; the staged steps only
+  // handle repairs and small deltas.
+  assert.doesNotMatch(yml, /steps\.plan\.outputs\.mode == 'discovery'|steps\.plan\.outputs\.mode == 'audit'/);
 });
 
 
@@ -242,7 +214,7 @@ test('a failed run shows the recorded reason in the status comment',async()=>{
   fs.writeFileSync(path.join(dir,'failure-reason.txt'),"Gemini review context exceeds 1500000 bytes\nsecond line");
   const bodies=[];
   const fetchImpl=async(url,init)=>{bodies.push(JSON.parse(init.body).body);return Response.json({id:7});};
-  await publishRunStatus({env:{GITHUB_ACTIONS:'true',TARGET_REPO:'a/b',GITHUB_REPOSITORY:'c/d',PR_NUMBER:'7',SOURCE_COMMENT_ID:'9',SOURCE_KIND:'pull_request',GITHUB_RUN_ID:'1',GITHUB_RUN_ATTEMPT:'1',HEAD_SHA:'a'.repeat(40),REVIEW_MODE:'discovery',REVIEW_REASON:'new review session',STATUS_STAGE:'finished',STATUS_COMMENT_ID:'7',GH_TOKEN:'t',GEMINI_PUBLISH_OUTCOME:'skipped',REVIEW_CONTEXT_DIR:dir},fetchImpl});
+  await publishRunStatus({env:{GITHUB_ACTIONS:'true',TARGET_REPO:'a/b',GITHUB_REPOSITORY:'c/d',PR_NUMBER:'7',SOURCE_COMMENT_ID:'9',SOURCE_KIND:'pull_request',GITHUB_RUN_ID:'1',GITHUB_RUN_ATTEMPT:'1',HEAD_SHA:'a'.repeat(40),REVIEW_MODE:'incremental',REVIEW_REASON:'small delta',STATUS_STAGE:'finished',STATUS_COMMENT_ID:'7',GH_TOKEN:'t',GEMINI_PUBLISH_OUTCOME:'skipped',REVIEW_CONTEXT_DIR:dir},fetchImpl});
   assert.match(bodies[0],/not confirmed/);
   assert.match(bodies[0],/Reason: Gemini review context exceeds 1500000 bytes second line/);
 });

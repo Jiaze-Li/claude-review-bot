@@ -1,9 +1,9 @@
+import { applyFullReview } from './helpers/full-review.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   MAX_VERIFICATION_ROUNDS,
-  applyAuditResult,
-  applyDiscoveryResult,
+    applyDiscoveryResult,
   applyVerificationResult,
   openMaterialFindings,
   parseSessionComment,
@@ -18,7 +18,7 @@ const finding=(severity='P1', title='Bug', riskClass='state-invariant')=>({
 
 test('new session gets one discovery pass',()=>{
   assert.deepEqual(planReviewSession({baseSha:BASE,headSha:A}),{
-    mode:'discovery',previousHead:null,reason:'new review session',
+    mode:'full_review',previousHead:null,reason:'new review session',
   });
 });
 
@@ -71,23 +71,23 @@ test('verification may add only modeled repair regressions and P3 stays non-bloc
   assert.deepEqual(s.findings.map(x=>[x.id,x.status]),[['F001','FIXED'],['F002','OPEN'],['F003','DEFERRED']]);
 });
 
-test('clean discovery schedules one final audit, then READY is a free no-op',()=>{
+test('a session waiting for its final review is finished by one complete full review, then READY is a free no-op',()=>{
   const pending=applyDiscoveryResult({result:{summary:'clean',findings:[]},baseSha:BASE,headSha:A,sourceCommentId:'9'});
   assert.equal(pending.status,'AUDIT_PENDING');
-  assert.equal(planReviewSession({session:pending,baseSha:BASE,headSha:A}).mode,'audit');
-  const s=applyAuditResult({session:pending,result:{summary:'final audit clean',findings:[]},headSha:A});
+  assert.equal(planReviewSession({session:pending,baseSha:BASE,headSha:A}).mode,'full_review');
+  const s=applyFullReview({session:pending,result:{summary:'final audit clean',findings:[]},headSha:A});
   assert.equal(s.status,'READY');
   assert.equal(s.auditCompleted,true);
   assert.equal(planReviewSession({session:s,baseSha:BASE,headSha:A}).mode,'noop_ready');
   assert.equal(planReviewSession({session:s,baseSha:BASE,headSha:B}).mode,'incremental_candidate');
 });
 
-test('final audit findings are verified without running a second audit',()=>{
+test('findings of the one final full review are verified without a second full review',()=>{
   let s=applyDiscoveryResult({result:{summary:'clean',findings:[]},baseSha:BASE,headSha:A,sourceCommentId:'9'});
-  s=applyAuditResult({session:s,result:{summary:'late bug',findings:[finding('P1','Late bug','final-audit')]},headSha:A});
+  s=applyFullReview({session:s,result:{summary:'late bug',findings:[finding('P1','Late bug','final-audit')]},headSha:A});
   assert.equal(s.status,'REWORK');
   assert.equal(s.auditCompleted,true);
-  assert.equal(s.findings.at(-1).origin,'FINAL_AUDIT');
+  assert.equal(s.findings.at(-1).origin,'CLAUDE_DEEP');
   s=applyVerificationResult({session:s,headSha:B,result:{
     summary:'fixed',verifications:[{findingId:s.findings.at(-1).id,status:'FIXED',reason:'repair closes final-audit trigger'}],findings:[],
   }});
@@ -118,7 +118,7 @@ test('verification cannot invent finding IDs outside the open durable registry',
 test('target base-tip movement alone never spends another discovery call',()=>{
   const NEW_BASE='e'.repeat(40);
   const pending=applyDiscoveryResult({result:{summary:'clean',findings:[]},baseSha:BASE,headSha:A,sourceCommentId:'9'});
-  const ready=applyAuditResult({session:pending,result:{summary:'audit clean',findings:[]},headSha:A});
+  const ready=applyFullReview({session:pending,result:{summary:'audit clean',findings:[]},headSha:A});
   assert.equal(planReviewSession({session:ready,baseSha:NEW_BASE,headSha:A}).mode,'noop_ready');
 
   const rework=applyDiscoveryResult({result:{summary:'bug',findings:[finding('P1')]},baseSha:BASE,headSha:A,sourceCommentId:'10'});

@@ -83,8 +83,7 @@ concurrency:
 jobs:
   review:
     runs-on: ubuntu-latest
-    # Discovery and final audit each have an eight-minute request budget;
-    # leave time for bounded validation and publication.
+    # Room for the sharded review (16 minutes) plus validation and publication.
     timeout-minutes: 30
 
     steps:
@@ -384,13 +383,13 @@ jobs:
 
       - name: Install Claude fallback dependencies
         continue-on-error: true # only needed if Gemini is out of credits; must never block a healthy Gemini review
-        if: steps.dedupe.outputs.duplicate != 'true' && (steps.plan.outputs.mode == 'discovery' || steps.plan.outputs.mode == 'incremental' || steps.plan.outputs.mode == 'verification' || steps.plan.outputs.mode == 'audit' || steps.plan.outputs.mode == 'dismiss')
+        if: steps.dedupe.outputs.duplicate != 'true' && (steps.plan.outputs.mode == 'incremental' || steps.plan.outputs.mode == 'verification')
         shell: bash
         run: npm ci --legacy-peer-deps --ignore-scripts --no-audit --no-fund --omit=dev
 
       - name: Run Gemini bounded review
         id: gemini-run
-        if: steps.dedupe.outputs.duplicate != 'true' && (steps.plan.outputs.mode == 'discovery' || steps.plan.outputs.mode == 'incremental' || steps.plan.outputs.mode == 'verification' || steps.plan.outputs.mode == 'audit')
+        if: steps.dedupe.outputs.duplicate != 'true' && (steps.plan.outputs.mode == 'incremental' || steps.plan.outputs.mode == 'verification')
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -402,7 +401,7 @@ jobs:
           REVIEW_OUTPUT_PATH: .review-context/review.json
         run: node scripts/run-gemini-review.mjs
 
-      - name: Record provider-unavailable discovery or verification
+      - name: Record provider-unavailable delta review
         if: failure() && steps.gemini-run.outcome == 'failure'
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
@@ -416,7 +415,7 @@ jobs:
 
       - name: Validate Gemini material findings
         id: validate-material
-        if: steps.dedupe.outputs.duplicate != 'true' && (steps.plan.outputs.mode == 'discovery' || steps.plan.outputs.mode == 'incremental' || steps.plan.outputs.mode == 'audit')
+        if: steps.dedupe.outputs.duplicate != 'true' && steps.plan.outputs.mode == 'incremental'
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -450,7 +449,7 @@ jobs:
 
       - name: Publish Gemini review and durable session
         id: publish-gemini
-        if: steps.dedupe.outputs.duplicate != 'true' && (steps.plan.outputs.mode == 'discovery' || steps.plan.outputs.mode == 'incremental' || steps.plan.outputs.mode == 'verification' || steps.plan.outputs.mode == 'audit')
+        if: steps.dedupe.outputs.duplicate != 'true' && (steps.plan.outputs.mode == 'incremental' || steps.plan.outputs.mode == 'verification')
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           TARGET_REPO: ${{ inputs.target_repo }}
@@ -461,115 +460,6 @@ jobs:
           SOURCE_KIND: ${{ inputs.source_kind }}
           REVIEW_CONTEXT_DIR: .review-context
           REVIEW_PATH: .review-context/review-publish.json
-        run: node scripts/publish-gemini-review.mjs
-
-      - name: Prepare automatic final audit
-        id: auto-audit
-        if: steps.dedupe.outputs.duplicate != 'true' && ((steps.publish-gemini.outcome == 'success' && (steps.plan.outputs.mode == 'discovery' || steps.plan.outputs.mode == 'verification')) || steps.dismiss.outcome == 'success')
-        shell: bash
-        run: |
-          set -euo pipefail
-          state=.review-context/published-session.json
-          [[ -f "$state" ]] || { echo "Published session handoff is missing" >&2; exit 1; }
-          status="$(jq -r '.session.status' "$state")"
-          if [[ "$status" != "AUDIT_PENDING" ]]; then
-            echo "run=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          # A diff too big for one staged run is audited by the sharded engine on the next review command instead.
-          if ! node scripts/staged-fits.mjs .review-context; then
-            echo "Audit diff is too large for the staged audit; the next review command runs it in shards."
-            echo "run=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          # Preserve the authenticated initiating command. In particular,
-          # @gemini dismiss MUST NOT turn into a cap-exempt @gemini review.
-          requested_mode="$(jq -r '.requestedMode // empty' .review-context/session-plan.json)"
-          [[ "$requested_mode" == "auto" || "$requested_mode" == "claude" || "$requested_mode" == "reset" || "$requested_mode" == "dismiss" || "$requested_mode" == "threads" ]] || { echo "Invalid original review command" >&2; exit 1; }
-          jq --arg requested_mode "$requested_mode" '{
-            requestedMode: $requested_mode,
-            decision: {
-              mode: "audit",
-              previousHead: null,
-              reason: "run one final independent audit before READY"
-            },
-            session: .session,
-            sessionCommentId: .sessionCommentId,
-            pendingSession: null,
-            pendingSourceCommentId: null,
-            pendingReviewId: null
-          }' "$state" > .review-context/session-plan.audit.json
-          mv .review-context/session-plan.audit.json .review-context/session-plan.json
-          echo "run=true" >> "$GITHUB_OUTPUT"
-
-      - name: Run automatic Gemini final audit
-        id: final-gemini-run
-        if: steps.auto-audit.outputs.run == 'true'
-        env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          TARGET_REPO: ${{ inputs.target_repo }}
-          PR_NUMBER: ${{ inputs.pr_number }}
-          HEAD_SHA: ${{ inputs.head_sha }}
-          SOURCE_KIND: ${{ inputs.source_kind }}
-          REVIEW_CONTEXT_DIR: .review-context
-          REVIEW_OUTPUT_PATH: .review-context/final-audit.json
-        run: node scripts/run-gemini-review.mjs
-
-      - name: Record provider-unavailable final audit
-        if: failure() && steps.final-gemini-run.outcome == 'failure'
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          TARGET_REPO: ${{ inputs.target_repo }}
-          PR_NUMBER: ${{ inputs.pr_number }}
-          BASE_SHA: ${{ inputs.base_sha }}
-          HEAD_SHA: ${{ inputs.head_sha }}
-          SOURCE_COMMENT_ID: ${{ inputs.source_comment_id }}
-          REVIEW_CONTEXT_DIR: .review-context
-        run: node scripts/stop-unavailable-review.mjs
-
-      - name: Validate automatic final audit findings
-        id: validate-final-material
-        if: steps.auto-audit.outputs.run == 'true'
-        env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          TARGET_REPO: ${{ inputs.target_repo }}
-          PR_NUMBER: ${{ inputs.pr_number }}
-          HEAD_SHA: ${{ inputs.head_sha }}
-          SOURCE_KIND: ${{ inputs.source_kind }}
-          TARGET_REPO_DIR: target
-          REVIEW_CONTEXT_DIR: .review-context
-          REVIEW_INPUT_PATH: .review-context/final-audit.json
-          REVIEW_OUTPUT_PATH: .review-context/final-audit-publish.json
-        run: node scripts/validate-gemini-findings.mjs
-
-      - name: Record provider-unavailable final audit validation
-        if: failure() && steps.validate-final-material.outcome == 'failure'
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          TARGET_REPO: ${{ inputs.target_repo }}
-          PR_NUMBER: ${{ inputs.pr_number }}
-          BASE_SHA: ${{ inputs.base_sha }}
-          HEAD_SHA: ${{ inputs.head_sha }}
-          SOURCE_COMMENT_ID: ${{ inputs.source_comment_id }}
-          REVIEW_CONTEXT_DIR: .review-context
-        run: node scripts/stop-unavailable-review.mjs
-
-      - name: Publish automatic final audit
-        id: publish-final-audit
-        if: steps.auto-audit.outputs.run == 'true'
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          TARGET_REPO: ${{ inputs.target_repo }}
-          PR_NUMBER: ${{ inputs.pr_number }}
-          BASE_SHA: ${{ inputs.base_sha }}
-          HEAD_SHA: ${{ inputs.head_sha }}
-          SOURCE_COMMENT_ID: ${{ inputs.source_comment_id }}
-          SOURCE_KIND: ${{ inputs.source_kind }}
-          REVIEW_CONTEXT_DIR: .review-context
-          REVIEW_PATH: .review-context/final-audit-publish.json
         run: node scripts/publish-gemini-review.mjs
 
       - name: Run Claude explicit deep review
@@ -678,12 +568,10 @@ jobs:
           REQUESTED_MODE: ${{ inputs.requested_mode }}
           REVIEW_REASON: ${{ steps.plan.outputs.reason }}
           GEMINI_PUBLISH_OUTCOME: ${{ steps.publish-gemini.outcome }}
-          FINAL_AUDIT_PUBLISH_OUTCOME: ${{ steps.publish-final-audit.outcome }}
           CLAUDE_PUBLISH_OUTCOME: ${{ steps.publish-claude.outcome }}
           OVERRIDE_OUTCOME: ${{ steps.override.outcome }}
           DISMISS_OUTCOME: ${{ steps.dismiss.outcome }}
           THREADS_OUTCOME: ${{ steps.threads.outcome }}
-          AUTO_AUDIT_RUN: ${{ steps.auto-audit.outputs.run }}
         run: node scripts/review-status.mjs
 
       - name: Mirror review state to the required commit status

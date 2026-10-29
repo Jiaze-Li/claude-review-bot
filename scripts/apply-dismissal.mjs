@@ -1,3 +1,4 @@
+import { saveSessionComment } from './session-comment.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -61,15 +62,14 @@ export async function applyManualDismissal({ env = process.env, fetchImpl = fetc
   });
   await proveHead();
   const body = renderSessionComment(session, { sourceCommentIds: [sourceId] });
-  const updated = await github(root + '/issues/comments/' + plan.sessionCommentId, env.GH_TOKEN, fetchImpl, {
-    method: 'PATCH', body: JSON.stringify({ body }),
+  const savedId = await saveSessionComment({
+    target: repo, prNumber, token: env.GH_TOKEN, fetchImpl, existingId: plan.sessionCommentId, previous: durable, session, body,
   });
-  if (String(updated.id) !== String(plan.sessionCommentId)) throw new Error('Session comment ID changed during publication');
 
   // The ordinary auto-audit step consumes this same contract after either a
   // verification or an evidence-based dismissal reaches AUDIT_PENDING.
   fs.writeFileSync(path.join(contextRoot, 'published-session.json'), JSON.stringify({
-    mode: 'dismiss', session, sessionCommentId: String(plan.sessionCommentId),
+    mode: 'dismiss', session, sessionCommentId: savedId,
   }, null, 2) + '\n', { mode: 0o600 });
   console.log('Human-evidenced dismissal recorded: ' + decision.findingId + '; status ' + session.status + '.');
   return session;

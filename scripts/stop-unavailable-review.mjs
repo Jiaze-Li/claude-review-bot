@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { renderSessionComment, stopUnavailableReviewSession } from './review-session-core.mjs';
+import { saveSessionComment } from './session-comment.mjs';
 
 const SHA = /^[0-9a-f]{40}$/i;
 const REPO = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
@@ -44,7 +45,7 @@ export async function stopUnavailableReview({ env = process.env, fetchImpl = fet
   const pr = required(env, 'PR_NUMBER', NUMBER);
   const sourceCommentId = required(env, 'SOURCE_COMMENT_ID', NUMBER);
   const token = required(env, 'GH_TOKEN');
-  if (!['discovery', 'incremental', 'verification', 'audit'].includes(marker.mode)
+  if (!['incremental', 'verification'].includes(marker.mode)
       || marker.mode !== plan.decision?.mode || marker.headSha !== headSha) {
     throw new Error('Provider failure marker does not match the exact planned review');
   }
@@ -65,11 +66,9 @@ export async function stopUnavailableReview({ env = process.env, fetchImpl = fet
   });
   const body = renderSessionComment(session, { sourceCommentIds: [sourceCommentId] });
   const existingId = plan.sessionCommentId ? required({ id: String(plan.sessionCommentId) }, 'id', NUMBER) : null;
-  const pathSuffix = existingId ? '/issues/comments/' + existingId : '/issues/' + pr + '/comments';
-  const updated = await githubJson(endpoint + pathSuffix, token, fetchImpl, {
-    method: existingId ? 'PATCH' : 'POST',
-    body: JSON.stringify({ body }),
-  });
+  const updated = { id: await saveSessionComment({
+    target: repo, prNumber: pr, token, fetchImpl, existingId, previous, session, body,
+  }) };
   if (!NUMBER.test(String(updated.id))) throw new Error('Invalid durable session comment ID');
   // Keep the exact-HEAD status authoritative even if publication races a push.
   const after = await githubJson(endpoint + '/pulls/' + pr, token, fetchImpl);

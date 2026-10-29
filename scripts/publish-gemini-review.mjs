@@ -1,10 +1,9 @@
+import { saveSessionComment } from './session-comment.mjs';
 import { addPatch, chooseAnchor, findingMarker, snapNote } from './review-anchors.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {
-  applyAuditResult,
-  applyDiscoveryResult,
   applyIncrementalResult,
   applyVerificationResult,
   chargeClaudeFallback,
@@ -34,7 +33,7 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
   const plan = JSON.parse(fs.readFileSync(path.join(contextRoot, 'session-plan.json'), 'utf8'));
   const raw = JSON.parse(fs.readFileSync(required(env, 'REVIEW_PATH'), 'utf8'));
   const mode = plan.decision?.mode;
-  if (!['discovery', 'incremental', 'verification', 'audit'].includes(mode)) throw new Error('Gemini publisher requires a model-backed session mode');
+  if (!['incremental', 'verification'].includes(mode)) throw new Error('Gemini publisher requires an incremental or verification session');
 
   const pr = await githubJson('https://api.github.com/repos/' + owner + '/' + repo + '/pulls/' + prNumber, env.GH_TOKEN, fetchImpl);
   if (pr.base?.sha !== baseSha) throw new Error('PR base moved before publish; refusing stale review');
@@ -42,29 +41,10 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
 
   let normalized;
   let session;
-  if (mode === 'discovery') {
-    normalized = normalizeReviewResult(raw);
-    session = applyDiscoveryResult({ result: normalized, baseSha, headSha, sourceCommentId });
-    // The per-PR deep-review spend ledger must survive a fresh discovery on a new HEAD.
-    if (plan.session?.deepSpendUsd > 0) session = { ...session, deepSpendUsd: plan.session.deepSpendUsd };
-    // Keep both ledgers when a new HEAD requires fresh discovery.
-    if (Number.isFinite(plan.session?.fallbackSpendUsd))
-      session = { ...session, fallbackSpendUsd: plan.session.fallbackSpendUsd };
-    else if (plan.session?.deepSpendUsd > 0)
-      session = { ...session, fallbackSpendUsd: plan.session.deepSpendUsd };
-    // Existing PRs predate cost provenance; preserve both newly introduced
-    // fields across a fresh discovery without inventing historical details.
-    for (const field of ['claudeSdkSpendUsd', 'claudeUnknownReserveUsd']) {
-      if (Number.isFinite(plan.session?.[field])) session = { ...session, [field]: plan.session[field] };
-    }
-  } else if (mode === 'incremental') {
+  if (mode === 'incremental') {
     normalized = normalizeReviewResult(raw);
     if (!plan.session) throw new Error('Incremental review plan is missing the previously audited session');
     session = applyIncrementalResult({ session: plan.session, result: normalized, headSha });
-  } else if (mode === 'audit') {
-    normalized = normalizeReviewResult(raw);
-    if (!plan.session) throw new Error('Final audit plan is missing durable prior session');
-    session = applyAuditResult({ session: plan.session, result: normalized, headSha });
   } else {
     normalized = normalizeVerificationResult(raw);
     if (!plan.session) throw new Error('Verification plan is missing durable prior session');
@@ -80,9 +60,9 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
   // Only source-backed REJECTED candidates are settled. UNCERTAIN P0–P2
   // candidates are persisted with their own IDs and block READY until a
   // code-backed decision or an explicitly attested human risk acceptance.
-  if (mode === 'discovery' || mode === 'incremental' || mode === 'audit') {
+  if (mode === 'incremental') {
     session = recordDismissed(session, raw._validation?.validations, headSha);
-    session = recordUncertainFindings(session, raw._validation?.validations, headSha, mode, plan.session);
+    session = recordUncertainFindings(session, raw._validation?.validations, headSha);
   }
 
   // Charge every completed Claude call separately, preserving reported versus
@@ -95,9 +75,7 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
   const sessionBody = renderSessionComment(session, { sourceCommentIds: [sourceCommentId] });
   const pendingMarker = pendingSessionMarker(session, sourceCommentId);
   const anchors = await loadAnchors({ owner, repo, prNumber, token: env.GH_TOKEN, fetchImpl });
-  const newFindings = mode === 'discovery'
-    ? session.findings
-    : session.findings.slice(plan.session.findings.length);
+  const newFindings = session.findings.slice(plan.session.findings.length);
   const inline = [];
   const unanchored = [];
   for (const finding of newFindings) {
@@ -113,7 +91,7 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
   }
 
   const open = openMaterialFindings(session);
-  const reviewKind = mode === 'discovery' ? 'Discovery' : mode === 'incremental' ? 'Incremental' : mode === 'audit' ? 'Final Audit' : 'Verification';
+  const reviewKind = mode === 'incremental' ? 'Incremental' : 'Verification';
   let body = '## ' + (raw._meta?.provider === 'claude' ? 'Claude' : 'Gemini') + ' ' + reviewKind + ' Review\n\n' + normalized.summary.trim();
   if (mode === 'verification') {
     body += '\n\n### Finding verification';
@@ -121,7 +99,7 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
       body += '\n- **' + verdict.findingId + ' — ' + verdict.status + '**: ' + verdict.reason;
     }
   }
-  if (['discovery', 'incremental', 'audit'].includes(mode) && raw._validation) {
+  if (mode === 'incremental' && raw._validation) {
     const validations = Array.isArray(raw._validation.validations) ? raw._validation.validations : [];
     const count = (verdict) => validations.filter((entry) => entry.verdict === verdict).length;
     body += '\n\n### Material finding validation';
@@ -140,7 +118,7 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
   }
 
   // Show exactly what the ledger dropped so a human can spot a wrong match.
-  const suppressed = mode === 'discovery' ? [] : [
+  const suppressed = [
     ...(Array.isArray(raw._ledgerSuppressed) ? raw._ledgerSuppressed : []),
     ...droppedFindings(normalized.findings, newFindings),
   ];
@@ -175,7 +153,7 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
   } else if (session.status === 'HUMAN_REQUIRED') {
     body += '\n\nAutomatic review has stopped. Human judgment is required before merger.';
   }
-  body += formatRuntime(raw._meta, mode === 'audit' ? 'Final audit runtime' : mode === 'verification' ? 'Verification runtime' : 'Discovery runtime');
+  body += formatRuntime(raw._meta, mode === 'verification' ? 'Verification runtime' : 'Incremental runtime');
   body += formatRuntime(raw._validation?._meta, 'Validation runtime');
   // This is intentionally NOT the processed-source marker. If durable session
   // persistence fails after the review POST, a retry remains eligible and can
@@ -198,8 +176,8 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
     throw new Error('PR moved while publishing the review; stale review may exist, but durable session state was not advanced');
   }
 
-  const sessionCommentId = await upsertSessionComment({
-    owner, repo, prNumber, existingId: plan.sessionCommentId, body: sessionBody, token: env.GH_TOKEN, fetchImpl,
+  const sessionCommentId = await saveSessionComment({
+    target: owner + '/' + repo, prNumber, existingId: plan.sessionCommentId, previous: plan.session, session, body: sessionBody, token: env.GH_TOKEN, fetchImpl,
   });
   const publishedStatePath = path.join(contextRoot, 'published-session.json');
   fs.writeFileSync(publishedStatePath, JSON.stringify({
@@ -219,17 +197,6 @@ export function droppedFindings(reported, kept) {
   return reported
     .filter((finding) => !keptKeys.has(key(finding)))
     .map((finding) => ({ title: finding.title, path: finding.path }));
-}
-
-async function upsertSessionComment({ owner, repo, prNumber, existingId, body, token, fetchImpl }) {
-  const endpoint = existingId
-    ? 'https://api.github.com/repos/' + owner + '/' + repo + '/issues/comments/' + existingId
-    : 'https://api.github.com/repos/' + owner + '/' + repo + '/issues/' + prNumber + '/comments';
-  const result = await githubJson(endpoint, token, fetchImpl, {
-    method: existingId ? 'PATCH' : 'POST',
-    body: JSON.stringify({ body }),
-  });
-  return String(result.id);
 }
 
 async function loadAnchors({ owner, repo, prNumber, token, fetchImpl }) {

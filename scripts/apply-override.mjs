@@ -1,3 +1,4 @@
+import { saveSessionComment } from './session-comment.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -25,9 +26,8 @@ export async function applyManualOverride({ env = process.env, fetchImpl = fetch
 
   const session = applyOverride({ session: plan.session, headSha, by });
   const body = renderSessionComment(session, { sourceCommentIds: [sourceCommentId] });
-  await github(`https://api.github.com/repos/${target}/issues/comments/${plan.sessionCommentId}`, env.GH_TOKEN, fetchImpl, {
-    method: 'PATCH',
-    body: JSON.stringify({ body }),
+  await saveSessionComment({
+    target, prNumber, token: env.GH_TOKEN, fetchImpl, existingId: plan.sessionCommentId, previous: plan.session, session, body,
   });
   console.log(`Manual override applied by @${by}; waived ${session.override.waived.length} finding(s); status READY.`);
   return session;

@@ -1,3 +1,4 @@
+import { saveSessionComment } from './session-comment.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -11,6 +12,7 @@ import {
   completeDeepReview,
   failDeepReview,
   isDeepReviewStale,
+  isManualBudgetExemptReview,
   renderSessionComment,
 } from './review-session-core.mjs';
 
@@ -31,7 +33,9 @@ export async function runDeepReviewCommand(command, { env = process.env, fetchIm
     // bounded $5 call even when the cumulative automatic $6 cap is exhausted. The same mode is
     // also chosen automatically when a PR is too large for Gemini; that run obeys the cap.
     const explicitClaude = ctx.plan.requestedMode === 'claude';
-    const manual = explicitClaude || env.SOURCE_KIND === 'comment';
+    // Who asked decides the money rules (the same rule the staged pipeline uses): a person's review command is
+    // manual; a dismissal, override or automatic event is not.
+    const manual = explicitClaude || isManualBudgetExemptReview({ sourceKind: env.SOURCE_KIND, requestedMode: ctx.plan.requestedMode });
     let runBudget = manual
       ? DEEP_REVIEW_MANUAL_RUN_BUDGET_USD
       : Math.min(DEEP_REVIEW_MANUAL_RUN_BUDGET_USD, claudeFallbackCallBudget(ctx.plan.session, { manual: false }));
@@ -45,14 +49,14 @@ export async function runDeepReviewCommand(command, { env = process.env, fetchIm
     }
     const session = beginDeepReview({
       session: ctx.plan.session, baseSha: ctx.baseSha, headSha: ctx.headSha, runId: env.GITHUB_RUN_ID,
-      reserveUsd: runBudget, standalone: true, audit: ctx.plan.decision?.audit === true, now,
+      reserveUsd: runBudget, now,
     });
     // Required status goes pending/error FIRST, so a failed durable write below can never leave an old green.
     await postCommitStatus({
       env, fetchImpl, target: ctx.target, headSha: ctx.headSha,
       status: { state: 'pending', description: 'Claude deep review in progress' },
     });
-    const commentId = await upsertSession(ctx, session, [], fetchImpl, false);
+    const commentId = await upsertSession(ctx, session, [], fetchImpl, ctx.plan.sessionCommentId, ctx.plan.session);
     fs.writeFileSync(stateFile, JSON.stringify({ session, sessionCommentId: commentId }) + '\n', { mode: 0o600 });
     output(env, 'began', 'true');
     output(env, 'run', 'true');
@@ -70,8 +74,8 @@ export async function runDeepReviewCommand(command, { env = process.env, fetchIm
     const session = completeDeepReview({
       session: state.session, result, headSha: ctx.headSha, spentUsd: usage.cost, costSource: usage.source, now,
     });
-    await upsertSession(ctx, session, [ctx.sourceCommentId], fetchImpl, false, state.sessionCommentId);
-    fs.writeFileSync(stateFile, JSON.stringify({ session, sessionCommentId: state.sessionCommentId }) + '\n', { mode: 0o600 });
+    const savedId = await upsertSession(ctx, session, [ctx.sourceCommentId], fetchImpl, state.sessionCommentId, state.session);
+    fs.writeFileSync(stateFile, JSON.stringify({ session, sessionCommentId: savedId }) + '\n', { mode: 0o600 });
     console.log(`Deep review merged into session; status ${session.status}.`);
     return session;
   }
@@ -104,7 +108,7 @@ export async function runDeepReviewCommand(command, { env = process.env, fetchIm
     const failed = failDeepReview({
       session, headSha: ctx.headSha, reason: env.DEEP_REVIEW_FAILURE_REASON || 'deep review did not complete', spentUsd: usage.cost, costSource: usage.source, now,
     });
-    await upsertSession(ctx, failed, [ctx.sourceCommentId], fetchImpl, true, commentId);
+    await upsertSession(ctx, failed, [ctx.sourceCommentId], fetchImpl, commentId, session);
     console.log(`Deep review failed closed: ${failed.deepReview.reason}`);
     return failed;
   }
@@ -156,13 +160,11 @@ async function assertHeadUnmoved(ctx, fetchImpl) {
   if (!(await headUnmoved(ctx, fetchImpl))) throw new Error('PR moved; refusing to change durable review state for a stale HEAD');
 }
 
-async function upsertSession(ctx, session, sourceCommentIds, fetchImpl, _terminal, existingId = ctx.plan.sessionCommentId) {
-  const body = renderSessionComment(session, { sourceCommentIds });
-  const endpoint = existingId
-    ? `https://api.github.com/repos/${ctx.target}/issues/comments/${existingId}`
-    : `https://api.github.com/repos/${ctx.target}/issues/${ctx.prNumber}/comments`;
-  const result = await github(endpoint, ctx.token, fetchImpl, { method: existingId ? 'PATCH' : 'POST', body: JSON.stringify({ body }) });
-  return String(result.id);
+function upsertSession(ctx, session, sourceCommentIds, fetchImpl, existingId, previous) {
+  return saveSessionComment({
+    target: ctx.target, prNumber: ctx.prNumber, token: ctx.token, fetchImpl, existingId, previous, session,
+    body: renderSessionComment(session, { sourceCommentIds }),
+  });
 }
 
 async function github(url, token, fetchImpl, init = {}) {
