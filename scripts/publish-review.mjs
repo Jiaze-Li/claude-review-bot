@@ -1,7 +1,8 @@
 import fs from 'node:fs';
-import { addPatch, chooseAnchor, findingMarker, snapNote } from './review-anchors.mjs';
+import { REVIEW_BODY_MAX_BYTES, anchorFindings, assertPrUnmoved, escapeHtml, githubJson, loadAnchors, pullUrl } from './github-review-api.mjs';
 
-const REVIEW_BODY_MAX_BYTES = 60_000;
+// The review POST can carry many inline comments, so it gets a longer timeout than the other API calls.
+const REVIEW_POST_TIMEOUT_MS = 60_000;
 const required = ['GH_TOKEN', 'TARGET_REPO', 'PR_NUMBER', 'BASE_SHA', 'HEAD_SHA', 'SOURCE_COMMENT_ID', 'REVIEW_PATH'];
 for (const key of required) {
   if (!process.env[key]) throw new Error(`Missing required environment variable: ${key}`);
@@ -27,33 +28,14 @@ try {
 validateReview(review);
 const runtimeSection = formatRuntimeSection(review._meta);
 
-const pr = await githubJson(`https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}`);
-if (pr.base?.sha !== process.env.BASE_SHA) {
-  throw new Error(`PR base moved from ${process.env.BASE_SHA} to ${pr.base?.sha ?? 'unknown'} before publish; refusing stale review`);
-}
-if (pr.head?.sha !== process.env.HEAD_SHA) {
-  throw new Error(`PR head moved from ${process.env.HEAD_SHA} to ${pr.head?.sha ?? 'unknown'} before publish; refusing stale review`);
-}
+const token = process.env.GH_TOKEN;
+const baseSha = process.env.BASE_SHA;
+const headSha = process.env.HEAD_SHA;
+await assertPrUnmoved({ owner, repo, prNumber, baseSha, headSha, token, fetchImpl: fetch });
 
-const anchors = await loadAnchorsFromGitHub();
-const inlineComments = [];
-const unanchored = [];
-
-for (const finding of review.findings) {
-  const anchor = chooseAnchor(anchors, finding);
-  const text = `**[${finding.severity}] ${finding.title}**\n\n${finding.body}`;
-
-  if (anchor) {
-    inlineComments.push({
-      path: finding.path,
-      line: anchor.line,
-      side: 'RIGHT',
-      body: `${text}${snapNote(anchor)}\n\n${findingMarker(finding.path, finding.title)}`,
-    });
-  } else {
-    unanchored.push(finding);
-  }
-}
+const anchors = await loadAnchors({ owner, repo, prNumber, token, fetchImpl: fetch });
+const { inline: inlineComments, unanchored } = anchorFindings(anchors, review.findings,
+  (finding) => `**[${finding.severity}] ${finding.title}**\n\n${finding.body}`);
 
 const providerCounts = review._meta?.providers && typeof review._meta.providers === 'object' ? review._meta.providers : {};
 const heading = providerCounts.gemini > 0 ? (providerCounts.claude > 0 ? 'Gemini + Claude Code Review' : 'Gemini Code Review') : 'Claude Code Review';
@@ -93,15 +75,16 @@ if (Buffer.byteLength(body, 'utf8') > REVIEW_BODY_MAX_BYTES) {
 }
 
 const payload = {
-  commit_id: process.env.HEAD_SHA,
+  commit_id: headSha,
   event: 'COMMENT',
   body,
   comments: inlineComments,
 };
 
-const result = await githubJson(`https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}/reviews`, {
+const result = await githubJson(`${pullUrl({ owner, repo, prNumber })}/reviews`, token, fetch, {
   method: 'POST',
   body: JSON.stringify(payload),
+  timeoutMs: REVIEW_POST_TIMEOUT_MS,
 });
 
 console.log(`Published explicit Claude review ${result.html_url ?? result.id} with ${inlineComments.length} inline comment(s).`);
@@ -202,53 +185,6 @@ function formatInteger(value) {
   return Math.trunc(value).toLocaleString('en-US');
 }
 
-async function loadAnchorsFromGitHub() {
-  const anchors = new Map();
-  let page = 1;
-
-  while (page <= 100) {
-    const files = await githubJson(`https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}/files?per_page=100&page=${page}`);
-    if (!Array.isArray(files)) throw new Error('GitHub pull files response was not an array');
-
-    for (const file of files) addPatch(anchors, file.filename, file.patch);
-
-    if (files.length < 100) return anchors;
-    page += 1;
-  }
-
-  throw new Error('Pull request file pagination exceeded safety limit');
-}
-
-async function githubJson(url, init = {}) {
-  const response = await fetch(url, {
-    ...init,
-    headers: {
-      Accept: 'application/vnd.github+json',
-      Authorization: `Bearer ${process.env.GH_TOKEN}`,
-      'Content-Type': 'application/json',
-      'X-GitHub-Api-Version': '2022-11-28',
-      'User-Agent': 'claude-review-bot',
-      ...(init.headers ?? {}),
-    },
-  });
-
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`GitHub API request failed (${response.status}) ${url}: ${text}`);
-  }
-
-  return response.json();
-}
-
 function sourceCommentMarker(commentId) {
   return `<!-- jiaze-review-source-comment:${String(commentId)} -->`;
-}
-
-function escapeHtml(text) {
-  return String(text)
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;')
-    .replaceAll("'", '&#39;');
 }
