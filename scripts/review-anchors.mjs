@@ -54,10 +54,17 @@ export function snapNote(anchor) {
   return anchor.snapped ? `\n\n_Pinned to the nearest changed line: ${anchor.reason}._` : '';
 }
 
-// A stable key for "this finding in this file", so a thread can be matched to a session finding later
-// even though the session stores a compacted title and the comment carries the full one.
+// The session keeps each finding's title cut to this many characters (compactText in review-session-core).
+const SESSION_TITLE_CHARS = 140;
+
+// A stable key for "this finding in this file", so a thread can be matched to a session finding later even
+// though the session stores a compacted title and the comment carries the full one. The title is cut exactly
+// the way the session cuts it and only then normalized, so both sides see the same text; it is deliberately not
+// shortened further, or two different findings in one file with a shared title opening would share a key and
+// closing one would resolve the other's thread.
 export function findingKey(path, title) {
-  const normalized = String(title ?? '').replace(/\s+/g, ' ').trim().toLowerCase().slice(0, 60);
+  const compact = String(title ?? '').replace(/[\r\n]+/g, ' ').trim().slice(0, SESSION_TITLE_CHARS);
+  const normalized = compact.replace(/\s+/g, ' ').trim().toLowerCase();
   return createHash('sha1').update(`${path}\0${normalized}`).digest('hex').slice(0, 10);
 }
 
