@@ -40,7 +40,7 @@ export async function* query({ prompt, options }) {
 function setup(fileSizes, session = null, ignore = null) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'run-review-'));
   fs.mkdirSync(path.join(root, 'scripts'));
-  for (const name of ['run-review.mjs', 'review-shards.mjs', 'review-session-core.mjs', 'gemini-shard.mjs', 'run-gemini-review.mjs', 'claude-fallback.mjs']) fs.copyFileSync(new URL(`../scripts/${name}`, import.meta.url), path.join(root, 'scripts', name));
+  for (const name of ['run-review.mjs', 'review-shards.mjs', 'review-session-core.mjs', 'gemini-shard.mjs', 'gemini-config.mjs', 'run-gemini-review.mjs', 'claude-fallback.mjs']) fs.copyFileSync(new URL(`../scripts/${name}`, import.meta.url), path.join(root, 'scripts', name));
   const sdk = path.join(root, 'node_modules/@anthropic-ai/claude-agent-sdk');
   fs.mkdirSync(sdk, { recursive: true });
   fs.writeFileSync(path.join(sdk, 'package.json'), JSON.stringify({ name: '@anthropic-ai/claude-agent-sdk', type: 'module', main: 'index.js', exports: './index.js' }));

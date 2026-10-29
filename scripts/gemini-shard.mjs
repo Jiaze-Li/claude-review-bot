@@ -3,21 +3,14 @@
 // Gemini has no tools here, so the shard's diff is sent inline.
 
 import { isGeminiUnavailableStatus } from './claude-fallback.mjs';
+import { geminiBaseUrl } from './gemini-config.mjs';
 import { GEMINI_MODEL, toGeminiJsonSchema } from './run-gemini-review.mjs';
 
 export const GEMINI_SHARD_THINKING = 'medium';
 export const GEMINI_SHARD_TIMEOUT_MS = 480_000;
 // A single huge file can make a shard far bigger than the usual ~100 KB; leave those to Claude.
 export const GEMINI_SHARD_MAX_BYTES = 600_000;
-const GEMINI_HOST = 'https://generativelanguage.googleapis.com';
-
-// The base URL may be overridden only for a local test server, never to send the key elsewhere.
-export function geminiBaseUrl(env = process.env) {
-  const value = env.GEMINI_API_BASE_URL;
-  if (!value) return GEMINI_HOST;
-  if (value === GEMINI_HOST || /^http:\/\/127\.0\.0\.1:\d+$/.test(value)) return value;
-  throw new Error('GEMINI_API_BASE_URL must be the Gemini API host or a local test server');
-}
+export { geminiBaseUrl };
 
 // kind: 'ok' | 'unavailable' (402/429/5xx: stop using Gemini) | 'config' (400/401/403/404: the key or
 // model is wrong, stop using Gemini) | 'failed' (timeout, network, malformed output: this shard only).
