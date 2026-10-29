@@ -1,5 +1,5 @@
 import { saveSessionComment } from './session-comment.mjs';
-import { addPatch, chooseAnchor, findingMarker, snapNote } from './review-anchors.mjs';
+import { REVIEW_BODY_MAX_BYTES, anchorFindings, assertPrUnmoved, escapeHtml, githubJson, loadAnchors, pullUrl, requiredEnv as required } from './github-review-api.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -17,8 +17,6 @@ import {
   unresolvedMaterialFindings,
 } from './review-session-core.mjs';
 
-const REVIEW_BODY_MAX_BYTES = 60000;
-
 export async function publishGeminiReview({ env = process.env, fetchImpl = fetch } = {}) {
   const target = required(env, 'TARGET_REPO');
   const parts = target.split('/');
@@ -35,9 +33,7 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
   const mode = plan.decision?.mode;
   if (!['incremental', 'verification'].includes(mode)) throw new Error('Gemini publisher requires an incremental or verification session');
 
-  const pr = await githubJson('https://api.github.com/repos/' + owner + '/' + repo + '/pulls/' + prNumber, env.GH_TOKEN, fetchImpl);
-  if (pr.base?.sha !== baseSha) throw new Error('PR base moved before publish; refusing stale review');
-  if (pr.head?.sha !== headSha) throw new Error('PR head moved before publish; refusing stale review');
+  await assertPrUnmoved({ owner, repo, prNumber, baseSha, headSha, token: env.GH_TOKEN, fetchImpl });
 
   let normalized;
   let session;
@@ -76,19 +72,9 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
   const pendingMarker = pendingSessionMarker(session, sourceCommentId);
   const anchors = await loadAnchors({ owner, repo, prNumber, token: env.GH_TOKEN, fetchImpl });
   const newFindings = session.findings.slice(plan.session.findings.length);
-  const inline = [];
-  const unanchored = [];
-  for (const finding of newFindings) {
-    const text = '**[' + finding.id + ' · ' + finding.severity + '] ' + finding.title + '**\n\n'
-      + finding.body + '\n\nRisk class: ' + finding.riskClass;
-    const anchor = chooseAnchor(anchors, finding);
-    if (anchor) {
-      inline.push({ path: finding.path, line: anchor.line, side: 'RIGHT',
-        body: text + snapNote(anchor) + '\n\n' + findingMarker(finding.path, finding.title) });
-    } else {
-      unanchored.push(finding);
-    }
-  }
+  const { inline, unanchored } = anchorFindings(anchors, newFindings, (finding) =>
+    '**[' + finding.id + ' · ' + finding.severity + '] ' + finding.title + '**\n\n'
+      + finding.body + '\n\nRisk class: ' + finding.riskClass);
 
   const open = openMaterialFindings(session);
   const reviewKind = mode === 'incremental' ? 'Incremental' : 'Verification';
@@ -161,7 +147,7 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
   body += '\n\n' + pendingMarker;
   if (Buffer.byteLength(body, 'utf8') > REVIEW_BODY_MAX_BYTES) throw new Error('Constructed review body exceeds safe size limit');
 
-  const review = await githubJson('https://api.github.com/repos/' + owner + '/' + repo + '/pulls/' + prNumber + '/reviews',
+  const review = await githubJson(pullUrl({ owner, repo, prNumber }) + '/reviews',
     env.GH_TOKEN, fetchImpl, {
       method: 'POST',
       body: JSON.stringify({ commit_id: headSha, event: 'COMMENT', body, comments: inline }),
@@ -170,10 +156,10 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
   // A review can be attached to an older commit even if the PR moves immediately
   // after the first preflight. Never advance durable session state until the
   // exact target HEAD is re-proven after review publication.
-  const afterReview = await githubJson('https://api.github.com/repos/' + owner + '/' + repo + '/pulls/' + prNumber,
-    env.GH_TOKEN, fetchImpl);
-  if (afterReview.base?.sha !== baseSha || afterReview.head?.sha !== headSha) {
-    throw new Error('PR moved while publishing the review; stale review may exist, but durable session state was not advanced');
+  try {
+    await assertPrUnmoved({ owner, repo, prNumber, baseSha, headSha, token: env.GH_TOKEN, fetchImpl, when: 'while publishing the review' });
+  } catch (error) {
+    throw new Error(error.message + '; stale review may exist, but durable session state was not advanced');
   }
 
   const sessionCommentId = await saveSessionComment({
@@ -199,39 +185,6 @@ export function droppedFindings(reported, kept) {
     .map((finding) => ({ title: finding.title, path: finding.path }));
 }
 
-async function loadAnchors({ owner, repo, prNumber, token, fetchImpl }) {
-  const anchors = new Map();
-  for (let page = 1; page <= 100; page += 1) {
-    const url = 'https://api.github.com/repos/' + owner + '/' + repo + '/pulls/' + prNumber + '/files?per_page=100&page=' + page;
-    const files = await githubJson(url, token, fetchImpl);
-    if (!Array.isArray(files)) throw new Error('GitHub pull files response was not an array');
-    for (const file of files) addPatch(anchors, file.filename, file.patch);
-    if (files.length < 100) return anchors;
-  }
-  throw new Error('Pull request file pagination exceeded safety limit');
-}
-
-async function githubJson(url, token, fetchImpl, init = {}) {
-  if (!token) throw new Error('Missing GH_TOKEN');
-  const response = await fetchImpl(url, {
-    ...init,
-    headers: {
-      Accept: 'application/vnd.github+json',
-      Authorization: 'Bearer ' + token,
-      'Content-Type': 'application/json',
-      'X-GitHub-Api-Version': '2022-11-28',
-      'User-Agent': 'jiaze-review-bot',
-      ...(init.headers || {}),
-    },
-    signal: AbortSignal.timeout(15000),
-  });
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error('GitHub API failed (HTTP ' + response.status + '): ' + text.slice(0, 500));
-  }
-  return response.json();
-}
-
 function formatRuntime(meta, label = 'Review runtime') {
   if (!meta || typeof meta !== 'object') return '';
   const usage = meta.usage || {};
@@ -245,21 +198,6 @@ function formatRuntime(meta, label = 'Review runtime') {
   if (meta.fallback_from) parts.push('fallback from ' + escapeHtml(meta.fallback_from) + ' (' + escapeHtml(meta.fallback_reason || 'unavailable') + ')');
   if (meta.risk_profile?.stateIntegrity === true) parts.push('risk state-integrity');
   return '\n\n' + (label === 'Discovery runtime' ? '---\n' : '') + '<sub>' + label + ': ' + parts.join(' · ') + '</sub>';
-}
-
-function required(env, key) {
-  const value = env[key];
-  if (!value) throw new Error('Missing required environment variable: ' + key);
-  return String(value);
-}
-
-function escapeHtml(value) {
-  return String(value)
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;')
-    .replaceAll("'", '&#39;');
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
