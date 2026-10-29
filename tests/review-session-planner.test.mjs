@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { planSession } from '../scripts/plan-review-session.mjs';
+import { findingMarker } from '../scripts/review-anchors.mjs';
 import { applyDiscoveryResult, pendingSessionMarker, renderSessionComment } from '../scripts/review-session-core.mjs';
 
 const BASE='b'.repeat(40), A='a'.repeat(40), C='c'.repeat(40);
@@ -68,28 +69,43 @@ test('explicit reset starts a fresh discovery while preserving session comment l
   assert.match(plan.decision.reason,/^explicit reset: /);
 });
 
-test('explicit Claude mode joins the durable session for this HEAD',async()=>{
-  const session=applyDiscoveryResult({result:{summary:'clean',findings:[]},baseSha:BASE,headSha:A,sourceCommentId:'1'});
-  const plan=await planSession({
-    env:env({REQUESTED_MODE:'claude'}),
-    fetchImpl:fetchState({comments:[comment(7,renderSessionComment(session))]}),
+test('@claude review plans exactly like @gemini review for the same session; only the model differs',async()=>{
+  const sessions={
+    awaitingAudit:applyDiscoveryResult({result:{summary:'clean',findings:[]},baseSha:BASE,headSha:A,sourceCommentId:'1'}),
+  };
+  const plan=async(mode,session,sourceKind='comment')=>planSession({
+    env:env({REQUESTED_MODE:mode,SOURCE_KIND:sourceKind}),
+    fetchImpl:fetchState({comments:session?[comment(7,renderSessionComment(session))]:[]}),
   });
-  assert.equal(plan.decision.mode,'claude');
-  assert.equal(plan.sessionCommentId,'7');
-  assert.equal(plan.session.lastReviewedHead,A);
+  // same HEAD, discovery done, audit pending
+  const claude=await plan('claude',sessions.awaitingAudit);
+  const gemini=await plan('auto',sessions.awaitingAudit);
+  assert.equal(claude.decision.mode,'audit');
+  assert.equal(claude.decision.mode,gemini.decision.mode);
+  assert.equal(claude.requestedMode,'claude');
+  assert.equal(gemini.requestedMode,'auto');
+  assert.equal(claude.sessionCommentId,'7');
+  // an open finding repaired on a new HEAD: verification, whichever model is asked
+  const rework=applyDiscoveryResult({result:{summary:'bug',findings:[{severity:'P1',title:'Bug',body:'Trigger X causes Y; expected Z.',path:'a.js',line:1,riskClass:'state'}]},baseSha:BASE,headSha:C,sourceCommentId:'1'});
+  assert.equal((await plan('claude',rework)).decision.mode,'verification');
+  assert.equal((await plan('auto',rework)).decision.mode,'verification');
+  // no session: the first review, in shards, by Claude only
+  const none=await plan('claude',null);
+  assert.equal(none.decision.mode,'claude');
+  assert.match(none.decision.reason,/Claude only/);
+  assert.match((await plan('auto',null)).decision.reason,/Gemini first, Claude continues/);
 });
 
-test('explicit Claude mode runs standalone when no session exists for this HEAD',async()=>{
-  const none=await planSession({env:env({REQUESTED_MODE:'claude'}),fetchImpl:fetchState()});
-  assert.equal(none.decision.mode,'claude');
-  assert.match(none.decision.reason,/standalone/);
-  const old=applyDiscoveryResult({result:{summary:'clean',findings:[]},baseSha:BASE,headSha:C,sourceCommentId:'1'});
-  const other=await planSession({
-    env:env({REQUESTED_MODE:'claude'}),
-    fetchImpl:fetchState({comments:[comment(7,renderSessionComment(old))]}),
-  });
-  assert.equal(other.decision.mode,'claude');
-  assert.equal(other.sessionCommentId,'7');
+test('@claude review waits for a deep review already running on this HEAD, and a PARTIAL review continues',async()=>{
+  const running={...applyDiscoveryResult({result:{summary:'clean',findings:[]},baseSha:BASE,headSha:A,sourceCommentId:'1'}),status:'REVIEW_IN_PROGRESS',
+    deepReview:{head:A,startedAt:new Date().toISOString(),state:'IN_PROGRESS',resumeStatus:'AUDIT_PENDING'}};
+  const waiting=await planSession({env:env({REQUESTED_MODE:'claude',SOURCE_KIND:'comment'}),fetchImpl:fetchState({comments:[comment(7,renderSessionComment(running))]})});
+  assert.equal(waiting.decision.mode,'noop_waiting');
+  const partial={...applyDiscoveryResult({result:{summary:'clean',findings:[]},baseSha:BASE,headSha:A,sourceCommentId:'1'}),status:'PARTIAL',
+    coverage:{complete:false,head:A,reviewedKeys:[],unreviewedPaths:['x'],unreviewedCount:1}};
+  const resumed=await planSession({env:env({REQUESTED_MODE:'claude',SOURCE_KIND:'comment'}),fetchImpl:fetchState({comments:[comment(7,renderSessionComment(partial))]})});
+  assert.equal(resumed.decision.mode,'claude');
+  assert.match(resumed.decision.reason,/partial review/);
 });
 
 test('planner recovers a trusted pending current-HEAD review instead of rerunning Gemini',async()=>{
@@ -161,4 +177,62 @@ test('every fresh full review goes through the sharded engine, whatever its size
     assert.equal(plan.decision.mode,'claude',`${bytes} bytes`);
     assert.match(plan.decision.reason,/in shards: Gemini first, Claude continues/);
   }
+});
+
+test('a resolved or reopened review thread is reconciled with the session without any model call',async()=>{
+  const rework=applyDiscoveryResult({result:{summary:'bug',findings:[{severity:'P1',title:'Bug',body:'Trigger X causes Y; expected Z.',path:'a.js',line:1,riskClass:'state'}]},baseSha:BASE,headSha:A,sourceCommentId:'1'});
+  const plan=(session)=>planSession({env:env({REQUESTED_MODE:'threads',SOURCE_KIND:'pull_request'}),fetchImpl:fetchState({comments:session?[comment(7,renderSessionComment(session))]:[]})});
+  const withSession=await plan(rework);
+  assert.equal(withSession.decision.mode,'threads');
+  assert.equal(withSession.sessionCommentId,'7');
+  assert.equal((await plan(null)).decision.mode,'noop_waiting');
+  const running={...rework,status:'REVIEW_IN_PROGRESS',deepReview:{head:A,startedAt:new Date().toISOString(),state:'IN_PROGRESS',resumeStatus:'REWORK'}};
+  const waiting=await plan(running);
+  assert.equal(waiting.decision.mode,'noop_waiting');
+  assert.match(waiting.decision.reason,/a review is running/);
+});
+
+test('a thread decision does not bypass recovery of a review that was published but not yet written to the session',async()=>{
+  const stale=applyDiscoveryResult({result:{summary:'clean',findings:[]},baseSha:BASE,headSha:A,sourceCommentId:'1'});
+  const newer=applyDiscoveryResult({result:{summary:'bug',findings:[{severity:'P1',title:'Bug',body:'Trigger X causes Y; expected Z.',path:'a.js',line:1,riskClass:'state'}]},baseSha:BASE,headSha:A,sourceCommentId:'11'});
+  newer.updatedAt=new Date(Date.now()+60_000).toISOString();
+  const plan=await planSession({
+    env:env({REQUESTED_MODE:'threads',SOURCE_KIND:'pull_request'}),
+    fetchImpl:fetchState({comments:[comment(7,renderSessionComment(stale))],reviews:[{id:101,user:{login:author},body:'review body\n'+pendingSessionMarker(newer,'11')}]}),
+  });
+  assert.equal(plan.decision.mode,'recover');
+  assert.match(plan.decision.reason,/review-thread decision was NOT applied yet/);
+  assert.equal(plan.pendingSession.findings.length,1);
+});
+
+function threadFetch({session,findings,resolvedBy='jiaze-li',permission='write'}){
+  return async(url,init={})=>{
+    if(/issues\/7\/comments/.test(url)) return Response.json([comment(7,renderSessionComment(session))]);
+    if(/pulls\/7\/reviews/.test(url)) return Response.json([]);
+    if(url.endsWith('/graphql')) return Response.json({data:{repository:{pullRequest:{reviewThreads:{pageInfo:{hasNextPage:false},nodes:findings.map((f,i)=>({
+      id:'T'+i,isResolved:resolvedBy!==null,resolvedBy:resolvedBy?{login:resolvedBy}:null,
+      comments:{nodes:[{databaseId:i+1,author:{login:author.replace('[bot]','')},body:'x\n\n'+findingMarker(f.path,f.title)}]},
+    }))}}}}});
+    if(url.includes('/collaborators/')) return Response.json({permission});
+    assert.fail('unexpected URL '+url);
+  };
+}
+const bug={severity:'P1',title:'Bug',body:'Trigger X causes Y; expected Z.',path:'a.js',line:1,riskClass:'state'};
+
+test('resolving every blocking thread after new commits runs the normal verification review; only its result decides READY',async()=>{
+  const session=applyDiscoveryResult({result:{summary:'bug',findings:[bug]},baseSha:BASE,headSha:A,sourceCommentId:'1'});
+  const plan=await planSession({env:env({REQUESTED_MODE:'threads',SOURCE_KIND:'pull_request',HEAD_SHA:C}),
+    fetchImpl:threadFetch({session,findings:session.findings})});
+  assert.equal(plan.decision.mode,'verification');
+  assert.equal(plan.decision.previousHead,A);
+  assert.match(plan.decision.reason,/resolved by a person/);
+});
+
+test('resolved threads do not start a review when nothing is pushed, a resolver is not a writer, or a thread is still open',async()=>{
+  const session=applyDiscoveryResult({result:{summary:'bug',findings:[bug]},baseSha:BASE,headSha:A,sourceCommentId:'1'});
+  const run=(extra,opts)=>planSession({env:env({REQUESTED_MODE:'threads',SOURCE_KIND:'pull_request',...extra}),fetchImpl:threadFetch({session,findings:session.findings,...opts})});
+  assert.equal((await run({HEAD_SHA:A},{})).decision.mode,'threads');
+  assert.equal((await run({HEAD_SHA:C},{permission:'read'})).decision.mode,'threads');
+  assert.equal((await run({HEAD_SHA:C},{resolvedBy:null})).decision.mode,'threads');
+  assert.equal((await run({HEAD_SHA:C},{resolvedBy:author.replace('[bot]','')})).decision.mode,'threads');
 });

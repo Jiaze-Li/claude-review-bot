@@ -304,6 +304,7 @@ jobs:
           PREFLIGHT_OUTCOME: success
           STATUS_STAGE: started
           REVIEW_MODE: ${{ steps.plan.outputs.mode }}
+          REQUESTED_MODE: ${{ inputs.requested_mode }}
           REVIEW_REASON: ${{ steps.plan.outputs.reason }}
         run: node scripts/review-status.mjs
 
@@ -365,6 +366,20 @@ jobs:
           EXPECTED_REVIEW_AUTHOR: ${{ steps.app-token.outputs.app-slug }}[bot]
           REVIEW_CONTEXT_DIR: .review-context
         run: node scripts/apply-dismissal.mjs
+
+      - name: Apply review-thread decisions
+        id: threads
+        if: steps.dedupe.outputs.duplicate != 'true' && steps.plan.outputs.mode == 'threads'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          BASE_SHA: ${{ inputs.base_sha }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          SOURCE_COMMENT_ID: ${{ inputs.source_comment_id }}
+          EXPECTED_REVIEW_AUTHOR: ${{ steps.app-token.outputs.app-slug }}[bot]
+          REVIEW_CONTEXT_DIR: .review-context
+        run: node scripts/apply-thread-resolutions.mjs
 
       - name: Install Claude fallback dependencies
         continue-on-error: true # only needed if Gemini is out of credits; must never block a healthy Gemini review
@@ -463,7 +478,7 @@ jobs:
           # Preserve the authenticated initiating command. In particular,
           # @gemini dismiss MUST NOT turn into a cap-exempt @gemini review.
           requested_mode="$(jq -r '.requestedMode // empty' .review-context/session-plan.json)"
-          [[ "$requested_mode" == "auto" || "$requested_mode" == "reset" || "$requested_mode" == "dismiss" ]] || { echo "Invalid original review command" >&2; exit 1; }
+          [[ "$requested_mode" == "auto" || "$requested_mode" == "claude" || "$requested_mode" == "reset" || "$requested_mode" == "dismiss" || "$requested_mode" == "threads" ]] || { echo "Invalid original review command" >&2; exit 1; }
           jq --arg requested_mode "$requested_mode" '{
             requestedMode: $requested_mode,
             decision: {
@@ -616,6 +631,7 @@ jobs:
           TARGET_REPO: ${{ inputs.target_repo }}
           PR_NUMBER: ${{ inputs.pr_number }}
           EXPECTED_REVIEW_AUTHOR: ${{ steps.app-token.outputs.app-slug }}[bot]
+          REVIEW_MODE: ${{ steps.plan.outputs.mode }}
         run: node scripts/sync-review-threads.mjs
 
       - name: Finalize workflow status
@@ -631,12 +647,14 @@ jobs:
           STATUS_STAGE: finished
           STATUS_COMMENT_ID: ${{ steps.review-status.outputs.comment_id }}
           REVIEW_MODE: ${{ steps.plan.outputs.mode }}
+          REQUESTED_MODE: ${{ inputs.requested_mode }}
           REVIEW_REASON: ${{ steps.plan.outputs.reason }}
           GEMINI_PUBLISH_OUTCOME: ${{ steps.publish-gemini.outcome }}
           FINAL_AUDIT_PUBLISH_OUTCOME: ${{ steps.publish-final-audit.outcome }}
           CLAUDE_PUBLISH_OUTCOME: ${{ steps.publish-claude.outcome }}
           OVERRIDE_OUTCOME: ${{ steps.override.outcome }}
           DISMISS_OUTCOME: ${{ steps.dismiss.outcome }}
+          THREADS_OUTCOME: ${{ steps.threads.outcome }}
           AUTO_AUDIT_RUN: ${{ steps.auto-audit.outputs.run }}
         run: node scripts/review-status.mjs
 

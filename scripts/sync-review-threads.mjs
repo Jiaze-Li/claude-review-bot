@@ -1,23 +1,18 @@
 import { pathToFileURL } from 'node:url';
-import { findingKey, markerKey } from './review-anchors.mjs';
+import { fetchReviewThreads, replyToThread, resolveThread, threadsByFinding, unresolveThread } from './review-threads.mjs';
 import { latestSession } from './sync-commit-status.mjs';
 
-// Keeps the PR's review threads in step with the durable session: when a finding is FIXED, DISMISSED or
-// WAIVED (an override), the inline thread the bot opened for it is resolved, so "unresolved threads" on
-// the PR means "problems still open". Only threads the bot itself started, carrying its finding marker,
-// are touched, and only in that one direction (a human's own resolve or unresolve is never undone).
-// Best effort: a failure here must never fail a review.
+// Keeps the PR's review threads in step with the durable session at the end of a review run.
+//
+// - A finding that is now FIXED, DISMISSED or WAIVED: its thread is resolved, so "unresolved threads" on the PR
+//   means "problems still open".
+// - After a verification run: a finding that is still open (or uncertain) but whose thread a person resolved
+//   is put back, with the reviewer's reason, because resolving it was a claim that the change fixed it and the
+//   review has just checked that claim.
+// Only threads the bot started are touched, a person's own resolve of a closed finding is never undone, and a
+// failure here never fails a review (best effort).
 const CLOSED = new Set(['FIXED', 'DISMISSED', 'WAIVED']);
-
-const THREADS_QUERY = `query($owner:String!,$repo:String!,$number:Int!,$after:String){
-  repository(owner:$owner,name:$repo){pullRequest(number:$number){
-    reviewThreads(first:100,after:$after){
-      pageInfo{hasNextPage endCursor}
-      nodes{id isResolved comments(first:1){nodes{body author{login}}}}
-    }
-  }}
-}`;
-const RESOLVE_MUTATION = 'mutation($id:ID!){resolveReviewThread(input:{threadId:$id}){thread{id isResolved}}}';
+const MATERIAL = new Set(['P0', 'P1', 'P2']);
 
 export async function syncReviewThreads({ env = process.env, fetchImpl = fetch, log = console } = {}) {
   const target = required(env, 'TARGET_REPO');
@@ -30,55 +25,53 @@ export async function syncReviewThreads({ env = process.env, fetchImpl = fetch, 
   const [owner, repo] = target.split('/');
 
   const session = await latestSession({ target, prNumber, author, token, fetchImpl });
-  const closed = new Set((session?.findings ?? []).filter((finding) => CLOSED.has(finding.status)).map((finding) => findingKey(finding.path, finding.title)));
-  if (!closed.size) return { resolved: 0, failed: 0, closed: 0 };
+  if (!session) return { resolved: 0, reopened: 0, failed: 0, closed: 0 };
+  const bounce = env.REVIEW_MODE === 'verification';
+  const wantsResolved = session.findings.filter((finding) => CLOSED.has(finding.status));
+  const stillOpen = session.findings.filter((finding) => MATERIAL.has(finding.severity) && ['OPEN', 'UNCERTAIN'].includes(finding.status));
+  if (!wantsResolved.length && !(bounce && stillOpen.length)) return { resolved: 0, reopened: 0, failed: 0, closed: 0 };
 
-  const threads = await fetchThreads({ owner, repo, number: Number(prNumber), token, fetchImpl });
+  const threads = await fetchReviewThreads({ owner, repo, number: Number(prNumber), token, fetchImpl });
+  const byFinding = threadsByFinding({ session, threads, botLogin });
   let resolved = 0;
+  let reopened = 0;
   let failed = 0;
-  for (const thread of threads) {
-    if (thread.isResolved) continue;
-    const first = thread.comments?.nodes?.[0];
-    if (!first || first.author?.login !== botLogin) continue;
-    const key = markerKey(first.body);
-    if (!key || !closed.has(key)) continue;
+  const attempt = async (work) => {
     try {
-      await graphql({ token, fetchImpl, query: RESOLVE_MUTATION, variables: { id: thread.id } });
-      resolved += 1;
+      await work();
+      return true;
     } catch (error) {
       failed += 1;
-      log.warn?.(`Could not resolve a review thread: ${String(error.message).slice(0, 200)}`);
+      log.warn?.(`Could not update a review thread: ${String(error.message).slice(0, 200)}`);
+      return false;
+    }
+  };
+
+  for (const finding of wantsResolved) {
+    for (const thread of byFinding.get(finding.id) ?? []) {
+      if (thread.isResolved) continue;
+      if (await attempt(() => resolveThread({ token, fetchImpl, id: thread.id }))) resolved += 1;
     }
   }
-  log.log?.(`Review threads: ${resolved} resolved for closed findings${failed ? `, ${failed} could not be resolved` : ''}.`);
-  return { resolved, failed, closed: closed.size };
-}
-
-async function fetchThreads({ owner, repo, number, token, fetchImpl }) {
-  const threads = [];
-  let after = null;
-  for (let page = 0; page < 20; page += 1) {
-    const data = await graphql({ token, fetchImpl, query: THREADS_QUERY, variables: { owner, repo, number, after } });
-    const connection = data?.repository?.pullRequest?.reviewThreads;
-    if (!connection) throw new Error('GitHub returned no review threads for this pull request');
-    threads.push(...(connection.nodes ?? []));
-    if (!connection.pageInfo?.hasNextPage) break;
-    after = connection.pageInfo.endCursor;
+  if (bounce) {
+    for (const finding of stillOpen) {
+      for (const thread of byFinding.get(finding.id) ?? []) {
+        if (!thread.isResolved || !thread.resolvedBy || thread.resolvedBy === botLogin) continue;
+        const reason = String(finding.resolutionReason ?? 'the change does not address it').slice(0, 600);
+        const ok = await attempt(async () => {
+          await unresolveThread({ token, fetchImpl, id: thread.id });
+          if (thread.commentId) {
+            await replyToThread({ target, prNumber, commentId: thread.commentId, token, fetchImpl,
+              body: `Reopened: I checked the changes since this finding and it still looks open.\n\n${reason}\n\nFix it and resolve the thread again, or, if it is not a bug, comment \`@gemini dismiss ${finding.id}\` with a Reason and Evidence link.` });
+          }
+        });
+        if (ok) reopened += 1;
+      }
+    }
   }
-  return threads;
-}
-
-async function graphql({ token, fetchImpl, query, variables }) {
-  const response = await fetchImpl('https://api.github.com/graphql', {
-    method: 'POST',
-    headers: { Accept: 'application/vnd.github+json', Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', 'User-Agent': 'jiaze-review-bot' },
-    body: JSON.stringify({ query, variables }),
-    signal: AbortSignal.timeout(15000),
-  });
-  if (!response.ok) throw new Error(`GitHub GraphQL failed (HTTP ${response.status})`);
-  const payload = await response.json();
-  if (payload.errors?.length) throw new Error(`GitHub GraphQL error: ${payload.errors.map((e) => e.message).join('; ')}`);
-  return payload.data;
+  const closed = wantsResolved.length;
+  log.log?.(`Review threads: ${resolved} resolved for closed findings${reopened ? `, ${reopened} reopened because the finding is still open` : ''}${failed ? `, ${failed} could not be updated` : ''}.`);
+  return { resolved, reopened, failed, closed };
 }
 
 function required(env, key) {

@@ -140,9 +140,9 @@ test('verification across parts: the verdict comes from the parts that contain t
   assert.equal(merged.findings.length, 1); // duplicate regression collapsed
 });
 
-test('a delta too large for the part limit fails with a pointer to @claude review instead of truncating', async () => {
+test('a delta too large for the part limit fails with a pointer to .reviewbotignore instead of truncating', async () => {
   const dir = setup({ mode: 'verification', diff: bigDiff(30, 110_000), session: { version: 1, findings: [] } });
-  await assert.rejects(runGeminiReview({ env: env(dir), logImpl: () => {}, fetchImpl: geminiReply({ summary: 's', verifications: [], findings: [] }) }), /too many parts.*@claude review/);
+  await assert.rejects(runGeminiReview({ env: env(dir), logImpl: () => {}, fetchImpl: geminiReply({ summary: 's', verifications: [], findings: [] }) }), /too many parts.*reviewbotignore/);
 });
 
 test('a small diff is still one request over the original diff, untouched', async () => {
@@ -151,4 +151,16 @@ test('a small diff is still one request over the original diff, untouched', asyn
   const result = await runGeminiReview({ env: env(dir), logImpl: () => {}, fetchImpl: async (url, init) => { requests += 1; return geminiReply({ summary: 'one', findings: [] })(url, init); } });
   assert.equal(requests, 1);
   assert.equal(result._meta.parts, undefined);
+});
+
+test('files matched by .reviewbotignore are not counted toward the staged parts', async () => {
+  const file = (name, bytes) => `diff --git a/${name} b/${name}\n--- a/${name}\n+++ b/${name}\n@@ -1 +1 @@\n+${'x'.repeat(bytes)}\n`;
+  const diff = Array.from({ length: 30 }, (_, i) => file(`gen/f${i}.json`, 90_000)).join('') + file('src/a.js', 100);
+  const dir = setup({ diff });
+  fs.writeFileSync(path.join(dir, 'ignore-patterns.txt'), 'gen/*\n');
+  const prompts = [];
+  const reply = geminiReply({ summary: 's', verifications: [], findings: [] });
+  await runGeminiReview({ env: env(dir), logImpl: () => {}, fetchImpl: async (url, init) => { prompts.push(JSON.parse(init.body).contents[0].parts[0].text); return reply(url, init); } });
+  assert.equal(prompts.length, 1);
+  assert.deepEqual(filesIn(prompts[0]), ['src/a.js']);
 });

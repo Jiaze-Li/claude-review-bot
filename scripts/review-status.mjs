@@ -3,7 +3,7 @@ import { pathToFileURL } from 'node:url';
 
 const repoPattern = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const positiveId = /^[1-9]\d*$/;
-const reviewModes = new Set(['discovery', 'incremental', 'verification', 'audit', 'recover', 'claude', 'noop_ready', 'noop_waiting', 'human_required', 'deep_review_stale', 'override', 'dismiss']);
+const reviewModes = new Set(['discovery', 'incremental', 'verification', 'audit', 'recover', 'claude', 'noop_ready', 'noop_waiting', 'human_required', 'deep_review_stale', 'override', 'dismiss', 'threads']);
 const sourceKinds = new Set(['comment', 'pull_request']);
 
 function checked(value, pattern, name) {
@@ -54,15 +54,22 @@ export async function publishRunStatus({ env = process.env, fetchImpl = fetch } 
   const reason = safeReason(env.REVIEW_REASON);
   let state;
   if (stage === 'started') {
-    if (mode === 'discovery') state = 'Exact-HEAD preflight passed. Gemini discovery review is running.';
-    else if (mode === 'incremental') state = 'Exact-HEAD preflight passed. Gemini delta review is running.';
-    else if (mode === 'verification') state = 'Exact-HEAD preflight passed. Gemini targeted verification is running.';
-    else if (mode === 'audit') state = 'Exact-HEAD preflight passed. Gemini one-time final audit is running.';
+    // `@claude review` runs the same review with Claude as the only model.
+    const model = env.REQUESTED_MODE === 'claude' ? 'Claude' : 'Gemini';
+    if (mode === 'discovery') state = `Exact-HEAD preflight passed. ${model} discovery review is running.`;
+    else if (mode === 'incremental') state = `Exact-HEAD preflight passed. ${model} delta review is running.`;
+    else if (mode === 'verification') state = `Exact-HEAD preflight passed. ${model} targeted verification is running.`;
+    else if (mode === 'audit') state = `Exact-HEAD preflight passed. ${model} one-time final audit is running.`;
     else if (mode === 'claude') state = 'Exact-HEAD preflight passed. Sharded deep review is running (Gemini first, Claude where Gemini cannot). ' + reason;
     else if (mode === 'override') state = 'Exact-HEAD preflight passed. Applying manual override.';
     else if (mode === 'dismiss') state = 'Exact-HEAD preflight passed. Checking evidence for one finding (no model call).';
+    else if (mode === 'threads') state = 'Exact-HEAD preflight passed. Applying review-thread decisions (no model call).';
     else if (mode === 'recover') state = 'A paid review is already published. Recovering durable session state with no model call.';
     else state = 'No model call is required for this trigger. ' + reason;
+  } else if (mode === 'threads') {
+    state = env.THREADS_OUTCOME === 'success'
+      ? 'Review-thread decisions applied. No model quota was spent.'
+      : 'Review-thread decisions were not confirmed. Check the workflow run.';
   } else if (mode === 'dismiss') {
     state = env.DISMISS_OUTCOME !== 'success'
       ? 'Finding dismissal was not confirmed; durable session did not acknowledge it.'

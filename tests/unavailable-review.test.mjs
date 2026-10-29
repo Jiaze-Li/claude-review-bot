@@ -245,7 +245,8 @@ test('a successful manually retried final audit clears HUMAN_REQUIRED only when 
 test('only explicit review comments qualify for manual budget exemption',()=>{
   assert.equal(isManualBudgetExemptReview({sourceKind:'comment',requestedMode:'auto'}),true);
   assert.equal(isManualBudgetExemptReview({sourceKind:'comment',requestedMode:'reset'}),true);
-  for (const requestedMode of ['dismiss','override','claude','unknown',undefined]) {
+  assert.equal(isManualBudgetExemptReview({sourceKind:'comment',requestedMode:'claude'}),true); // same review, other model
+  for (const requestedMode of ['dismiss','override','unknown',undefined]) {
     assert.equal(isManualBudgetExemptReview({sourceKind:'comment',requestedMode}),false);
   }
   assert.equal(isManualBudgetExemptReview({sourceKind:'pull_request',requestedMode:'auto'}),false);

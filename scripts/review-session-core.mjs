@@ -364,7 +364,8 @@ export function claudeFallbackBudgetLeft(session) {
 // the automatic cap. A dismiss/override command is human-initiated, but it is
 // NOT authorization to spend beyond the limit during its follow-on audit.
 export function isManualBudgetExemptReview({ sourceKind, requestedMode } = {}) {
-  return sourceKind === 'comment' && ['auto', 'reset'].includes(requestedMode);
+  // A review-thread decision is a writer's action too (the Worker only forwards a writer's resolve).
+  return (sourceKind === 'comment' && ['auto', 'reset', 'claude'].includes(requestedMode)) || requestedMode === 'threads';
 }
 
 export function claudeFallbackCallBudget(session, { manual = false, pendingUsd = 0 } = {}) {
@@ -791,6 +792,41 @@ export function applyOverride({ session, headSha, by, now = new Date().toISOStri
   };
 }
 
+// A person resolving the thread of a NON-blocking finding (a P3, status DEFERRED) closes it: it is recorded as
+// waived by that person and never re-raised, and unresolving the thread reopens it. Blocking findings are not
+// closed this way: resolving one is a claim that it is fixed, which a review has to check (see the planner's
+// `threads` decision), so they are left alone here. Nothing about the session's status changes.
+// `closed` is [{ id, by }]; `reopened` is finding ids whose thread was unresolved.
+export function applyThreadDecisions({ session, headSha, closed = [], reopened = [], now = new Date().toISOString() } = {}) {
+  validateSession(session);
+  checkedSha(headSha, 'headSha');
+  if (session.status === 'REVIEW_IN_PROGRESS') throw new Error('a review is running; thread decisions wait for it');
+  const findings = session.findings.map((finding) => ({ ...finding }));
+  let changed = false;
+  for (const { id, by } of closed) {
+    if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/.test(String(by ?? ''))) continue;
+    const finding = findings.find((item) => item.id === id);
+    if (!finding || finding.status !== 'DEFERRED') continue;
+    finding.status = 'WAIVED';
+    finding.resolvedVia = 'thread';
+    finding.resolvedBy = by;
+    finding.lastCheckedHead = headSha;
+    finding.resolutionReason = compactText(`Resolved by @${by} (review thread)`, 300);
+    changed = true;
+  }
+  for (const id of reopened) {
+    const finding = findings.find((item) => item.id === id);
+    if (!finding || finding.status !== 'WAIVED' || finding.resolvedVia !== 'thread') continue;
+    finding.status = 'DEFERRED';
+    delete finding.resolvedVia;
+    delete finding.resolvedBy;
+    finding.resolutionReason = null;
+    finding.lastCheckedHead = headSha;
+    changed = true;
+  }
+  return changed ? { ...session, findings, updatedAt: now } : session;
+}
+
 export function openMaterialFindings(session) {
   validateSession(session);
   return session.findings.filter((finding) => finding.status === 'OPEN' && MATERIAL_SEVERITIES.has(finding.severity));
@@ -900,6 +936,10 @@ export function renderSessionComment(session, { sourceCommentIds = [] } = {}) {
       + ' — ' + cleanInline(finding.dismissal?.reason ?? ''),
     '  - Evidence: ' + (finding.dismissal?.evidence ?? []).map(cleanInline).join(' · '),
   ]);
+  const threadLines = session.findings
+    .filter((finding) => finding.status === 'WAIVED' && finding.resolvedVia === 'thread')
+    .slice(-6)
+    .map((finding) => '- ' + finding.id + ' resolved by @' + cleanInline(finding.resolvedBy ?? 'unknown'));
   const findingLines = [
     ...open.slice(0, 8).flatMap(finding => [
       `- ${finding.id} **${finding.severity}** — ${cleanInline(finding.title)}`,
@@ -937,6 +977,7 @@ export function renderSessionComment(session, { sourceCommentIds = [] } = {}) {
     '',
     ...findingLines,
     ...(dismissalLines.length ? ['', 'Human-dismissed findings (cited, not machine-verified):', ...dismissalLines] : []),
+    ...(threadLines.length ? ['', 'Closed by people (review thread resolved):', ...threadLines] : []),
     '',
     `Next: ${next}`,
     '',
