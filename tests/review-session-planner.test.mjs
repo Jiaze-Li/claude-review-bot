@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { planSession } from '../scripts/plan-review-session.mjs';
+import { fullReviewDecision, planSession } from '../scripts/plan-review-session.mjs';
 import { findingMarker } from '../scripts/review-anchors.mjs';
 import { applyDiscoveryResult, pendingSessionMarker, renderSessionComment } from '../scripts/review-session-core.mjs';
 
@@ -80,7 +80,9 @@ test('@claude review plans exactly like @gemini review for the same session; onl
   // same HEAD, discovery done, audit pending
   const claude=await plan('claude',sessions.awaitingAudit);
   const gemini=await plan('auto',sessions.awaitingAudit);
-  assert.equal(claude.decision.mode,'audit');
+  assert.equal(claude.decision.mode,'claude'); // the final review is a full review: the sharded engine
+  assert.match(claude.decision.reason,/Claude only/);
+  assert.match(gemini.decision.reason,/Gemini first, Claude continues/);
   assert.equal(claude.decision.mode,gemini.decision.mode);
   assert.equal(claude.requestedMode,'claude');
   assert.equal(gemini.requestedMode,'auto');
@@ -241,21 +243,35 @@ test('resolved threads do not start a review when nothing is pushed, a resolver 
   assert.equal((await run({HEAD_SHA:C},{resolvedBy:author.replace('[bot]','')})).decision.mode,'threads');
 });
 
-test('a final audit too big for one staged run goes to the sharded engine as the audit; a small one stays staged',async()=>{
+test('the final review of a PR is a full review in the engine, whatever the size; a delta that needs a full look is too',async()=>{
   const awaiting=applyDiscoveryResult({result:{summary:'clean',findings:[]},baseSha:BASE,headSha:A,sourceCommentId:'1'});
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'plan-audit-'));
   fs.writeFileSync(path.join(dir,'pr.json'),'{}');
   const file=(i,bytes)=>`diff --git a/src/f${i}.js b/src/f${i}.js\n--- a/src/f${i}.js\n+++ b/src/f${i}.js\n@@ -1 +1 @@\n+${'x'.repeat(bytes)}\n`;
   const plan=(mode='auto')=>planSession({env:env({REVIEW_CONTEXT_DIR:dir,REQUESTED_MODE:mode,SOURCE_KIND:'comment'}),fetchImpl:fetchState({comments:[comment(7,renderSessionComment(awaiting))]})});
-  fs.writeFileSync(path.join(dir,'pr.diff'),file(0,100));
-  assert.equal((await plan()).decision.mode,'audit');
-  fs.writeFileSync(path.join(dir,'pr.diff'),Array.from({length:30},(_,i)=>file(i,90_000)).join(''));
-  const big=await plan();
-  assert.equal(big.decision.mode,'claude');
-  assert.equal(big.decision.audit,true);
-  assert.match(big.decision.reason,/Gemini first/);
-  assert.match((await plan('claude')).decision.reason,/Claude only/);
-  // files the reviews skip do not count toward the limit
-  fs.writeFileSync(path.join(dir,'ignore-patterns.txt'),'src/*\n');
-  assert.equal((await plan()).decision.mode,'audit');
+  for(const diff of [file(0,100),Array.from({length:30},(_,i)=>file(i,90_000)).join('')]){
+    fs.writeFileSync(path.join(dir,'pr.diff'),diff);
+    const planned=await plan();
+    assert.equal(planned.decision.mode,'claude');
+    assert.match(planned.decision.reason,/Gemini first/);
+    assert.match((await plan('claude')).decision.reason,/Claude only/);
+  }
+});
+
+test('a delta that needs a full look becomes a full review in the engine, with the reason kept',()=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'plan-full-'));
+  fs.writeFileSync(path.join(dir,'pr.diff'),'x'.repeat(5000));
+  const gemini=fullReviewDecision({REVIEW_CONTEXT_DIR:dir},'auto','Full review: high-risk path: .github/workflows/build.yml');
+  assert.equal(gemini.mode,'claude');
+  assert.match(gemini.reason,/high-risk path.*5 KB diff in shards: Gemini first, Claude continues/);
+  assert.match(fullReviewDecision({REVIEW_CONTEXT_DIR:dir},'claude','x').reason,/Claude only/);
+});
+
+test('a PARTIAL review continues for a person\'s command or for the run that continues it, not for an unrelated automatic event',async()=>{
+  const partial={...applyDiscoveryResult({result:{summary:'clean',findings:[]},baseSha:BASE,headSha:A,sourceCommentId:'1'}),status:'PARTIAL',
+    coverage:{complete:false,head:A,reviewedKeys:[],unreviewedPaths:['x'],unreviewedCount:1}};
+  const plan=(extra)=>planSession({env:env(extra),fetchImpl:fetchState({comments:[comment(7,renderSessionComment(partial))]})});
+  assert.equal((await plan({SOURCE_KIND:'comment'})).decision.mode,'claude');
+  assert.equal((await plan({SOURCE_KIND:'pull_request',SOURCE_COMMENT_ID:'8140844152995'})).decision.mode,'claude'); // the continuation run
+  assert.equal((await plan({SOURCE_KIND:'pull_request',SOURCE_COMMENT_ID:'263171400319958021003132'})).decision.mode,'noop_waiting'); // a reopened PR
 });

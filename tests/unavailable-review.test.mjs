@@ -1,3 +1,4 @@
+import { applyFullReview } from './helpers/full-review.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -9,15 +10,15 @@ import { planSession } from '../scripts/plan-review-session.mjs';
 import {
   CLAUDE_AUTO_MIN_BUDGET_USD, DEEP_REVIEW_PR_BUDGET_USD,
   chargeClaudeFallback, claudeFallbackBudgetLeft, claudeFallbackCallBudget, isManualBudgetExemptReview,
-  applyAuditResult, applyDiscoveryResult, planReviewSession, renderSessionComment,
+  applyDiscoveryResult, planReviewSession, renderSessionComment,
   sessionCommitStatus, stopUnavailableReviewSession,
 } from '../scripts/review-session-core.mjs';
 
 const BASE = 'b'.repeat(40), HEAD = 'a'.repeat(40), PRIOR = 'c'.repeat(40);
 const AUTHOR = 'jiaze-claude-review-bot[bot]';
-function folder(mode='discovery',session=null){
+function folder(mode='incremental',session=null){
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'unavailable-review-'));
-  fs.writeFileSync(path.join(dir,'pr.diff'),'diff --git a/a b/a\n');
+  fs.writeFileSync(path.join(dir,'repair.diff'),'diff --git a/a b/a\n');
   fs.writeFileSync(path.join(dir,'pr.json'),'{}');
   fs.writeFileSync(path.join(dir,'session-plan.json'),JSON.stringify({
     requestedMode:'auto',decision:{mode},session,sessionCommentId:session?'123':null,
@@ -66,19 +67,19 @@ test('automatic fallback shares the full $6 ledger; manual requests have a $5 pe
 });
 
 test('HTTP 402 stop records a marker and never starts Claude when budget is exhausted',async()=>{
-  const dir=folder('discovery',{deepSpendUsd:6.22,fallbackSpendUsd:3});
+  const dir=folder('incremental',{deepSpendUsd:6.22,fallbackSpendUsd:3});
   const calls=[];
   await assert.rejects(runGeminiReview({env:runnerEnv(dir),fetchImpl:unavailable(),queryImpl:fakeClaude(calls),
     logImpl:()=>{}}),/budget is exhausted or insufficient/);
   assert.equal(calls.length,0);
   const marker=JSON.parse(fs.readFileSync(path.join(dir,'fallback-unavailable.json'),'utf8'));
-  assert.equal(marker.mode,'discovery');
+  assert.equal(marker.mode,'incremental');
   assert.equal(marker.headSha,HEAD);
   assert.equal(marker.spentUsd,0);
 });
 
 test('Claude fallback uses the shared remaining allowance, not the old $3 fallback pool',async()=>{
-  const dir=folder('discovery',{deepSpendUsd:2.5,fallbackSpendUsd:1.5});
+  const dir=folder('incremental',{deepSpendUsd:2.5,fallbackSpendUsd:1.5});
   const calls=[];
   const result=await runGeminiReview({env:runnerEnv(dir),fetchImpl:unavailable(),queryImpl:fakeClaude(calls),
     logImpl:()=>{}});
@@ -87,42 +88,43 @@ test('Claude fallback uses the shared remaining allowance, not the old $3 fallba
   assert.equal(calls[0].options.maxBudgetUsd,3.5);
 });
 
-test('unavailable review persists a fail-closed state without fabricating discovery',async()=>{
+test('unavailable review persists a fail-closed state without fabricating a review',async()=>{
   const dir=folder();
   fs.writeFileSync(path.join(dir,'fallback-unavailable.json'),JSON.stringify({
-    mode:'discovery',headSha:HEAD,reason:'Gemini HTTP 402; Claude fallback budget exhausted',spentUsd:0,
+    mode:'incremental',headSha:HEAD,reason:'Gemini HTTP 402; Claude fallback budget exhausted',spentUsd:0,
   }));
   const calls=[];
   const result=await stopUnavailableReview({env:stopEnv(dir),fetchImpl:prAPI(calls)});
   assert.equal(result.handled,true);
   assert.equal(result.session.status,'HUMAN_REQUIRED');
   assert.equal(result.session.lastReviewedHead,HEAD);
-  assert.equal(result.session.reviewFailure.mode,'discovery');
+  assert.equal(result.session.reviewFailure.mode,'incremental');
   assert.equal(result.session.auditCompleted,false);
-  assert.match(renderSessionComment(result.session),/Discovery: \*\*not completed\*\*/);
   assert.match(renderSessionComment(result.session),/Comment `@gemini review`/);
   assert.equal(calls.filter(c=>c.init.method==='POST').length,1);
   assert.deepEqual(planReviewSession({session:result.session,baseSha:BASE,headSha:HEAD}).mode,'human_required');
 });
 
-test('failed audit retains confirmed discovery, existing spend, and audit retry stage',()=>{
-  const session={version:1,baseSha:BASE,lastReviewedHead:HEAD,status:'AUDIT_PENDING',
-    findings:[],auditCompleted:false,verificationRound:0,maxVerificationRounds:2,deepSpendUsd:4,
+test('a failed delta review keeps the reviewed state, the spend and the retry stage',()=>{
+  const session={version:1,baseSha:BASE,lastReviewedHead:PRIOR,status:'READY',
+    findings:[],auditCompleted:true,verificationRound:0,maxVerificationRounds:2,deepSpendUsd:4,
     fallbackSpendUsd:2,updatedAt:'2026-10-17T00:00:00Z'};
   const stopped=stopUnavailableReviewSession({session,baseSha:BASE,headSha:HEAD,
-    sourceCommentId:'201',mode:'audit',reason:'provider outage'});
+    sourceCommentId:'201',mode:'incremental',reason:'provider outage'});
   assert.equal(stopped.status,'HUMAN_REQUIRED');
   assert.equal(stopped.deepSpendUsd,4);
   assert.equal(stopped.fallbackSpendUsd,2);
-  assert.match(renderSessionComment(stopped),/Discovery: \*\*complete\*\*/);
-  assert.equal(planReviewSession({session:stopped,baseSha:BASE,headSha:HEAD,retryUnavailable:true}).mode,'audit');
+  assert.equal(planReviewSession({session:stopped,baseSha:BASE,headSha:HEAD,retryUnavailable:true}).mode,'incremental');
   assert.equal(planReviewSession({session:stopped,baseSha:BASE,headSha:HEAD,retryUnavailable:false}).mode,'human_required');
-  assert.equal(planReviewSession({session:stopped,baseSha:BASE,headSha:PRIOR,retryUnavailable:true}).mode,'discovery');
+  assert.equal(planReviewSession({session:stopped,baseSha:BASE,headSha:'d'.repeat(40),retryUnavailable:true}).mode,'full_review');
+  assert.throws(()=>stopUnavailableReviewSession({session,baseSha:BASE,headSha:HEAD,sourceCommentId:'201',mode:'discovery',reason:'x'}),/invalid failed review mode/);
 });
 
 test('manual @gemini review resumes ONLY a provider-unavailable stop',async()=>{
-  const session=stopUnavailableReviewSession({baseSha:BASE,headSha:HEAD,sourceCommentId:'100',
-    mode:'discovery',reason:'Gemini HTTP 429; fallback disabled'});
+  // a stop recorded by an older version, when a first review could also fail this way
+  const stopped=stopUnavailableReviewSession({baseSha:BASE,headSha:HEAD,sourceCommentId:'100',
+    mode:'incremental',reason:'Gemini HTTP 429; fallback disabled'});
+  const session={...stopped,reviewFailure:{...stopped.reviewFailure,mode:'discovery'}};
   const fetchImpl=async(url)=>url.includes('/issues/5/comments')
     ? Response.json([{id:123,user:{login:AUTHOR},body:renderSessionComment(session)}])
     : Response.json([]);
@@ -146,7 +148,7 @@ test('verification retry preserves previous reviewed HEAD across repeated provid
 test('unknown Claude spend on an errored fallback is reserved and persisted',async()=>{
   const dir=folder();
   fs.writeFileSync(path.join(dir,'fallback-unavailable.json'),JSON.stringify({
-    mode:'discovery',headSha:HEAD,reason:'Claude failed after Gemini 502',spentUsd:2.5,
+    mode:'incremental',headSha:HEAD,reason:'Claude failed after Gemini 502',spentUsd:2.5,
   }));
   const calls=[];
   const s=(await stopUnavailableReview({env:stopEnv(dir),fetchImpl:prAPI(calls)})).session;
@@ -155,11 +157,11 @@ test('unknown Claude spend on an errored fallback is reserved and persisted',asy
 });
 
 test('replaying a source comment cannot double-charge a persisted fallback failure',async()=>{
-  const previous=stopUnavailableReviewSession({baseSha:BASE,headSha:HEAD,mode:'discovery',
+  const previous=stopUnavailableReviewSession({baseSha:BASE,headSha:HEAD,mode:'incremental',
     reason:'Gemini unavailable',sourceCommentId:'200',spentUsd:1});
-  const dir=folder('discovery',previous);
+  const dir=folder('incremental',previous);
   fs.writeFileSync(path.join(dir,'fallback-unavailable.json'),JSON.stringify({
-    mode:'discovery',headSha:HEAD,reason:'Gemini unavailable',spentUsd:1,
+    mode:'incremental',headSha:HEAD,reason:'Gemini unavailable',spentUsd:1,
   }));
   const calls=[];
   const s=(await stopUnavailableReview({env:stopEnv(dir),fetchImpl:prAPI(calls)})).session;
@@ -173,21 +175,21 @@ test('moved HEAD and non-provider errors never advance the durable status',async
   assert.equal((await stopUnavailableReview({env:stopEnv(dir),fetchImpl:prAPI(calls)})).handled,false);
   assert.equal(calls.length,0);
   fs.writeFileSync(path.join(dir,'fallback-unavailable.json'),JSON.stringify({
-    mode:'discovery',headSha:HEAD,reason:'Gemini down',spentUsd:0,
+    mode:'incremental',headSha:HEAD,reason:'Gemini down',spentUsd:0,
   }));
   await assert.rejects(stopUnavailableReview({env:stopEnv(dir),fetchImpl:prAPI(calls,{head:PRIOR})}),/PR moved/);
   assert.equal(calls.filter(c=>c.init.method==='PATCH'||c.init.method==='POST').length,0);
 });
 
 test('low automatic allowance avoids a doomed Claude call, but a manual comment can exceed $6',async()=>{
-  const dir=folder('discovery',{deepSpendUsd:5.8,fallbackSpendUsd:3});
+  const dir=folder('incremental',{deepSpendUsd:5.8,fallbackSpendUsd:3});
   const calls=[];
   await assert.rejects(runGeminiReview({env:runnerEnv(dir,{SOURCE_KIND:'pull_request'}),
     fetchImpl:unavailable(),queryImpl:fakeClaude(calls),logImpl:()=>{}}),/budget is exhausted or insufficient/);
   assert.equal(calls.length,0);
   const marker=JSON.parse(fs.readFileSync(path.join(dir,'fallback-unavailable.json'),'utf8'));
   assert.equal(marker.spentUsd,0);
-  const manual=folder('discovery',{deepSpendUsd:8,fallbackSpendUsd:3});
+  const manual=folder('incremental',{deepSpendUsd:8,fallbackSpendUsd:3});
   const result=await runGeminiReview({env:runnerEnv(manual,{SOURCE_KIND:'comment'}),
     fetchImpl:unavailable(),queryImpl:fakeClaude(calls),logImpl:()=>{}});
   assert.equal(result.summary,'No confirmed defect');
@@ -197,7 +199,7 @@ test('low automatic allowance avoids a doomed Claude call, but a manual comment 
 });
 
 test('a pull request webhook cannot masquerade as a manually authorized review',async()=>{
-  const dir=folder('discovery',{deepSpendUsd:7});
+  const dir=folder('incremental',{deepSpendUsd:7});
   const calls=[];
   await assert.rejects(runGeminiReview({env:runnerEnv(dir,{SOURCE_KIND:'pull_request'}),
     fetchImpl:unavailable(),queryImpl:fakeClaude(calls),logImpl:()=>{}}),/budget is exhausted or insufficient/);
@@ -205,7 +207,7 @@ test('a pull request webhook cannot masquerade as a manually authorized review',
 });
 
 test('failed fallback reserves unknown cost separately from SDK-reported spend',()=>{
-  const prior=stopUnavailableReviewSession({baseSha:BASE,headSha:HEAD,mode:'discovery',
+  const prior=stopUnavailableReviewSession({baseSha:BASE,headSha:HEAD,mode:'incremental',
     sourceCommentId:'200',reason:'provider down',spentUsd:1.1,
     costCharges:[{amount:0.2,source:'sdk'},{amount:0.9,source:'reserve'}]});
   assert.equal(prior.deepSpendUsd,1.1);
@@ -224,17 +226,19 @@ test('verification retry on a moved HEAD preserves the original repair baseline'
   assert.equal(plan.previousHead,PRIOR);
 });
 
-test('a successful manually retried final audit clears HUMAN_REQUIRED only when findings are clean',()=>{
+test('a manually retried final review after an older provider stop clears HUMAN_REQUIRED only when findings are clean',()=>{
   const audited=applyDiscoveryResult({result:{summary:'clean',findings:[]},
     baseSha:BASE,headSha:HEAD,sourceCommentId:'10'});
-  const stopped=stopUnavailableReviewSession({session:audited,baseSha:BASE,headSha:HEAD,
-    sourceCommentId:'20',mode:'audit',reason:'Gemini 402 and fallback exhausted'});
+  // a stop recorded by an older version, when the final audit could also fail this way
+  const base=stopUnavailableReviewSession({session:audited,baseSha:BASE,headSha:HEAD,
+    sourceCommentId:'20',mode:'incremental',reason:'Gemini 402 and fallback exhausted'});
+  const stopped={...base,reviewFailure:{...base.reviewFailure,mode:'audit'}};
   assert.equal(stopped.status,'HUMAN_REQUIRED');
-  assert.equal(planReviewSession({session:stopped,baseSha:BASE,headSha:HEAD,retryUnavailable:true}).mode,'audit');
-  const clear=applyAuditResult({session:stopped,headSha:HEAD,result:{summary:'independent audit clean',findings:[]}});
+  assert.equal(planReviewSession({session:stopped,baseSha:BASE,headSha:HEAD,retryUnavailable:true}).mode,'full_review');
+  const clear=applyFullReview({session:stopped,headSha:HEAD,result:{summary:'independent audit clean',findings:[]}});
   assert.equal(clear.status,'READY');
   assert.equal(sessionCommitStatus(clear,HEAD).state,'success');
-  const bug=applyAuditResult({session:stopped,headSha:HEAD,result:{summary:'bug',findings:[{
+  const bug=applyFullReview({session:stopped,headSha:HEAD,result:{summary:'bug',findings:[{
     severity:'P2',title:'Failed write',body:'A known state loses data after retry',
     path:'src/app.js',line:2,riskClass:'state',
   }]}});
@@ -250,27 +254,4 @@ test('only explicit review comments qualify for manual budget exemption',()=>{
     assert.equal(isManualBudgetExemptReview({sourceKind:'comment',requestedMode}),false);
   }
   assert.equal(isManualBudgetExemptReview({sourceKind:'pull_request',requestedMode:'auto'}),false);
-});
-
-test('a dismiss-triggered final audit cannot bypass an exhausted automatic Claude budget',async()=>{
-  const dir=folder('audit',{version:1,baseSha:BASE,lastReviewedHead:HEAD,status:'AUDIT_PENDING',
-    auditCompleted:false,findings:[],deepSpendUsd:6});
-  const plan=JSON.parse(fs.readFileSync(path.join(dir,'session-plan.json'),'utf8'));
-  plan.requestedMode='dismiss';
-  fs.writeFileSync(path.join(dir,'session-plan.json'),JSON.stringify(plan));
-  const calls=[];
-  await assert.rejects(runGeminiReview({env:runnerEnv(dir,{SOURCE_KIND:'comment'}),
-    fetchImpl:unavailable(),queryImpl:fakeClaude(calls),logImpl:()=>{}}),
-    /automatic budget is exhausted or insufficient/);
-  assert.equal(calls.length,0);
-});
-
-test('the final audit workflow preserves the originating command, not a fabricated manual review',()=>{
-  const workflow=fs.readFileSync(new URL('../.github/workflows/review-v2.yml',import.meta.url),'utf8');
-  const auditPlan=workflow.split('      - name: Prepare automatic final audit')[1]
-    ?.split('      - name: Run automatic Gemini final audit')[0] ?? '';
-  assert.match(auditPlan,/jq -r '\.requestedMode \/\/ empty'/);
-  assert.match(auditPlan,/requestedMode: \$requested_mode/);
-  assert.match(auditPlan,/requested_mode.*dismiss/);
-  assert.doesNotMatch(auditPlan,/requestedMode: "auto"/);
 });

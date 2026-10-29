@@ -1,13 +1,15 @@
+import { applyFullReview } from './helpers/full-review.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
-  applyAuditResult,
-  applyDiscoveryResult,
+    applyDiscoveryResult,
   applyFindingDismissal,
   applyOverride,
+  beginDeepReview,
+  completeDeepReview,
   applyVerificationResult,
   knownIssuesPromptBlock,
   normalizeReviewResult,
@@ -62,7 +64,7 @@ test('legacy findings without a failurePath field keep their severity', () => {
 
 test('Gemini schema requires failurePath on every finding', () => {
   const req = buildGeminiRequest({
-    mode: 'discovery', repo: 'a/b', prNumber: 1, headSha: A, prJson: '{}', diff: 'd', session: null,
+    mode: 'incremental', repo: 'a/b', prNumber: 1, headSha: A, prJson: '{}', diff: 'd', session: null,
   });
   assert.ok(req.schema.properties.findings.items.required.includes('failurePath'));
 });
@@ -85,39 +87,15 @@ test('recordDismissed keeps only evidence-rejected candidates and caps the list'
   assert.equal(big.dismissed.length, 20);
 });
 
-test('final audit drops a reworded repeat of a dismissed concern but keeps genuinely new ones', () => {
-  const s = { ...recordDismissed(session(), [dismissal()], A), status: 'AUDIT_PENDING' };
-  const out = applyAuditResult({
-    session: s, headSha: A,
-    result: { summary: 'a', findings: [
-      finding({ title: 'Save path suffers a lost update' }),
-      finding({ title: 'Token never expires', path: 'src/auth.js' }),
-    ] },
-  });
-  assert.equal(out.findings.length, 1);
-  assert.equal(out.findings[0].path, 'src/auth.js');
-});
-
-test('a distinct bug with similarly worded title in the same file is NOT suppressed', () => {
-  const s = {
-    ...recordDismissed(session(), [dismissal({ title: 'Save function returns wrong value on timeout' })], A),
-    status: 'AUDIT_PENDING',
-  };
-  const out = applyAuditResult({
-    session: s, headSha: A,
-    result: { summary: 'a', findings: [finding({ title: 'Save function returns wrong value on invalid input' })] },
-  });
-  assert.equal(out.findings.length, 1);
-  assert.equal(out.status, 'REWORK');
-});
-
-test('same title in a different file is not suppressed', () => {
-  const s = { ...recordDismissed(session(), [dismissal()], A), status: 'AUDIT_PENDING' };
-  const out = applyAuditResult({
-    session: s, headSha: A,
-    result: { summary: 'a', findings: [finding({ path: 'src/b.js' })] },
-  });
-  assert.equal(out.findings.length, 1);
+test('a reworded repeat of a dismissed concern is recognised; genuinely new ones and similar-but-distinct bugs are not', () => {
+  const s = recordDismissed(session(), [dismissal()], A);
+  assert.equal(matchesKnownDismissal(finding({ title: 'Save path suffers a lost update' }), s), true);
+  assert.equal(matchesKnownDismissal(finding({ title: 'Token never expires', path: 'src/auth.js' }), s), false);
+  // a distinct bug with a similarly worded title in the same file is NOT suppressed
+  const timeout = recordDismissed(session(), [dismissal({ title: 'Save function returns wrong value on timeout' })], A);
+  assert.equal(matchesKnownDismissal(finding({ title: 'Save function returns wrong value on invalid input' }), timeout), false);
+  // the same title in a different file is not suppressed
+  assert.equal(matchesKnownDismissal(finding({ path: 'src/b.js' }), s), false);
 });
 
 test('repair regressions matching a dismissed concern are dropped during verification', () => {
@@ -137,7 +115,7 @@ test('prompt block lists dismissed and settled items, and is empty when none exi
   assert.match(block, /ALREADY EXAMINED/);
   assert.match(block, /\[REJECTED\] src\/a\.js/);
   const audit = buildGeminiRequest({
-    mode: 'audit', repo: 'a/b', prNumber: 1, headSha: A, prJson: '{}', diff: 'd',
+    mode: 'verification', repo: 'a/b', prNumber: 1, headSha: A, prJson: '{}', diff: 'd',
     session: recordDismissed(session(), [dismissal()], A),
   });
   assert.match(audit.prompt, /ALREADY EXAMINED/);
@@ -169,7 +147,7 @@ test('override waives open findings and ends the session as READY on the current
 test('after an override the same HEAD is a no-op and a new commit starts a fresh session', () => {
   const out = applyOverride({ session: session([finding()]), headSha: B, by: 'alice' });
   assert.equal(planReviewSession({ session: out, baseSha: BASE, headSha: B }).mode, 'noop_ready');
-  assert.equal(planReviewSession({ session: out, baseSha: BASE, headSha: C }).mode, 'discovery');
+  assert.equal(planReviewSession({ session: out, baseSha: BASE, headSha: C }).mode, 'full_review');
 });
 
 test('override rejects READY sessions and unsafe user names', () => {
@@ -207,7 +185,7 @@ test('planner chooses override only for an unfinished session', async () => {
   assert.equal(done.decision.mode, 'noop_waiting');
 });
 
-test('apply-override rewrites the session comment with the processed-source marker', async () => {
+test('apply-override posts the new session comment with the processed-source marker and removes the old one', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'override-'));
   const s = session([finding()]);
   fs.writeFileSync(path.join(dir, 'session-plan.json'), JSON.stringify({
@@ -217,7 +195,8 @@ test('apply-override rewrites the session comment with the processed-source mark
   const fetchImpl = async (url, init = {}) => {
     calls.push({ url, method: init.method || 'GET', body: init.body });
     if (!init.method) return Response.json({ base: { sha: BASE }, head: { sha: B } });
-    return Response.json({ id: 5 });
+    if (init.method === 'DELETE') return new Response(null, { status: 204 });
+    return Response.json({ id: 6 });
   };
   const out = await applyManualOverride({
     env: { GH_TOKEN: 't', TARGET_REPO: 'acme/p', PR_NUMBER: '7', BASE_SHA: BASE, HEAD_SHA: B,
@@ -225,9 +204,11 @@ test('apply-override rewrites the session comment with the processed-source mark
     fetchImpl,
   });
   assert.equal(out.status, 'READY');
-  const patch = calls.find((c) => c.method === 'PATCH');
-  assert.match(patch.url, /issues\/comments\/5$/);
-  const body = JSON.parse(patch.body).body;
+  // READY is a new result for the PR: posted as the newest comment, and the old session comment removed
+  const post = calls.find((c) => c.method === 'POST');
+  assert.match(post.url, /issues\/7\/comments$/);
+  assert.match(calls.find((c) => c.method === 'DELETE').url, /issues\/comments\/5$/);
+  const body = JSON.parse(post.body).body;
   assert.match(body, /jiaze-review-source-comment:77/);
   assert.equal(parseSessionComment(body).status, 'READY');
 });
@@ -244,31 +225,6 @@ test('apply-override refuses when the PR HEAD moved', async () => {
   }), /PR moved/);
 });
 
-test('validator drops known repeats before calling the model and reports them', async () => {
-  const { validateMaterialFindings } = await import('../scripts/validate-gemini-findings.mjs');
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'val-ledger-'));
-  const repo = path.join(root, 'repo'); const ctx = path.join(root, 'ctx');
-  fs.mkdirSync(path.join(repo, 'src'), { recursive: true }); fs.mkdirSync(ctx);
-  fs.writeFileSync(path.join(repo, 'src/a.js'), 'x\n');
-  fs.writeFileSync(path.join(ctx, 'pr.diff'), '');
-  const prior = { ...recordDismissed(session(), [dismissal()], A), status: 'AUDIT_PENDING' };
-  fs.writeFileSync(path.join(ctx, 'session-plan.json'), JSON.stringify({ session: prior }));
-  const input = path.join(ctx, 'audit.json');
-  fs.writeFileSync(input, JSON.stringify({ summary: 's', _meta: { mode: 'audit' }, findings: [
-    finding({ title: 'Save path suffers a lost update' }),
-  ] }));
-  let calls = 0;
-  const out = await validateMaterialFindings({
-    env: { GEMINI_API_KEY: 'k', TARGET_REPO: 'a/b', PR_NUMBER: '1', HEAD_SHA: A,
-      TARGET_REPO_DIR: repo, REVIEW_CONTEXT_DIR: ctx, REVIEW_INPUT_PATH: input, REVIEW_OUTPUT_PATH: path.join(ctx, 'o.json') },
-    fetchImpl: async () => { calls += 1; return Response.json({}); },
-  });
-  assert.equal(calls, 0);
-  assert.equal(out._validation.status, 'SKIPPED');
-  assert.equal(out._ledgerSuppressed.length, 1);
-  assert.equal(out.findings.length, 0);
-});
-
 const uncertainCandidate = (over={}) => ({
   candidateId:'D001',verdict:'UNCERTAIN',severity:'P2',title:'Possible lost update during save',
   path:'src/a.js',line:10,riskClass:'state',reason:'Validator could not inspect the call site.',...over,
@@ -281,14 +237,14 @@ const adjudicate = (s,id='F001',head=A) => applyFindingDismissal({
 });
 
 test('UNCERTAIN P2 from targeted validation persists, blocks READY and is not suppressed',()=>{
-  const pending=recordUncertainFindings(session(),[uncertainCandidate()],A,'discovery');
+  const pending=recordUncertainFindings(session(),[uncertainCandidate()],A);
   assert.equal(pending.status,'HUMAN_REQUIRED');
   assert.equal(openMaterialFindings(pending).length,0);
   assert.equal(unresolvedMaterialFindings(pending).length,1);
   assert.equal(unresolvedMaterialFindings(pending)[0].id,'F001');
   assert.equal(sessionCommitStatus(pending,A).state,'error');
   assert.equal(planReviewSession({session:pending,baseSha:BASE,headSha:A}).mode,'human_required');
-  assert.equal(planReviewSession({session:pending,baseSha:BASE,headSha:B}).mode,'discovery');
+  assert.equal(planReviewSession({session:pending,baseSha:BASE,headSha:B}).mode,'full_review');
   assert.equal(knownIssuesPromptBlock(pending),'');
   assert.equal(matchesKnownDismissal(finding({title:'Possible lost update during save'}),pending),false);
   const body=renderSessionComment(pending);
@@ -299,12 +255,12 @@ test('UNCERTAIN P2 from targeted validation persists, blocks READY and is not su
 });
 
 test('an evidence-backed dismissal resolves UNCERTAIN; final audit is still required',()=>{
-  const pending=recordUncertainFindings(session(),[uncertainCandidate()],A,'discovery');
+  const pending=recordUncertainFindings(session(),[uncertainCandidate()],A);
   const decided=adjudicate(pending);
   assert.equal(decided.status,'AUDIT_PENDING');
   assert.equal(unresolvedMaterialFindings(decided).length,0);
   assert.equal(decided.findings[0].status,'DISMISSED');
-  const audited=applyAuditResult({session:decided,headSha:A,result:{summary:'verified',findings:[]}});
+  const audited=applyFullReview({session:decided,headSha:A,result:{summary:'verified',findings:[]}});
   assert.equal(audited.status,'READY');
   assert.equal(sessionCommitStatus(audited,A).state,'success');
   assert.match(renderSessionComment(audited),/dismissed by @maintainer/);
@@ -312,7 +268,7 @@ test('an evidence-backed dismissal resolves UNCERTAIN; final audit is still requ
 
 test('a confirmed bug may be fixed, but concurrent uncertainty must remain blocking',()=>{
   const withBug=session([finding()]);
-  const mixed=recordUncertainFindings(withBug,[uncertainCandidate({title:'Separate uncertain error'})],A,'discovery');
+  const mixed=recordUncertainFindings(withBug,[uncertainCandidate({title:'Separate uncertain error'})],A);
   assert.equal(mixed.status,'REWORK');
   const fixed=applyVerificationResult({session:mixed,headSha:B,result:{
     summary:'confirmed issue fixed',verifications:[{findingId:'F001',status:'FIXED',reason:'guard added'}],findings:[],
@@ -323,15 +279,15 @@ test('a confirmed bug may be fixed, but concurrent uncertainty must remain block
   assert.equal(adjudicate(fixed,'F002',B).status,'AUDIT_PENDING');
 });
 
-test('UNCERTAIN in final audit means audit did not pass, even when confirmed findings are zero',()=>{
-  const base=session();
-  const clean=applyAuditResult({session:base,headSha:A,result:{summary:'clean model output',findings:[]}});
-  const withheld=recordUncertainFindings(clean,[uncertainCandidate()],A,'audit');
+test('an inconclusive material candidate from a delta review blocks READY until a human decides',()=>{
+  const clean=applyFullReview({session:session(),headSha:A,result:{summary:'clean model output',findings:[]}});
+  assert.equal(clean.status,'READY');
+  const withheld=recordUncertainFindings(clean,[uncertainCandidate()],A);
   assert.equal(withheld.status,'HUMAN_REQUIRED');
-  assert.equal(withheld.auditCompleted,false);
+  assert.equal(sessionCommitStatus(withheld,A).state,'error');
   const decided=adjudicate(withheld);
-  assert.equal(decided.status,'AUDIT_PENDING');
-  assert.equal(applyAuditResult({session:decided,headSha:A,result:{summary:'audit clear',findings:[]}}).status,'READY');
+  assert.equal(decided.status,'READY');
+  assert.equal(unresolvedMaterialFindings(decided).length,0);
 });
 
 test('old UNCERTAIN suppression markers must not hide later P2 claims',()=>{
@@ -341,7 +297,7 @@ test('old UNCERTAIN suppression markers must not hide later P2 claims',()=>{
 });
 
 test('a manual explicit waiver of an uncertain candidate is recorded as human override',()=>{
-  const uncertain=recordUncertainFindings(session(),[uncertainCandidate()],A,'discovery');
+  const uncertain=recordUncertainFindings(session(),[uncertainCandidate()],A);
   const accepted=applyOverride({session:uncertain,headSha:A,by:'maintainer'});
   assert.equal(accepted.status,'READY');
   assert.equal(accepted.findings[0].status,'WAIVED');
@@ -350,7 +306,7 @@ test('a manual explicit waiver of an uncertain candidate is recorded as human ov
 });
 
 test('manual scoped dismissal planner can select an UNCERTAIN finding without pretending it was confirmed',async()=>{
-  const pending=recordUncertainFindings(session(),[uncertainCandidate()],A,'discovery');
+  const pending=recordUncertainFindings(session(),[uncertainCandidate()],A);
   const result=await planSession({env:planEnv({HEAD_SHA:A,REQUESTED_MODE:'dismiss',SOURCE_KIND:'comment'}),
     fetchImpl:listFetch([{id:5,user:{login:author},body:renderSessionComment(pending)}])});
   assert.equal(result.decision.mode,'dismiss');
@@ -358,7 +314,7 @@ test('manual scoped dismissal planner can select an UNCERTAIN finding without pr
 
 test('READY never passes for an unaudited tree or any unresolved material issue',()=>{
   const clean=session();
-  const audited=applyAuditResult({session:clean,headSha:A,result:{summary:'clean',findings:[]}});
+  const audited=applyFullReview({session:clean,headSha:A,result:{summary:'clean',findings:[]}});
   assert.equal(sessionCommitStatus(audited,A).state,'success');
   for(const broken of [
     {...audited,auditCompleted:false},
@@ -370,43 +326,24 @@ test('READY never passes for an unaudited tree or any unresolved material issue'
   }
 });
 
-test('unresolved candidate survives an unrelated new HEAD when the reviewer omits it',()=>{
-  const prior=recordUncertainFindings(session(),[uncertainCandidate()],A,'discovery');
-  const next=applyDiscoveryResult({result:{summary:'new HEAD model silent',findings:[]},
-    baseSha:BASE,headSha:B,sourceCommentId:'20'});
-  const carried=recordUncertainFindings(next,[],B,'discovery',prior);
-  assert.equal(carried.status,'HUMAN_REQUIRED');
-  assert.equal(carried.auditCompleted,false);
-  assert.equal(unresolvedMaterialFindings(carried).length,1);
-  assert.equal(carried.findings[0].origin,'CARRIED_UNCERTAIN');
-  assert.equal(carried.findings[0].lastCheckedHead,A);
-  assert.equal(sessionCommitStatus(carried,B).state,'error');
-  const prompt=buildGeminiRequest({mode:'discovery',repo:'a/b',prNumber:1,
-    headSha:B,prJson:'{}',diff:'new changes',session:prior}).prompt;
-  assert.match(prompt,/PREVIOUS UNRESOLVED MATERIAL CANDIDATES/);
-  assert.match(prompt,/Possible lost update during save/);
-});
-
-test('new targeted verdict resolves the same carried candidate but silence never does',()=>{
-  const prior=recordUncertainFindings(session(),[uncertainCandidate()],A,'discovery');
-  const next=applyDiscoveryResult({result:{summary:'rerun',findings:[]},
-    baseSha:BASE,headSha:B,sourceCommentId:'22'});
-  const same={path:'src/a.js',title:'Possible lost update during save'};
-  const disproved=recordUncertainFindings(next,[{...same,verdict:'REJECTED'}],B,'discovery',prior);
-  assert.equal(disproved.status,'AUDIT_PENDING');
-  assert.equal(unresolvedMaterialFindings(disproved).length,0);
-  const found=recordUncertainFindings(next,[{...same,verdict:'CONFIRMED'}],B,'discovery',prior);
-  assert.equal(unresolvedMaterialFindings(found).length,0);
-  const repeated=recordUncertainFindings(next,[uncertainCandidate()],B,'discovery',prior);
-  assert.equal(unresolvedMaterialFindings(repeated).length,1);
-});
-
-test('explicit reset on an unchanged HEAD also preserves unresolved material evidence',()=>{
-  const prior=recordUncertainFindings(session(),[uncertainCandidate()],A,'discovery');
-  const reset=applyDiscoveryResult({result:{summary:'reset model silent',findings:[]},
-    baseSha:BASE,headSha:A,sourceCommentId:'45'});
-  const carried=recordUncertainFindings(reset,[],A,'discovery',prior);
-  assert.equal(carried.status,'HUMAN_REQUIRED');
-  assert.equal(unresolvedMaterialFindings(carried).length,1);
-  assert.equal(sessionCommitStatus(carried,A).state,'error');
+test('an unresolved candidate survives a new HEAD and a reset; silence from the next full review never clears it, only a human decision does',()=>{
+  const prior=recordUncertainFindings(session(),[uncertainCandidate()],A);
+  const full={summary:'model silent',findings:[],coverage:{complete:true,unreviewedPaths:[]}};
+  // a new HEAD starts a fresh session with the candidate carried over
+  const begun=beginDeepReview({session:prior,baseSha:BASE,headSha:B});
+  assert.equal(begun.findings[0].origin,'CARRIED_UNCERTAIN');
+  assert.equal(begun.findings[0].status,'UNCERTAIN');
+  assert.equal(begun.findings[0].lastCheckedHead,A);
+  const done=completeDeepReview({session:begun,headSha:B,result:full});
+  assert.equal(done.status,'HUMAN_REQUIRED');
+  assert.equal(unresolvedMaterialFindings(done).length,1);
+  assert.equal(sessionCommitStatus(done,B).state,'error');
+  // the same HEAD (an explicit reset) keeps the session as it is
+  const again=completeDeepReview({session:beginDeepReview({session:prior,baseSha:BASE,headSha:A}),headSha:A,result:full});
+  assert.equal(again.status,'HUMAN_REQUIRED');
+  assert.equal(unresolvedMaterialFindings(again).length,1);
+  // a human decision clears it; the final full review is still owed
+  const decided=adjudicate(done,'F001',B);
+  assert.equal(unresolvedMaterialFindings(decided).length,0);
+  assert.equal(decided.status,'AUDIT_PENDING');
 });

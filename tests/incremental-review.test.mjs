@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import {
-  applyAuditResult, applyDiscoveryResult, applyIncrementalResult,
+  applyDiscoveryResult, applyIncrementalResult, beginDeepReview, completeDeepReview,
   applyVerificationResult, parseSessionComment, planReviewSession,
   renderSessionComment, sessionCommitStatus, stopUnavailableReviewSession,
 } from '../scripts/review-session-core.mjs';
@@ -23,7 +23,8 @@ const issue = (title = 'Regression') => ({
 });
 function ready() {
   const first = applyDiscoveryResult({ result: empty, baseSha: BASE, headSha: A, sourceCommentId: '91' });
-  return applyAuditResult({ session: first, result: empty, headSha: A });
+  // the baseline is a complete full review of the HEAD with nothing blocking
+  return completeDeepReview({ session: beginDeepReview({ session: first, baseSha: BASE, headSha: A }), result: { ...empty, coverage: { complete: true, unreviewedPaths: [] } }, headSha: A });
 }
 const patch = 'diff --git a/src/ui.js b/src/ui.js\n--- a/src/ui.js\n+++ b/src/ui.js\n@@ -1 +1 @@\n-oldLabel\n+newLabel\n';
 const changed = (extra = {}) => ({
@@ -32,17 +33,17 @@ const changed = (extra = {}) => ({
 
 test('clean small delta is classified incremental, while risk and ambiguous metadata go full', () => {
   assert.equal(classifyIncrementalDelta(changed()).mode, 'incremental');
-  assert.equal(classifyIncrementalDelta(changed({ numstat: '51\t0\tsrc/ui.js\0' })).mode, 'discovery');
+  assert.equal(classifyIncrementalDelta(changed({ numstat: '51\t0\tsrc/ui.js\0' })).mode, 'full');
   assert.equal(classifyIncrementalDelta(changed({ numstat: '1\t1\t.github/workflows/build.yml\0',
-    nameStatus: 'M\0.github/workflows/build.yml\0' })).mode, 'discovery');
-  assert.equal(classifyIncrementalDelta(changed({ patch: patch + '+mutex.lock()\n' })).mode, 'discovery');
-  assert.equal(classifyIncrementalDelta(changed({ nameStatus: 'D\0src/ui.js\0' })).mode, 'discovery');
+    nameStatus: 'M\0.github/workflows/build.yml\0' })).mode, 'full');
+  assert.equal(classifyIncrementalDelta(changed({ patch: patch + '+mutex.lock()\n' })).mode, 'full');
+  assert.equal(classifyIncrementalDelta(changed({ nameStatus: 'D\0src/ui.js\0' })).mode, 'full');
   assert.equal(classifyIncrementalDelta(changed({ numstat: '1\t1\tproject.pbxproj\0',
-    nameStatus: 'M\0project.pbxproj\0' })).mode, 'discovery');
-  assert.equal(classifyIncrementalDelta(changed({ numstat: '-\t-\tsrc/ui.js\0' })).mode, 'discovery');
-  assert.equal(classifyIncrementalDelta(changed({ session: { ...ready(), override: { by: 'human' } } })).mode, 'discovery');
-  assert.equal(classifyIncrementalDelta(changed({ session: { ...ready(), incrementalReviewCount: 15 } })).mode, 'discovery');
-  assert.equal(classifyIncrementalDelta(changed({ nameStatus: 'R100\0src/a.js\0src/ui.js\0' })).mode, 'discovery');
+    nameStatus: 'M\0project.pbxproj\0' })).mode, 'full');
+  assert.equal(classifyIncrementalDelta(changed({ numstat: '-\t-\tsrc/ui.js\0' })).mode, 'full');
+  assert.equal(classifyIncrementalDelta(changed({ session: { ...ready(), override: { by: 'human' } } })).mode, 'full');
+  assert.equal(classifyIncrementalDelta(changed({ session: { ...ready(), incrementalReviewCount: 15 } })).mode, 'full');
+  assert.equal(classifyIncrementalDelta(changed({ nameStatus: 'R100\0src/a.js\0src/ui.js\0' })).mode, 'full');
 });
 
 test('READY changes are candidates; successful delta advances exact HEAD without a full audit', () => {
@@ -105,7 +106,7 @@ test('provider failure never turns an unreviewed incremental HEAD green; exact r
   assert.equal(retry.previousHead, A);
   // A maintainer can explicitly retry a moved HEAD; the old incremental delta
   // no longer describes that tree, so run a new full discovery instead.
-  assert.equal(planReviewSession({ session: failed, baseSha: BASE, headSha: C, retryUnavailable: true }).mode, 'discovery');
+  assert.equal(planReviewSession({ session: failed, baseSha: BASE, headSha: C, retryUnavailable: true }).mode, 'full_review');
   assert.equal(planReviewSession({ session: failed, baseSha: BASE, headSha: C }).mode, 'human_required');
   const reviewed = applyIncrementalResult({ session: failed, headSha: B, result: empty });
   assert.equal(reviewed.status, 'READY');

@@ -196,21 +196,8 @@ export function mergeShardResults({ shards, results, deferred = [], allFiles, pr
   };
 }
 
-// The staged model layer (delta reviews and the final audit) sends one request up to this size, else parts.
-export const STAGED_SINGLE_REQUEST_BYTES = 300_000;
-
 // The diff after the files every review skips (binary assets and the repository's .reviewbotignore) are removed.
 export function dropIgnoredFiles(diffText, ignoreText = '') {
   const patterns = [...DEFAULT_IGNORE, ...parseIgnorePatterns(ignoreText)];
   return splitDiffByFile(diffText).filter((chunk) => !matchesIgnore(chunk.path, patterns)).map((chunk) => chunk.text).join('');
-}
-
-// Whether the staged pipeline can review this diff in one run: one request, or at most MAX_SHARDS parts. A bigger
-// diff has to go through the sharded engine, which can continue over several runs.
-export function stagedDiffFits(diffText, ignoreText = '') {
-  const diff = dropIgnoredFiles(diffText, ignoreText);
-  if (Buffer.byteLength(diff, 'utf8') <= STAGED_SINGLE_REQUEST_BYTES) return true;
-  const chunks = splitDiffByFile(diff);
-  const { shards, deferred } = planShards({ files: chunks.map((chunk) => chunk.path), chunks });
-  return deferred.length === 0 && shards.length > 0;
 }

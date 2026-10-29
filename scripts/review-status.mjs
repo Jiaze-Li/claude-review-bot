@@ -3,7 +3,7 @@ import { pathToFileURL } from 'node:url';
 
 const repoPattern = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const positiveId = /^[1-9]\d*$/;
-const reviewModes = new Set(['discovery', 'incremental', 'verification', 'audit', 'recover', 'claude', 'noop_ready', 'noop_waiting', 'human_required', 'deep_review_stale', 'override', 'dismiss', 'threads']);
+const reviewModes = new Set(['incremental', 'verification', 'recover', 'claude', 'noop_ready', 'noop_waiting', 'human_required', 'deep_review_stale', 'override', 'dismiss', 'threads']);
 const sourceKinds = new Set(['comment', 'pull_request']);
 
 function checked(value, pattern, name) {
@@ -56,10 +56,8 @@ export async function publishRunStatus({ env = process.env, fetchImpl = fetch } 
   if (stage === 'started') {
     // `@claude review` runs the same review with Claude as the only model.
     const model = env.REQUESTED_MODE === 'claude' ? 'Claude' : 'Gemini';
-    if (mode === 'discovery') state = `Exact-HEAD preflight passed. ${model} discovery review is running.`;
-    else if (mode === 'incremental') state = `Exact-HEAD preflight passed. ${model} delta review is running.`;
+    if (mode === 'incremental') state = `Exact-HEAD preflight passed. ${model} delta review is running.`;
     else if (mode === 'verification') state = `Exact-HEAD preflight passed. ${model} targeted verification is running.`;
-    else if (mode === 'audit') state = `Exact-HEAD preflight passed. ${model} one-time final audit is running.`;
     else if (mode === 'claude') state = 'Exact-HEAD preflight passed. Sharded deep review is running (Gemini first, Claude where Gemini cannot). ' + reason;
     else if (mode === 'override') state = 'Exact-HEAD preflight passed. Applying manual override.';
     else if (mode === 'dismiss') state = 'Exact-HEAD preflight passed. Checking evidence for one finding (no model call).';
@@ -73,21 +71,13 @@ export async function publishRunStatus({ env = process.env, fetchImpl = fetch } 
   } else if (mode === 'dismiss') {
     state = env.DISMISS_OUTCOME !== 'success'
       ? 'Finding dismissal was not confirmed; durable session did not acknowledge it.'
-      : env.FINAL_AUDIT_PUBLISH_OUTCOME === 'success'
-        ? 'Finding dismissal recorded; the outstanding final audit was published.'
-        : env.AUTO_AUDIT_RUN === 'true'
-          ? 'Finding dismissal recorded; final audit publication was not confirmed. Check workflow logs.'
-          : 'Finding dismissal recorded. No model quota was spent by dismissal.';
+      : 'Finding dismissal recorded. No model quota was spent by dismissal.';
   } else if (['recover', 'noop_ready', 'noop_waiting', 'human_required', 'deep_review_stale'].includes(mode)) {
     state = 'No model quota was spent. ' + reason;
   } else {
-    const finalAuditOutcome = env.FINAL_AUDIT_PUBLISH_OUTCOME;
-    const geminiOutcome = finalAuditOutcome && finalAuditOutcome !== 'skipped'
-      ? finalAuditOutcome
-      : env.GEMINI_PUBLISH_OUTCOME;
     const outcome = mode === 'claude'
       ? env.CLAUDE_PUBLISH_OUTCOME
-      : mode === 'override' ? env.OVERRIDE_OUTCOME : geminiOutcome;
+      : mode === 'override' ? env.OVERRIDE_OUTCOME : env.GEMINI_PUBLISH_OUTCOME;
     state = outcome === 'success'
       ? 'Review publication completed. Read the PR review and durable review-session comment for the result.'
       : 'Review publication was not confirmed. Check the workflow run; no successful publication is being claimed.'

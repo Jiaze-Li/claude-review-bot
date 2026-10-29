@@ -1,10 +1,11 @@
+import { applyFullReview } from './helpers/full-review.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
-  applyAuditResult, applyDiscoveryResult, applyFindingDismissal,
+  applyDiscoveryResult, applyFindingDismissal,
   matchesKnownDismissal, openMaterialFindings, parseSessionComment,
   planReviewSession, renderSessionComment,
 } from '../scripts/review-session-core.mjs';
@@ -69,22 +70,22 @@ test('last dismissed blocker enters AUDIT_PENDING rather than skipping Final Aud
   const out = dismiss(initial());
   assert.equal(out.status, 'AUDIT_PENDING');
   assert.equal(out.auditCompleted, false);
-  assert.equal(planReviewSession({ session: out, baseSha: BASE, headSha: A }).mode, 'audit');
-  const ready = applyAuditResult({ session: out, result: { summary: 'clean audit', findings: [] }, headSha: A });
+  assert.equal(planReviewSession({ session: out, baseSha: BASE, headSha: A }).mode, 'full_review');
+  const ready = applyFullReview({ session: out, result: { summary: 'clean audit', findings: [] }, headSha: A });
   assert.equal(ready.status, 'READY');
   assert.equal(ready.auditCompleted, true);
   assert.equal(planReviewSession({ session: ready, baseSha: BASE, headSha: A }).mode, 'noop_ready');
 });
 
-test('after already completed Final Audit, no second audit is allowed', () => {
-  const clean = applyDiscoveryResult({
-    result: { summary: 'none', findings: [] }, baseSha: BASE, headSha: A, sourceCommentId: '9',
+test('after the one final full review has run, no second full review is owed', () => {
+  const waiting = dismiss(initial()); // every finding settled, the final full review is next
+  assert.equal(waiting.status, 'AUDIT_PENDING');
+  const audited = applyFullReview({
+    session: waiting, result: { summary: 'late bug', findings: [issue('A late bug the earlier reviews missed')] }, headSha: A,
   });
-  const audited = applyAuditResult({
-    session: clean, result: { summary: 'late bug', findings: [issue()] }, headSha: A,
-  });
+  assert.equal(audited.status, 'REWORK');
   assert.equal(audited.auditCompleted, true);
-  const out = dismiss(audited);
+  const out = dismiss(audited, { findingId: 'F002' });
   assert.equal(out.status, 'READY');
   assert.equal(out.auditCompleted, true);
   assert.equal(planReviewSession({ session: out, baseSha: BASE, headSha: A }).mode, 'noop_ready');
@@ -115,13 +116,6 @@ test('known-issue guard rejects exact dismissed premise, not a distinct real bug
   assert.equal(matchesKnownDismissal({
     ...issue(), failurePath: 'A DIFFERENT REACHABLE PATH triggers the wrong response.',
   }, s), false);
-  const afterAudit = applyAuditResult({
-    session: s, headSha: A, result: { summary: 'found distinct failure', findings: [
-      issue(), issue('Different premise on same endpoint'),
-    ] },
-  });
-  assert.equal(afterAudit.status, 'REWORK');
-  assert.equal(afterAudit.findings.length, 2);
 });
 
 const env = (root) => ({
@@ -152,7 +146,9 @@ function mockGitHub(session, { actor = 'maintainer', permission = 'write', head 
       });
     }
     if (pathname === '/repos/acme/project/collaborators/maintainer/permission') return Response.json({ permission });
+    if (pathname === '/repos/acme/project/issues/7/comments' && method === 'POST') return Response.json({ id: 6 });
     if (pathname === '/repos/acme/project/issues/comments/5') {
+      if (method === 'DELETE') return new Response(null, { status: 204 });
       return method === 'PATCH' ? Response.json({ id: 5 }) : Response.json({
         user: { login: AUTHOR }, body: commentBody,
       });
@@ -168,14 +164,16 @@ test('workflow confirms permissions, writes evidence and produces final-audit ha
   const mock = mockGitHub(session);
   const out = await applyManualDismissal({ env: env(root), fetchImpl: mock.fetchImpl });
   assert.equal(out.status, 'AUDIT_PENDING');
-  const patched = mock.calls.find(c => c.method === 'PATCH');
-  assert.equal(patched.pathname, '/repos/acme/project/issues/comments/5');
-  const written = JSON.parse(patched.body).body;
+  // REWORK -> AUDIT_PENDING is a new result: posted as the newest comment, the old one removed
+  const posted = mock.calls.find(c => c.method === 'POST');
+  assert.equal(posted.pathname, '/repos/acme/project/issues/7/comments');
+  assert.equal(mock.calls.find(c => c.method === 'DELETE').pathname, '/repos/acme/project/issues/comments/5');
+  const written = JSON.parse(posted.body).body;
   assert.match(written, /jiaze-review-source-comment:99/);
   assert.equal(parseSessionComment(written).findings[0].status, 'DISMISSED');
   const handoff = JSON.parse(fs.readFileSync(path.join(root, 'published-session.json'), 'utf8'));
   assert.equal(handoff.session.status, 'AUDIT_PENDING');
-  assert.equal(handoff.sessionCommentId, '5');
+  assert.equal(handoff.sessionCommentId, '6');
   assert.equal(handoff.mode, 'dismiss');
 });
 
@@ -191,7 +189,7 @@ for (const [name, opts, error] of [
     const s = initial(); writePlan(root, s);
     const mock = mockGitHub(s, opts);
     await assert.rejects(applyManualDismissal({ env: env(root), fetchImpl: mock.fetchImpl }), error);
-    assert.equal(mock.calls.filter(c => c.method === 'PATCH').length, 0);
+    assert.equal(mock.calls.filter(c => ['PATCH', 'POST', 'DELETE'].includes(c.method)).length, 0);
     assert.equal(fs.existsSync(path.join(root, 'published-session.json')), false);
   });
 }
@@ -215,20 +213,12 @@ test('planner selects dismissal only for an OPEN blocker on the same reviewed HE
   assert.equal(done.decision.mode, 'noop_waiting');
 });
 
-test('workflow wires dismissal into the existing bounded automatic audit', () => {
+test('the dismissal step holds no provider credentials, and the final review that follows is a continuation, not a second pipeline', () => {
   const yml = fs.readFileSync(new URL('../.github/workflows/review-v2.yml', import.meta.url), 'utf8');
   assert.match(yml, /id: dismiss/);
   assert.match(yml, /run: node scripts\/apply-dismissal\.mjs/);
-  assert.match(yml, /steps\.dismiss\.outcome == 'success'/);
-  assert.match(yml, /if: steps\.auto-audit\.outputs\.run == 'true'/);
   const block = yml.slice(yml.indexOf('- name: Apply evidence-based finding dismissal'),
-    yml.indexOf('- name: Run Gemini bounded review'));
+    yml.indexOf('- name: Apply review-thread decisions'));
   assert.doesNotMatch(block, /GEMINI_API_KEY|CLAUDE_CODE_OAUTH_TOKEN/);
-});
-
-test('a dismissal-triggered final audit installs the Claude fallback dependencies',()=>{
-  const workflow=fs.readFileSync(new URL('../.github/workflows/review-v2.yml',import.meta.url),'utf8');
-  const step=workflow.split('- name: ').find((block)=>block.startsWith('Install Claude fallback dependencies'));
-  assert.ok(step,'install step exists');
-  assert.match(step,/steps\.plan\.outputs\.mode == 'dismiss'/);
+  assert.doesNotMatch(yml, /auto-audit|final-gemini-run/);
 });

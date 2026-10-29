@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { fetchReviewThreads, isWriter, replyToThread, threadsByFinding, unresolveThread, blockingClaims } from './review-threads.mjs';
+import { saveSessionComment } from './session-comment.mjs';
 import { applyThreadDecisions, renderSessionComment } from './review-session-core.mjs';
 
 // A person resolving or reopening the bot's review threads. No model call here (when a review of the changes is
@@ -78,7 +79,7 @@ export async function applyThreadResolutions({ env = process.env, fetchImpl = fe
   const next = applyThreadDecisions({ session, headSha, closed, reopened });
   if (next !== session) {
     const body = renderSessionComment(next, { sourceCommentIds: [sourceCommentId] });
-    await rest(`https://api.github.com/repos/${target}/issues/comments/${plan.sessionCommentId}`, token, fetchImpl, { method: 'PATCH', body: JSON.stringify({ body }) });
+    await saveSessionComment({ target, prNumber, token, fetchImpl, existingId: plan.sessionCommentId, previous: session, session: next, body });
   }
   log.log?.(`Review-thread decisions: ${closed.length} non-blocking finding(s) closed, ${reopened.length} reopened, ${bounced} thread(s) put back (nothing to verify).`);
   return { session: next, closed, reopened, bounced };

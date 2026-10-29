@@ -325,7 +325,7 @@ test('state-integrity material validator gets larger structured-output budget',a
     _meta:{
       provider:'gemini',
       effort:'medium',
-      mode:'audit',
+      mode:'incremental',
       risk_profile:{
         version:1,
         stateIntegrity:true,

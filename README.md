@@ -1,232 +1,133 @@
 # claude-review-bot
 
-Account-wide bounded PR review service for GitHub.
+Account-wide bounded PR review service for GitHub: Gemini first, Claude where Gemini cannot, one session per PR.
 
-## Daily use
+## How a review works (the whole picture)
 
-Normal PR review is automatic once the GitHub App is subscribed to **Pull request**
-events and the current Worker is deployed:
+There is one session per PR, stored in a bot-authored **Independent Review Session** comment, and one rule for
+every model and every PR size.
 
-- opening a non-draft PR starts a bounded discovery session automatically;
-- moving a draft PR to **Ready for review** starts it automatically;
-- commenting `@gemini review` after pushing a repair while the session is **REWORK** runs targeted verification;
-- commenting `@gemini review` after pushing a new commit on a **READY** session first classifies the exact delta from the last reviewed HEAD: small low-risk changes get an incremental review, while broad/high-risk changes get full discovery + audit;
-- webhook redelivery is idempotent, and an unchanged PR HEAD is a no-op at the durable session planner, so it does not spend another reviewer call.
+**Two kinds of review**
 
-The manual commands remain available as a retry/escape hatch:
+| Kind | What it looks at | Who runs it |
+| --- | --- | --- |
+| **Full review** | every file of the PR | the sharded engine: the diff is split by file into shards (~100 KB each, at most 20 per run, 3 at a time); each shard goes to Gemini first, and to Claude for whatever Gemini cannot finish |
+| **Delta review** | only what changed since a reviewed state | the staged pipeline: *verification* (a repair against the open findings) and *incremental* (a small, low-risk change on a READY PR) |
 
-```text
-@gemini review
-@claude review
-```
+A full review is used for: a PR's first review, the review after a big or risky change, `reset review`, and the
+**final full review** (below). `@claude review` is the same review with Claude as the only model.
 
-The review session is intentionally stateful and simple:
-
-- First review of a PR/session: **latest Gemini Flash (`gemini-flash-latest` alias), medium thinking, one discovery pass**.
-- Any P0/P1/P2 discovery candidate gets one **targeted Gemini Flash / medium validation pass** over the candidate file, related symbols/guards, and matching tests.
-- **CONFIRMED** P0–P2 findings enter REWORK. **REJECTED** candidates are resolved only when source/evidence checks refute the claim. **UNCERTAIN** P0–P2 candidates stay in the durable ledger with their own F-number and **block READY**: targeted validation has already run but could not establish a verdict. With no other confirmed blockers, status becomes **HUMAN_REQUIRED**. They are never added to the already-examined suppression ledger.
-- If confirmed material findings exist, push a repair; the new PR commit automatically triggers the next review step. For **UNCERTAIN** candidates, inspect their cited code and supply evidence via `@gemini dismiss F001` if disproven, or push a fix/new HEAD for a fresh full review. Unresolved candidates carry across HEADs unless the new targeted validator explicitly CONFIRMS or REJECTS that same concern; **silence does not clear it**. Neither "validator omitted a candidate" nor "source evidence insufficient" counts as a pass.
-- A REWORK repair becomes targeted **verification** plus checks for independent regressions introduced by that HEAD delta, not another full PR discovery.
-- At most **2 verification rounds** are allowed.
-- Once material findings converge, one independent final audit runs automatically on the final cumulative PR diff. It stays **Gemini Flash / low** for ordinary PRs; a deterministic state-integrity classifier escalates only shared-state/concurrency-sensitive PRs to **medium** with an explicit interleaving audit.
-- Final-audit P0/P1/P2 candidates use the same targeted medium validator.
-- The final broad audit runs **at most once per full-review session**. Safe incremental updates reuse that audit for unchanged code; after 15 successful incremental reviews a fresh full audit is required.
-- P3 findings are non-blocking.
-- A malformed/no-text structured Gemini review response is retried **once with the identical prompt, model, thinking level, and schema**; usage from both attempts is reported.
-- Re-running on the same unchanged HEAD spends **no reviewer model quota**.
-- If material findings remain after the verification budget, or a material candidate remains **UNCERTAIN** after its targeted validator check, the session stops at **HUMAN_REQUIRED** instead of claiming success. An unresolved candidate cannot be cleared by an unrelated clean final audit or a free-form Claude answer.
-- If Gemini is unavailable (HTTP 402/429/5xx), Claude automatically takes over. **All automatic Claude calls**, including material-finding validation and final audit, share a **$6 cumulative cap per PR**; there is no separate $3 fallback pool. Each automatic call receives at most the remaining cap through SDK `maxBudgetUsd`, and does not start below a **$0.50** allowance.
-- An authorized writer's explicit `@gemini review`, `@jiaze-claude-review-bot reset review` or `@claude review` **may exceed the internal $6 automatic cap**. Each manual Claude call remains limited by its SDK `maxBudgetUsd`; actual provider credits/quota still apply. Automatic pull-request events can never opt out.
-- If Gemini is unavailable **and** fallback cannot run (budget, credential, or SDK failure), the bot records a durable **HUMAN_REQUIRED / reviewer unavailable** state for the exact HEAD. Comment `@gemini review` to retry even if HEAD advanced: unfinished verification keeps its prior repair baseline; other moved-head retries start a fresh discovery. The successful model review must still complete the required final audit and resolve all material findings before **READY**. A manual `@claude review` retries it exactly as `@gemini review` does, using Claude only.
-- Costs remain cumulative across retries, pushes and manual reviews. The ledger distinguishes SDK-reported costs, conservative reservations when usage is unknown, and old unclassified amounts; reservations are not presented as confirmed charges. Normal model/publication failures still fail closed.
-- Session state is stored in a bot-authored GitHub PR comment, so it survives new ChatGPT conversations, different agents, and local restarts.
-
-
-### Meaning of READY
-
-**READY is an independent code-review clearance, not merely "no confirmed bugs yet".**
-For the reviewed HEAD, every P0/P1/P2 candidate must be resolved (confirmed and fixed,
-evidence-backed rejected, or explicitly human-adjudicated), the required audit must
-have passed, and no unresolved material uncertainty may remain. An explicit
-`override review` is marked **manually overridden** so it cannot be mistaken
-for machine clearance.
-
-**GitHub remains the final merge gate.** READY alone does not prove that
-independent CI, branch protection, required approvals, or conflict checks have
-passed. The PR is mergeable only when its review is READY *and* GitHub's
-other required checks succeed. This avoids a circular dependency on the
-review bot's own required status check.
-
-### HEAD changes after READY
-
-A successful full audit establishes a trusted code-tree baseline. On the next HEAD,
-the reviewer computes the exact diff between the previous **reviewed** HEAD and
-the new HEAD (not the cumulative 100-commit PR diff). A delta of at most 50
-added/deleted lines across at most 3 files is eligible for a single incremental
-Gemini review, with surrounding function context. Changes to high-risk paths
-(workflows, security, schemas, dependencies, migration/persistence, etc.), risk
-signals in changed lines, renames/deletions/binary files, large patches, unknown
-old revisions, and uncertain diff metadata cause **full Discovery + Final Audit**.
-
-Incremental review still validates any material findings, publishes on the exact
-HEAD, and never inherits the previous commit's green status without a successful
-model result. Findings, verification state, and the Claude spending ledger survive
-eligible changes. If new bugs are found, their fixes enter the existing bounded
-Verification path without repeating Final Audit. The 15th completed incremental
-review is followed by a full refresh on the next update. An explicit manual
-override does **not** establish a reusable audited baseline.
-
-A forced push or rebase is compared by final code trees, not by commit ancestry.
-If the old reviewed commit can no longer be fetched, the bot fails back to
-full review. A provider outage on an incremental HEAD remains HUMAN_REQUIRED;
-a manual retry resumes the same delta rather than silently clearing the gate.
-
-### Gemini request timeout policy
-
-Discovery and final audit each allow up to **480 seconds per model request** (verification: **180 seconds**, hard cap: **600 seconds**). The review workflow has a 30-minute overall job limit to accommodate sequential stages. Override per mode with `GEMINI_DISCOVERY_TIMEOUT_MS` or `GEMINI_AUDIT_TIMEOUT_MS`; `GEMINI_TIMEOUT_MS` remains a fallback override.
-
-Workflow logs report the review mode, request/context byte sizes, timeout budget, and elapsed time—not the prompt, diff contents, or API key. A Gemini request timeout is not retried against Gemini: the request (or, for a large diff, that part) is handed to Claude and the timeout is recorded as the fallback reason in the review footer. Only if Claude cannot take it (no credential, or its allowance for this PR is spent) does the run **fail closed** without claiming a successful review; after checking the logs, use `@gemini review` to manually retry an unchanged HEAD. Large diffs are split into parts (see above), so one timeout no longer costs the whole review.
-
-You do **not** need to remember discovery, verification, round numbers, or provider selection.
-
-Manual commands (the first nonblank line must be exactly one of these):
+**The session status**
 
 ```text
-@gemini review   # manual retry; allowed past automatic $6 cap, $5 per Claude call
-@claude review   # the same review as @gemini review, with Claude as the only model ($5 per run)
+ (new PR / @gemini review)
+          |
+   FULL REVIEW ---- nothing blocking, every file covered ------> READY
+          |
+          +--- P0/P1/P2 found ----> REWORK --- you fix, resolve threads --->  VERIFICATION (max 2 rounds)
+          |                                                                      |        |
+          |                                          findings fixed, none left   |        +-- still open: back to REWORK
+          |                                                                      v           (after 2 rounds: HUMAN_REQUIRED)
+          |                                                              AUDIT_PENDING
+          |                                                                      |
+          |                                                  FINAL FULL REVIEW (runs by itself, once)
+          |                                                                      |
+          +--- some files not reached ----> PARTIAL ---- continues by itself ----+--> READY (or REWORK for what it adds;
+                                                                                        those are verified, no second full review)
 ```
 
-Gemini review runs automatically only when a PR is opened, reopened, or marked ready. **New pushes do not trigger a review**; comment `@gemini review` or `@claude review` when you want the latest HEAD reviewed. **The two commands are the same review; only the model differs.** Whatever the session calls for (a first review, an incremental check, verification of a repair, the final audit, or continuing a partial review) is what either command does; `@gemini review` tries Gemini first and lets Claude finish what Gemini cannot, `@claude review` uses Claude alone and never needs a Gemini key or session. Both are exempt from the automatic per-PR cap the same way, and on a HEAD that is already READY both are a no-op (use `@jiaze-claude-review-bot reset review` for a fresh review). A complete, clean pass is READY by itself (partial coverage is PARTIAL, never READY). `@claude review` is never automatic. **Every first full review takes one route, whatever its size or provider:** the diff is split by file into shards (about 100 KB each, at most 20, so a small PR is one shard), and each shard is reviewed by the first provider that can: Gemini first (cheaper, inline diff, its own API key), and Claude (with Read/Glob/Grep tools) for any shard Gemini cannot finish. Gemini is switched off for the rest of a run once it is out of credits, rate limited, down or misconfigured (HTTP 402/429/5xx/400/401/403/404) or after two shard-level failures; the review says how many shards Claude took over and why. Up to 3 shards run at once within a 16-minute deadline; Claude's share is bounded by the run budget ($5 for a manual command, the per-PR automatic allowance otherwise, and when that is spent Gemini alone can still review; Gemini is billed to its own key, not that ledger). The review lists reviewed/assigned files per shard. Concerns already dismissed or settled in the session are shown to every shard, and an exact repeat of a dismissed finding is not reported again. If a run cannot reach every file (time, budget), the session remembers which files it covered; comment `@gemini review` or `@claude review` again on the same HEAD and only the remaining files are reviewed. Binary assets (png, jpg, gif, ico, pdf, fonts) are skipped automatically. A repository can skip more (lockfiles, generated code) with a `.reviewbotignore` file at its root (gitignore-style patterns, one per line, `#` comments); the bot reads it from the PR's **base** commit, so a PR cannot exempt its own files. Skipped files are reported as skipped, not as unreviewed. A clean, complete pass is READY by itself; any file no provider reached makes it PARTIAL, never READY. Delta reviews after a repair (verification, incremental) and the final audit keep the staged pipeline (validator, verification rounds, audit before READY) but use the same model layer: a small diff is one request as before, a diff over about 300 KB is split by file into up to 20 parts (3 at a time, 20-minute limit) reviewed Gemini first with Claude for any part Gemini cannot do (any Gemini failure, not just out of credits: it is recorded as the fallback reason, and Gemini is skipped for the rest of the run after a credit, rate-limit, outage or key error, or two other failures). The parts are merged back into one result: findings deduplicated and limited to what a session records, and for verification the verdict of a finding comes from the parts that contain its file, worst first. Claude calls in a large run are capped at $1 each within the same $5 manual or per-PR automatic allowance, counted across parts.
+* **READY** needs a complete pass over every changed file with no open P0/P1/P2 and nothing uncertain. It is the
+  *review's* clearance; CI, approvals and branch protection still decide whether the PR can merge.
+* **PARTIAL** means some files were not reached (time, budget). It is never READY. It continues by itself, up to
+  3 more runs, and `@gemini review` continues it by hand; an unrelated event (a reopened PR) does not.
+* **HUMAN_REQUIRED** means a person must decide: verification budget spent, an UNCERTAIN material candidate, or
+  both providers unavailable. Use `@gemini dismiss F001` (with evidence) or `override review`.
+* A new commit never inherits an old READY. A READY PR with a small, low-risk new commit gets an *incremental*
+  review (at most 50 changed lines in at most 3 files; no workflow/security/schema/dependency paths; every 15th is
+  a full refresh); anything else gets a full review.
 
-`@gemini review` is the same as the original `@jiaze-claude-review-bot review`, and `@jiaze-claude-review-bot claude review` is the same as `@claude review`; the longer forms keep working.
+## What you do
 
-If the PR has changed so radically that the old review session should be discarded:
+1. Open (or mark ready) a PR. A full review starts by itself. **Pushes do not trigger a review.**
+2. Read the findings. Each one is a review thread pinned to a line.
+3. Fix a problem, push, and click **Resolve** on its thread. Once *every* blocking thread is resolved and there is a
+   new commit, the verification starts by itself and only its result decides READY; a finding that is not really
+   fixed gets its thread reopened with the reason. P3 threads: Resolve closes the finding for good, no model run.
+4. When everything is settled, the final full review runs by itself, and the session turns READY.
+5. The newest comment at the bottom of the PR is always the session status: **when the status changes (or a new
+   HEAD gets its result) it is posted as a new comment and the old one is removed**, so you do not have to look
+   for it. If nothing visible changed it is edited in place.
+
+**Commands** (the first non-blank line must be exactly one of these):
 
 ```text
-@jiaze-claude-review-bot reset review
+@gemini review                          # review the latest HEAD: whatever the session calls for, Gemini first
+@claude review                          # the same review, Claude only (no Gemini key needed)
+@jiaze-claude-review-bot reset review   # discard the session and review from scratch
+@jiaze-claude-review-bot override review  # a writer accepts the risk: waives open findings, READY (marked as manual)
+@gemini dismiss F001                    # + Reason:/Evidence: lines, see below
 ```
 
-Reset is intentionally explicit; the normal review command never silently opens unlimited discovery rounds.
+`@gemini review` / `@claude review` are the same review; only the model differs. On a HEAD that is already READY
+they do nothing. An unchanged HEAD never spends model quota.
 
-If you have read the open findings and decide the PR is fine to merge anyway (for example when the session is stuck in REWORK or HUMAN_REQUIRED):
+## Money and models
 
-```text
-@jiaze-claude-review-bot override review
-```
+* **Gemini** (`gemini-flash-latest`, its own API key) is tried first for every full-review shard and every delta.
+  It is switched off for the rest of a run after a credit/rate-limit/outage/key error (HTTP 402/429/5xx/400/401/403/404)
+  or two shard-level failures; the review says how much Claude took over and why.
+* **Claude** (subscription OAuth token) takes what Gemini cannot. Its spend is a per-PR ledger:
+  automatic reviews share a **$6 per-PR allowance** (a call does not start below $0.50); a person's command
+  (`@gemini review`, `@claude review`, `reset review`, or resolving threads) may exceed it, each Claude call being
+  capped at **$5**. Gemini is billed to its own key and never to this ledger. A dismissal or override is not a
+  request for more review: what follows it obeys the automatic allowance.
+* If neither provider can run, the session records **HUMAN_REQUIRED / reviewer unavailable** for that HEAD;
+  `@gemini review` retries.
+* The review of a very large PR is split over several runs: each run reviews up to 20 shards within a 16-minute
+  deadline and remembers which files it covered; the next run (automatic, up to 3 more) takes the rest. The review
+  lists reviewed/assigned files per shard.
+* Binary assets are skipped. A repository can skip more (lockfiles, generated code) with a `.reviewbotignore` at its
+  root (gitignore-style patterns); it is read from the PR's **base** commit, so a PR cannot exempt its own files.
 
-This needs write access, spends no model quota, waives both confirmed-open and unresolved-uncertain material findings (they stay in the record as WAIVED), and explicitly marks the current HEAD **READY (manually overridden)**. This is a human risk acceptance, *not* a claim that the bot disproved the concern. A later commit starts a fresh bounded session.
+## Findings
 
-### Findings as review threads
+* Every finding is an inline review thread, pinned to its own line when that line is part of the diff, else to the
+  nearest changed line (with a note). Only a finding about a file the PR does not touch, or a file that is deleted
+  entirely, stays in the review body ("Findings without an inline anchor") and cannot be resolved by a click.
+* At the end of every run the bot resolves the threads of findings that are now FIXED, DISMISSED or WAIVED. It only
+  touches threads it opened, and never undoes a person's own resolve or unresolve.
+* Convergence: only 2 verification rounds; each finding needs a concrete `failurePath` (trigger state → wrong result)
+  or it is demoted to non-blocking P3; concerns already dismissed or settled are shown to every reviewer and an exact
+  repeat is not reported again; a delta's P0-P2 candidates get one targeted validation pass that can confirm, reject
+  or mark them UNCERTAIN (UNCERTAIN blocks READY; silence from a later review never clears it).
+* A PR the deterministic classifier marks as touching shared durable state gets an explicit concurrency procedure
+  (stale snapshots, lost updates, TOCTOU, two-actor interleavings) in every full-review prompt.
 
-Every finding is posted as an inline review thread you can resolve. A finding is pinned to its own line when that line is part of the PR's diff (changed or an unchanged line inside a hunk); otherwise to the nearest changed line of the same file, with a note saying so. Only a finding about a file the PR does not touch (or a file GitHub gives no patch for) stays in the review body under "Findings without an inline anchor". Each thread carries a hidden marker, and at the end of every review run the bot resolves the threads of findings that are now **FIXED**, **DISMISSED** or **WAIVED** (an override), so the PR's unresolved-thread count is the number of problems still open. It only ever resolves threads it opened itself, never reopens one, and never undoes a person's own resolve or unresolve; if the GitHub App lacks permission to resolve threads the step warns and the review is unaffected. Threads posted before this feature have no marker and are left for you to resolve by hand.
+### Dismiss a disproven finding
 
-**Resolving a thread means "I fixed it", and the review checks that.** When a person with write access clicks **Resolve** on the bot's threads, nothing turns green by itself. Once *every* blocking (P0-P2) finding has been resolved and new commits exist since the last review, the normal verification review starts automatically (Gemini first, Claude continues if Gemini cannot; same route as `@gemini review`), and only its result decides READY. A finding that is really fixed becomes FIXED; one that is still open has its thread reopened with the reviewer's reason as a reply. If everything is resolved but nothing was pushed, there is nothing to check, so the threads are reopened with a note to push a fix or use `@gemini dismiss`. Resolving a non-blocking (P3) thread simply closes that finding for good, and unresolving it reopens it, with no model run. Only a writer's resolve counts and the bot's own resolves never do. This needs the GitHub App to be subscribed to the **Pull request review thread** event (App settings, Permissions & events, Subscribe to events) and the Worker redeployed.
-
-**Very large PRs and the final audit.** The final audit normally runs as one staged request (or up to 20 parts). If the diff is bigger than that even after the ignore rules, the audit is run by the sharded engine instead (Gemini first, Claude continues): it can continue over several runs, a PARTIAL result is continued by the next review command, and a complete pass with no blocking finding counts as the audit and makes the HEAD READY.
-
-**A big review finishes by itself.** When a run ends with work left (the sharded engine ran out of room and the review is PARTIAL, or the final audit is too large for one run), the workflow starts the next run on the same HEAD with the same inputs, up to 3 times, so nobody has to type the command again. Each run still obeys its Claude budget (a manual command $5 per call; an automatic review the $6 per-PR allowance). The chain stops as soon as a run leaves nothing of that kind behind or fails; `@gemini review` continues by hand at any time. The workflow's `actions: write` permission is used only to start this same workflow.
-
-### Dismiss a disproven finding without skipping final audit
-
-An authorized repository writer can dismiss **one specific** confirmed-open **or UNCERTAIN** P0/P1/P2
-candidate on the **same exact reviewed HEAD** by posting a fresh PR comment with 1–3 evidence links:
+An authorized writer can dismiss **one** open or UNCERTAIN P0/P1/P2 finding on the exact reviewed HEAD:
 
 ```text
 @gemini dismiss F001
 Reason: The report mixes exact Git reference lookups with matching-refs; the exact endpoint does not return arrays.
 Evidence: https://docs.github.com/en/rest/git/refs
-Evidence: https://api.github.com/repos/actions/checkout/git/ref/tags/v5.0
 ```
 
-The `Reason:` line must be 30-400 characters; supply 1-3 `Evidence:` lines
-with credential-free HTTPS URLs. Evidence is **attributed to the human operator**,
-not automatically certified by the bot. The workflow re-reads the source
-comment, validates its PR, author, writer permission and the unchanged HEAD,
-and stores actor, cited links, reason, source comment, HEAD and timestamp in
-the durable session.
-
-Only the named OPEN or UNCERTAIN material candidate becomes **DISMISSED**.
-Other confirmed or unresolved candidates remain blocking. A successful cited
-dismissal does not pretend the underlying claim was model-verified. If the
-audit has not passed, the session enters **AUDIT_PENDING** and runs the normal
-Final Audit; an already completed audit is not repeated.
-
-Resolving a GitHub review thread alone is not a dismissal. The separate
-`override review` command still waives the entire PR and is **not** used
-to adjudicate false positives.
-
-## Convergence rules
-
-These keep the reviewer from finding "one more thing" forever:
-
-- **Known-issue ledger.** Only REJECTED candidates, human-dismissed claims and nonblocking P3s enter the settled/suppression ledger. UNCERTAIN P0–P2 concerns retain actionable IDs and **are never suppressed as settled**. The review notes which settled items were omitted.
-- **Evidence rule.** Every finding must give a concrete `failurePath` (input/state -> wrong result). A P0/P1/P2 without one is demoted to non-blocking P3, and a validator CONFIRMED verdict with no cited evidence becomes UNCERTAIN.
-- **Exact-HEAD source check.** A validator `CONFIRMED` verdict additionally needs a real code quote (`path`, one-based `line`, exact excerpt) present both in targeted context and at that line in the reviewed checkout. Unsupported or invented citations become visible **UNCERTAIN blockers**, not invented confirmed bugs. This verifies a quote, **not the correctness of a claimed failure path**; externally dependent claims still require authoritative verification.
-- **Narrow external-fact guard.** Only explicit assertions that a particular GitHub Action `owner/repo@ref` does not exist are eligible for an official GitHub ref check. The absence claim must directly attach to that reference, not an unrelated local defect such as missing permissions. An existing ref disproves the missing-ref claim; absence is considered verified only if the action repository is accessible. All other findings—including workflow security issues, local `provider` bugs, and third-party API claims—follow the ordinary Gemini validation path without an automatic downgrade. Probes use only `api.github.com` with a bounded timeout and never fetch untrusted URLs.
-- **Manual override.** See above.
-
-READY means the **review's** required evidence is resolved and its audit gate passed; separate CI, approvals and GitHub branch protection remain mandatory before merge. A manual override is visibly marked.
-
-## Review policy
-
-The automatic state machine is:
-
-```text
-New PR / changed HEAD
-       |
-       v
-Discovery or incremental review
-       |
-       +-- No material candidates ------+
-       |                                |
-       +-- P0/P1/P2 candidates          |
-                    |                   |
-             Targeted validator         |
-                    |                   |
-        +-----------+----------+        |
-        |           |          |        |
-     REJECTED   CONFIRMED   UNCERTAIN    |
-        |           |          |        |
-        |         REWORK   HUMAN_REQUIRED
-        |           |          |
-        |        fix + push   evidence-based dismissal,
-        |           |        code change or explicit waiver
-        |           |          |
-        +-----------+----------+--------+
-                                       |
-                              Final audit if required
-                                       |
-                         same material-validation rules
-                                       |
-                       zero unresolved material candidates
-                                       |
-                                     READY
-                          (also require independent CI)
-```
-
-Material validation is not a second discovery pass: it may only confirm, reject, or mark uncertain the candidates already produced by discovery, and must actively check downstream guards, fingerprints/scope filters, and relevant tests before confirming. **UNCERTAIN is not REJECTED:** it is persisted as a review blocker (not a confirmed bug); an independent audit may not silently suppress it. After evidence-based human dismissal, the normal final-audit rule still applies. Verification is likewise not allowed to reopen broad, unrelated discovery. A new finding is valid there only when it is a regression directly caused by the repair (except a catastrophic P0/security issue). After convergence, one independent final audit gets a fresh look at the final cumulative diff; it can run only once and any confirmed audit finding returns to targeted verification rather than reopening broad discovery. These bounds prevent the endless “review → fix → fresh full review → new edge case” loop.
-
-Codex is deliberately **not automatic in v1**. At HUMAN_REQUIRED, use a targeted Codex or Claude review only when human judgment says the remaining issue is worth escalation. This keeps Codex and Claude usage low.
+`Reason:` 30-400 characters and 1-3 credential-free HTTPS `Evidence:` lines. The evidence is attributed to the
+person, not certified by the bot. The other findings stay blocking; when none is left the session goes to
+AUDIT_PENDING and the final full review runs by itself. Resolving a thread alone is not a dismissal.
 
 ## Security and execution model
 
-The GitHub comment is only a trigger. The central workflow pins the exact PR HEAD, builds trusted diff context, runs the reviewer without a GitHub write token, and re-checks HEAD before publication.
+The GitHub comment is only a trigger. The central workflow pins the exact PR HEAD, builds trusted diff context,
+runs the reviewer without a GitHub write token, and re-checks HEAD before publishing. A review published against
+a HEAD that moved is refused. Gemini gets no tools; Claude has Read/Glob/Grep over a sanitized snapshot only
+(no symlinks, submodules, `CLAUDE.md`, `.claude/`, `.mcp.json`) under host-enforced tool policy. The bot only trusts
+session comments authored by its own GitHub App identity. Only commands from users with write access count, in
+the first non-blank line (quoted, fenced, edited or mid-prose mentions do not).
 
-Default Gemini review is intentionally lightweight:
-
-```text
-model: gemini-flash-latest   # moving alias; override with GEMINI_MODEL to pin
-thinking: MEDIUM (discovery); LOW for verification and ordinary final audit
-input: exact cumulative PR diff for discovery and final audit
-       exact previous-HEAD..new-HEAD delta for incremental review
-       repair diff + durable open findings for verification
-```
-
-Gemini is not given agent tools or repository write access. The existing Claude deep-review path retains its read-only sanitized snapshot and host-enforced tool policy.
-
-A durable **Independent Review Session** comment records READY / REWORK / HUMAN_REQUIRED, stable finding IDs (F001, F002, ...), verification count, and next action. The bot only trusts session comments authored by its own GitHub App identity.
-
-The first nonblank line must contain only a supported command. Matching ignores case and ordinary spaces/tabs; quoted commands, fenced/indented code, lists, mid-prose mentions, and edited comments do not trigger.
+Concurrency: the workflow is serialized per PR. A run that ends with work left starts the next run of the same
+workflow itself (the `actions: write` permission is used only for that).
 
 ### Deploying a trigger change
 
@@ -250,105 +151,6 @@ tests without Claude calls or Cloudflare deployment.
 Repository code cannot change the GitHub App event subscription or deploy the
 Cloudflare Worker by itself: after merging a trigger change, subscribe the App to
 **Pull request** events and redeploy the Worker from the merged checkout.
-
-## Legacy Claude deep-review path
-
-- Listens for `@claude review` on pull requests through one GitHub App.
-- Works across every repository where that App is installed; target repos do not need their own Claude workflow.
-- Rejects triggers from users without write/admin access.
-- Pins the review to the exact PR head SHA that was current when the command was sent.
-- Checks out the target repository and gives Claude the real PR diff plus read access to the repository code.
-- Claude is review-only: it does not edit, push, merge, or approve code.
-- Publishes actionable findings as inline PR review comments when they can be anchored to changed lines; otherwise includes them in the review summary.
-- Uses Claude Code's moving `sonnet` alias at `medium` effort with a 24-turn ceiling to give non-trivial PRs enough room to finish while still bounding subscription usage.
-- The alias is resolved by the Claude Code CLI bundled in `@anthropic-ai/claude-agent-sdk`, so it only follows new Sonnet releases when the SDK is current. `.github/dependabot.yml` opens a PR for each new SDK release; merge it to move the alias forward. The published review's runtime line shows the resolved model.
-- Reports the resolved model, agent turns, and SDK token usage in each published review.
-
-## Architecture
-
-```text
-PR opened / reopened / ready
-or manual review command
-        |
-        v
-GitHub App webhook / Cloudflare Worker
-        |
-        v
-review-v2.yml (serialized per PR)
-        |
-        +--> exact-HEAD preflight + PR diff
-        +--> restore durable review session
-        +--> choose automatically:
-        |      Gemini discovery
-        |      Gemini verification
-        |      one-time Gemini final audit
-        |      no-op / HUMAN_REQUIRED
-        |
-        +--> exact-HEAD publisher
-        +--> update durable session comment
-        |
-        v
-READY / REWORK / HUMAN_REQUIRED
-```
-
-The provider is an implementation detail. The session policy, stable finding IDs,
-round budget, and GitHub publication are separate from the Gemini/Claude adapters.
-A future ReviewLoop integration should call this service through one thin review
-interface rather than embedding provider-specific logic in ReviewLoop core.
-
-## Review cost controls
-
-Default automatic review:
-
-```text
-discovery:
-  model: gemini-flash-latest
-  thinking: medium
-  structured-output budget: 32k (medium thinking)
-  passes: 1
-
-material validator:
-  model: gemini-flash-latest
-  thinking: medium
-  structured-output budget: 8k normally; 32k for state-integrity candidates
-  passes: max 1 per discovery
-  only CONFIRMED blocks
-
-verification:
-  model: gemini-flash-latest
-  scope: repair diff + open findings
-  passes: max 2
-
-final audit:
-  model: gemini-flash-latest
-  thinking: low normally; medium only for deterministic state-integrity risk
-  structured-output budget: 16k normally; 32k for medium state-integrity audit
-  scope: final cumulative PR diff
-  passes: max 1 per session
-  state-integrity risk: explicitly test read-modify-write boundaries, stale snapshots,
-                        lost updates, TOCTOU, CAS/version checks and two-actor interleavings
-  P0/P1/P2 candidates: targeted medium validator
-
-P3: non-blocking
-same HEAD: no model call
-```
-
-Gemini receives bounded textual context rather than repository tools. Discovery
-uses the exact PR diff. The material validator receives only targeted context for
-each candidate (primary file, relevant PR hunk, matching symbols/guards and tests).
-Verification uses only the repair diff plus durable open findings. Before model review, a zero-model-cost deterministic classifier inspects added diff lines for a narrow combination of synchronization/transaction primitives plus durable/shared-state changes. The final audit reuses the cumulative PR diff exactly once after convergence; only a state-integrity hit changes its thinking level and prompt. The request has a hard output/thinking-token ceiling and the publisher fails closed on malformed output or a moved PR HEAD.
-
-Claude remains an explicit deep-review escape hatch:
-
-```text
-model: sonnet
-effort: medium
-maxTurns: 24
-```
-
-It is not part of the normal automatic loop. Explicit Claude calls are bounded
-to $2 each even if prior automatic fallback calls already reached the $6 PR cap.
-Codex is also not called automatically; use targeted escalation after HUMAN_REQUIRED.
 
 ## One-time setup
 
@@ -411,11 +213,9 @@ The Worker dispatches `.github/workflows/review-v2.yml` on `main`, so the workfl
 Open a non-draft PR in any repository covered by the GitHub App, or move a draft
 PR to **Ready for review**.
 
-Expected behavior: the PR event automatically runs a Gemini discovery review and
-creates an **Independent Review Session** comment. If material findings exist,
-push a repair, then comment `@gemini review` to run targeted verification (pushes do not trigger it).
-After findings converge, the workflow automatically runs the one-time final audit
-before READY. A later commit after READY is reviewed only when you comment `@gemini review`.
+Expected behavior: the PR event automatically runs a full review and posts an **Independent Review Session**
+comment. If it finds problems, fix them and resolve their threads; the review that checks the repair starts by
+itself once every blocking thread is resolved (or comment `@gemini review`). Pushes do not trigger a review.
 
 The manual command remains useful for retrying a stopped/no-op path:
 

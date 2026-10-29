@@ -44,9 +44,16 @@ test('P3-only deep findings do not block READY', () => {
   assert.equal(s.status, 'READY');
 });
 
-test('deep review refuses to seed a session when none exists for the exact HEAD', () => {
-  assert.throws(() => beginDeepReview({ session: null, baseSha: BASE, headSha: A, now: T0 }), /existing review session/);
-  assert.throws(() => beginDeepReview({ session: readySession(C), baseSha: BASE, headSha: A, now: T0 }), /existing review session/);
+test('a full review of a HEAD with no session of its own starts one and keeps the spend of an earlier session', () => {
+  const fresh = beginDeepReview({ session: null, baseSha: BASE, headSha: A, now: T0 });
+  assert.equal(fresh.status, 'REVIEW_IN_PROGRESS');
+  assert.equal(fresh.lastReviewedHead, A);
+  const old = { ...readySession(C), deepSpendUsd: 4, claudeSdkSpendUsd: 3 };
+  const begun = beginDeepReview({ session: old, baseSha: BASE, headSha: A, reserveUsd: 5, now: T0 });
+  assert.equal(begun.lastReviewedHead, A);
+  assert.equal(begun.deepSpendUsd, 9);
+  assert.equal(begun.claudeSdkSpendUsd, 3);
+  assert.equal(begun.findings.length, 0);
 });
 
 test('a result for a different HEAD is refused and never advances the session', () => {
@@ -115,6 +122,7 @@ function fakeGitHub({ head = A, base = BASE } = {}) {
   const writes = [];
   const fetchImpl = async (url, init = {}) => {
     if (/\/pulls\/7$/.test(url)) return Response.json({ base: { sha: base }, head: { sha: head } });
+    if (init.method === 'DELETE') { writes.push({ url, method: 'DELETE', body: null }); return new Response(null, { status: 204 }); }
     if (init.method === 'POST' || init.method === 'PATCH') {
       writes.push({ url, method: init.method, body: JSON.parse(init.body) });
       const patched = String(url).match(/comments\/(\d+)$/);
@@ -150,6 +158,22 @@ test('begin -> finalize writes IN_PROGRESS then READY into the same comment', as
   assert.equal(done.deepSpendUsd, 0.5);
   assert.equal(gh.writes[1].url.endsWith('/issues/comments/300'), true);
   assert.match(gh.writes[1].body.body, /jiaze-review-source-comment:55/);
+});
+
+test('a review that ends in a different status than it started posts the result as a new comment and removes the old one', async () => {
+  const gh = fakeGitHub();
+  const dir = ctxDir({ requestedMode: 'claude', decision: { mode: 'claude' }, session: readySession(), sessionCommentId: '300' }, { total_cost_usd: 0.5 });
+  const env = cenv(dir, { GITHUB_OUTPUT: path.join(dir, 'out') });
+  await runDeepReviewCommand('begin', { env, fetchImpl: gh.fetchImpl, now: T0 });
+  assert.equal(gh.writes[0].method, 'PATCH'); // entering IN_PROGRESS is edited in place
+  fs.writeFileSync(path.join(dir, 'review.json'), JSON.stringify({ summary: 'bug', findings: [finding('P2')] }));
+  const done = await runDeepReviewCommand('finalize', { env: { ...env, REVIEW_PATH: path.join(dir, 'review.json') }, fetchImpl: gh.fetchImpl, now: T0 });
+  assert.equal(done.status, 'REWORK');
+  assert.equal(gh.writes[1].method, 'POST'); // READY -> REWORK: new comment at the bottom
+  assert.equal(gh.writes[2].method, 'DELETE');
+  assert.match(gh.writes[2].url, /comments\/300$/);
+  // the next step of the same job finds the new comment
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dir, 'deep-review-state.json'), 'utf8')).sessionCommentId, '901');
 });
 
 test('manual @claude review runs with $5 limit even after exhausting the automatic PR cap', async () => {
@@ -330,8 +354,8 @@ function sweepFetch({ repos, prs, comments, onWrite, liveHead = {} }) {
     const one = String(url).match(/repos\/([^/]+\/[^/]+)\/issues\/comments\/(\d+)$/);
     if (one && !init.method) return Response.json(Object.values(comments).flat().find((c) => String(c.id) === one[2]));
     const list = String(url).match(/repos\/([^/]+\/[^/]+)\/issues\/(\d+)\/comments/);
-    if (list) return Response.json(comments[`${list[1]}#${list[2]}`] ?? []);
-    if (init.method) { onWrite({ url, method: init.method, body: JSON.parse(init.body) }); return Response.json({}); }
+    if (list && !init.method) return Response.json(comments[`${list[1]}#${list[2]}`] ?? []);
+    if (init.method) { onWrite({ url, method: init.method, body: init.body ? JSON.parse(init.body) : null }); return init.method === 'DELETE' ? new Response(null, { status: 204 }) : Response.json({ id: 999 }); }
     assert.fail('unexpected ' + url);
   };
 }
@@ -367,8 +391,12 @@ test('close fails a stale review closed and posts an error status', async () => 
   });
   const ok = await closeStaleDeepReview({ repo: 'acme/project', prNumber: 7, env: { EXPECTED_REVIEW_AUTHOR: 'bot[bot]', GH_TOKEN: 't', STATUS_TOKEN: 's' }, fetchImpl });
   assert.equal(ok, true);
+  // the result is a different status than before the run, so it is a new comment at the bottom and the old one goes
+  assert.equal(writes[0].method, 'POST');
   assert.match(writes[0].body.body, /Status: \*\*HUMAN_REQUIRED\*\*/);
-  assert.equal(writes[1].body.state, 'error');
+  assert.equal(writes[1].method, 'DELETE');
+  assert.match(writes[1].url, /issues\/comments\/70$/);
+  assert.equal(writes[2].body.state, 'error');
 });
 
 test('close inside the lock leaves alone a review that was restarted or moved since the scan', async () => {
@@ -420,17 +448,21 @@ test('successful manual Claude review recovers a provider-unavailable audited HE
   assert.equal(sessionCommitStatus(done,A).state,'success');
 });
 
-test('manual Claude cannot turn an unfinished discovery/final audit or material bug directly READY',()=>{
+test('a complete full pass is the independent review, wherever the session stood; a material bug still blocks it', () => {
   const discovery=applyDiscoveryResult({result:{summary:'clean',findings:[]},
     baseSha:BASE,headSha:A,sourceCommentId:'40'});
+  assert.equal(discovery.status,'AUDIT_PENDING');
   const stopped=stopUnavailableReviewSession({session:discovery,baseSha:BASE,headSha:A,
-    sourceCommentId:'42',mode:'audit',reason:'providers unavailable'});
-  const begun=beginDeepReview({session:stopped,baseSha:BASE,headSha:A,now:T0});
-  const clean=completeDeepReview({session:begun,result:{summary:'clean',findings:[]},headSha:A});
-  assert.equal(clean.status,'AUDIT_PENDING');
-  const found=completeDeepReview({session:begun,result:{summary:'bug',findings:[finding('P2')]},headSha:A});
-  assert.equal(found.status,'REWORK');
-  assert.equal(sessionCommitStatus(found,A).state,'failure');
+    sourceCommentId:'42',mode:'verification',reason:'providers unavailable'});
+  for (const from of [discovery, stopped]) {
+    const begun=beginDeepReview({session:from,baseSha:BASE,headSha:A,now:T0});
+    const clean=completeDeepReview({session:begun,result:{summary:'clean',findings:[],coverage:{complete:true,unreviewedPaths:[]}},headSha:A});
+    assert.equal(clean.status,'READY');
+    assert.equal(clean.auditCompleted,true);
+    const found=completeDeepReview({session:begun,result:{summary:'bug',findings:[finding('P2')]},headSha:A});
+    assert.equal(found.status,'REWORK');
+    assert.equal(sessionCommitStatus(found,A).state,'failure');
+  }
 });
 
 test('partial coverage never reaches READY, names the unreviewed files, and a complete re-run clears it', () => {
@@ -445,9 +477,11 @@ test('partial coverage never reaches READY, names the unreviewed files, and a co
   const body = renderSessionComment(partial);
   assert.match(body, /Review coverage: \*\*PARTIAL\*\*/);
   assert.match(body, /ui\/Layout\.swift/);
-  // The same HEAD waits for a manual re-run; a new HEAD restarts bounded discovery.
-  assert.equal(planReviewSession({ session: partial, baseSha: BASE, headSha: A }).mode, 'noop_waiting');
-  assert.equal(planReviewSession({ session: partial, baseSha: BASE, headSha: C }).mode, 'discovery');
+  // The same HEAD continues with the files not yet covered (by a command or by the run that continues it); a new HEAD starts a fresh review.
+  assert.equal(planReviewSession({ session: partial, baseSha: BASE, headSha: A, retryUnavailable: true }).mode, 'claude');
+  assert.equal(planReviewSession({ session: partial, baseSha: BASE, headSha: A, continuation: true }).mode, 'claude');
+  assert.equal(planReviewSession({ session: partial, baseSha: BASE, headSha: A }).mode, 'noop_waiting'); // an unrelated automatic event spends nothing
+  assert.equal(planReviewSession({ session: partial, baseSha: BASE, headSha: C }).mode, 'full_review');
   const rerun = completeDeepReview({
     session: beginDeepReview({ session: partial, baseSha: BASE, headSha: A, now: T0 }), headSha: A,
     result: { summary: 'all covered', findings: [], coverage: { complete: true, unreviewedPaths: [], note: '' } },
@@ -470,10 +504,9 @@ test('a model claiming complete while listing unreviewed files is still PARTIAL;
   assert.equal(bug.status, 'REWORK');
 });
 
-test('standalone @claude review needs no Gemini session: complete pass is READY with the audit marked done', () => {
-  const begun = beginDeepReview({ session: null, baseSha: BASE, headSha: A, standalone: true, now: T0 });
+test('a full review needs no earlier session: a complete pass is READY with the audit marked done', () => {
+  const begun = beginDeepReview({ session: null, baseSha: BASE, headSha: A, now: T0 });
   assert.equal(begun.status, 'REVIEW_IN_PROGRESS');
-  assert.equal(begun.deepReview.standalone, true);
   const done = completeDeepReview({
     session: begun, headSha: A,
     result: { summary: 'clean', findings: [], coverage: { complete: true, unreviewedPaths: [], note: '' } },
@@ -481,29 +514,18 @@ test('standalone @claude review needs no Gemini session: complete pass is READY 
   assert.equal(done.status, 'READY');
   assert.equal(done.auditCompleted, true);
   assert.equal(sessionCommitStatus(done, A).state, 'success');
-  // Partial coverage or a P2 still blocks a standalone review.
+  // Partial coverage or a P2 still blocks it.
   const partial = completeDeepReview({ session: begun, headSha: A, result: { summary: 's', findings: [], coverage: { complete: false, unreviewedPaths: ['x'] } } });
   assert.equal(partial.status, 'PARTIAL');
   assert.equal(completeDeepReview({ session: begun, headSha: A, result: { summary: 's', findings: [finding('P2')] } }).status, 'REWORK');
 });
 
-test('standalone review on a new HEAD starts fresh but keeps the PR spend ledger; non-standalone still requires a session', () => {
-  const old = { ...readySession(C), deepSpendUsd: 4, claudeSdkSpendUsd: 3 };
-  const begun = beginDeepReview({ session: old, baseSha: BASE, headSha: A, standalone: true, reserveUsd: 5, now: T0 });
-  assert.equal(begun.lastReviewedHead, A);
-  assert.equal(begun.deepSpendUsd, 9);
-  assert.equal(begun.claudeSdkSpendUsd, 3);
-  assert.equal(begun.findings.length, 0);
-  assert.throws(() => beginDeepReview({ session: old, baseSha: BASE, headSha: A, now: T0 }), /requires an existing review session/);
-});
-
-test('a standalone review re-run after PARTIAL keeps its standalone marker and reaches READY', () => {
-  const first = beginDeepReview({ session: null, baseSha: BASE, headSha: A, standalone: true, now: T0 });
+test('a review continued after PARTIAL reaches READY when the rest is covered', () => {
+  const first = beginDeepReview({ session: null, baseSha: BASE, headSha: A, now: T0 });
   const partial = completeDeepReview({ session: first, headSha: A, result: { summary: 's', findings: [], coverage: { complete: false, unreviewedPaths: ['x'] } } });
   assert.equal(partial.status, 'PARTIAL');
   assert.equal(partial.auditCompleted, false);
   const rerun = beginDeepReview({ session: partial, baseSha: BASE, headSha: A, now: T0 });
-  assert.equal(rerun.deepReview.standalone, true);
   const done = completeDeepReview({ session: rerun, headSha: A, result: { summary: 's', findings: [], coverage: { complete: true, unreviewedPaths: [] } } });
   assert.equal(done.status, 'READY');
   assert.equal(done.auditCompleted, true);
@@ -511,7 +533,7 @@ test('a standalone review re-run after PARTIAL keeps its standalone marker and r
 
 test('a deep review that failed closed can be retried and recovers; findings-based HUMAN_REQUIRED stays sticky', () => {
   const failed = failDeepReview({
-    session: beginDeepReview({ session: null, baseSha: BASE, headSha: A, standalone: true, now: T0 }),
+    session: beginDeepReview({ session: null, baseSha: BASE, headSha: A, now: T0 }),
     headSha: A, reason: 'timed out',
   });
   assert.equal(failed.status, 'HUMAN_REQUIRED');
@@ -550,6 +572,11 @@ test('an automatic review tries Gemini first and its Claude part obeys the autom
   await runDeepReviewCommand('begin', { env: manual.env, fetchImpl: fakeGitHub().fetchImpl, now: T0 });
   assert.match(fs.readFileSync(path.join(manual.dir, 'out'), 'utf8'), /run_budget_usd=5.00/);
   assert.match(fs.readFileSync(path.join(manual.dir, 'out'), 'utf8'), /providers=gemini,claude/);
+  // A dismissal is not a request for more review: whatever follows it obeys the automatic allowance, comment or not.
+  const dismissed = ctxDir({ requestedMode: 'dismiss', decision: { mode: 'claude' }, session: { ...readySession(), deepSpendUsd: 6 }, sessionCommentId: '300' });
+  await runDeepReviewCommand('begin', { env: cenv(dismissed, { GITHUB_OUTPUT: path.join(dismissed, 'out'), SOURCE_KIND: 'comment' }), fetchImpl: fakeGitHub().fetchImpl, now: T0 });
+  assert.match(fs.readFileSync(path.join(dismissed, 'out'), 'utf8'), /providers=gemini\n/);
+  assert.match(fs.readFileSync(path.join(dismissed, 'out'), 'utf8'), /run_budget_usd=0.00/);
   // An explicit @claude review asks for Claude only.
   const explicit = ctxDir({ requestedMode: 'claude', decision: { mode: 'claude' }, session: readySession(), sessionCommentId: '300' });
   await runDeepReviewCommand('begin', { env: cenv(explicit, { GITHUB_OUTPUT: path.join(explicit, 'out'), SOURCE_KIND: 'comment' }), fetchImpl: fakeGitHub().fetchImpl, now: T0 });
@@ -559,7 +586,7 @@ test('an automatic review tries Gemini first and its Claude part obeys the autom
 test('a partial review remembers the files it covered in compact keys, and a complete re-run clears them', () => {
   const files = Array.from({ length: 300 }, (_, i) => `Sources/Module${i}/File${i}.swift`);
   const first = completeDeepReview({
-    session: beginDeepReview({ session: null, baseSha: BASE, headSha: A, standalone: true, now: T0 }), headSha: A,
+    session: beginDeepReview({ session: null, baseSha: BASE, headSha: A, now: T0 }), headSha: A,
     result: { summary: 's', findings: [], coverage: { complete: false, reviewedPaths: files.slice(0, 250), unreviewedPaths: files.slice(250), note: 'ran out of time' } },
   });
   assert.equal(first.status, 'PARTIAL');
@@ -575,21 +602,23 @@ test('a partial review remembers the files it covered in compact keys, and a com
   assert.equal(done.coverage, undefined);
 });
 
-test('a sharded pass begun as the final audit reaches READY with the audit done; a partial one stays PARTIAL and continues as the audit', async () => {
-  const { beginDeepReview, completeDeepReview, applyDiscoveryResult } = await import('../scripts/review-session-core.mjs');
-  const B = 'b'.repeat(40), H = 'a'.repeat(40);
-  const awaiting = applyDiscoveryResult({ result: { summary: 'clean', findings: [] }, baseSha: B, headSha: H, sourceCommentId: '1' });
-  assert.equal(awaiting.status, 'AUDIT_PENDING');
-  const plain = completeDeepReview({ session: beginDeepReview({ session: awaiting, baseSha: B, headSha: H }), result: { summary: 's', findings: [], coverage: { complete: true, unreviewedPaths: [], reviewedPaths: [] } }, headSha: H });
-  assert.equal(plain.status, 'AUDIT_PENDING'); // an ordinary pass is not the audit
-  const begun = beginDeepReview({ session: awaiting, baseSha: B, headSha: H, audit: true });
-  const partial = completeDeepReview({ session: begun, result: { summary: 's', findings: [], coverage: { complete: false, unreviewedPaths: ['x'], reviewedPaths: ['y'] } }, headSha: H });
+test('the final full review is owed once: findings it adds are verified and no second full review follows; a first review that finds something is not the final one', () => {
+  const waiting = applyDiscoveryResult({ result: { summary: 'clean', findings: [] }, baseSha: BASE, headSha: A, sourceCommentId: '1' });
+  const full = (findings) => ({ summary: 's', findings, coverage: { complete: true, unreviewedPaths: [] } });
+  const final = completeDeepReview({ session: beginDeepReview({ session: waiting, baseSha: BASE, headSha: A, now: T0 }), result: full([finding('P2')]), headSha: A });
+  assert.equal(final.status, 'REWORK');
+  assert.equal(final.auditCompleted, true);
+  assert.equal(final.fullAuditHead, A);
+  // a first review (no session) that finds something still owes the final one
+  const first = completeDeepReview({ session: beginDeepReview({ session: null, baseSha: BASE, headSha: A, now: T0 }), result: full([finding('P2')]), headSha: A });
+  assert.equal(first.status, 'REWORK');
+  assert.equal(first.auditCompleted, false);
+  // a final review that runs out of room is not done, and continuing it is still the final review
+  const partial = completeDeepReview({ session: beginDeepReview({ session: waiting, baseSha: BASE, headSha: A, now: T0 }), result: { summary: 's', findings: [], coverage: { complete: false, unreviewedPaths: ['x'] } }, headSha: A });
   assert.equal(partial.status, 'PARTIAL');
-  const again = beginDeepReview({ session: partial, baseSha: B, headSha: H });
-  assert.equal(again.deepReview.audit, true);
-  const done = completeDeepReview({ session: again, result: { summary: 's', findings: [], coverage: { complete: true, unreviewedPaths: [], reviewedPaths: ['x'] } }, headSha: H });
-  assert.equal(done.status, 'READY');
+  assert.equal(partial.auditCompleted, false);
+  const again = beginDeepReview({ session: partial, baseSha: BASE, headSha: A, now: T0 });
+  assert.equal(again.deepReview.final, true);
+  const done = completeDeepReview({ session: again, result: full([finding('P2')]), headSha: A });
   assert.equal(done.auditCompleted, true);
-  const bug = completeDeepReview({ session: beginDeepReview({ session: awaiting, baseSha: B, headSha: H, audit: true }), result: { summary: 's', findings: [{ severity: 'P1', title: 'Bug', body: 'Trigger X causes wrong result Y.', path: 'a.js', line: 1, riskClass: 'state' }], coverage: { complete: true, unreviewedPaths: [] } }, headSha: H });
-  assert.equal(bug.status, 'REWORK');
 });
