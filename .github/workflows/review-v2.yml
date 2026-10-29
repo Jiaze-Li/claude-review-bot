@@ -219,6 +219,10 @@ jobs:
           git -C target diff --no-ext-diff --no-textconv --unified=80 "$merge_base" "$HEAD_SHA" > .review-context/pr.diff
           git -C target diff --no-ext-diff --no-textconv --name-only "$merge_base" "$HEAD_SHA" > .review-context/changed-files.txt
           git -C target diff --no-ext-diff --no-textconv --stat "$merge_base" "$HEAD_SHA" > .review-context/diff-stat.txt
+          # Optional per-repository skip list. It comes from the PR's BASE commit, never from the PR
+          # itself, so a PR cannot exempt its own files from review.
+          { git -C target show "${merge_base}:.reviewbotignore" 2>/dev/null | head -c 20000 > .review-context/ignore-patterns.txt; } || true
+          [[ -f .review-context/ignore-patterns.txt ]] || : > .review-context/ignore-patterns.txt
 
       - name: Classify deterministic review risk
         if: steps.dedupe.outputs.duplicate != 'true'

@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 const MATERIAL_SEVERITIES = new Set(['P0', 'P1', 'P2']);
 export const SESSION_VERSION = 1;
 export const MAX_VERIFICATION_ROUNDS = 2;
@@ -21,6 +22,13 @@ export function geminiContextTooLarge({ diffBytes = 0, prJsonBytes = 0, session 
   return diffBytes + prJsonBytes + sessionBytes + GEMINI_CONTEXT_MARGIN_BYTES > GEMINI_MAX_CONTEXT_BYTES;
 }
 const MAX_UNREVIEWED_PATHS = 20;
+const MAX_REVIEWED_KEYS = 400;
+
+// Short stable key for a path, so a session can remember which files a partial review
+// already covered without storing every path in its 24 KB state.
+export function pathKey(path) {
+  return createHash('sha1').update(String(path)).digest('hex').slice(0, 8);
+}
 export const CLAUDE_AUTO_MIN_BUDGET_USD = 0.5;
 // An IN_PROGRESS session older than this belongs to a run that died without
 // reporting; it must resolve instead of waiting forever.
@@ -546,6 +554,9 @@ function normalizeCoverage(value) {
     complete,
     unreviewedCount: unreviewed.length,
     unreviewedPaths: unreviewed.slice(0, MAX_UNREVIEWED_PATHS),
+    reviewedKeys: Array.isArray(value.reviewedPaths)
+      ? [...new Set(value.reviewedPaths.filter((p) => typeof p === 'string' && p).map(pathKey))].slice(0, MAX_REVIEWED_KEYS)
+      : [],
     ...(value.note ? { note: compactText(value.note, 300) } : {}),
   };
 }

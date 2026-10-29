@@ -1,8 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { query } from '@anthropic-ai/claude-agent-sdk';
-import { knownIssuesPromptBlock, matchesKnownDismissal } from './review-session-core.mjs';
-import { mergeShardResults, planShards, splitDiffByFile } from './review-shards.mjs';
+import { knownIssuesPromptBlock, matchesKnownDismissal, pathKey } from './review-session-core.mjs';
+import { DEFAULT_IGNORE, matchesIgnore, mergeShardResults, parseIgnorePatterns, planShards, splitDiffByFile } from './review-shards.mjs';
 
 const cwd = process.cwd();
 const safeRoot = realDir(process.env.SAFE_REPO_DIR ?? 'safe-target');
@@ -67,13 +67,17 @@ const schema = {
   required: ['summary', 'findings', 'coverage'],
 };
 
-function buildPrompt({ shard, index, count, diffPath, maxTurns, budgetUsd, knownIssues }) {
+function buildPrompt({ shard, index, count, listFiles, diffPath, maxTurns, budgetUsd, knownIssues }) {
+  const assignedFiles = `Assigned files:\n${shard.files.map((file) => `- ${file}`).join('\n')}`;
   const assigned = count > 1
     ? `This is a LARGE pull request reviewed in ${count} independent shards. You are reviewing shard ${index + 1} of ${count}. Review ONLY the ${shard.files.length} file(s) assigned to you below. Their complete diff is in ${diffPath}; do not read pr.diff. You may Grep/Read other files in safe-target/ for context, but do not report findings for files outside your shard.
 
-Assigned files:
-${shard.files.map((file) => `- ${file}`).join('\n')}`
-    : `The diff to review is ${diffPath}.`;
+${assignedFiles}`
+    : listFiles
+      ? `Review ONLY the ${shard.files.length} file(s) assigned to you below; other changed files in this PR are already reviewed or deliberately skipped. Their complete diff is in ${diffPath}; do not read pr.diff. You may Grep/Read other files in safe-target/ for context, but do not report findings for files outside this list.
+
+${assignedFiles}`
+      : `The diff to review is ${diffPath}.`;
   return `You are reviewing pull request ${targetRepo}#${prNumber} at exact head SHA ${headSha}.
 
 This is a CODE REVIEW task, not a request to answer the trigger comment.
@@ -151,18 +155,34 @@ async function runShard({ prompt, maxTurns, maxBudgetUsd, timeoutMs }) {
   return { structured, meta, subtype, errors };
 }
 
-const changedFiles = readLines(path.join(contextRoot, 'changed-files.txt'));
-const chunks = splitDiffByFile(readText(path.join(contextRoot, 'pr.diff')));
-const allFiles = [...new Set([...changedFiles, ...chunks.map((chunk) => chunk.path)])].sort();
+const session = readSession();
+const everyFile = [...new Set([...readLines(path.join(contextRoot, 'changed-files.txt')), ...splitDiffByFile(readText(path.join(contextRoot, 'pr.diff'))).map((chunk) => chunk.path)])].sort();
+// Files with nothing to read, or a repository's own .reviewbotignore (taken from the PR's base
+// commit by the workflow, never from the PR under review), are skipped rather than reported unreviewed.
+const ignorePatterns = [...DEFAULT_IGNORE, ...parseIgnorePatterns(readText(path.join(contextRoot, 'ignore-patterns.txt')))];
+const ignoredFiles = new Set(everyFile.filter((file) => matchesIgnore(file, ignorePatterns)));
+const allFiles = everyFile.filter((file) => !ignoredFiles.has(file));
+// A partial review of this exact HEAD remembers which files it covered; continue with the rest.
+const earlierKeys = new Set(session?.coverage?.head === headSha ? (session.coverage.reviewedKeys ?? []) : []);
+const priorReviewed = allFiles.filter((file) => earlierKeys.has(pathKey(file)));
+const todo = new Set(allFiles.filter((file) => !earlierKeys.has(pathKey(file))));
+const changedFiles = [...todo];
+const chunks = splitDiffByFile(readText(path.join(contextRoot, 'pr.diff'))).filter((chunk) => todo.has(chunk.path));
+const nothingToDo = allFiles.length > 0 && todo.size === 0;
 const plan = planShards({ files: changedFiles, chunks });
-const shards = plan.shards.length ? plan.shards : [{ files: [], bytes: 0, diff: '' }];
+const shards = plan.shards.length || nothingToDo ? plan.shards : [{ files: [], bytes: 0, diff: '' }];
 const sharded = shards.length > 1 || plan.deferred.length > 0;
-if (sharded) {
+// A single pass over everything uses pr.diff as is; once files are skipped or already covered the
+// reviewer gets an explicit file list and a diff holding only those files.
+const listFiles = sharded || ignoredFiles.size > 0 || priorReviewed.length > 0;
+if (ignoredFiles.size || priorReviewed.length) {
+  console.log(`${ignoredFiles.size} file(s) skipped by ignore rules; ${priorReviewed.length} already reviewed earlier on this HEAD; ${todo.size} left to review.`);
+}
+if (listFiles) {
   fs.mkdirSync(path.join(contextRoot, 'shards'), { recursive: true, mode: 0o700 });
   console.log(`Large PR: ${allFiles.length} changed file(s) in ${shards.length} shard(s)${plan.deferred.length ? `, ${plan.deferred.length} file(s) deferred beyond the shard limit` : ''}.`);
 }
 
-const session = readSession();
 const knownIssues = knownIssuesPromptBlock(session);
 const startedAt = Date.now();
 const results = [];
@@ -192,11 +212,11 @@ async function worker() {
     inflightUsd += cap;
     try {
       let diffPath = '.review-context/pr.diff';
-      if (sharded) {
+      if (listFiles) {
         diffPath = `.review-context/shards/shard-${index + 1}.diff`;
         fs.writeFileSync(path.resolve(cwd, diffPath), shards[index].diff, { mode: 0o600 });
       }
-      const prompt = buildPrompt({ shard: shards[index], index, count: sharded ? shards.length : 1, diffPath, maxTurns: SHARD_MAX_TURNS, budgetUsd: cap, knownIssues });
+      const prompt = buildPrompt({ shard: shards[index], index, count: sharded ? shards.length : 1, listFiles, diffPath, maxTurns: SHARD_MAX_TURNS, budgetUsd: cap, knownIssues });
       let charged = cap;
       try {
         const run = await runShard({ prompt, maxTurns: SHARD_MAX_TURNS, maxBudgetUsd: cap, timeoutMs: startedAt + DEADLINE_MS - Date.now() - 30_000 });
@@ -224,12 +244,12 @@ try {
   fs.writeFileSync(usagePath, `${JSON.stringify({ subtype: results.some((r) => r?.ok) ? 'success' : 'error', total_cost_usd: spentUsd > 0 ? Number(spentUsd.toFixed(4)) : null })}\n`, { mode: 0o600 });
 }
 
-if (!results.some((result) => result?.ok)) {
+if (!nothingToDo && !results.some((result) => result?.ok)) {
   const reasons = results.map((result, index) => `shard ${index + 1}: ${result?.error ?? 'did not run'}`).join('; ');
   throw new Error(`Claude review failed: no shard completed${reasons ? ` (${reasons})` : ''}`);
 }
 
-const merged = mergeShardResults({ shards, results, deferred: plan.deferred, allFiles });
+const merged = mergeShardResults({ shards, results, deferred: plan.deferred, allFiles, priorReviewed, ignoredCount: ignoredFiles.size });
 // Concerns a human already dismissed or accepted (exact title on the same path) are not repeated.
 const repeats = merged.findings.filter((finding) => matchesKnownDismissal(finding, session));
 if (repeats.length) {
@@ -238,7 +258,7 @@ if (repeats.length) {
 }
 const reviewDocument = {
   ...merged,
-  _meta: { ...aggregateMeta(metas), shards: shards.length, shards_run: results.filter(Boolean).length, deferred_files: plan.deferred.length },
+  _meta: { ...aggregateMeta(metas), shards: shards.length, shards_run: results.filter(Boolean).length, deferred_files: plan.deferred.length, ignored_files: ignoredFiles.size },
 };
 
 fs.mkdirSync(path.dirname(outputPath), { recursive: true, mode: 0o700 });

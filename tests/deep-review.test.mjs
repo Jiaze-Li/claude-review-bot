@@ -546,3 +546,22 @@ test('a Claude review chosen automatically (PR too large for Gemini) obeys the a
   await runDeepReviewCommand('begin', { env: manual.env, fetchImpl: fakeGitHub().fetchImpl, now: T0 });
   assert.match(fs.readFileSync(path.join(manual.dir, 'out'), 'utf8'), /run_budget_usd=5.00/);
 });
+
+test('a partial review remembers the files it covered in compact keys, and a complete re-run clears them', () => {
+  const files = Array.from({ length: 300 }, (_, i) => `Sources/Module${i}/File${i}.swift`);
+  const first = completeDeepReview({
+    session: beginDeepReview({ session: null, baseSha: BASE, headSha: A, standalone: true, now: T0 }), headSha: A,
+    result: { summary: 's', findings: [], coverage: { complete: false, reviewedPaths: files.slice(0, 250), unreviewedPaths: files.slice(250), note: 'ran out of time' } },
+  });
+  assert.equal(first.status, 'PARTIAL');
+  assert.equal(first.coverage.reviewedKeys.length, 250);
+  assert.equal(first.coverage.head, A);
+  assert.ok(first.coverage.reviewedKeys.every((k) => /^[0-9a-f]{8}$/.test(k)));
+  assert.doesNotThrow(() => renderSessionComment(first)); // still fits the 24 KB session state
+  const done = completeDeepReview({
+    session: beginDeepReview({ session: first, baseSha: BASE, headSha: A, now: T0 }), headSha: A,
+    result: { summary: 's', findings: [], coverage: { complete: true, reviewedPaths: files, unreviewedPaths: [], note: '' } },
+  });
+  assert.equal(done.status, 'READY');
+  assert.equal(done.coverage, undefined);
+});
