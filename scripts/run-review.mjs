@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { query } from '@anthropic-ai/claude-agent-sdk';
+import { knownIssuesPromptBlock, matchesKnownDismissal } from './review-session-core.mjs';
 import { mergeShardResults, planShards, splitDiffByFile } from './review-shards.mjs';
 
 const cwd = process.cwd();
@@ -22,6 +23,8 @@ const REVIEW_MAX_BUDGET_USD = positiveNumberEnv('DEEP_REVIEW_MAX_BUDGET_USD', 2)
 // context never has to hold the whole diff. Shards that do not fit are reported as unreviewed.
 const SHARD_MAX_TURNS = positiveNumberEnv('DEEP_REVIEW_SHARD_TURNS', 14);
 const MIN_SHARD_BUDGET_USD = 0.3;
+// Shards are independent, so a few run at once to fit more of a large PR in the deadline.
+const SHARD_CONCURRENCY = Math.max(1, Math.floor(positiveNumberEnv('DEEP_REVIEW_SHARD_CONCURRENCY', 3)));
 // The workflow step has a 20 minute timeout; stop starting shards well before it.
 const DEADLINE_MS = positiveNumberEnv('DEEP_REVIEW_DEADLINE_MS', 16 * 60 * 1000);
 const usagePath = path.join(contextRoot, 'claude-usage.json');
@@ -64,7 +67,7 @@ const schema = {
   required: ['summary', 'findings', 'coverage'],
 };
 
-function buildPrompt({ shard, index, count, diffPath, maxTurns, budgetUsd }) {
+function buildPrompt({ shard, index, count, diffPath, maxTurns, budgetUsd, knownIssues }) {
   const assigned = count > 1
     ? `This is a LARGE pull request reviewed in ${count} independent shards. You are reviewing shard ${index + 1} of ${count}. Review ONLY the ${shard.files.length} file(s) assigned to you below. Their complete diff is in ${diffPath}; do not read pr.diff. You may Grep/Read other files in safe-target/ for context, but do not report findings for files outside your shard.
 
@@ -93,7 +96,7 @@ Start from the diff. Do NOT read every changed file or scan the whole repository
 You have a strict ${maxTurns}-turn agent budget. Spend the early turns on the highest-risk changes first. By turn ${Math.max(1, Math.floor(maxTurns * 0.75))}, stop broad exploration and use the remaining budget to produce the final structured review. A focused completed review is better than an exhaustive search that hits the turn limit and returns nothing.
 
 Focus only on actionable correctness bugs, security vulnerabilities, regressions, broken edge cases, and important missing tests. Do not report style preferences, compliments, or speculative concerns without a concrete failure mode. Report at most 6 findings, most severe first.
-
+${knownIssues}
 You may only inspect files using the available Read, Glob, and Grep tools. Host-side policy restricts those tools to the sanitized repository snapshot and trusted review context. Do not attempt to access any other path.
 
 For each finding, use a repository-relative path. If it can be anchored to an added/modified RIGHT-side line in the PR, set line to that file line number. Otherwise set line to null.
@@ -159,41 +162,63 @@ if (sharded) {
   console.log(`Large PR: ${allFiles.length} changed file(s) in ${shards.length} shard(s)${plan.deferred.length ? `, ${plan.deferred.length} file(s) deferred beyond the shard limit` : ''}.`);
 }
 
+const session = readSession();
+const knownIssues = knownIssuesPromptBlock(session);
 const startedAt = Date.now();
 const results = [];
 const metas = [];
 let remainingUsd = REVIEW_MAX_BUDGET_USD;
+let inflightUsd = 0;
 let spentUsd = 0;
-try {
-  for (let index = 0; index < shards.length; index += 1) {
+let nextIndex = 0;
+let stopped = false;
+
+async function worker() {
+  while (!stopped && nextIndex < shards.length) {
     const timeLeft = startedAt + DEADLINE_MS - Date.now();
-    if (remainingUsd < MIN_SHARD_BUDGET_USD || timeLeft < 60_000) {
-      console.warn(`Stopping before shard ${index + 1}/${shards.length}: ${remainingUsd < MIN_SHARD_BUDGET_USD ? 'budget exhausted' : 'time budget exhausted'}.`);
-      break;
+    const available = remainingUsd - inflightUsd;
+    if (timeLeft < 60_000 || (available < MIN_SHARD_BUDGET_USD && inflightUsd === 0)) {
+      stopped = true;
+      console.warn(`Stopping before shard ${nextIndex + 1}/${shards.length}: ${timeLeft < 60_000 ? 'time budget exhausted' : 'budget exhausted'}.`);
+      return;
     }
-    const cap = sharded ? Math.min(remainingUsd, Math.max(1, REVIEW_MAX_BUDGET_USD / 3)) : remainingUsd;
-    let diffPath = '.review-context/pr.diff';
-    if (sharded) {
-      diffPath = `.review-context/shards/shard-${index + 1}.diff`;
-      fs.writeFileSync(path.resolve(cwd, diffPath), shards[index].diff, { mode: 0o600 });
+    if (available < MIN_SHARD_BUDGET_USD) {
+      await new Promise((resolve) => setTimeout(resolve, 250)); // wait for a running shard to release budget
+      continue;
     }
-    const prompt = buildPrompt({ shard: shards[index], index, count: sharded ? shards.length : 1, diffPath, maxTurns: SHARD_MAX_TURNS, budgetUsd: cap });
+    const index = nextIndex;
+    nextIndex += 1;
+    const cap = sharded ? Math.min(available, Math.max(1, REVIEW_MAX_BUDGET_USD / 3)) : available;
+    inflightUsd += cap;
     try {
-      const run = await runShard({ prompt, maxTurns: SHARD_MAX_TURNS, maxBudgetUsd: cap, timeoutMs: timeLeft - 30_000 });
-      const cost = run.meta?.total_cost_usd ?? cap; // unknown spend is charged at the allotted cap
-      spentUsd += cost;
-      remainingUsd -= cost;
-      if (run.meta) metas.push(run.meta);
-      results[index] = run.subtype === 'success' && run.structured
-        ? { ok: true, structured: run.structured }
-        : { ok: false, error: run.subtype ? `${run.subtype}${run.errors ? `: ${run.errors}` : ''}` : 'no structured output' };
-    } catch (error) {
-      spentUsd += cap;
-      remainingUsd -= cap;
-      results[index] = { ok: false, error: error?.message ?? String(error) };
+      let diffPath = '.review-context/pr.diff';
+      if (sharded) {
+        diffPath = `.review-context/shards/shard-${index + 1}.diff`;
+        fs.writeFileSync(path.resolve(cwd, diffPath), shards[index].diff, { mode: 0o600 });
+      }
+      const prompt = buildPrompt({ shard: shards[index], index, count: sharded ? shards.length : 1, diffPath, maxTurns: SHARD_MAX_TURNS, budgetUsd: cap, knownIssues });
+      let charged = cap;
+      try {
+        const run = await runShard({ prompt, maxTurns: SHARD_MAX_TURNS, maxBudgetUsd: cap, timeoutMs: startedAt + DEADLINE_MS - Date.now() - 30_000 });
+        charged = run.meta?.total_cost_usd ?? cap; // unknown spend is charged at the allotted cap
+        if (run.meta) metas.push(run.meta);
+        results[index] = run.subtype === 'success' && run.structured
+          ? { ok: true, structured: run.structured }
+          : { ok: false, error: run.subtype ? `${run.subtype}${run.errors ? `: ${run.errors}` : ''}` : 'no structured output' };
+      } catch (error) {
+        results[index] = { ok: false, error: error?.message ?? String(error) };
+      }
+      spentUsd += charged;
+      remainingUsd -= charged;
+      if (results[index].ok === false) console.warn(`Shard ${index + 1}/${shards.length} did not complete: ${results[index].error}`);
+    } finally {
+      inflightUsd -= cap;
     }
-    if (results[index].ok === false) console.warn(`Shard ${index + 1}/${shards.length} did not complete: ${results[index].error}`);
   }
+}
+
+try {
+  await Promise.all(Array.from({ length: Math.min(SHARD_CONCURRENCY, shards.length) }, () => worker()));
 } finally {
   // Spend must be accounted even when shards fail (budget/turn exhaustion still costs).
   fs.writeFileSync(usagePath, `${JSON.stringify({ subtype: results.some((r) => r?.ok) ? 'success' : 'error', total_cost_usd: spentUsd > 0 ? Number(spentUsd.toFixed(4)) : null })}\n`, { mode: 0o600 });
@@ -205,9 +230,15 @@ if (!results.some((result) => result?.ok)) {
 }
 
 const merged = mergeShardResults({ shards, results, deferred: plan.deferred, allFiles });
+// Concerns a human already dismissed or accepted (exact title on the same path) are not repeated.
+const repeats = merged.findings.filter((finding) => matchesKnownDismissal(finding, session));
+if (repeats.length) {
+  merged.findings = merged.findings.filter((finding) => !repeats.includes(finding));
+  merged.summary = `${merged.summary}\n\n${repeats.length} finding(s) matching earlier dismissals were not repeated.`.slice(0, 3900);
+}
 const reviewDocument = {
   ...merged,
-  _meta: { ...aggregateMeta(metas), shards: shards.length },
+  _meta: { ...aggregateMeta(metas), shards: shards.length, shards_run: results.filter(Boolean).length, deferred_files: plan.deferred.length },
 };
 
 fs.mkdirSync(path.dirname(outputPath), { recursive: true, mode: 0o700 });
@@ -230,6 +261,14 @@ function aggregateMeta(list) {
     usage,
     model_usage: {},
   };
+}
+
+function readSession() {
+  try {
+    return JSON.parse(readText(path.join(contextRoot, 'session-plan.json'))).session ?? null;
+  } catch {
+    return null;
+  }
 }
 
 function readText(file) {
