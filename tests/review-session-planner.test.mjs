@@ -213,7 +213,11 @@ function threadFetch({session,findings,resolvedBy='jiaze-li',permission='write'}
       id:'T'+i,isResolved:resolvedBy!==null,resolvedBy:resolvedBy?{login:resolvedBy}:null,
       comments:{nodes:[{databaseId:i+1,author:{login:author.replace('[bot]','')},body:'x\n\n'+findingMarker(f.path,f.title)}]},
     }))}}}}});
-    if(url.includes('/collaborators/')) return Response.json({permission});
+    if(url.includes('/collaborators/')){
+      // only the real resolver exists; a wrongly built login (e.g. an object) must not pass
+      if(decodeURIComponent(url.split('/collaborators/')[1].split('/')[0])!==resolvedBy) return Response.json({message:'Not Found'},{status:404});
+      return Response.json({permission});
+    }
     assert.fail('unexpected URL '+url);
   };
 }
