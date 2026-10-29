@@ -68,28 +68,43 @@ test('explicit reset starts a fresh discovery while preserving session comment l
   assert.match(plan.decision.reason,/^explicit reset: /);
 });
 
-test('explicit Claude mode joins the durable session for this HEAD',async()=>{
-  const session=applyDiscoveryResult({result:{summary:'clean',findings:[]},baseSha:BASE,headSha:A,sourceCommentId:'1'});
-  const plan=await planSession({
-    env:env({REQUESTED_MODE:'claude'}),
-    fetchImpl:fetchState({comments:[comment(7,renderSessionComment(session))]}),
+test('@claude review plans exactly like @gemini review for the same session; only the model differs',async()=>{
+  const sessions={
+    awaitingAudit:applyDiscoveryResult({result:{summary:'clean',findings:[]},baseSha:BASE,headSha:A,sourceCommentId:'1'}),
+  };
+  const plan=async(mode,session,sourceKind='comment')=>planSession({
+    env:env({REQUESTED_MODE:mode,SOURCE_KIND:sourceKind}),
+    fetchImpl:fetchState({comments:session?[comment(7,renderSessionComment(session))]:[]}),
   });
-  assert.equal(plan.decision.mode,'claude');
-  assert.equal(plan.sessionCommentId,'7');
-  assert.equal(plan.session.lastReviewedHead,A);
+  // same HEAD, discovery done, audit pending
+  const claude=await plan('claude',sessions.awaitingAudit);
+  const gemini=await plan('auto',sessions.awaitingAudit);
+  assert.equal(claude.decision.mode,'audit');
+  assert.equal(claude.decision.mode,gemini.decision.mode);
+  assert.equal(claude.requestedMode,'claude');
+  assert.equal(gemini.requestedMode,'auto');
+  assert.equal(claude.sessionCommentId,'7');
+  // an open finding repaired on a new HEAD: verification, whichever model is asked
+  const rework=applyDiscoveryResult({result:{summary:'bug',findings:[{severity:'P1',title:'Bug',body:'Trigger X causes Y; expected Z.',path:'a.js',line:1,riskClass:'state'}]},baseSha:BASE,headSha:C,sourceCommentId:'1'});
+  assert.equal((await plan('claude',rework)).decision.mode,'verification');
+  assert.equal((await plan('auto',rework)).decision.mode,'verification');
+  // no session: the first review, in shards, by Claude only
+  const none=await plan('claude',null);
+  assert.equal(none.decision.mode,'claude');
+  assert.match(none.decision.reason,/Claude only/);
+  assert.match((await plan('auto',null)).decision.reason,/Gemini first, Claude continues/);
 });
 
-test('explicit Claude mode runs standalone when no session exists for this HEAD',async()=>{
-  const none=await planSession({env:env({REQUESTED_MODE:'claude'}),fetchImpl:fetchState()});
-  assert.equal(none.decision.mode,'claude');
-  assert.match(none.decision.reason,/standalone/);
-  const old=applyDiscoveryResult({result:{summary:'clean',findings:[]},baseSha:BASE,headSha:C,sourceCommentId:'1'});
-  const other=await planSession({
-    env:env({REQUESTED_MODE:'claude'}),
-    fetchImpl:fetchState({comments:[comment(7,renderSessionComment(old))]}),
-  });
-  assert.equal(other.decision.mode,'claude');
-  assert.equal(other.sessionCommentId,'7');
+test('@claude review waits for a deep review already running on this HEAD, and a PARTIAL review continues',async()=>{
+  const running={...applyDiscoveryResult({result:{summary:'clean',findings:[]},baseSha:BASE,headSha:A,sourceCommentId:'1'}),status:'REVIEW_IN_PROGRESS',
+    deepReview:{head:A,startedAt:new Date().toISOString(),state:'IN_PROGRESS',resumeStatus:'AUDIT_PENDING'}};
+  const waiting=await planSession({env:env({REQUESTED_MODE:'claude',SOURCE_KIND:'comment'}),fetchImpl:fetchState({comments:[comment(7,renderSessionComment(running))]})});
+  assert.equal(waiting.decision.mode,'noop_waiting');
+  const partial={...applyDiscoveryResult({result:{summary:'clean',findings:[]},baseSha:BASE,headSha:A,sourceCommentId:'1'}),status:'PARTIAL',
+    coverage:{complete:false,head:A,reviewedKeys:[],unreviewedPaths:['x'],unreviewedCount:1}};
+  const resumed=await planSession({env:env({REQUESTED_MODE:'claude',SOURCE_KIND:'comment'}),fetchImpl:fetchState({comments:[comment(7,renderSessionComment(partial))]})});
+  assert.equal(resumed.decision.mode,'claude');
+  assert.match(resumed.decision.reason,/partial review/);
 });
 
 test('planner recovers a trusted pending current-HEAD review instead of rerunning Gemini',async()=>{

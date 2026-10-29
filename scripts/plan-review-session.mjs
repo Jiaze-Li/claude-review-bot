@@ -53,15 +53,11 @@ export async function planSession({ env=process.env, fetchImpl=fetch }={}) {
     };
   }
 
-  if(requested==='claude'){
-    // Explicit deep review joins the durable session for this exact HEAD. A fresh
-    // in-progress marker means a run is already going; a stale one is restartable.
-    const waiting=session && session.lastReviewedHead===headSha && session.status==='REVIEW_IN_PROGRESS' && !isDeepReviewStale(session);
-    // Claude is an independent reviewer: with no session for this HEAD it starts its own.
-    const hasSession=session && session.lastReviewedHead===headSha;
-    const decision=waiting
-      ?{mode:'noop_waiting',previousHead:headSha,reason:'a Claude deep review is already in progress for this HEAD'}
-      :{mode:'claude',previousHead:null,reason:hasSession?'explicit Claude deep review bound to this HEAD':'standalone Claude review of this HEAD'};
+  // `@claude review` plans exactly like `@gemini review` (first review, incremental, verification or final
+  // audit, whatever the session calls for); only the model differs: Claude alone instead of Gemini first.
+  // A run still in progress for this exact HEAD is the one thing to wait for rather than start again.
+  if(requested==='claude' && session && session.lastReviewedHead===headSha && session.status==='REVIEW_IN_PROGRESS' && !isDeepReviewStale(session)){
+    const decision={mode:'noop_waiting',previousHead:headSha,reason:'a deep review is already in progress for this HEAD'};
     return {requestedMode:requested,decision,session,sessionCommentId,pendingSession:null,pendingSourceCommentId:null,pendingReviewId:null};
   }
 
@@ -83,14 +79,14 @@ export async function planSession({ env=process.env, fetchImpl=fetch }={}) {
   }
 
   let decision=planReviewSession({session,baseSha,headSha,reset:requested==='reset',
-    retryUnavailable:requested==='auto' && env.SOURCE_KIND==='comment'});
+    retryUnavailable:['auto','claude'].includes(requested) && env.SOURCE_KIND==='comment'});
   // One route for every full review, whatever its size or provider: the sharded engine (a small PR is
   // a single shard). It tries Gemini first and lets Claude continue what Gemini cannot finish. Delta
   // reviews (incremental, verification) and the final audit still use the staged Gemini pipeline.
   if(decision.mode==='discovery'){
     const diffBytes=fileBytes(path.join(path.resolve(env.REVIEW_CONTEXT_DIR||'.review-context'),'pr.diff'));
     decision={mode:'claude',previousHead:null,
-      reason:`${decision.reason}: reviewing the ${Math.max(1,Math.round(diffBytes/1000))} KB diff in shards: Gemini first, Claude continues if Gemini cannot`};
+      reason:`${decision.reason}: reviewing the ${Math.max(1,Math.round(diffBytes/1000))} KB diff in shards: ${requested==='claude'?'Claude only':'Gemini first, Claude continues if Gemini cannot'}`};
   }
   return {requestedMode:requested,decision,session,sessionCommentId,pendingSession:null,pendingSourceCommentId:null,pendingReviewId:null};
 }

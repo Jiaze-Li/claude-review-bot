@@ -54,10 +54,12 @@ export async function publishRunStatus({ env = process.env, fetchImpl = fetch } 
   const reason = safeReason(env.REVIEW_REASON);
   let state;
   if (stage === 'started') {
-    if (mode === 'discovery') state = 'Exact-HEAD preflight passed. Gemini discovery review is running.';
-    else if (mode === 'incremental') state = 'Exact-HEAD preflight passed. Gemini delta review is running.';
-    else if (mode === 'verification') state = 'Exact-HEAD preflight passed. Gemini targeted verification is running.';
-    else if (mode === 'audit') state = 'Exact-HEAD preflight passed. Gemini one-time final audit is running.';
+    // `@claude review` runs the same review with Claude as the only model.
+    const model = env.REQUESTED_MODE === 'claude' ? 'Claude' : 'Gemini';
+    if (mode === 'discovery') state = `Exact-HEAD preflight passed. ${model} discovery review is running.`;
+    else if (mode === 'incremental') state = `Exact-HEAD preflight passed. ${model} delta review is running.`;
+    else if (mode === 'verification') state = `Exact-HEAD preflight passed. ${model} targeted verification is running.`;
+    else if (mode === 'audit') state = `Exact-HEAD preflight passed. ${model} one-time final audit is running.`;
     else if (mode === 'claude') state = 'Exact-HEAD preflight passed. Sharded deep review is running (Gemini first, Claude where Gemini cannot). ' + reason;
     else if (mode === 'override') state = 'Exact-HEAD preflight passed. Applying manual override.';
     else if (mode === 'dismiss') state = 'Exact-HEAD preflight passed. Checking evidence for one finding (no model call).';

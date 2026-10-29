@@ -364,7 +364,7 @@ export function claudeFallbackBudgetLeft(session) {
 // the automatic cap. A dismiss/override command is human-initiated, but it is
 // NOT authorization to spend beyond the limit during its follow-on audit.
 export function isManualBudgetExemptReview({ sourceKind, requestedMode } = {}) {
-  return sourceKind === 'comment' && ['auto', 'reset'].includes(requestedMode);
+  return sourceKind === 'comment' && ['auto', 'reset', 'claude'].includes(requestedMode);
 }
 
 export function claudeFallbackCallBudget(session, { manual = false, pendingUsd = 0 } = {}) {
