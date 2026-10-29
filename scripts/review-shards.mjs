@@ -148,7 +148,12 @@ export function mergeShardResults({ shards, results, deferred = [], allFiles, pr
     shardStats.push(`${index + 1}: ${result.provider ? `${result.provider} ` : ''}ok ${coverage.reviewedPaths.length}/${shard.files.length}`);
     if (result.fellBackFrom) fellBack.push(result.fellBackFrom);
     coverage.reviewedPaths.forEach((p) => reviewed.add(p));
-    if (!coverage.complete && coverage.note) notes.push(coverage.note);
+    if (!coverage.complete) {
+      // The reviewer's own explanation, then what the bot observed about how it stopped.
+      const said = coverage.note ? `reviewer said: ${coverage.note.slice(0, 110)}` : '';
+      const note = [said, result.facts].filter(Boolean).join(' — ');
+      if (note) notes.push(note);
+    }
     if (result.structured.summary) summaries.push(String(result.structured.summary).trim());
     for (const finding of result.structured.findings ?? []) {
       const key = `${finding.path}\0${String(finding.title).trim().toLowerCase()}`;
