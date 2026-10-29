@@ -16,6 +16,17 @@ function safeReason(value) {
   return value.replace(/[\r\n]+/g, ' ').replace(/<!--|-->/g, '').slice(0, 500);
 }
 
+// Why the run failed, when a script recorded it (e.g. the diff is over Gemini's size limit).
+function failureReason(env) {
+  try {
+    const file = (env.REVIEW_CONTEXT_DIR || '.review-context') + '/failure-reason.txt';
+    const text = safeReason(fs.readFileSync(file, 'utf8'));
+    return text ? ' Reason: ' + text : '';
+  } catch {
+    return '';
+  }
+}
+
 export async function publishRunStatus({ env = process.env, fetchImpl = fetch } = {}) {
   if (env.GITHUB_ACTIONS !== 'true') throw new Error('Status requires a real GitHub Actions run');
   if (env.DUPLICATE === 'true') return null;
@@ -47,7 +58,7 @@ export async function publishRunStatus({ env = process.env, fetchImpl = fetch } 
     else if (mode === 'incremental') state = 'Exact-HEAD preflight passed. Gemini delta review is running.';
     else if (mode === 'verification') state = 'Exact-HEAD preflight passed. Gemini targeted verification is running.';
     else if (mode === 'audit') state = 'Exact-HEAD preflight passed. Gemini one-time final audit is running.';
-    else if (mode === 'claude') state = 'Exact-HEAD preflight passed. Explicit Claude deep review is running.';
+    else if (mode === 'claude') state = 'Exact-HEAD preflight passed. Claude deep review is running. ' + reason;
     else if (mode === 'override') state = 'Exact-HEAD preflight passed. Applying manual override.';
     else if (mode === 'dismiss') state = 'Exact-HEAD preflight passed. Checking evidence for one finding (no model call).';
     else if (mode === 'recover') state = 'A paid review is already published. Recovering durable session state with no model call.';
@@ -72,7 +83,8 @@ export async function publishRunStatus({ env = process.env, fetchImpl = fetch } 
       : mode === 'override' ? env.OVERRIDE_OUTCOME : geminiOutcome;
     state = outcome === 'success'
       ? 'Review publication completed. Read the PR review and durable review-session comment for the result.'
-      : 'Review publication was not confirmed. Check the workflow run; no successful publication is being claimed.';
+      : 'Review publication was not confirmed. Check the workflow run; no successful publication is being claimed.'
+        + failureReason(env);
   }
 
   const completedNoop = stage === 'finished' && ['recover', 'noop_ready', 'noop_waiting', 'human_required', 'deep_review_stale'].includes(mode);

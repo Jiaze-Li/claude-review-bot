@@ -2,11 +2,48 @@
 // merge the per-shard results back into one review with honest coverage.
 
 export const SHARD_TARGET_BYTES = 100_000;
-export const MAX_SHARDS = 10;
+export const MAX_SHARDS = 20;
 // Findings recorded in the durable session are capped; material ones are kept first.
 export const MAX_MERGED_FINDINGS = 6;
 const SEVERITY_ORDER = { P0: 0, P1: 1, P2: 2, P3: 3 };
 const MATERIAL = new Set(['P0', 'P1', 'P2']);
+
+// Files whose diff has nothing a reviewer can read. Lockfiles and generated code are NOT
+// here on purpose (a dependency or build change can matter); a repository opts those in
+// with a .reviewbotignore read from the PR's base commit, never from the PR itself.
+export const DEFAULT_IGNORE = ['*.png', '*.jpg', '*.jpeg', '*.gif', '*.ico', '*.icns', '*.pdf', '*.woff', '*.woff2', '*.ttf', '*.otf'];
+
+export function parseIgnorePatterns(text) {
+  return String(text ?? '').split('\n').map((line) => line.trim()).filter((line) => line && !line.startsWith('#') && line.length <= 200).slice(0, 200);
+}
+
+function globToRegExp(glob) {
+  let source = '';
+  for (let i = 0; i < glob.length; i += 1) {
+    const char = glob[i];
+    if (char === '*') {
+      if (glob[i + 1] === '*') {
+        i += 1;
+        if (glob[i + 1] === '/') { i += 1; source += '(?:.*/)?'; } else source += '.*';
+      } else source += '[^/]*';
+    } else if (char === '?') source += '[^/]';
+    else source += char.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+  }
+  return source;
+}
+
+// gitignore-like: a trailing slash matches a directory anywhere; a pattern with no slash
+// matches a file name anywhere; otherwise it is anchored at the repository root.
+export function matchesIgnore(path, patterns) {
+  return patterns.some((raw) => {
+    let pattern = raw.replace(/^\//, '');
+    const dirOnly = pattern.endsWith('/');
+    if (dirOnly) pattern = pattern.slice(0, -1);
+    const anchored = raw.startsWith('/') || pattern.includes('/');
+    const prefix = anchored ? '^' : '^(?:.*/)?';
+    return new RegExp(`${prefix}${globToRegExp(pattern)}${dirOnly ? '/.*' : '(?:/.*)?'}$`, 'i').test(path);
+  });
+}
 
 // One entry per `diff --git` block: { path, text, bytes }.
 export function splitDiffByFile(diffText) {
@@ -89,8 +126,8 @@ export function reconcileCoverage(coverage, assignedFiles) {
 
 // results[i] is { ok: true, structured } or { ok: false, error } for shards[i]; shards
 // that never started have no entry.
-export function mergeShardResults({ shards, results, deferred = [], allFiles }) {
-  const reviewed = new Set();
+export function mergeShardResults({ shards, results, deferred = [], allFiles, priorReviewed = [], ignoredCount = 0 }) {
+  const reviewed = new Set(priorReviewed);
   const notes = [];
   const findings = new Map();
   const summaries = [];
@@ -124,7 +161,9 @@ export function mergeShardResults({ shards, results, deferred = [], allFiles }) 
   const kept = ordered.slice(0, MAX_MERGED_FINDINGS);
   const droppedMaterial = ordered.slice(MAX_MERGED_FINDINGS).filter((f) => MATERIAL.has(f.severity)).length;
 
-  const header = `Reviewed ${reviewed.size} of ${allFiles.length} changed file(s) in ${shards.length} shard(s)${complete ? '' : ' — PARTIAL'}.`;
+  const prior = priorReviewed.length ? ` (${priorReviewed.length} already covered by an earlier run on this HEAD)` : '';
+  const ignored = ignoredCount ? ` ${ignoredCount} more file(s) skipped by ignore rules.` : '';
+  const header = `Reviewed ${reviewed.size} of ${allFiles.length} changed file(s) in ${shards.length} shard(s)${prior}${complete ? '' : ' — PARTIAL'}.${ignored}`;
   const extra = [
     ...(shards.length > 1 || deferred.length ? [`Shards (reviewed/assigned): ${shardStats.join(' · ')}${deferred.length ? ` · deferred beyond limit: ${deferred.length} file(s)` : ''}.`] : []),
     ...(droppedMaterial ? [`${droppedMaterial} more material finding(s) were omitted to fit the session limit; fix the listed ones and re-review.`] : []),

@@ -3,9 +3,11 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { postCommitStatus } from './sync-commit-status.mjs';
 import {
+  CLAUDE_AUTO_MIN_BUDGET_USD,
   DEEP_REVIEW_MANUAL_RUN_BUDGET_USD,
   DEEP_REVIEW_RUN_BUDGET_USD,
   beginDeepReview,
+  claudeFallbackCallBudget,
   completeDeepReview,
   failDeepReview,
   isDeepReviewStale,
@@ -25,10 +27,18 @@ export async function runDeepReviewCommand(command, { env = process.env, fetchIm
   if (command === 'begin') {
     if (ctx.plan.decision?.mode !== 'claude') throw new Error('begin requires an explicit Claude deep review plan');
     await assertHeadUnmoved(ctx, fetchImpl);
-    // This entry point is an explicit @claude review, not an automatic PR
-    // trigger. The caller deliberately authorizes a bounded $5 call even when
-    // the cumulative automatic $6 cap is exhausted.
-    const runBudget = DEEP_REVIEW_MANUAL_RUN_BUDGET_USD;
+    // An explicit @claude review (or a manual @gemini review comment) deliberately authorizes a
+    // bounded $5 call even when the cumulative automatic $6 cap is exhausted. The same mode is
+    // also chosen automatically when a PR is too large for Gemini; that run obeys the cap.
+    const manual = ctx.plan.requestedMode === 'claude' || env.SOURCE_KIND === 'comment';
+    const runBudget = manual
+      ? DEEP_REVIEW_MANUAL_RUN_BUDGET_USD
+      : Math.min(DEEP_REVIEW_MANUAL_RUN_BUDGET_USD, claudeFallbackCallBudget(ctx.plan.session, { manual: false }));
+    if (!manual && runBudget < CLAUDE_AUTO_MIN_BUDGET_USD) {
+      const reason = 'automatic Claude budget for this PR is exhausted; comment `@claude review` to run the review manually';
+      writeFailureReason(ctx.contextRoot, reason);
+      throw new Error(reason);
+    }
     const session = beginDeepReview({
       session: ctx.plan.session, baseSha: ctx.baseSha, headSha: ctx.headSha, runId: env.GITHUB_RUN_ID,
       reserveUsd: runBudget, standalone: true, now,
@@ -95,6 +105,14 @@ export async function runDeepReviewCommand(command, { env = process.env, fetchIm
   }
 
   throw new Error(`Unknown deep-review command: ${command}`);
+}
+
+function writeFailureReason(contextRoot, message) {
+  try {
+    fs.writeFileSync(path.join(contextRoot, 'failure-reason.txt'), String(message).slice(0, 400), { mode: 0o600 });
+  } catch {
+    // best effort
+  }
 }
 
 function readContext(env) {

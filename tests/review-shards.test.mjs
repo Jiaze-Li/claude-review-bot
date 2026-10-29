@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { MAX_MERGED_FINDINGS, filePriority, mergeShardResults, planShards, reconcileCoverage, splitDiffByFile } from '../scripts/review-shards.mjs';
+import { DEFAULT_IGNORE, MAX_MERGED_FINDINGS, filePriority, matchesIgnore, mergeShardResults, parseIgnorePatterns, planShards, reconcileCoverage, splitDiffByFile } from '../scripts/review-shards.mjs';
 
 const diff = (path, body = 'x'.repeat(10)) => `diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n@@ -1 +1 @@\n+${body}\n`;
 const finding = (severity, path = 'a.swift', title = 'bug') => ({ severity, title, body: 'b', path, line: 1 });
@@ -76,4 +76,25 @@ test('merge never records more findings than the session allows and says when ma
   });
   assert.equal(merged.findings.length, MAX_MERGED_FINDINGS);
   assert.match(merged.summary, /3 more material finding\(s\) were omitted/);
+});
+
+test('ignore rules: gitignore-like patterns, comments, case-insensitive, and binary assets are skipped by default', () => {
+  const patterns = parseIgnorePatterns('# generated\n*.lock\nbuild/\n/docs/gen/**\nSources/**/Generated/*.swift\n');
+  const hit = ['a.lock', 'x/y/a.lock', 'build/o.js', 'src/build/o.js', 'docs/gen/a/b.md', 'Sources/A/B/Generated/x.swift'];
+  const miss = ['docs/other.md', 'Sources/A.swift', 'src/lock.txt'];
+  assert.ok(hit.every((f) => matchesIgnore(f, patterns)), 'should match');
+  assert.ok(miss.every((f) => !matchesIgnore(f, patterns)), 'should not match');
+  assert.ok(matchesIgnore('img/Logo.PNG', DEFAULT_IGNORE));
+  // Lockfiles are NOT skipped unless a repository opts in.
+  assert.ok(!matchesIgnore('package-lock.json', DEFAULT_IGNORE));
+  assert.deepEqual(parseIgnorePatterns('x'.repeat(300) + '\nok'), ['ok']);
+});
+
+test('merge: files covered by an earlier run count as reviewed and are named in the header', () => {
+  const merged = mergeShardResults({
+    shards: [{ files: ['c'] }], allFiles: ['a', 'b', 'c'], priorReviewed: ['a', 'b'], ignoredCount: 4,
+    results: [ok({ summary: 's', findings: [], coverage: { complete: true, reviewedPaths: ['c'], unreviewedPaths: [], note: '' } })],
+  });
+  assert.equal(merged.coverage.complete, true);
+  assert.match(merged.summary, /Reviewed 3 of 3 changed file\(s\) in 1 shard\(s\) \(2 already covered by an earlier run on this HEAD\)\. 4 more file\(s\) skipped by ignore rules\./);
 });

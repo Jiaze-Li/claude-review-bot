@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { pathKey } from '../scripts/review-session-core.mjs';
 
 // Runs the real run-review.mjs against a fake Agent SDK so the shard loop, merge and
 // usage accounting are exercised end to end without any model call.
@@ -35,7 +36,7 @@ export async function* query({ prompt, options }) {
 }
 `;
 
-function setup(fileSizes, session = null) {
+function setup(fileSizes, session = null, ignore = null) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'run-review-'));
   fs.mkdirSync(path.join(root, 'scripts'));
   for (const name of ['run-review.mjs', 'review-shards.mjs', 'review-session-core.mjs']) fs.copyFileSync(new URL(`../scripts/${name}`, import.meta.url), path.join(root, 'scripts', name));
@@ -46,6 +47,7 @@ function setup(fileSizes, session = null) {
   fs.mkdirSync(path.join(root, 'safe-target'));
   fs.mkdirSync(path.join(root, '.review-context'));
   if (session) fs.writeFileSync(path.join(root, '.review-context/session-plan.json'), JSON.stringify({ session }));
+  if (ignore !== null) fs.writeFileSync(path.join(root, '.review-context/ignore-patterns.txt'), ignore);
   const names = Object.keys(fileSizes);
   fs.writeFileSync(path.join(root, '.review-context/changed-files.txt'), names.join('\n') + '\n');
   fs.writeFileSync(path.join(root, '.review-context/pr.diff'), names.map((n) => `diff --git a/${n} b/${n}\n--- a/${n}\n+++ b/${n}\n@@ -1 +1 @@\n+${'x'.repeat(fileSizes[n])}\n`).join(''));
@@ -154,4 +156,45 @@ test('concurrent shards still share one budget: nothing is started once it is sp
   assert.ok(calls.length < 4);
   assert.equal(review.coverage.complete, false);
   assert.ok(usage.total_cost_usd <= 1);
+});
+
+test('files matching the base-commit ignore list are skipped, not assigned, and not counted as unreviewed', () => {
+  const root = setup({ 'Sources/A.swift': 100, 'package-lock.json': 100, 'img/logo.png': 100 }, null, '*.json\n');
+  const { result, calls, review } = run(root);
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(calls.flatMap((c) => c.files), ['Sources/A.swift']);
+  assert.equal(review.coverage.complete, true);
+  assert.equal(review._meta.ignored_files, 2);
+  assert.match(review.summary, /2 more file\(s\) skipped by ignore rules/);
+});
+
+test('a second run on the same HEAD reviews only the files the first run did not reach', () => {
+  const session = { coverage: { head: 'a'.repeat(40), complete: false, reviewedKeys: [] }, findings: [], dismissed: [] };
+  const names = ['a/1.swift', 'b/2.swift', 'c/3.swift'];
+  session.coverage.reviewedKeys = names.slice(0, 2).map(pathKey);
+  const root = setup({ 'a/1.swift': 100, 'b/2.swift': 100, 'c/3.swift': 100 }, session);
+  const { result, calls, review } = run(root);
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(calls.flatMap((c) => c.files), ['c/3.swift']);
+  assert.equal(review.coverage.complete, true);
+  assert.deepEqual(review.coverage.reviewedPaths.sort(), names);
+  assert.match(review.summary, /Reviewed 3 of 3 changed file\(s\) in 1 shard\(s\) \(2 already covered by an earlier run on this HEAD\)/);
+});
+
+test('coverage recorded for a different HEAD is not reused', () => {
+  const session = { coverage: { head: 'b'.repeat(40), complete: false, reviewedKeys: ['a/1.swift'].map(pathKey) }, findings: [], dismissed: [] };
+  const root = setup({ 'a/1.swift': 100 }, session);
+  const { calls } = run(root);
+  assert.deepEqual(calls.flatMap((c) => c.files), ['a/1.swift']);
+});
+
+test('when every file is already covered no model is called and the review is complete', () => {
+  const names = ['a/1.swift', 'b/2.swift'];
+  const session = { coverage: { head: 'a'.repeat(40), complete: false, reviewedKeys: names.map(pathKey) }, findings: [], dismissed: [] };
+  const root = setup({ 'a/1.swift': 100, 'b/2.swift': 100 }, session);
+  const { result, calls, review, usage } = run(root);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(calls.length, 0);
+  assert.equal(review.coverage.complete, true);
+  assert.equal(usage.total_cost_usd, null);
 });

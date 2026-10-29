@@ -137,7 +137,7 @@ const cenv = (dir, extra = {}) => ({
 
 test('begin -> finalize writes IN_PROGRESS then READY into the same comment', async () => {
   const gh = fakeGitHub();
-  const dir = ctxDir({ decision: { mode: 'claude' }, session: readySession(), sessionCommentId: '300' }, { total_cost_usd: 0.5 });
+  const dir = ctxDir({ requestedMode: 'claude', decision: { mode: 'claude' }, session: readySession(), sessionCommentId: '300' }, { total_cost_usd: 0.5 });
   const env = cenv(dir, { GITHUB_OUTPUT: path.join(dir, 'out') });
   const begun = await runDeepReviewCommand('begin', { env, fetchImpl: gh.fetchImpl, now: T0 });
   assert.equal(begun.status, 'REVIEW_IN_PROGRESS');
@@ -154,7 +154,7 @@ test('begin -> finalize writes IN_PROGRESS then READY into the same comment', as
 
 test('manual @claude review runs with $5 limit even after exhausting the automatic PR cap', async () => {
   const gh = fakeGitHub();
-  const dir = ctxDir({ decision: { mode: 'claude' }, session: { ...readySession(), deepSpendUsd: 6 }, sessionCommentId: '300' });
+  const dir = ctxDir({ requestedMode: 'claude', decision: { mode: 'claude' }, session: { ...readySession(), deepSpendUsd: 6 }, sessionCommentId: '300' });
   const env = cenv(dir, { GITHUB_OUTPUT: path.join(dir, 'out') });
   const s = await runDeepReviewCommand('begin', { env, fetchImpl: gh.fetchImpl, now: T0 });
   assert.equal(s.status, 'REVIEW_IN_PROGRESS');
@@ -165,7 +165,7 @@ test('manual @claude review runs with $5 limit even after exhausting the automat
 
 test('fail closes an in-progress run to HUMAN_REQUIRED and accounts the spend', async () => {
   const gh = fakeGitHub();
-  const dir = ctxDir({ decision: { mode: 'claude' }, session: readySession(), sessionCommentId: '300' }, { total_cost_usd: 1.2 });
+  const dir = ctxDir({ requestedMode: 'claude', decision: { mode: 'claude' }, session: readySession(), sessionCommentId: '300' }, { total_cost_usd: 1.2 });
   const env = cenv(dir, { GITHUB_OUTPUT: path.join(dir, 'out') });
   await runDeepReviewCommand('begin', { env, fetchImpl: gh.fetchImpl, now: T0 });
   const f = await runDeepReviewCommand('fail', { env: { ...env, DEEP_REVIEW_FAILURE_REASON: 'turn limit' }, fetchImpl: gh.fetchImpl, now: T0 });
@@ -196,7 +196,7 @@ test('fail never touches a fresh in-progress marker owned by another live run', 
 
 test('a killed run with no usage file is charged its allotted budget', async () => {
   const gh = fakeGitHub();
-  const dir = ctxDir({ decision: { mode: 'claude' }, session: readySession(), sessionCommentId: '300' });
+  const dir = ctxDir({ requestedMode: 'claude', decision: { mode: 'claude' }, session: readySession(), sessionCommentId: '300' });
   const env = cenv(dir, { GITHUB_OUTPUT: path.join(dir, 'out'), DEEP_REVIEW_MAX_BUDGET_USD: '1.50' });
   await runDeepReviewCommand('begin', { env, fetchImpl: gh.fetchImpl, now: T0 });
   const f = await runDeepReviewCommand('fail', { env, fetchImpl: gh.fetchImpl, now: T0 });
@@ -205,7 +205,7 @@ test('a killed run with no usage file is charged its allotted budget', async () 
 
 test('if the PR moved, begin refuses and fail leaves the superseded marker alone', async () => {
   const moved = fakeGitHub({ head: C });
-  const dir = ctxDir({ decision: { mode: 'claude' }, session: readySession(), sessionCommentId: '300' });
+  const dir = ctxDir({ requestedMode: 'claude', decision: { mode: 'claude' }, session: readySession(), sessionCommentId: '300' });
   await assert.rejects(() => runDeepReviewCommand('begin', { env: cenv(dir), fetchImpl: moved.fetchImpl, now: T0 }), /PR moved/);
   const stale = beginDeepReview({ session: readySession(), baseSha: BASE, headSha: A, now: T0 });
   const dir2 = ctxDir({ decision: { mode: 'deep_review_stale' }, session: stale, sessionCommentId: '300' });
@@ -268,7 +268,7 @@ test('auto stale marker is planned as deep_review_stale from the comment', async
 
 test('the run budget is reserved at begin so an interrupted run still counts against the PR cap', async () => {
   const gh = fakeGitHub();
-  const dir = ctxDir({ decision: { mode: 'claude' }, session: { ...readySession(), deepSpendUsd: 3 }, sessionCommentId: '300' });
+  const dir = ctxDir({ requestedMode: 'claude', decision: { mode: 'claude' }, session: { ...readySession(), deepSpendUsd: 3 }, sessionCommentId: '300' });
   const s = await runDeepReviewCommand('begin', { env: cenv(dir, { GITHUB_OUTPUT: path.join(dir, 'out') }), fetchImpl: gh.fetchImpl, now: T0 });
   assert.equal(s.deepSpendUsd, 8); // 3 already spent + 5 reserved
   assert.equal(parseSessionComment(gh.writes[0].body.body).deepSpendUsd, 8);
@@ -299,14 +299,14 @@ test('begin posts the pending status BEFORE the durable write, so a failed write
     if (init.method === 'PATCH') { order.push('write'); return new Response('boom', { status: 500 }); }
     assert.fail('unexpected ' + url);
   };
-  const dir = ctxDir({ decision: { mode: 'claude' }, session: readySession(), sessionCommentId: '300' });
+  const dir = ctxDir({ requestedMode: 'claude', decision: { mode: 'claude' }, session: readySession(), sessionCommentId: '300' });
   await assert.rejects(() => runDeepReviewCommand('begin', { env: cenv(dir, { STATUS_TOKEN: 's' }), fetchImpl, now: T0 }), /HTTP 500/);
   assert.deepEqual(order, ['status:pending', 'write']);
 });
 
 test('strict mode: begin refuses to start when the pending status cannot be posted', async () => {
   const gh = fakeGitHub();
-  const dir = ctxDir({ decision: { mode: 'claude' }, session: readySession(), sessionCommentId: '300' });
+  const dir = ctxDir({ requestedMode: 'claude', decision: { mode: 'claude' }, session: readySession(), sessionCommentId: '300' });
   await assert.rejects(() => runDeepReviewCommand('begin', { env: cenv(dir, { STATUS_STRICT: 'true' }), fetchImpl: gh.fetchImpl, now: T0 }), /permission/);
   assert.equal(gh.writes.length, 0);
 });
@@ -522,4 +522,46 @@ test('a deep review that failed closed can be retried and recovers; findings-bas
   // A HUMAN_REQUIRED that came from elsewhere (here a provider failure) is not cleared by this path.
   const other = { ...failed, reviewFailure: { code: 'REVIEWER_UNAVAILABLE', mode: 'discovery', head: A, reason: 'x' } };
   assert.equal(beginDeepReview({ session: other, baseSha: BASE, headSha: A, now: T0 }).deepReview.resumeStatus, 'HUMAN_REQUIRED');
+});
+
+test('a Claude review chosen automatically (PR too large for Gemini) obeys the automatic cap, not the manual exemption', async () => {
+  const auto = (extra, env = {}) => {
+    const dir = ctxDir({ requestedMode: 'auto', decision: { mode: 'claude' }, session: extra, sessionCommentId: '300' });
+    return { dir, env: cenv(dir, { GITHUB_OUTPUT: path.join(dir, 'out'), SOURCE_KIND: 'pull_request', ...env }) };
+  };
+  // Fresh PR: the call budget is $5 even though $6 is left.
+  const fresh = auto({ ...readySession(), deepSpendUsd: 0 });
+  await runDeepReviewCommand('begin', { env: fresh.env, fetchImpl: fakeGitHub().fetchImpl, now: T0 });
+  assert.match(fs.readFileSync(path.join(fresh.dir, 'out'), 'utf8'), /run_budget_usd=5.00/);
+  // Only $2.50 left of the automatic $6: that is the call budget.
+  const some = auto({ ...readySession(), deepSpendUsd: 3.5 });
+  await runDeepReviewCommand('begin', { env: some.env, fetchImpl: fakeGitHub().fetchImpl, now: T0 });
+  assert.match(fs.readFileSync(path.join(some.dir, 'out'), 'utf8'), /run_budget_usd=2.50/);
+  // Exhausted: refuses, and records a reason the status comment shows.
+  const spent = auto({ ...readySession(), deepSpendUsd: 6 });
+  await assert.rejects(runDeepReviewCommand('begin', { env: spent.env, fetchImpl: fakeGitHub().fetchImpl, now: T0 }), /automatic Claude budget for this PR is exhausted/);
+  assert.match(fs.readFileSync(path.join(spent.dir, 'failure-reason.txt'), 'utf8'), /comment `@claude review`/);
+  // The same plan from a manual comment is exempt.
+  const manual = auto({ ...readySession(), deepSpendUsd: 6 }, { SOURCE_KIND: 'comment' });
+  await runDeepReviewCommand('begin', { env: manual.env, fetchImpl: fakeGitHub().fetchImpl, now: T0 });
+  assert.match(fs.readFileSync(path.join(manual.dir, 'out'), 'utf8'), /run_budget_usd=5.00/);
+});
+
+test('a partial review remembers the files it covered in compact keys, and a complete re-run clears them', () => {
+  const files = Array.from({ length: 300 }, (_, i) => `Sources/Module${i}/File${i}.swift`);
+  const first = completeDeepReview({
+    session: beginDeepReview({ session: null, baseSha: BASE, headSha: A, standalone: true, now: T0 }), headSha: A,
+    result: { summary: 's', findings: [], coverage: { complete: false, reviewedPaths: files.slice(0, 250), unreviewedPaths: files.slice(250), note: 'ran out of time' } },
+  });
+  assert.equal(first.status, 'PARTIAL');
+  assert.equal(first.coverage.reviewedKeys.length, 250);
+  assert.equal(first.coverage.head, A);
+  assert.ok(first.coverage.reviewedKeys.every((k) => /^[0-9a-f]{8}$/.test(k)));
+  assert.doesNotThrow(() => renderSessionComment(first)); // still fits the 24 KB session state
+  const done = completeDeepReview({
+    session: beginDeepReview({ session: first, baseSha: BASE, headSha: A, now: T0 }), headSha: A,
+    result: { summary: 's', findings: [], coverage: { complete: true, reviewedPaths: files, unreviewedPaths: [], note: '' } },
+  });
+  assert.equal(done.status, 'READY');
+  assert.equal(done.coverage, undefined);
 });

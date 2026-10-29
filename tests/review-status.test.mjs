@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { publishRunStatus } from '../scripts/review-status.mjs';
 
 const baseEnv = {
@@ -233,4 +235,14 @@ test('legacy review.yml is a thin auto-mode wrapper over review-v2', () => {
   assert.match(v2, /workflow_call:/);
   assert.match(v2, /requested_mode:\n\s+required: false\n\s+default: auto/);
   assert.match(v2, /source_kind:\n\s+required: false\n\s+default: comment/);
+});
+
+test('a failed run shows the recorded reason in the status comment',async()=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'status-reason-'));
+  fs.writeFileSync(path.join(dir,'failure-reason.txt'),"Gemini review context exceeds 1500000 bytes\nsecond line");
+  const bodies=[];
+  const fetchImpl=async(url,init)=>{bodies.push(JSON.parse(init.body).body);return Response.json({id:7});};
+  await publishRunStatus({env:{GITHUB_ACTIONS:'true',TARGET_REPO:'a/b',GITHUB_REPOSITORY:'c/d',PR_NUMBER:'7',SOURCE_COMMENT_ID:'9',SOURCE_KIND:'pull_request',GITHUB_RUN_ID:'1',GITHUB_RUN_ATTEMPT:'1',HEAD_SHA:'a'.repeat(40),REVIEW_MODE:'discovery',REVIEW_REASON:'new review session',STATUS_STAGE:'finished',STATUS_COMMENT_ID:'7',GH_TOKEN:'t',GEMINI_PUBLISH_OUTCOME:'skipped',REVIEW_CONTEXT_DIR:dir},fetchImpl});
+  assert.match(bodies[0],/not confirmed/);
+  assert.match(bodies[0],/Reason: Gemini review context exceeds 1500000 bytes second line/);
 });

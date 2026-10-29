@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { isDeepReviewStale, parsePendingSessionReview, parseSessionComment, planReviewSession } from './review-session-core.mjs';
+import { geminiContextTooLarge, isDeepReviewStale, parsePendingSessionReview, parseSessionComment, planReviewSession } from './review-session-core.mjs';
 import { prepareIncrementalDelta } from './select-incremental-review.mjs';
 
 const repoPattern=/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
@@ -82,9 +82,23 @@ export async function planSession({ env=process.env, fetchImpl=fetch }={}) {
     return {requestedMode:requested,decision,session,sessionCommentId,pendingSession:null,pendingSourceCommentId:null,pendingReviewId:null};
   }
 
-  const decision=planReviewSession({session,baseSha,headSha,reset:requested==='reset',
+  let decision=planReviewSession({session,baseSha,headSha,reset:requested==='reset',
     retryUnavailable:requested==='auto' && env.SOURCE_KIND==='comment'});
+  // Gemini cannot take a diff this large. Hand a fresh full review to Claude (in shards)
+  // up front rather than failing before any model runs.
+  if(decision.mode==='discovery'){
+    const contextDir=path.resolve(env.REVIEW_CONTEXT_DIR||'.review-context');
+    const diffBytes=fileBytes(path.join(contextDir,'pr.diff'));
+    if(geminiContextTooLarge({diffBytes,prJsonBytes:fileBytes(path.join(contextDir,'pr.json')),session})){
+      decision={mode:'claude',previousHead:null,
+        reason:`the diff is ${(diffBytes/1_000_000).toFixed(1)} MB, over Gemini's 1.5 MB limit, so Claude reviews it in shards instead`};
+    }
+  }
   return {requestedMode:requested,decision,session,sessionCommentId,pendingSession:null,pendingSourceCommentId:null,pendingReviewId:null};
+}
+
+function fileBytes(file){
+  try{return fs.statSync(file).size;}catch{return 0;}
 }
 
 function isPendingNewer(durable,pending){
