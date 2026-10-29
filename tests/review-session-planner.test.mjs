@@ -190,3 +190,16 @@ test('a resolved or reopened review thread is reconciled with the session withou
   assert.equal(waiting.decision.mode,'noop_waiting');
   assert.match(waiting.decision.reason,/a review is running/);
 });
+
+test('a thread decision does not bypass recovery of a review that was published but not yet written to the session',async()=>{
+  const stale=applyDiscoveryResult({result:{summary:'clean',findings:[]},baseSha:BASE,headSha:A,sourceCommentId:'1'});
+  const newer=applyDiscoveryResult({result:{summary:'bug',findings:[{severity:'P1',title:'Bug',body:'Trigger X causes Y; expected Z.',path:'a.js',line:1,riskClass:'state'}]},baseSha:BASE,headSha:A,sourceCommentId:'11'});
+  newer.updatedAt=new Date(Date.now()+60_000).toISOString();
+  const plan=await planSession({
+    env:env({REQUESTED_MODE:'threads',SOURCE_KIND:'pull_request'}),
+    fetchImpl:fetchState({comments:[comment(7,renderSessionComment(stale))],reviews:[{id:101,user:{login:author},body:'review body\n'+pendingSessionMarker(newer,'11')}]}),
+  });
+  assert.equal(plan.decision.mode,'recover');
+  assert.match(plan.decision.reason,/review-thread decision was NOT applied yet/);
+  assert.equal(plan.pendingSession.findings.length,1);
+});

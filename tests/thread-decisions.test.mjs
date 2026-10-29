@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { applyThreadDecisions, parseSessionComment, renderSessionComment, sessionCommitStatus, applyDiscoveryResult } from '../scripts/review-session-core.mjs';
+import { applyThreadDecisions, planReviewSession, parseSessionComment, renderSessionComment, sessionCommitStatus, applyDiscoveryResult } from '../scripts/review-session-core.mjs';
 import { applyThreadResolutions } from '../scripts/apply-thread-resolutions.mjs';
 import { findingMarker } from '../scripts/review-anchors.mjs';
 
@@ -88,6 +88,34 @@ test('reopening a thread a person resolved reopens the finding and takes READY a
   const nitOpen = applyThreadDecisions({ session: nit, headSha: HEAD, reopened: ['F003'] });
   assert.equal(nitOpen.status, 'READY');
   assert.equal(byId(nitOpen).F003.status, 'DEFERRED');
+});
+
+test('reopening restores what was true before the decision: no audit flag earned by a click, and the reviewed HEAD', () => {
+  const session = reworkSession({}, OLD); // reviewed at OLD, audit never ran
+  assert.equal(session.auditCompleted, false);
+  const ready = applyThreadDecisions({ session, headSha: HEAD, closed: [{ id: 'F001', by: 'a' }, { id: 'F002', by: 'a' }] });
+  assert.equal(ready.auditCompleted, true);
+  assert.equal(ready.lastReviewedHead, HEAD);
+  const back = applyThreadDecisions({ session: ready, headSha: HEAD, reopened: ['F001'] });
+  assert.equal(back.status, 'REWORK');
+  assert.equal(back.auditCompleted, false);
+  assert.equal(back.lastReviewedHead, OLD);
+  assert.equal(back.override, undefined);
+  // so the repair on the current HEAD is verified (from the reviewed HEAD) rather than waved through
+  assert.equal(planReviewSession({ session: back, baseSha: BASE, headSha: HEAD }).mode, 'verification');
+  // a session that really had its audit keeps that fact
+  const audited = reworkSession({ auditCompleted: true });
+  const readyAudited = applyThreadDecisions({ session: audited, headSha: HEAD, closed: [{ id: 'F001', by: 'a' }, { id: 'F002', by: 'a' }] });
+  assert.equal(applyThreadDecisions({ session: readyAudited, headSha: HEAD, reopened: ['F001'] }).auditCompleted, true);
+});
+
+test('the commit status says it was a person\'s decision, not an independent review', () => {
+  const ready = applyThreadDecisions({ session: reworkSession(), headSha: HEAD, closed: [{ id: 'F001', by: 'jiaze-li' }, { id: 'F002', by: 'jiaze-li' }] });
+  const status = sessionCommitStatus(ready, HEAD);
+  assert.equal(status.state, 'success');
+  assert.match(status.description, /READY: findings resolved by @jiaze-li via review threads \(HEAD not re-reviewed\)/);
+  assert.ok(status.description.length <= 140); // GitHub's limit for a status description
+  assert.equal(sessionCommitStatus({ ...ready, override: undefined }, HEAD).description, 'Independent review complete: READY');
 });
 
 test('the session comment says who resolved what and that the HEAD was not re-reviewed, and round-trips', () => {

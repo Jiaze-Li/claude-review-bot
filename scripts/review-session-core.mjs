@@ -587,7 +587,9 @@ export function sessionCommitStatus(session, headSha) {
     case 'READY': return session.auditCompleted !== true || openMaterialFindings(session).length > 0
       || unresolvedMaterialFindings(session).length > 0
       ? { state: 'error', description: 'Review evidence incomplete or material candidates unresolved' }
-      : { state: 'success', description: 'Independent review complete: READY' };
+      : session.override?.via === 'review thread'
+        ? { state: 'success', description: `READY: findings resolved by @${String(session.override.by).slice(0, 39)} via review threads (HEAD not re-reviewed)` }
+        : { state: 'success', description: 'Independent review complete: READY' };
     case 'REVIEW_IN_PROGRESS': return { state: 'pending', description: 'Claude deep review in progress' };
     case 'AUDIT_PENDING': return { state: 'pending', description: 'Final audit pending' };
     case 'REWORK': return { state: 'failure', description: 'Open material findings: rework needed' };
@@ -838,12 +840,20 @@ export function applyThreadDecisions({ session, headSha, closed = [], reopened =
         status: 'READY',
         auditCompleted: true,
         lastReviewedHead: headSha,
-        override: { by: by[0], at: now, head: headSha, waived: [...closedBy.keys()], via: 'review thread' },
+        // What was true before this decision, so reopening a thread puts it back instead of leaving an audit
+        // flag set that no audit earned.
+        override: { by: by[0], at: now, head: headSha, waived: [...closedBy.keys()], via: 'review thread', priorHead: session.lastReviewedHead, priorAudit: session.auditCompleted === true },
         lastSummary: compactText(`Open findings resolved by @${by.join(', @')} via review threads; HEAD not re-reviewed.`, 800),
       };
   } else if (reopenedIds.length && blocking && next.status === 'READY') {
     const { override, ...rest } = next;
-    next = { ...rest, status: 'REWORK', ...(override?.via === 'review thread' ? {} : { override }), lastSummary: compactText('A resolved review thread was reopened; a finding is open again.', 800) };
+    const byThread = override?.via === 'review thread';
+    next = {
+      ...rest,
+      status: 'REWORK',
+      ...(byThread ? { auditCompleted: override.priorAudit === true, lastReviewedHead: override.priorHead ?? rest.lastReviewedHead } : { override }),
+      lastSummary: compactText('A resolved review thread was reopened; a finding is open again.', 800),
+    };
   }
   return next;
 }

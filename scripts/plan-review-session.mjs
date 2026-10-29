@@ -33,17 +33,6 @@ export async function planSession({ env=process.env, fetchImpl=fetch }={}) {
     if(!session) throw new Error('Latest bot-authored review session comment is unreadable; refusing to discard durable state');
   }
 
-  // A person resolved or reopened one of the bot's review threads: reconcile the session with the threads.
-  // No model call. If a review is running right now its own run will write the session; leave it be.
-  if(requested==='threads'){
-    const decision=!session
-      ?{mode:'noop_waiting',previousHead:null,reason:'there is no review session for this PR yet'}
-      :session.status==='REVIEW_IN_PROGRESS'
-        ?{mode:'noop_waiting',previousHead:session.lastReviewedHead,reason:'a review is running; resolve the thread again, or comment @gemini review, once it has finished'}
-        :{mode:'threads',previousHead:null,reason:'a person resolved or reopened a review thread; reconciling the session with the threads'};
-    return {requestedMode:requested,decision,session,sessionCommentId,pendingSession:null,pendingSourceCommentId:null,pendingReviewId:null};
-  }
-
   const pendingCandidates=reviews
     .filter(r=>r?.user?.login===expectedAuthor && typeof r.body==='string')
     .map(r=>({reviewId:String(r.id),pending:parsePendingSessionReview(r.body)}))
@@ -55,13 +44,26 @@ export async function planSession({ env=process.env, fetchImpl=fetch }={}) {
       requestedMode:requested,
       decision:{mode:'recover',previousHead:null,reason:requested==='claude'
         ?'recover published review session without another model call. Your @claude review request was NOT run; send it again after this recovery.'
-        :'recover published review session without another model call'},
+        :requested==='threads'
+          ?'recover published review session without another model call. Your review-thread decision was NOT applied yet; resolve the thread again (or comment @gemini review) after this recovery.'
+          :'recover published review session without another model call'},
       session,
       sessionCommentId,
       pendingSession:pending.pending.session,
       pendingSourceCommentId:pending.pending.sourceCommentId,
       pendingReviewId:pending.reviewId,
     };
+  }
+
+  // A person resolved or reopened one of the bot's review threads: reconcile the session with the threads.
+  // No model call. If a review is running right now its own run will write the session; leave it be.
+  if(requested==='threads'){
+    const decision=!session
+      ?{mode:'noop_waiting',previousHead:null,reason:'there is no review session for this PR yet'}
+      :session.status==='REVIEW_IN_PROGRESS'
+        ?{mode:'noop_waiting',previousHead:session.lastReviewedHead,reason:'a review is running; resolve the thread again, or comment @gemini review, once it has finished'}
+        :{mode:'threads',previousHead:null,reason:'a person resolved or reopened a review thread; reconciling the session with the threads'};
+    return {requestedMode:requested,decision,session,sessionCommentId,pendingSession:null,pendingSourceCommentId:null,pendingReviewId:null};
   }
 
   // `@claude review` plans exactly like `@gemini review` (first review, incremental, verification or final
