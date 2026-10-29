@@ -85,7 +85,7 @@ a manual retry resumes the same delta rather than silently clearing the gate.
 
 Discovery and final audit each allow up to **480 seconds per model request** (verification: **180 seconds**, hard cap: **600 seconds**). The review workflow has a 30-minute overall job limit to accommodate sequential stages. Override per mode with `GEMINI_DISCOVERY_TIMEOUT_MS` or `GEMINI_AUDIT_TIMEOUT_MS`; `GEMINI_TIMEOUT_MS` remains a fallback override.
 
-Workflow logs report the review mode, request/context byte sizes, timeout budget, and elapsed time—not the prompt, diff contents, or API key. A request timeout **fails closed** without claiming a successful review and does not automatically spend another model request. After checking the logs, use `@gemini review` to manually retry an unchanged HEAD. This additional headroom is not a substitute for a future large-PR review strategy.
+Workflow logs report the review mode, request/context byte sizes, timeout budget, and elapsed time—not the prompt, diff contents, or API key. A Gemini request timeout is not retried against Gemini: the request (or, for a large diff, that part) is handed to Claude and the timeout is recorded as the fallback reason in the review footer. Only if Claude cannot take it (no credential, or its allowance for this PR is spent) does the run **fail closed** without claiming a successful review; after checking the logs, use `@gemini review` to manually retry an unchanged HEAD. Large diffs are split into parts (see above), so one timeout no longer costs the whole review.
 
 You do **not** need to remember discovery, verification, round numbers, or provider selection.
 

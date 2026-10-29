@@ -157,6 +157,7 @@ export function mergeShardResults({ shards, results, deferred = [], allFiles, pr
   });
 
   const unreviewedPaths = allFiles.filter((p) => !reviewed.has(p));
+  const geminiFellBack = fellBack.filter((note) => typeof note === 'string' && /^gemini/i.test(note));
   if (deferred.length) notes.push(`${deferred.length} file(s) were beyond the ${shards.length}-shard limit`);
   const complete = unreviewedPaths.length === 0 && failedShards === 0;
 
@@ -168,7 +169,7 @@ export function mergeShardResults({ shards, results, deferred = [], allFiles, pr
   const ignored = ignoredCount ? ` ${ignoredCount} more file(s) skipped by ignore rules.` : '';
   const header = `Reviewed ${reviewed.size} of ${allFiles.length} changed file(s) in ${shards.length} shard(s)${prior}${complete ? '' : ' — PARTIAL'}.${ignored}`;
   const extra = [
-    ...(fellBack.some(Boolean) ? [`Gemini could not finish ${fellBack.filter(Boolean).length} shard(s) (${String(fellBack.find(Boolean)).slice(0, 120)}); Claude took over what it left.`] : []),
+    ...(geminiFellBack.length ? [`Gemini could not finish ${geminiFellBack.length} shard(s) (${String(geminiFellBack[0]).slice(0, 120)}); Claude took over what it left.`] : []),
     ...(shards.length > 1 || deferred.length || fellBack.some(Boolean) ? [`Shards (reviewed/assigned): ${shardStats.join(' · ')}${deferred.length ? ` · deferred beyond limit: ${deferred.length} file(s)` : ''}.`] : []),
     ...(droppedMaterial ? [`${droppedMaterial} more material finding(s) were omitted to fit the session limit; fix the listed ones and re-review.`] : []),
     ...(complete ? [] : [`Not reviewed: ${unreviewedPaths.slice(0, 15).join(', ')}${unreviewedPaths.length > 15 ? `, … (+${unreviewedPaths.length - 15})` : ''}.`]),

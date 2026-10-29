@@ -31,6 +31,12 @@ export async function* query({ prompt, options }) {
     yield { type: 'result', subtype: 'error_max_turns', num_turns: options.maxTurns, total_cost_usd: 0.4, errors: ['turn limit'] };
     return;
   }
+  if (mode === 'one-at-a-time' || mode === 'no-progress') {
+    const credited = mode === 'one-at-a-time' ? files.slice(0, 1) : [];
+    yield { type: 'result', subtype: 'success', num_turns: 2, total_cost_usd: 0.1, usage: {},
+      structured_output: { summary: 'partial pass ' + myCall, findings: [], coverage: { complete: false, reviewedPaths: credited, unreviewedPaths: files.filter((f) => !credited.includes(f)), note: 'stopped early' } } };
+    return;
+  }
   yield { type: 'result', subtype: 'success', num_turns: 5, total_cost_usd: 0.25, usage: { input_tokens: 10, output_tokens: 5 },
     structured_output: { summary: 'shard ' + myCall + ' ok', findings: myCall === 1 ? [{ severity: 'P2', title: 'Real bug', body: 'b', path: files[0] ?? 'x', line: null }] : [],
       coverage: { complete: true, reviewedPaths: files, unreviewedPaths: [], note: '' } } };
@@ -408,15 +414,42 @@ test('if Claude cannot take what Gemini left, the shard keeps Gemini\'s work and
   });
 });
 
-test('with no later provider, incomplete coverage from the only provider stays partial', async () => {
+test('with no later provider, a provider that makes no progress leaves the files unreviewed (PARTIAL)', async () => {
   await withGemini((n, files) => ({
-    text: JSON.stringify({ summary: 'g', findings: [], coverage: { complete: false, reviewedPaths: files.slice(0, 1), unreviewedPaths: files.slice(1), note: '' } }),
-  }), async ({ base }) => {
+    text: JSON.stringify({ summary: 'g', findings: [], coverage: { complete: false, reviewedPaths: [], unreviewedPaths: files, note: 'saw nothing useful' } }),
+  }), async ({ requests, base }) => {
     const root = setup({ 'a/1.swift': 100, 'a/2.swift': 100 });
     const out = await runAsync(root, base, { REVIEW_PROVIDERS: 'gemini' });
     assert.equal(out.status, 0, out.stderr);
     assert.equal(out.calls.length, 0);
+    assert.equal(requests.length, 1); // no progress, so no second ask
     assert.equal(out.review.coverage.complete, false);
-    assert.deepEqual(out.review.coverage.unreviewedPaths, ['a/2.swift']);
+    assert.deepEqual(out.review.coverage.unreviewedPaths, ['a/1.swift', 'a/2.swift']);
   });
+});
+
+test('a provider that stops early is asked to continue with exactly the files it left, while it makes progress', () => {
+  const root = setup({ 'a/1.swift': 100, 'a/2.swift': 100, 'a/3.swift': 100 });
+  const { result, calls, review } = run(root, 'one-at-a-time');
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(calls.map((c) => c.files), [['a/1.swift', 'a/2.swift', 'a/3.swift'], ['a/2.swift', 'a/3.swift'], ['a/3.swift']]);
+  assert.equal(review.coverage.complete, true);
+  assert.doesNotMatch(review.summary, /Gemini could not finish/);
+});
+
+test('continuation is limited to two extra passes, and the files still left are reported', () => {
+  const root = setup({ 'a/1.swift': 100, 'a/2.swift': 100, 'a/3.swift': 100, 'a/4.swift': 100, 'a/5.swift': 100 });
+  const { result, calls, review } = run(root, 'one-at-a-time');
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(calls.length, 3);
+  assert.equal(review.coverage.complete, false);
+  assert.deepEqual(review.coverage.unreviewedPaths, ['a/4.swift', 'a/5.swift']);
+});
+
+test('a provider that makes no progress is not asked again', () => {
+  const root = setup({ 'a/1.swift': 100, 'a/2.swift': 100 });
+  const { result, calls, review } = run(root, 'no-progress');
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(calls.length, 1);
+  assert.equal(review.coverage.complete, false);
 });

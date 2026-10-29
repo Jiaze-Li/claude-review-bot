@@ -256,7 +256,7 @@ async function tryClaude(index, makePrompt) {
 
 // A provider that answers but credits fewer files than it was assigned has not finished: the next
 // provider takes exactly the files it left, and the two results are combined.
-async function reviewUnit(index, unit, providers, suffix = '') {
+async function reviewUnit(index, unit, providers, suffix = '', retries = 2) {
   const diffPath = `.review-context/shards/shard-${index + 1}${suffix}.diff`;
   fs.writeFileSync(path.resolve(cwd, diffPath), unit.diff, { mode: 0o600 });
   const common = { shard: unit, index, count: shards.length, diffPath, knownIssues };
@@ -286,6 +286,13 @@ async function reviewUnit(index, unit, providers, suffix = '') {
       const why = `${provider}: ${coverage.unreviewedPaths.length} of ${unit.files.length} file(s) not covered${coverage.note ? ` (${coverage.note.slice(0, 80)})` : ''}`;
       return combineUnits(result, coverage, continued, [...notes, why], rest.files);
     }
+    // The last provider left files but did make progress: it may simply have stopped early, so let the
+    // same provider continue with exactly the files left (a few times at most, only while it advances).
+    if (coverage.unreviewedPaths.length && !later.length && retries > 0 && coverage.reviewedPaths.length > 0 && timeLeftMs() > 120_000) {
+      const rest = unitFor(coverage.unreviewedPaths);
+      const continued = await reviewUnit(index, rest, [provider], `${suffix}-more`, retries - 1);
+      return combineUnits(result, coverage, continued, notes, rest.files);
+    }
     return notes.length ? { ...result, fellBackFrom: notes.join('; ') } : result;
   }
   return { ok: false, error: notes.join('; ') || 'no provider available', provider: null };
@@ -308,8 +315,8 @@ function combineUnits(first, firstCoverage, second, notes, restFiles) {
   const unreviewedPaths = restFiles.filter((file) => !secondReviewed.includes(file));
   return {
     ok: true,
-    provider: `${first.provider}+${second.provider}`,
-    fellBackFrom: notes.join('; '),
+    provider: [...new Set(`${first.provider}+${second.provider}`.split('+'))].join('+'),
+    ...(notes.length ? { fellBackFrom: notes.join('; ') } : {}),
     structured: {
       summary: [first.structured.summary, second.structured.summary].filter(Boolean).join('\n\n').slice(0, 5900) || 'combined review',
       findings: [...(first.structured.findings ?? []), ...(second.structured.findings ?? [])],
