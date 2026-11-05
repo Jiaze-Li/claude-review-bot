@@ -58,6 +58,7 @@ export async function applyThreadResolutions({ env = process.env, fetchImpl = fe
 
   // Everything blocking is resolved but nothing new was pushed: there is nothing to verify. Put the threads back.
   let bounced = 0;
+  let bounceFailed = 0;
   const claims = blockingClaims({ session, byFinding, botLogin });
   if (claims.allClaimed && session.lastReviewedHead === headSha) {
     for (const finding of claims.claimed) {
@@ -70,6 +71,7 @@ export async function applyThreadResolutions({ env = process.env, fetchImpl = fe
           }
           bounced += 1;
         } catch (error) {
+          bounceFailed += 1;
           log.warn?.(`Could not reopen a thread: ${String(error.message).slice(0, 200)}`);
         }
       }
@@ -81,8 +83,8 @@ export async function applyThreadResolutions({ env = process.env, fetchImpl = fe
     const body = renderSessionComment(next, { sourceCommentIds: [sourceCommentId] });
     await saveSessionComment({ target, prNumber, token, fetchImpl, existingId: plan.sessionCommentId, previous: session, session: next, body });
   }
-  log.log?.(`Review-thread decisions: ${closed.length} non-blocking finding(s) closed, ${reopened.length} reopened, ${bounced} thread(s) put back (nothing to verify).`);
-  return { session: next, closed, reopened, bounced };
+  log.log?.(`Review-thread decisions: ${closed.length} non-blocking finding(s) closed, ${reopened.length} reopened, ${bounced} thread(s) put back (nothing to verify)${bounceFailed ? `, ${bounceFailed} could not be put back` : ''}.`);
+  return { session: next, closed, reopened, bounced, bounceFailed };
 }
 
 async function rest(url, token, fetchImpl, init = {}) {

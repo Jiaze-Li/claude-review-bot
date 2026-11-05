@@ -96,8 +96,20 @@ async function graphql({ token, fetchImpl, query, variables }) {
     body: JSON.stringify({ query, variables }),
     signal: AbortSignal.timeout(15000),
   });
-  if (!response.ok) throw new Error(`GitHub GraphQL failed (HTTP ${response.status})`);
+  if (!response.ok) throw threadApiError(`GitHub GraphQL failed (HTTP ${response.status})`, response.status === 401 || response.status === 403);
   const payload = await response.json();
-  if (payload.errors?.length) throw new Error(`GitHub GraphQL error: ${payload.errors.map((e) => e.message).join('; ')}`);
+  if (payload.errors?.length) {
+    const denied = payload.errors.some((e) => e.type === 'FORBIDDEN' || /resource not accessible|must have (admin|write)|forbidden/i.test(String(e.message)));
+    throw threadApiError(`GitHub GraphQL error: ${payload.errors.map((e) => e.message).join('; ')}`, denied);
+  }
   return payload.data;
+}
+
+// A refusal because the token may not do this at all (as opposed to one thread failing): it will repeat for every
+// thread, so callers stop trying and report it as a permission problem. resolveReviewThread / unresolveReviewThread
+// are reported to need the App's Contents permission as "write" besides Pull requests "write"; GitHub does not document it.
+function threadApiError(message, permission) {
+  const error = new Error(message);
+  error.permissionDenied = permission;
+  return error;
 }

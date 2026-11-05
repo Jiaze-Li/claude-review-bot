@@ -78,14 +78,16 @@ test('nothing is queried or resolved when no finding is closed, or there is no s
   }
 });
 
-test('a thread that cannot be resolved (missing permission) is counted, not thrown, and the rest still resolve', async () => {
+test('a thread that cannot be resolved (one-off error) is counted, not thrown, and the rest still resolve', async () => {
   const sess = session({ 'Bug one': 'FIXED', 'Bug two': 'FIXED' });
   const warnings = [];
   const gh = fakeGitHub(sess, [thread('T1', 'Bug one'), thread('T2', 'Bug two')], { failResolve: ['T1'] });
+  const real = gh.fetchImpl;
+  gh.fetchImpl = async (url, init = {}) => (url.endsWith('/graphql') && JSON.parse(init.body).variables?.id === 'T1' ? Response.json({ errors: [{ message: 'Could not resolve to a node' }] }) : real(url, init));
   const out = await syncReviewThreads({ env, fetchImpl: gh.fetchImpl, log: { log() {}, warn: (m) => warnings.push(m) } });
   assert.deepEqual(gh.resolved, ['T2']);
   assert.deepEqual([out.resolved, out.failed], [1, 1]);
-  assert.match(warnings[0], /Resource not accessible by integration/);
+  assert.match(warnings[0], /Could not resolve to a node/);
 });
 
 test('the workflow runs the thread sync last and never lets it fail a review', async () => {
@@ -113,4 +115,87 @@ test('after a verification run, a still-open finding whose thread a person resol
   const plain = fakeGitHub(sess, [resolvedByPerson('T1', 'Open bug')]);
   await syncReviewThreads({ env, fetchImpl: plain.fetchImpl, log: quiet });
   assert.deepEqual(plain.reopened, []);
+});
+
+// --- failure handling -------------------------------------------------------------------------------------------
+
+function denyAll(sess, threads, { http = false } = {}) {
+  const gh = fakeGitHub(sess, threads);
+  const calls = { mutations: 0, sessionWrites: 0 };
+  const fetchImpl = async (url, init = {}) => {
+    if (init.method && init.method !== 'GET' && /\/issues\//.test(url)) calls.sessionWrites += 1;
+    if (url === 'https://api.github.com/graphql' && /resolveReviewThread/i.test(JSON.parse(init.body).query)) {
+      calls.mutations += 1;
+      return http ? new Response('{}', { status: 403 }) : Response.json({ errors: [{ type: 'FORBIDDEN', message: 'Resource not accessible by integration' }] });
+    }
+    return gh.fetchImpl(url, init);
+  };
+  return { fetchImpl, calls, gh };
+}
+
+test('a refused token (GraphQL FORBIDDEN or HTTP 403) stops after one try and reports the rest as not tried', async () => {
+  for (const http of [false, true]) {
+    const sess = session({ 'Bug one': 'FIXED', 'Bug two': 'FIXED', 'Bug three': 'FIXED' });
+    const { fetchImpl, calls } = denyAll(sess, [thread('T1', 'Bug one'), thread('T2', 'Bug two'), thread('T3', 'Bug three')], { http });
+    const out = await syncReviewThreads({ env, fetchImpl, log: quiet });
+    assert.equal(calls.mutations, 1);
+    assert.deepEqual([out.resolved, out.failed, out.skipped, out.permissionDenied], [0, 1, 2, true]);
+  }
+});
+
+test('a failure is reported in the Job Summary and an annotation, never as a PR comment or a session change', async () => {
+  const { mkdtempSync, readFileSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const summary = `${mkdtempSync(`${tmpdir()}/sum-`)}/summary.md`;
+  const warnings = [];
+  const sess = session({ 'Bug one': 'FIXED' });
+  const { fetchImpl, calls } = denyAll(sess, [thread('T1', 'Bug one')]);
+  await syncReviewThreads({ env: { ...env, GITHUB_STEP_SUMMARY: summary }, fetchImpl, log: { log() {}, warn: (m) => warnings.push(m) } });
+  const text = readFileSync(summary, 'utf8');
+  assert.match(text, /did not fully complete/);
+  assert.match(text, /Contents: Read and write/);
+  assert.match(text, /Contents: read/);
+  assert.ok(warnings.some((m) => m.startsWith('::warning')));
+  assert.equal(calls.sessionWrites, 0);
+});
+
+test('partial failure is counted exactly: a non-permission error on one thread does not hide the other successes', async () => {
+  const sess = session({ 'Bug one': 'FIXED', 'Bug two': 'FIXED', 'Bug three': 'FIXED' });
+  const gh = fakeGitHub(sess, [thread('T1', 'Bug one'), thread('T2', 'Bug two'), thread('T3', 'Bug three')], {});
+  const fetchImpl = async (url, init = {}) => {
+    if (url.endsWith('/graphql') && JSON.parse(init.body).variables?.id === 'T2') return Response.json({ errors: [{ message: 'Could not resolve to a node' }] });
+    return gh.fetchImpl(url, init);
+  };
+  const out = await syncReviewThreads({ env, fetchImpl, log: quiet });
+  assert.deepEqual(gh.resolved, ['T1', 'T3']);
+  assert.deepEqual([out.resolved, out.failed, out.skipped, out.permissionDenied], [2, 1, 0, false]);
+});
+
+test('reopening: a refused unresolve is a failure and posts no reply; a failed reply still counts the thread as reopened', async () => {
+  const sess = session({ 'Open bug': 'OPEN' });
+  const byPerson = { ...thread('T1', 'Open bug', { resolved: true }), resolvedBy: { login: 'jiaze-li' } };
+  const denied = denyAll(sess, [byPerson]);
+  const out = await syncReviewThreads({ env: { ...env, REVIEW_MODE: 'verification' }, fetchImpl: denied.fetchImpl, log: quiet });
+  assert.deepEqual([out.reopened, out.failed], [0, 1]);
+  assert.deepEqual(denied.gh.replies, []);
+
+  const gh = fakeGitHub(sess, [byPerson]);
+  const fetchImpl = async (url, init) => (/\/replies$/.test(url) ? new Response('no', { status: 500 }) : gh.fetchImpl(url, init));
+  const out2 = await syncReviewThreads({ env: { ...env, REVIEW_MODE: 'verification' }, fetchImpl, log: quiet });
+  assert.deepEqual([out2.reopened, out2.failed, out2.replyFailed], [1, 0, 1]);
+});
+
+test('already-resolved threads cause no mutation and no problem report', async () => {
+  const sess = session({ 'Fixed bug': 'FIXED' });
+  const { fetchImpl, calls } = denyAll(sess, [thread('T1', 'Fixed bug', { resolved: true })]);
+  const out = await syncReviewThreads({ env, fetchImpl, log: quiet });
+  assert.equal(calls.mutations, 0);
+  assert.deepEqual([out.resolved, out.failed, out.skipped], [0, 0, 0]);
+});
+
+test('the workflow never widens the token itself: Contents stays read-only', async () => {
+  const { readFileSync } = await import('node:fs');
+  const yml = readFileSync(new URL('../.github/workflows/review-v2.yml', import.meta.url), 'utf8');
+  assert.doesNotMatch(yml, /permission-contents: write/);
+  assert.match(yml, /permission-contents: read\n\s+permission-pull-requests: write\n\s+permission-issues: read/);
 });
