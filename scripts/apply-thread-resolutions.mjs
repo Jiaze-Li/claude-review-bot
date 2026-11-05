@@ -1,7 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { fetchReviewThreads, isWriter, replyToThread, threadsByFinding, unresolveThread, blockingClaims } from './review-threads.mjs';
+import { appendFileSync } from 'node:fs';
+import { fetchReviewThreads, isWriter, replyToThread, reportThreadProblem, threadsByFinding, unresolveThread, blockingClaims } from './review-threads.mjs';
 import { saveSessionComment } from './session-comment.mjs';
 import { applyThreadDecisions, renderSessionComment } from './review-session-core.mjs';
 
@@ -58,22 +59,51 @@ export async function applyThreadResolutions({ env = process.env, fetchImpl = fe
 
   // Everything blocking is resolved but nothing new was pushed: there is nothing to verify. Put the threads back.
   let bounced = 0;
+  let bounceFailed = 0;
+  let bounceSkipped = 0;
+  let replyFailed = 0;
+  let denied = false;
+  const errors = [];
   const claims = blockingClaims({ session, byFinding, botLogin });
   if (claims.allClaimed && session.lastReviewedHead === headSha) {
     for (const finding of claims.claimed) {
       for (const thread of byFinding.get(finding.id)) {
+        if (denied) { bounceSkipped += 1; continue; }
         try {
           await unresolveThread({ token, fetchImpl, id: thread.id });
-          if (thread.commentId) {
-            await replyToThread({ target, prNumber, commentId: thread.commentId, token, fetchImpl,
-              body: `Reopened: nothing has been pushed since I reported this, so there is no change for me to check.\n\nPush a fix and resolve the thread again, or, if it is not a bug, comment \`@gemini dismiss ${finding.id}\` with a Reason and Evidence link.` });
-          }
-          bounced += 1;
         } catch (error) {
-          log.warn?.(`Could not reopen a thread: ${String(error.message).slice(0, 200)}`);
+          bounceFailed += 1;
+          if (error.permissionDenied) denied = true;
+          const message = String(error.message).slice(0, 200);
+          if (!errors.includes(message)) errors.push(message);
+          log.warn?.(`Could not reopen a thread: ${message}`);
+          continue;
+        }
+        bounced += 1;
+        if (!thread.commentId) continue;
+        try {
+          await replyToThread({ target, prNumber, commentId: thread.commentId, token, fetchImpl,
+            body: `Reopened: nothing has been pushed since I reported this, so there is no change for me to check.\n\nPush a fix and resolve the thread again, or, if it is not a bug, comment \`@gemini dismiss ${finding.id}\` with a Reason and Evidence link.` });
+        } catch (error) {
+          replyFailed += 1;
+          log.warn?.(`Reopened a thread but could not explain why: ${String(error.message).slice(0, 200)}`);
         }
       }
     }
+  }
+  // The session decisions above stand on their own; trouble with the threads is only reported (the step's exit and
+  // the review result are unchanged) and handed to the final status line through the step output.
+  const problems = bounceFailed + bounceSkipped + replyFailed;
+  if (problems) {
+    reportThreadProblem({
+      env, log, errors, permissionDenied: denied,
+      heading: 'Review thread changes did not fully complete',
+      counts: `Put back: ${bounced}, failed: ${bounceFailed}, not tried: ${bounceSkipped}${replyFailed ? `, reopen notes not posted: ${replyFailed}` : ''}`,
+      warning: `${bounceFailed} failed, ${bounceSkipped} not tried${replyFailed ? `, ${replyFailed} reopen note(s) not posted` : ''}${denied ? ' (permission refused by GitHub)' : ''}.`,
+    });
+  }
+  if (env.GITHUB_OUTPUT) {
+    try { appendFileSync(env.GITHUB_OUTPUT, `thread_problems=${problems}\n`); } catch { /* output is optional */ }
   }
 
   const next = applyThreadDecisions({ session, headSha, closed, reopened });
@@ -81,8 +111,8 @@ export async function applyThreadResolutions({ env = process.env, fetchImpl = fe
     const body = renderSessionComment(next, { sourceCommentIds: [sourceCommentId] });
     await saveSessionComment({ target, prNumber, token, fetchImpl, existingId: plan.sessionCommentId, previous: session, session: next, body });
   }
-  log.log?.(`Review-thread decisions: ${closed.length} non-blocking finding(s) closed, ${reopened.length} reopened, ${bounced} thread(s) put back (nothing to verify).`);
-  return { session: next, closed, reopened, bounced };
+  log.log?.(`Review-thread decisions: ${closed.length} non-blocking finding(s) closed, ${reopened.length} reopened, ${bounced} thread(s) put back (nothing to verify)${problems ? `, ${problems} thread operation(s) did not complete` : ''}.`);
+  return { session: next, closed, reopened, bounced, bounceFailed, bounceSkipped, replyFailed, problems };
 }
 
 async function rest(url, token, fetchImpl, init = {}) {

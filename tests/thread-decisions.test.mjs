@@ -138,3 +138,60 @@ test('a PR that moved is refused', async () => {
   const moved = setup(session, [], { head: 'd'.repeat(40) });
   await assert.rejects(applyThreadResolutions({ env: moved.env, fetchImpl: moved.fetchImpl, log: quiet }), /PR moved/);
 });
+
+// --- thread operations that do not complete are reported, and never change the session or the step's result -----
+
+function bounceSetup({ denyUnresolve = false, failReply = false } = {}) {
+  const session = reworkSession();
+  const [one, two] = session.findings;
+  const gh = setup(session, [threadNode('T1', one, { resolvedBy: 'jiaze-li' }), threadNode('T2', two, { resolvedBy: 'jiaze-li' })]);
+  const inner = gh.fetchImpl;
+  const unresolves = [];
+  const fetchImpl = async (url, init = {}) => {
+    if (url.endsWith('/graphql') && /unresolveReviewThread/.test(init.body)) {
+      unresolves.push(JSON.parse(init.body).variables.id);
+      return denyUnresolve ? Response.json({ errors: [{ type: 'FORBIDDEN', message: 'Resource not accessible by integration' }] }) : Response.json({ data: {} });
+    }
+    if (/\/comments\/\d+\/replies$/.test(url)) return failReply ? new Response('no', { status: 500 }) : Response.json({ id: 1 });
+    return inner(url, init);
+  };
+  const out = fs.mkdtempSync(path.join(os.tmpdir(), 'thread-out-'));
+  const env = { ...gh.env, GITHUB_STEP_SUMMARY: path.join(out, 'summary.md'), GITHUB_OUTPUT: path.join(out, 'output.txt') };
+  return { env, fetchImpl, gh, unresolves, session, read: (name) => (fs.existsSync(path.join(out, name)) ? fs.readFileSync(path.join(out, name), 'utf8') : '') };
+}
+
+test('a refused put-back stops after one try, lands in the Job Summary, a warning and a step output, and leaves the session alone', async () => {
+  const t = bounceSetup({ denyUnresolve: true });
+  const warnings = [];
+  const out = await applyThreadResolutions({ env: t.env, fetchImpl: t.fetchImpl, log: { log() {}, warn: (m) => warnings.push(m) } });
+  assert.equal(t.unresolves.length, 1);
+  assert.deepEqual([out.bounced, out.bounceFailed, out.bounceSkipped, out.problems], [0, 1, 1, 2]);
+  assert.match(t.read('summary.md'), /did not fully complete/);
+  assert.match(t.read('summary.md'), /Contents: Read and write/);
+  assert.ok(warnings.some((m) => m.startsWith('::warning')));
+  assert.equal(t.read('output.txt'), 'thread_problems=2\n');
+  assert.equal(out.session.status, 'REWORK');
+  assert.equal(t.gh.patches.length, 0);
+});
+
+test('a failed reply still counts the thread as put back but is reported as a problem', async () => {
+  const t = bounceSetup({ failReply: true });
+  const out = await applyThreadResolutions({ env: t.env, fetchImpl: t.fetchImpl, log: quiet });
+  assert.deepEqual([out.bounced, out.bounceFailed, out.replyFailed, out.problems], [2, 0, 2, 2]);
+  assert.match(t.read('summary.md'), /reopen notes not posted: 2/);
+});
+
+test('when every put-back works nothing is reported and the output says zero problems', async () => {
+  const t = bounceSetup();
+  const out = await applyThreadResolutions({ env: t.env, fetchImpl: t.fetchImpl, log: quiet });
+  assert.equal(out.problems, 0);
+  assert.equal(t.read('summary.md'), '');
+  assert.equal(t.read('output.txt'), 'thread_problems=0\n');
+});
+
+test('the workflow hands the thread problem count to the final status without making the apply step fail-handling stricter', async () => {
+  const yml = fs.readFileSync(new URL('../.github/workflows/review-v2.yml', import.meta.url), 'utf8');
+  assert.match(yml, /THREAD_PROBLEMS: \$\{\{ steps\.threads\.outputs\.thread_problems \}\}/);
+  const apply = yml.slice(yml.indexOf('- name: Apply review-thread decisions'));
+  assert.doesNotMatch(apply.slice(0, apply.indexOf('run: node scripts/apply-thread-resolutions.mjs')), /continue-on-error/);
+});

@@ -1,4 +1,5 @@
 // The bot's review threads, read and changed through GitHub's GraphQL API, and how they map to findings.
+import { appendFileSync } from 'node:fs';
 import { findingKey, markerKey } from './review-anchors.mjs';
 
 const THREADS_QUERY = `query($owner:String!,$repo:String!,$number:Int!,$after:String){
@@ -96,8 +97,34 @@ async function graphql({ token, fetchImpl, query, variables }) {
     body: JSON.stringify({ query, variables }),
     signal: AbortSignal.timeout(15000),
   });
-  if (!response.ok) throw new Error(`GitHub GraphQL failed (HTTP ${response.status})`);
+  if (!response.ok) throw threadApiError(`GitHub GraphQL failed (HTTP ${response.status})`, response.status === 401 || response.status === 403);
   const payload = await response.json();
-  if (payload.errors?.length) throw new Error(`GitHub GraphQL error: ${payload.errors.map((e) => e.message).join('; ')}`);
+  if (payload.errors?.length) {
+    const denied = payload.errors.some((e) => e.type === 'FORBIDDEN' || /resource not accessible|must have (admin|write)|forbidden/i.test(String(e.message)));
+    throw threadApiError(`GitHub GraphQL error: ${payload.errors.map((e) => e.message).join('; ')}`, denied);
+  }
   return payload.data;
+}
+
+// A refusal because the token may not do this at all (as opposed to one thread failing): it will repeat for every
+// thread, so callers stop trying and report it as a permission problem. resolveReviewThread / unresolveReviewThread
+// are reported to need the App's Contents permission as "write" besides Pull requests "write"; GitHub does not document it.
+function threadApiError(message, permission) {
+  const error = new Error(message);
+  error.permissionDenied = permission;
+  return error;
+}
+
+// Thread housekeeping trouble goes to the Actions log, an annotation and the Job Summary (never a PR comment) and
+// never touches the review session.
+export function reportThreadProblem({ env, log, heading, counts, errors = [], permissionDenied = false, warning }) {
+  const lines = [`### ${heading}`, '', `- ${counts}`, ...errors.map((message) => `- GitHub said: ${message}`)];
+  if (permissionDenied) {
+    lines.push('', 'GitHub refused the thread change for this token. Resolving/reopening a review thread is reported to need the App\'s **Contents: Read and write** besides **Pull requests: Read and write** (this workflow\'s token has Contents: read).'
+      + ' The review result itself is unaffected; threads can be resolved by hand. See the README for the one-time App setup.');
+  }
+  log.warn?.(`::warning title=${heading}::${warning} The review result is unaffected.`);
+  if (env.GITHUB_STEP_SUMMARY) {
+    try { appendFileSync(env.GITHUB_STEP_SUMMARY, `${lines.join('\n')}\n`); } catch { /* summary is optional */ }
+  }
 }

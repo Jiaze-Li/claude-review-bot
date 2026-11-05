@@ -95,7 +95,30 @@ they do nothing. An unchanged HEAD never spends model quota.
   nearest changed line (with a note). Only a finding about a file the PR does not touch, or a file that is deleted
   entirely, stays in the review body ("Findings without an inline anchor") and cannot be resolved by a click.
 * At the end of every run the bot resolves the threads of findings that are now FIXED, DISMISSED or WAIVED. It only
-  touches threads it opened, and never undoes a person's own resolve or unresolve.
+  touches threads it opened, and never undoes a person's own resolve or unresolve. If GitHub refuses (see below) the
+  run still succeeds; the refusal shows as a warning and in the Job Summary, and the review result is not affected.
+
+### One-time App setup for resolving/reopening threads
+
+GitHub rejects `resolveReviewThread`/`unresolveReviewThread` ("Resource not accessible by integration") for an App
+token that has Pull requests: write but only Contents: read, while reading threads still works. This is reported by
+several users but not documented by GitHub, so the first run after the change is the verification. To enable it:
+
+1. GitHub → Settings → Developer settings → GitHub Apps → this App → Permissions & events → Repository permissions →
+   **Contents: Read and write** (leave everything else as is) → Save.
+2. For the installation on the reviewed account/org, open the App's installation page and **Accept new permissions**
+   (until accepted, tokens cannot get the permission).
+3. Make the thread steps request it. The workflow does **not** do this by itself, so nothing widens until you decide.
+   Narrowest change: add a token step right after "Create best-effort commit-status token" in `review-v2.yml`
+   (`id: thread-token`, `continue-on-error: true`, same inputs as that step but `permission-contents: write` and
+   `permission-pull-requests: write`), then set `GH_TOKEN: ${{ steps.thread-token.outputs.token || steps.app-token.outputs.token }}`
+   on the two steps "Apply review-thread decisions" and "Resolve review threads for closed findings" only.
+4. Verify with a real change, not just an empty summary. On a test PR with a bot thread whose finding is closed
+   (FIXED/DISMISSED/WAIVED), trigger a review and confirm **both**: (a) the run's log says `Review threads: N resolved`
+   with N ≥ 1 and the thread now shows as resolved on the PR; and (b) a thread a person resolved while its finding is
+   still open (run a verification) is reopened with the bot's "Reopened:" reply. No "did not fully complete" section in
+   the Job Summary is necessary but not sufficient: a run that had nothing to change also has none.
+
 * Convergence: only 2 verification rounds; each finding needs a concrete `failurePath` (trigger state → wrong result)
   or it is demoted to non-blocking P3; concerns already dismissed or settled are shown to every reviewer and an exact
   repeat is not reported again; a delta's P0-P2 candidates get one targeted validation pass that can confirm, reject

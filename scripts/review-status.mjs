@@ -66,7 +66,7 @@ export async function publishRunStatus({ env = process.env, fetchImpl = fetch } 
     else state = 'No model call is required for this trigger. ' + reason;
   } else if (mode === 'threads') {
     state = env.THREADS_OUTCOME === 'success'
-      ? 'Review-thread decisions applied. No model quota was spent.'
+      ? `Review-thread decisions applied. No model quota was spent.${Number(env.THREAD_PROBLEMS) > 0 ? ' Some review threads could not be changed (see the run Job Summary); the review result is unaffected.' : ''}`
       : 'Review-thread decisions were not confirmed. Check the workflow run.';
   } else if (mode === 'dismiss') {
     state = env.DISMISS_OUTCOME !== 'success'
