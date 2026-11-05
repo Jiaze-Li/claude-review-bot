@@ -270,6 +270,8 @@ test("recordSessionMarker fails closed on corrupted session comment and refuses 
     deepSpendUsd: 0,
   };
   const calls = [];
+  const warnings = [];
+  const log = { warn: (msg) => warnings.push(msg) };
   const fetchImpl = async (url, options = {}) => {
     calls.push({ url, method: options.method || "GET", body: options.body });
     if (!options.method || options.method === "GET") {
@@ -289,16 +291,21 @@ test("recordSessionMarker fails closed on corrupted session comment and refuses 
       STATUS_STAGE: "finished",
     },
     fetchImpl,
+    log,
     plan: { sessionCommentId: "5678", session: staleSession },
   });
 
   assert.equal(res, null);
   assert.equal(calls.length, 1);
   assert.equal(calls[0].method, "GET");
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /corrupted or unparseable state/);
 });
 
 test("recordSessionMarker fails closed on HTTP error and refuses to PATCH", async () => {
   const calls = [];
+  const warnings = [];
+  const log = { warn: (msg) => warnings.push(msg) };
   const fetchImpl = async (url, options = {}) => {
     calls.push({ url, method: options.method || "GET", body: options.body });
     return new Response("Not found", { status: 404 });
@@ -312,15 +319,20 @@ test("recordSessionMarker fails closed on HTTP error and refuses to PATCH", asyn
       STATUS_STAGE: "finished",
     },
     fetchImpl,
+    log,
     plan: { sessionCommentId: "5678", session: defaultSession },
   });
 
   assert.equal(res, null);
   assert.equal(calls.length, 1);
   assert.equal(calls[0].method, "GET");
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /HTTP 404/);
 });
 
 test("recordSessionMarker fails closed on network exception and refuses to PATCH", async () => {
+  const warnings = [];
+  const log = { warn: (msg) => warnings.push(msg) };
   const fetchImpl = async () => {
     throw new Error("Network timeout");
   };
@@ -333,10 +345,13 @@ test("recordSessionMarker fails closed on network exception and refuses to PATCH
       STATUS_STAGE: "finished",
     },
     fetchImpl,
+    log,
     plan: { sessionCommentId: "5678", session: defaultSession },
   });
 
   assert.equal(res, null);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /Network timeout/);
 });
 
 test('failed status write cannot invent a comment id or echo sensitive response content', async () => {

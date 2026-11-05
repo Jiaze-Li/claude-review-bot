@@ -59,6 +59,7 @@ export async function recordSessionMarker({
   session = null,
   sourceCommentId,
   fetchImpl = fetch,
+  log = console,
 }) {
   if (!sessionCommentId || !sourceCommentId) return null;
   const root = `https://api.github.com/repos/${targetRepo}`;
@@ -73,14 +74,19 @@ export async function recordSessionMarker({
       },
       signal: AbortSignal.timeout(15000),
     });
-  } catch {
+  } catch (error) {
+    log?.warn?.(`::warning::Failed to fetch session comment ${sessionCommentId} for marker ${sourceCommentId}: ${error?.message || error}`);
     return null;
   }
-  if (!response?.ok) return null;
+  if (!response?.ok) {
+    log?.warn?.(`::warning::Failed to fetch session comment ${sessionCommentId} for marker ${sourceCommentId} (HTTP ${response.status})`);
+    return null;
+  }
   let data;
   try {
     data = await response.json();
-  } catch {
+  } catch (error) {
+    log?.warn?.(`::warning::Failed to parse session comment ${sessionCommentId} JSON for marker ${sourceCommentId}: ${error?.message || error}`);
     return null;
   }
   const existingMarkers = extractSourceCommentMarkers(data?.body);
@@ -90,22 +96,30 @@ export async function recordSessionMarker({
   // Fail closed: if the live session cannot be parsed, refuse to patch to prevent overwriting
   // findings, READY/REWORK status, cost records, or lastReviewedHead with stale data.
   const currentSession = parseSessionComment(data?.body);
-  if (!currentSession) return null;
+  if (!currentSession) {
+    log?.warn?.(`::warning::Session comment ${sessionCommentId} has corrupted or unparseable state; refusing to record marker ${sourceCommentId} to preserve durable state`);
+    return null;
+  }
   const sourceCommentIds = [...existingMarkers, String(sourceCommentId)];
   const body = renderSessionComment(currentSession, { sourceCommentIds });
-  return await saveSessionComment({
-    target: targetRepo,
-    prNumber,
-    token,
-    fetchImpl,
-    existingId: sessionCommentId,
-    previous: currentSession,
-    session: currentSession,
-    body,
-  });
+  try {
+    return await saveSessionComment({
+      target: targetRepo,
+      prNumber,
+      token,
+      fetchImpl,
+      existingId: sessionCommentId,
+      previous: currentSession,
+      session: currentSession,
+      body,
+    });
+  } catch (error) {
+    log?.warn?.(`::warning::Failed to patch session comment ${sessionCommentId} with marker ${sourceCommentId}: ${error?.message || error}`);
+    return null;
+  }
 }
 
-export async function publishRunStatus({ env = process.env, fetchImpl = fetch, plan = null } = {}) {
+export async function publishRunStatus({ env = process.env, fetchImpl = fetch, plan = null, log = console } = {}) {
   if (env.GITHUB_ACTIONS !== 'true') throw new Error('Status requires a real GitHub Actions run');
   if (env.DUPLICATE === 'true') return null;
   const stage = env.STATUS_STAGE;
@@ -165,6 +179,7 @@ export async function publishRunStatus({ env = process.env, fetchImpl = fetch, p
         session: resolvedPlan.session,
         sourceCommentId: env.SOURCE_COMMENT_ID,
         fetchImpl,
+        log,
       });
     }
     return null;
