@@ -507,6 +507,7 @@ jobs:
         run: node scripts/deep-review.mjs finalize
 
       - name: Fail closed if the deep review did not complete
+        id: fail-deep
         if: always() && steps.dedupe.outputs.duplicate != 'true' && ((steps.begin-deep.outputs.began == 'true' && steps.begin-deep.outputs.run == 'true' && steps.finalize-deep.outcome != 'success') || steps.plan.outputs.mode == 'deep_review_stale')
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
@@ -553,7 +554,7 @@ jobs:
         run: node scripts/continue-review.mjs
 
       - name: Finalize workflow status
-        if: always() && steps.review-status.outputs.comment_id != ''
+        if: always() && steps.dedupe.outputs.duplicate != 'true'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
@@ -573,6 +574,9 @@ jobs:
           DISMISS_OUTCOME: ${{ steps.dismiss.outcome }}
           THREADS_OUTCOME: ${{ steps.threads.outcome }}
           THREAD_PROBLEMS: ${{ steps.threads.outputs.thread_problems }}
+          RECOVER_OUTCOME: ${{ steps.recover-session.outcome }}
+          FAIL_DEEP_OUTCOME: ${{ steps.fail-deep.outcome }}
+          REVIEW_CONTEXT_DIR: .review-context
         run: node scripts/review-status.mjs
 
       - name: Mirror review state to the required commit status

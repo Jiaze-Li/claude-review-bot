@@ -1,9 +1,21 @@
 import fs from 'node:fs';
+import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import {
+  NOTIFICATION_ACTIONS,
+  decideNotificationAction,
+  extractSourceCommentMarkers,
+} from './notification-policy.mjs';
+import { parseSessionComment, renderSessionComment } from './review-session-core.mjs';
+import { saveSessionComment } from './session-comment.mjs';
 
 const repoPattern = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const positiveId = /^[1-9]\d*$/;
-const reviewModes = new Set(['incremental', 'verification', 'recover', 'claude', 'noop_ready', 'noop_waiting', 'human_required', 'deep_review_stale', 'override', 'dismiss', 'threads']);
+const reviewModes = new Set([
+  'incremental', 'verification', 'recover', 'claude',
+  'noop_ready', 'noop_waiting', 'human_required', 'deep_review_stale',
+  'override', 'dismiss', 'threads',
+]);
 const sourceKinds = new Set(['comment', 'pull_request']);
 
 function checked(value, pattern, name) {
@@ -19,7 +31,7 @@ function safeReason(value) {
 // Why the run failed, when a script recorded it (e.g. the diff is over Gemini's size limit).
 function failureReason(env) {
   try {
-    const file = (env.REVIEW_CONTEXT_DIR || '.review-context') + '/failure-reason.txt';
+    const file = path.join(path.resolve(env.REVIEW_CONTEXT_DIR || '.review-context'), 'failure-reason.txt');
     const text = safeReason(fs.readFileSync(file, 'utf8'));
     return text ? ' Reason: ' + text : '';
   } catch {
@@ -27,7 +39,73 @@ function failureReason(env) {
   }
 }
 
-export async function publishRunStatus({ env = process.env, fetchImpl = fetch } = {}) {
+function loadSessionPlan(env) {
+  try {
+    const file = path.join(path.resolve(env.REVIEW_CONTEXT_DIR || '.review-context'), 'session-plan.json');
+    if (fs.existsSync(file)) {
+      return JSON.parse(fs.readFileSync(file, 'utf8'));
+    }
+  } catch {
+    // Ignore read or parse errors
+  }
+  return null;
+}
+
+export async function recordSessionMarker({
+  targetRepo,
+  prNumber,
+  token,
+  sessionCommentId,
+  session = null,
+  sourceCommentId,
+  fetchImpl = fetch,
+}) {
+  if (!sessionCommentId || !sourceCommentId) return null;
+  const root = `https://api.github.com/repos/${targetRepo}`;
+  let response;
+  try {
+    response = await fetchImpl(`${root}/issues/comments/${sessionCommentId}`, {
+      headers: {
+        Accept: 'application/vnd.github+json',
+        Authorization: `Bearer ${token}`,
+        'X-GitHub-Api-Version': '2022-11-28',
+        'User-Agent': 'jiaze-review-bot',
+      },
+      signal: AbortSignal.timeout(15000),
+    });
+  } catch {
+    return null;
+  }
+  if (!response?.ok) return null;
+  let data;
+  try {
+    data = await response.json();
+  } catch {
+    return null;
+  }
+  const existingMarkers = extractSourceCommentMarkers(data?.body);
+  if (existingMarkers.includes(String(sourceCommentId))) {
+    return String(sessionCommentId);
+  }
+  // Fail closed: if the live session cannot be parsed, refuse to patch to prevent overwriting
+  // findings, READY/REWORK status, cost records, or lastReviewedHead with stale data.
+  const currentSession = parseSessionComment(data?.body);
+  if (!currentSession) return null;
+  const sourceCommentIds = [...existingMarkers, String(sourceCommentId)];
+  const body = renderSessionComment(currentSession, { sourceCommentIds });
+  return await saveSessionComment({
+    target: targetRepo,
+    prNumber,
+    token,
+    fetchImpl,
+    existingId: sessionCommentId,
+    previous: currentSession,
+    session: currentSession,
+    body,
+  });
+}
+
+export async function publishRunStatus({ env = process.env, fetchImpl = fetch, plan = null } = {}) {
   if (env.GITHUB_ACTIONS !== 'true') throw new Error('Status requires a real GitHub Actions run');
   if (env.DUPLICATE === 'true') return null;
   const stage = env.STATUS_STAGE;
@@ -47,23 +125,55 @@ export async function publishRunStatus({ env = process.env, fetchImpl = fetch } 
   const mode = String(env.REVIEW_MODE || '');
   if (!reviewModes.has(mode)) throw new Error('Invalid REVIEW_MODE');
   if (!env.GH_TOKEN) throw new Error('Missing GH_TOKEN');
-  const commentId = stage === 'finished'
+
+  const commentId = (stage === 'finished' && env.STATUS_COMMENT_ID)
     ? checked(env.STATUS_COMMENT_ID, positiveId, 'STATUS_COMMENT_ID')
     : null;
 
+  const failure = failureReason(env);
+  const resolvedPlan = plan || loadSessionPlan(env);
+  const hasSessionComment = Boolean(resolvedPlan?.sessionCommentId && resolvedPlan?.session);
+  const decision = decideNotificationAction({
+    stage,
+    mode,
+    requestedMode: env.REQUESTED_MODE || 'auto',
+    outcomes: {
+      geminiPublish: env.GEMINI_PUBLISH_OUTCOME,
+      claudePublish: env.CLAUDE_PUBLISH_OUTCOME,
+      override: env.OVERRIDE_OUTCOME,
+      dismiss: env.DISMISS_OUTCOME,
+      threads: env.THREADS_OUTCOME,
+      recover: env.RECOVER_OUTCOME,
+      failDeep: env.FAIL_DEEP_OUTCOME,
+    },
+    hasSessionComment,
+    sourceCommentId: env.SOURCE_COMMENT_ID,
+    hasFailureReason: Boolean(failure),
+  });
+
+  if (decision.action === NOTIFICATION_ACTIONS.SILENT) {
+    return null;
+  }
+
+  if (decision.action === NOTIFICATION_ACTIONS.RECORD_SESSION_MARKER) {
+    if (resolvedPlan?.sessionCommentId && resolvedPlan?.session) {
+      await recordSessionMarker({
+        targetRepo: repo,
+        prNumber: pr,
+        token: env.GH_TOKEN,
+        sessionCommentId: resolvedPlan.sessionCommentId,
+        session: resolvedPlan.session,
+        sourceCommentId: env.SOURCE_COMMENT_ID,
+        fetchImpl,
+      });
+    }
+    return null;
+  }
+
   const reason = safeReason(env.REVIEW_REASON);
   let state;
-  if (stage === 'started') {
-    // `@claude review` runs the same review with Claude as the only model.
-    const model = env.REQUESTED_MODE === 'claude' ? 'Claude' : 'Gemini';
-    if (mode === 'incremental') state = `Exact-HEAD preflight passed. ${model} delta review is running.`;
-    else if (mode === 'verification') state = `Exact-HEAD preflight passed. ${model} targeted verification is running.`;
-    else if (mode === 'claude') state = 'Exact-HEAD preflight passed. Sharded deep review is running (Gemini first, Claude where Gemini cannot). ' + reason;
-    else if (mode === 'override') state = 'Exact-HEAD preflight passed. Applying manual override.';
-    else if (mode === 'dismiss') state = 'Exact-HEAD preflight passed. Checking evidence for one finding (no model call).';
-    else if (mode === 'threads') state = 'Exact-HEAD preflight passed. Applying review-thread decisions (no model call).';
-    else if (mode === 'recover') state = 'A paid review is already published. Recovering durable session state with no model call.';
-    else state = 'No model call is required for this trigger. ' + reason;
+  if (decision.action === NOTIFICATION_ACTIONS.POST_HUMAN_PROMPT) {
+    state = 'No model quota was spent. ' + reason;
   } else if (mode === 'threads') {
     state = env.THREADS_OUTCOME === 'success'
       ? `Review-thread decisions applied. No model quota was spent.${Number(env.THREAD_PROBLEMS) > 0 ? ' Some review threads could not be changed (see the run Job Summary); the review result is unaffected.' : ''}`
@@ -72,19 +182,21 @@ export async function publishRunStatus({ env = process.env, fetchImpl = fetch } 
     state = env.DISMISS_OUTCOME !== 'success'
       ? 'Finding dismissal was not confirmed; durable session did not acknowledge it.'
       : 'Finding dismissal recorded. No model quota was spent by dismissal.';
-  } else if (['recover', 'noop_ready', 'noop_waiting', 'human_required', 'deep_review_stale'].includes(mode)) {
-    state = 'No model quota was spent. ' + reason;
+  } else if (mode === 'override') {
+    state = env.OVERRIDE_OUTCOME !== 'success'
+      ? 'Manual override was not confirmed. Check the workflow run.'
+      : 'Manual override recorded.';
+  } else if (mode === 'recover') {
+    state = 'Session recovery was not confirmed. Check the workflow run; no successful recovery is being claimed.'
+      + failure;
+  } else if (mode === 'deep_review_stale') {
+    state = 'Stale deep review cleanup was not confirmed. Check the workflow run.'
+      + failure;
   } else {
-    const outcome = mode === 'claude'
-      ? env.CLAUDE_PUBLISH_OUTCOME
-      : mode === 'override' ? env.OVERRIDE_OUTCOME : env.GEMINI_PUBLISH_OUTCOME;
-    state = outcome === 'success'
-      ? 'Review publication completed. Read the PR review and durable review-session comment for the result.'
-      : 'Review publication was not confirmed. Check the workflow run; no successful publication is being claimed.'
-        + failureReason(env);
+    state = 'Review publication was not confirmed. Check the workflow run; no successful publication is being claimed.'
+      + failure;
   }
 
-  const completedNoop = stage === 'finished' && ['recover', 'noop_ready', 'noop_waiting', 'human_required', 'deep_review_stale'].includes(mode);
   const isContinuation = /^8[0-9]\d{11}$/.test(sourceId);
   const sourceReference = isContinuation
     ? 'Trigger: automatic continuation of the previous run'
@@ -94,7 +206,7 @@ export async function publishRunStatus({ env = process.env, fetchImpl = fetch } 
 
   const body = [
     '<!-- jiaze-review-run:' + runId + ':' + attempt + ' -->',
-    ...(completedNoop ? ['<!-- jiaze-review-source-comment:' + sourceId + ' -->'] : []),
+    ...(sourceId ? ['<!-- jiaze-review-source-comment:' + sourceId + ' -->'] : []),
     '### Independent review',
     state,
     '',
