@@ -33,6 +33,19 @@ function fakeFetch() {
   };
 }
 
+const defaultSession = {
+  version: 1,
+  status: "READY",
+  findings: [],
+  verificationRound: 0,
+  maxVerificationRounds: 3,
+  auditCompleted: true,
+  lastReviewedHead: baseEnv.HEAD_SHA,
+  baseSha: baseEnv.HEAD_SHA,
+  fullAuditHead: baseEnv.HEAD_SHA,
+  deepSpendUsd: 0,
+};
+
 test('verified workflow start is silent and posts no comment', async () => {
   const fake = fakeFetch();
   const res = await publishRunStatus({ env: baseEnv, fetchImpl: fake.fetchImpl });
@@ -162,7 +175,7 @@ test('bounded no-op with session comment silently attaches dedupe marker without
     if (!options.method || options.method === 'GET') {
       return Response.json({
         id: 5678,
-        body: '<!-- jiaze-review-session:v1 -->\n### Independent Review Session\nStatus: **READY**',
+        body: renderSessionComment(dummySession),
       });
     }
     return Response.json({ id: 5678 });
@@ -241,6 +254,89 @@ test('recordSessionMarker preserves live session state from GitHub rather than s
   assert.match(calls[1].body, /Status: \*\*READY\*\*/);
   assert.match(calls[1].body, /jiaze-review-source-comment:11/);
   assert.match(calls[1].body, /jiaze-review-source-comment:99/);
+});
+
+test("recordSessionMarker fails closed on corrupted session comment and refuses to PATCH", async () => {
+  const staleSession = {
+    version: 1,
+    status: "READY",
+    findings: [],
+    verificationRound: 0,
+    maxVerificationRounds: 3,
+    auditCompleted: true,
+    lastReviewedHead: baseEnv.HEAD_SHA,
+    baseSha: baseEnv.HEAD_SHA,
+    fullAuditHead: baseEnv.HEAD_SHA,
+    deepSpendUsd: 0,
+  };
+  const calls = [];
+  const fetchImpl = async (url, options = {}) => {
+    calls.push({ url, method: options.method || "GET", body: options.body });
+    if (!options.method || options.method === "GET") {
+      return Response.json({
+        id: 5678,
+        body: "<!-- jiaze-review-session:v1 -->\nCorrupted body without state comment",
+      });
+    }
+    return Response.json({ id: 5678 });
+  };
+
+  const res = await publishRunStatus({
+    env: {
+      ...baseEnv,
+      REVIEW_MODE: "noop_ready",
+      REVIEW_REASON: "review clear on this HEAD",
+      STATUS_STAGE: "finished",
+    },
+    fetchImpl,
+    plan: { sessionCommentId: "5678", session: staleSession },
+  });
+
+  assert.equal(res, null);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].method, "GET");
+});
+
+test("recordSessionMarker fails closed on HTTP error and refuses to PATCH", async () => {
+  const calls = [];
+  const fetchImpl = async (url, options = {}) => {
+    calls.push({ url, method: options.method || "GET", body: options.body });
+    return new Response("Not found", { status: 404 });
+  };
+
+  const res = await publishRunStatus({
+    env: {
+      ...baseEnv,
+      REVIEW_MODE: "noop_ready",
+      REVIEW_REASON: "review clear on this HEAD",
+      STATUS_STAGE: "finished",
+    },
+    fetchImpl,
+    plan: { sessionCommentId: "5678", session: defaultSession },
+  });
+
+  assert.equal(res, null);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].method, "GET");
+});
+
+test("recordSessionMarker fails closed on network exception and refuses to PATCH", async () => {
+  const fetchImpl = async () => {
+    throw new Error("Network timeout");
+  };
+
+  const res = await publishRunStatus({
+    env: {
+      ...baseEnv,
+      REVIEW_MODE: "noop_ready",
+      REVIEW_REASON: "review clear on this HEAD",
+      STATUS_STAGE: "finished",
+    },
+    fetchImpl,
+    plan: { sessionCommentId: "5678", session: defaultSession },
+  });
+
+  assert.equal(res, null);
 });
 
 test('failed status write cannot invent a comment id or echo sensitive response content', async () => {

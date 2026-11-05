@@ -56,28 +56,40 @@ export async function recordSessionMarker({
   prNumber,
   token,
   sessionCommentId,
-  session,
+  session = null,
   sourceCommentId,
   fetchImpl = fetch,
 }) {
-  if (!sessionCommentId || !session || !sourceCommentId) return null;
+  if (!sessionCommentId || !sourceCommentId) return null;
   const root = `https://api.github.com/repos/${targetRepo}`;
-  const response = await fetchImpl(`${root}/issues/comments/${sessionCommentId}`, {
-    headers: {
-      Accept: 'application/vnd.github+json',
-      Authorization: `Bearer ${token}`,
-      'X-GitHub-Api-Version': '2022-11-28',
-      'User-Agent': 'jiaze-review-bot',
-    },
-    signal: AbortSignal.timeout(15000),
-  });
-  if (!response.ok) return null;
-  const data = await response.json();
+  let response;
+  try {
+    response = await fetchImpl(`${root}/issues/comments/${sessionCommentId}`, {
+      headers: {
+        Accept: 'application/vnd.github+json',
+        Authorization: `Bearer ${token}`,
+        'X-GitHub-Api-Version': '2022-11-28',
+        'User-Agent': 'jiaze-review-bot',
+      },
+      signal: AbortSignal.timeout(15000),
+    });
+  } catch {
+    return null;
+  }
+  if (!response?.ok) return null;
+  let data;
+  try {
+    data = await response.json();
+  } catch {
+    return null;
+  }
   const existingMarkers = extractSourceCommentMarkers(data?.body);
   if (existingMarkers.includes(String(sourceCommentId))) {
     return String(sessionCommentId);
   }
-  const currentSession = parseSessionComment(data?.body) || session;
+  // Fail closed: if the live session cannot be parsed, refuse to patch to prevent overwriting
+  // findings, READY/REWORK status, cost records, or lastReviewedHead with stale data.
+  const currentSession = parseSessionComment(data?.body);
   if (!currentSession) return null;
   const sourceCommentIds = [...existingMarkers, String(sourceCommentId)];
   const body = renderSessionComment(currentSession, { sourceCommentIds });
