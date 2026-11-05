@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { publishRunStatus } from '../scripts/review-status.mjs';
+import { renderSessionComment } from '../scripts/review-session-core.mjs';
 
 const baseEnv = {
   GITHUB_ACTIONS: 'true',
@@ -26,52 +27,38 @@ function fakeFetch() {
   return {
     calls,
     fetchImpl: async (url, options) => {
-      calls.push({ url, method: options.method, body: JSON.parse(options.body).body });
+      calls.push({ url, method: options.method, body: options.body ? JSON.parse(options.body).body : undefined });
       return Response.json({ id: 5678 });
     },
   };
 }
 
-test('verified workflow posts generic run-linked delta-review status', async () => {
+test('verified workflow start is silent and posts no comment', async () => {
   const fake = fakeFetch();
-  assert.equal(await publishRunStatus({ env: baseEnv, fetchImpl: fake.fetchImpl }), '5678');
-  assert.equal(fake.calls.length, 1);
-  const call = fake.calls[0];
-  assert.equal(call.method, 'POST');
-  assert.equal(call.url, 'https://api.github.com/repos/acme/project/issues/7/comments');
-  assert.match(call.body, /actions\/runs\/1234\/attempts\/2/);
-  assert.match(call.body, /issuecomment-99/);
-  assert.ok(call.body.includes(baseEnv.HEAD_SHA));
-  assert.match(call.body, /Gemini delta review is running/);
-  assert.match(call.body, /Independent review/);
-  assert.doesNotMatch(call.body, /👀|synthetic-test-token/);
+  const res = await publishRunStatus({ env: baseEnv, fetchImpl: fake.fetchImpl });
+  assert.equal(res, null);
+  assert.equal(fake.calls.length, 0);
 });
 
-test('automatic PR trigger status does not invent a source-comment link', async () => {
+test('automatic PR trigger start status is also silent and validates inputs', async () => {
   const fake = fakeFetch();
-  await publishRunStatus({
+  const res = await publishRunStatus({
     env: { ...baseEnv, SOURCE_KIND: 'pull_request', SOURCE_COMMENT_ID: '123456789' },
     fetchImpl: fake.fetchImpl,
   });
-  assert.match(fake.calls[0].body, /Trigger: automatic pull request event/);
-  assert.doesNotMatch(fake.calls[0].body, /issuecomment-123456789|Source comment/);
+  assert.equal(res, null);
+  assert.equal(fake.calls.length, 0);
 });
 
-
 for (const mode of ['verification', 'recover', 'claude', 'noop_ready', 'noop_waiting', 'human_required']) {
-  test(`status renders supported review mode ${mode}`, async () => {
+  test(`started status is silent for review mode ${mode}`, async () => {
     const fake = fakeFetch();
-    await publishRunStatus({
+    const res = await publishRunStatus({
       env: { ...baseEnv, REVIEW_MODE: mode, REVIEW_REASON: 'bounded-session reason' },
       fetchImpl: fake.fetchImpl,
     });
-    assert.match(fake.calls[0].body, new RegExp(mode === 'verification'
-      ? 'Gemini targeted verification'
-      : mode === 'recover'
-        ? 'Recovering durable session state'
-        : mode === 'claude'
-          ? 'Sharded deep review is running'
-          : 'No model call'));
+    assert.equal(res, null);
+    assert.equal(fake.calls.length, 0);
   });
 }
 
@@ -100,8 +87,23 @@ test('deduplicated run never posts an extra started status', async () => {
   assert.equal(fake.calls.length, 0);
 });
 
-for (const outcome of ['success', 'failure', 'cancelled', 'skipped', undefined]) {
-  test(`Gemini final status reports publication outcome ${outcome}`, async () => {
+test('Gemini final status is silent when publication succeeds', async () => {
+  const fake = fakeFetch();
+  const res = await publishRunStatus({
+    env: {
+      ...baseEnv,
+      STATUS_STAGE: 'finished',
+      STATUS_COMMENT_ID: '5678',
+      GEMINI_PUBLISH_OUTCOME: 'success',
+    },
+    fetchImpl: fake.fetchImpl,
+  });
+  assert.equal(res, null);
+  assert.equal(fake.calls.length, 0);
+});
+
+for (const outcome of ['failure', 'cancelled', 'skipped', undefined]) {
+  test(`Gemini final status reports unconfirmed publication on ${outcome}`, async () => {
     const fake = fakeFetch();
     await publishRunStatus({
       env: {
@@ -114,40 +116,151 @@ for (const outcome of ['success', 'failure', 'cancelled', 'skipped', undefined])
     });
     assert.equal(fake.calls[0].method, 'PATCH');
     assert.equal(fake.calls[0].url, 'https://api.github.com/repos/acme/project/issues/comments/5678');
-    assert.match(fake.calls[0].body, outcome === 'success' ? /publication completed/ : /publication was not confirmed/);
+    assert.match(fake.calls[0].body, /publication was not confirmed/);
+    assert.match(fake.calls[0].body, /jiaze-review-source-comment:99/);
   });
 }
 
-test('bounded no-op final status explicitly says zero model quota', async () => {
+test('human_required final status posts human prompt containing idempotency marker', async () => {
   const fake = fakeFetch();
-  await publishRunStatus({
+  const res = await publishRunStatus({
     env: {
       ...baseEnv,
-      REVIEW_MODE: 'noop_waiting',
-      REVIEW_REASON: 'push a repair before verification',
+      REVIEW_MODE: 'human_required',
+      REVIEW_REASON: 'verification budget exhausted',
       STATUS_STAGE: 'finished',
-      STATUS_COMMENT_ID: '5678',
     },
     fetchImpl: fake.fetchImpl,
   });
-  assert.match(fake.calls[0].body, /No model quota was spent/);
+  assert.equal(res, '5678');
+  assert.equal(fake.calls.length, 1);
+  assert.equal(fake.calls[0].method, 'POST');
+  assert.match(fake.calls[0].body, /No model quota was spent\. verification budget exhausted/);
   assert.match(fake.calls[0].body, /jiaze-review-source-comment:99/);
+});
+
+test('bounded no-op with session comment silently attaches dedupe marker without conversational noise', async () => {
+  const dummySession = {
+    version: 1,
+    status: 'READY',
+    findings: [],
+    verificationRound: 0,
+    maxVerificationRounds: 3,
+    auditCompleted: true,
+    lastReviewedHead: baseEnv.HEAD_SHA,
+    baseSha: baseEnv.HEAD_SHA,
+    fullAuditHead: baseEnv.HEAD_SHA,
+    deepSpendUsd: 0,
+  };
+  const dummyPlan = {
+    sessionCommentId: '5678',
+    session: dummySession,
+  };
+  const calls = [];
+  const fetchImpl = async (url, options = {}) => {
+    calls.push({ url, method: options.method || 'GET', body: options.body ? JSON.parse(options.body).body : undefined });
+    if (!options.method || options.method === 'GET') {
+      return Response.json({
+        id: 5678,
+        body: '<!-- jiaze-review-session:v1 -->\n### Independent Review Session\nStatus: **READY**',
+      });
+    }
+    return Response.json({ id: 5678 });
+  };
+
+  const res = await publishRunStatus({
+    env: {
+      ...baseEnv,
+      REVIEW_MODE: 'noop_ready',
+      REVIEW_REASON: 'review clear on this HEAD',
+      STATUS_STAGE: 'finished',
+    },
+    fetchImpl,
+    plan: dummyPlan,
+  });
+  assert.equal(res, null);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].method, 'GET');
+  assert.equal(calls[1].method, 'PATCH');
+  assert.match(calls[1].body, /jiaze-review-source-comment:99/);
+  assert.match(calls[1].body, /Independent Review Session/);
+  assert.doesNotMatch(calls[1].body, /### Independent review\n/);
+});
+
+test('recordSessionMarker preserves live session state from GitHub rather than stale pre-run plan', async () => {
+  const staleSession = {
+    version: 1,
+    status: 'REWORK',
+    findings: [],
+    verificationRound: 1,
+    maxVerificationRounds: 3,
+    auditCompleted: false,
+    lastReviewedHead: baseEnv.HEAD_SHA,
+    baseSha: baseEnv.HEAD_SHA,
+    fullAuditHead: baseEnv.HEAD_SHA,
+    deepSpendUsd: 0,
+  };
+  const liveSession = {
+    version: 1,
+    status: 'READY',
+    findings: [],
+    verificationRound: 2,
+    maxVerificationRounds: 3,
+    auditCompleted: true,
+    lastReviewedHead: baseEnv.HEAD_SHA,
+    baseSha: baseEnv.HEAD_SHA,
+    fullAuditHead: baseEnv.HEAD_SHA,
+    deepSpendUsd: 0,
+  };
+  const calls = [];
+  const fetchImpl = async (url, options = {}) => {
+    calls.push({ url, method: options.method || 'GET', body: options.body });
+    if (!options.method || options.method === 'GET') {
+      return Response.json({
+        id: 5678,
+        body: renderSessionComment(liveSession, { sourceCommentIds: ['11'] }),
+      });
+    }
+    return Response.json({ id: 5678 });
+  };
+
+  await publishRunStatus({
+    env: {
+      ...baseEnv,
+      REVIEW_MODE: 'noop_ready',
+      REVIEW_REASON: 'review clear on this HEAD',
+      STATUS_STAGE: 'finished',
+    },
+    fetchImpl,
+    plan: { sessionCommentId: '5678', session: staleSession },
+  });
+
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].method, 'PATCH');
+  // Patched body must preserve the live session status READY (not stale REWORK) and include both markers
+  assert.match(calls[1].body, /Status: \*\*READY\*\*/);
+  assert.match(calls[1].body, /jiaze-review-source-comment:11/);
+  assert.match(calls[1].body, /jiaze-review-source-comment:99/);
 });
 
 test('failed status write cannot invent a comment id or echo sensitive response content', async () => {
   await assert.rejects(
     publishRunStatus({
-      env: baseEnv,
+      env: {
+        ...baseEnv,
+        STATUS_STAGE: 'finished',
+        GEMINI_PUBLISH_OUTCOME: 'failure',
+      },
       fetchImpl: async () => new Response('sensitive-content', { status: 403 }),
     }),
     (error) => /HTTP 403/.test(error.message) && !error.message.includes('sensitive-content'),
   );
 });
 
-test('finished status cannot update an unknown comment', async () => {
+test('finished status rejects invalid comment id', async () => {
   const fake = fakeFetch();
   await assert.rejects(publishRunStatus({
-    env: { ...baseEnv, STATUS_STAGE: 'finished' },
+    env: { ...baseEnv, STATUS_STAGE: 'finished', STATUS_COMMENT_ID: 'invalid_id' },
     fetchImpl: fake.fetchImpl,
   }));
   assert.equal(fake.calls.length, 0);
@@ -196,7 +309,6 @@ test('v2 workflow isolates provider credentials and serializes durable PR sessio
   assert.doesNotMatch(yml, /steps\.plan\.outputs\.mode == 'discovery'|steps\.plan\.outputs\.mode == 'audit'/);
 });
 
-
 test('legacy review.yml is a thin auto-mode wrapper over review-v2', () => {
   const legacy = fs.readFileSync(new URL('../.github/workflows/review.yml', import.meta.url), 'utf8');
   const v2 = fs.readFileSync(new URL('../.github/workflows/review-v2.yml', import.meta.url), 'utf8');
@@ -209,28 +321,49 @@ test('legacy review.yml is a thin auto-mode wrapper over review-v2', () => {
   assert.match(v2, /source_kind:\n\s+required: false\n\s+default: comment/);
 });
 
-test('a failed run shows the recorded reason in the status comment',async()=>{
-  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'status-reason-'));
-  fs.writeFileSync(path.join(dir,'failure-reason.txt'),"Gemini review context exceeds 1500000 bytes\nsecond line");
-  const bodies=[];
-  const fetchImpl=async(url,init)=>{bodies.push(JSON.parse(init.body).body);return Response.json({id:7});};
-  await publishRunStatus({env:{GITHUB_ACTIONS:'true',TARGET_REPO:'a/b',GITHUB_REPOSITORY:'c/d',PR_NUMBER:'7',SOURCE_COMMENT_ID:'9',SOURCE_KIND:'pull_request',GITHUB_RUN_ID:'1',GITHUB_RUN_ATTEMPT:'1',HEAD_SHA:'a'.repeat(40),REVIEW_MODE:'incremental',REVIEW_REASON:'small delta',STATUS_STAGE:'finished',STATUS_COMMENT_ID:'7',GH_TOKEN:'t',GEMINI_PUBLISH_OUTCOME:'skipped',REVIEW_CONTEXT_DIR:dir},fetchImpl});
-  assert.match(bodies[0],/not confirmed/);
-  assert.match(bodies[0],/Reason: Gemini review context exceeds 1500000 bytes second line/);
+test('a failed run shows the recorded reason in the status comment', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'status-reason-'));
+  fs.writeFileSync(path.join(dir, 'failure-reason.txt'), "Gemini review context exceeds 1500000 bytes\nsecond line");
+  const bodies = [];
+  const fetchImpl = async (url, init) => { bodies.push(JSON.parse(init.body).body); return Response.json({ id: 7 }); };
+  await publishRunStatus({
+    env: {
+      GITHUB_ACTIONS: 'true',
+      TARGET_REPO: 'a/b',
+      GITHUB_REPOSITORY: 'c/d',
+      PR_NUMBER: '7',
+      SOURCE_COMMENT_ID: '9',
+      SOURCE_KIND: 'pull_request',
+      GITHUB_RUN_ID: '1',
+      GITHUB_RUN_ATTEMPT: '1',
+      HEAD_SHA: 'a'.repeat(40),
+      REVIEW_MODE: 'incremental',
+      REVIEW_REASON: 'small delta',
+      STATUS_STAGE: 'finished',
+      STATUS_COMMENT_ID: '7',
+      GH_TOKEN: 't',
+      GEMINI_PUBLISH_OUTCOME: 'skipped',
+      REVIEW_CONTEXT_DIR: dir,
+    },
+    fetchImpl,
+  });
+  assert.match(bodies[0], /not confirmed/);
+  assert.match(bodies[0], /Reason: Gemini review context exceeds 1500000 bytes second line/);
 });
 
-test('thread decisions are announced as needing no model, and the outcome is stated honestly',async()=>{
-  const sent=[];
-  const fetchImpl=async(url,init)=>{sent.push(JSON.parse(init.body).body);return Response.json({id:7});};
-  const base={...baseEnv,REVIEW_MODE:'threads',REVIEW_REASON:'r',STATUS_COMMENT_ID:'7'};
-  await publishRunStatus({env:{...base,STATUS_STAGE:'started'},fetchImpl});
-  await publishRunStatus({env:{...base,STATUS_STAGE:'finished',THREADS_OUTCOME:'success'},fetchImpl});
-  await publishRunStatus({env:{...base,STATUS_STAGE:'finished',THREADS_OUTCOME:'failure'},fetchImpl});
-  assert.match(sent[0],/Applying review-thread decisions \(no model call\)/);
-  assert.match(sent[1],/Review-thread decisions applied\. No model quota was spent/);
-  assert.match(sent[2],/not confirmed/);
-  await publishRunStatus({env:{...base,STATUS_STAGE:'finished',THREADS_OUTCOME:'success',THREAD_PROBLEMS:'2'},fetchImpl});
-  assert.match(sent[3],/Review-thread decisions applied/);
-  assert.match(sent[3],/Some review threads could not be changed.*review result is unaffected/);
-  assert.doesNotMatch(sent[1],/could not be changed/);
+test('thread decisions are silent on success and reported honestly on failure', async () => {
+  const sent = [];
+  const fetchImpl = async (url, init) => { sent.push(JSON.parse(init.body).body); return Response.json({ id: 7 }); };
+  const base = { ...baseEnv, REVIEW_MODE: 'threads', REVIEW_REASON: 'r', STATUS_COMMENT_ID: '7' };
+  const r1 = await publishRunStatus({ env: { ...base, STATUS_STAGE: 'started' }, fetchImpl });
+  assert.equal(r1, null);
+  assert.equal(sent.length, 0);
+
+  const r2 = await publishRunStatus({ env: { ...base, STATUS_STAGE: 'finished', THREADS_OUTCOME: 'success' }, fetchImpl });
+  assert.equal(r2, null);
+  assert.equal(sent.length, 0);
+
+  await publishRunStatus({ env: { ...base, STATUS_STAGE: 'finished', THREADS_OUTCOME: 'failure' }, fetchImpl });
+  assert.equal(sent.length, 1);
+  assert.match(sent[0], /Review-thread decisions were not confirmed/);
 });

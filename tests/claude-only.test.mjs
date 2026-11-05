@@ -55,12 +55,13 @@ test('a large diff under @claude review is split into parts all reviewed by Clau
   assert.ok(calls.every((c) => c.options.maxBudgetUsd <= 1.0 + 1e-9));
 });
 
-test('the status comment names the model that was asked for', async () => {
+test('workflow start is silent even for explicit @claude review', async () => {
   const bodies = [];
   const base = { GITHUB_ACTIONS: 'true', TARGET_REPO: 'a/b', GITHUB_REPOSITORY: 'c/d', PR_NUMBER: '7', SOURCE_COMMENT_ID: '9', SOURCE_KIND: 'comment', GITHUB_RUN_ID: '1', GITHUB_RUN_ATTEMPT: '1', HEAD_SHA: A, REVIEW_MODE: 'verification', REVIEW_REASON: 'r', STATUS_STAGE: 'started', PREFLIGHT_OUTCOME: 'success', GH_TOKEN: 't' };
   const fetchImpl = async (url, init) => { bodies.push(JSON.parse(init.body).body); return Response.json({ id: 7 }); };
-  await publishRunStatus({ env: { ...base, REQUESTED_MODE: 'claude' }, fetchImpl });
-  await publishRunStatus({ env: { ...base, REQUESTED_MODE: 'auto' }, fetchImpl });
-  assert.match(bodies[0], /Claude targeted verification is running/);
-  assert.match(bodies[1], /Gemini targeted verification is running/);
+  const res1 = await publishRunStatus({ env: { ...base, REQUESTED_MODE: 'claude' }, fetchImpl });
+  const res2 = await publishRunStatus({ env: { ...base, REQUESTED_MODE: 'auto' }, fetchImpl });
+  assert.equal(res1, null);
+  assert.equal(res2, null);
+  assert.equal(bodies.length, 0);
 });
