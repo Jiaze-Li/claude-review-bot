@@ -108,6 +108,7 @@ export class GeminiProviderAdapter extends ProviderAdapter {
     fetchImpl = fetch,
     maxAttempts = 2,
     logImpl = null,
+    metadata = null,
   }) {
     const apiKey = env?.GEMINI_API_KEY;
     if (!apiKey) {
@@ -147,6 +148,7 @@ export class GeminiProviderAdapter extends ProviderAdapter {
       },
     });
 
+    const requestBytes = Buffer.byteLength(requestBody, 'utf8');
     const usageTotals = {
       promptTokenCount: 0,
       candidatesTokenCount: 0,
@@ -163,7 +165,9 @@ export class GeminiProviderAdapter extends ProviderAdapter {
       const attemptStart = Date.now();
       const signal = AbortSignal.timeout(timeoutMs);
       if (typeof logImpl === 'function') {
-        logImpl(`Gemini request attempt ${attempt}/${maxAttempts}: model=${model} effort=${effort} timeout_ms=${timeoutMs}`);
+        const mode = metadata?.mode ?? 'review';
+        const contextBytes = metadata?.contextBytes ?? 0;
+        logImpl(`Gemini request started: mode=${mode} attempt=${attempt} model=${model} thinking=${effort} timeout_ms=${timeoutMs} context_bytes=${contextBytes} request_bytes=${requestBytes}`);
       }
 
       try {
@@ -243,6 +247,11 @@ export class GeminiProviderAdapter extends ProviderAdapter {
         };
       }
 
+      if (typeof logImpl === 'function') {
+        const mode = metadata?.mode ?? 'review';
+        logImpl(`Gemini request completed: mode=${mode} attempt=${attempt} elapsed_ms=${Date.now() - attemptStart}`);
+      }
+
       if (typeof payload?.modelVersion === 'string' && payload.modelVersion) servedModel = payload.modelVersion;
       const input = payload?.usageMetadata?.promptTokenCount;
       const output = payload?.usageMetadata?.candidatesTokenCount;
@@ -272,7 +281,7 @@ export class GeminiProviderAdapter extends ProviderAdapter {
             requested_model: model,
             resolved_model: servedModel || model,
             effort,
-            num_turns: 1,
+            num_turns: attempt,
             max_turns: 1,
             duration_ms: Date.now() - startedAt,
             duration_api_ms: Date.now() - startedAt,
@@ -361,8 +370,9 @@ export class ClaudeProviderAdapter extends ProviderAdapter {
     logImpl = null,
     fallbackUnknownCostUsd = FALLBACK_UNKNOWN_COST_USD,
     isolateEnv = false,
+    requireAuthToken = false,
   }) {
-    if (!env?.CLAUDE_CODE_OAUTH_TOKEN && !queryImpl) {
+    if (requireAuthToken && !env?.CLAUDE_CODE_OAUTH_TOKEN && !queryImpl) {
       return {
         ok: false,
         kind: OUTCOME_KINDS.CONFIG,
@@ -395,7 +405,7 @@ export class ClaudeProviderAdapter extends ProviderAdapter {
     const timer = setTimeout(() => abortController.abort(), Math.max(1000, timeoutMs));
 
     const subprocessEnv = isolateEnv
-      ? { PATH: env.PATH, HOME: env.HOME, TMPDIR: env.TMPDIR, CLAUDE_CODE_OAUTH_TOKEN: env.CLAUDE_CODE_OAUTH_TOKEN }
+      ? { PATH: env?.PATH, HOME: env?.HOME, TMPDIR: env?.TMPDIR, ...(env?.CLAUDE_CODE_OAUTH_TOKEN ? { CLAUDE_CODE_OAUTH_TOKEN: env.CLAUDE_CODE_OAUTH_TOKEN } : {}) }
       : env;
 
     const toolAuthorizer = canUseTool ?? (async () => ({ behavior: 'deny', message: 'No tools available in this review.' }));
