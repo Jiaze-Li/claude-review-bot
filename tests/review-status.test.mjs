@@ -463,3 +463,80 @@ test('thread decisions are silent on success and reported honestly on failure', 
   assert.equal(sent.length, 1);
   assert.match(sent[0], /Review-thread decisions were not confirmed/);
 });
+
+test("recover finished status reports outcome: success is silent, failure posts error", async () => {
+  const sent = [];
+  const fetchImpl = async (url, init) => { sent.push(JSON.parse(init.body).body); return Response.json({ id: 99 }); };
+  const base = { ...baseEnv, REVIEW_MODE: "recover", REVIEW_REASON: "session recovery" };
+
+  // Success is completely silent
+  const r1 = await publishRunStatus({
+    env: { ...base, STATUS_STAGE: "finished", RECOVER_OUTCOME: "success" },
+    fetchImpl,
+  });
+  assert.equal(r1, null);
+  assert.equal(sent.length, 0);
+
+  // Failure posts error comment with workflow link
+  const r2 = await publishRunStatus({
+    env: { ...base, STATUS_STAGE: "finished", RECOVER_OUTCOME: "failure" },
+    fetchImpl,
+  });
+  assert.equal(r2, "99");
+  assert.equal(sent.length, 1);
+  assert.match(sent[0], /Session recovery was not confirmed/);
+  assert.match(sent[0], /actions\/runs\/1234\/attempts\/2/);
+  assert.match(sent[0], /<!-- jiaze-review-source-comment:99 -->/);
+
+  // Skipped also posts error
+  const r3 = await publishRunStatus({
+    env: { ...base, STATUS_STAGE: "finished", RECOVER_OUTCOME: "skipped" },
+    fetchImpl,
+  });
+  assert.equal(r3, "99");
+  assert.equal(sent.length, 2);
+  assert.match(sent[1], /Session recovery was not confirmed/);
+});
+
+test("deep_review_stale finished status reports outcome: success records marker, failure posts error", async () => {
+  const sent = [];
+  const calls = [];
+  const fetchImpl = async (url, init = {}) => {
+    calls.push({ url, method: init.method || "GET" });
+    if (!init.method || init.method === "GET") {
+      return Response.json({
+        id: 5678,
+        body: renderSessionComment(defaultSession),
+      });
+    }
+    sent.push(JSON.parse(init.body).body);
+    return Response.json({ id: 5678 });
+  };
+  const base = { ...baseEnv, REVIEW_MODE: "deep_review_stale", REVIEW_REASON: "stale deep review" };
+
+  // Success records marker silently
+  const r1 = await publishRunStatus({
+    env: { ...base, STATUS_STAGE: "finished", FAIL_DEEP_OUTCOME: "success" },
+    fetchImpl,
+    plan: { sessionCommentId: "5678", session: defaultSession },
+  });
+  assert.equal(r1, null);
+  // GET existing comment + PATCH session comment with marker
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].method, "GET");
+  assert.equal(calls[1].method, "PATCH");
+  assert.match(sent[0], /Independent Review Session/);
+
+  // Failure posts error comment
+  calls.length = 0;
+  sent.length = 0;
+  const r2 = await publishRunStatus({
+    env: { ...base, STATUS_STAGE: "finished", FAIL_DEEP_OUTCOME: "failure" },
+    fetchImpl,
+  });
+  assert.equal(r2, "5678");
+  assert.equal(sent.length, 1);
+  assert.match(sent[0], /Stale deep review cleanup was not confirmed/);
+  assert.match(sent[0], /actions\/runs\/1234\/attempts\/2/);
+  assert.match(sent[0], /<!-- jiaze-review-source-comment:99 -->/);
+});

@@ -217,10 +217,40 @@ test('session recovery mode: recover is silent in conversation while preserving 
     requestedMode: 'auto',
     hasSessionComment: true,
     sourceCommentId: '601',
-    outcomes: { geminiPublish: 'success' },
+    outcomes: { recover: 'success' },
   });
-  // recover mode does not post duplicate conversation noise
   assert.equal(decision.action, NOTIFICATION_ACTIONS.SILENT);
+});
+
+test('session recovery failure produces error notification with workflow link and marker', async () => {
+  const posted = [];
+  const fetchImpl = async (url, options) => {
+    posted.push(JSON.parse(options.body).body);
+    return Response.json({ id: 888 });
+  };
+
+  const env = {
+    GITHUB_ACTIONS: 'true',
+    GITHUB_REPOSITORY: 'owner/repo',
+    GITHUB_RUN_ID: '905',
+    GITHUB_RUN_ATTEMPT: '1',
+    TARGET_REPO: 'target/repo',
+    PR_NUMBER: '42',
+    SOURCE_COMMENT_ID: '602',
+    SOURCE_KIND: 'comment',
+    HEAD_SHA: HEAD,
+    STATUS_STAGE: 'finished',
+    REVIEW_MODE: 'recover',
+    RECOVER_OUTCOME: 'failure',
+    GH_TOKEN: 'fake-token',
+  };
+
+  const res = await publishRunStatus({ env, fetchImpl });
+  assert.equal(res, '888');
+  assert.equal(posted.length, 1);
+  assert.match(posted[0], /Session recovery was not confirmed/);
+  assert.match(posted[0], /actions\/runs\/905\/attempts\/1/);
+  assert.match(posted[0], /<!-- jiaze-review-source-comment:602 -->/);
 });
 
 test('error status retains source comment marker so webhook does not retry infinitely', async () => {

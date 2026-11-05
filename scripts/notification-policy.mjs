@@ -46,7 +46,9 @@ export function decideNotificationAction({
     || (['incremental', 'verification'].includes(mode) && outcomes.geminiPublish !== 'success')
     || (mode === 'override' && outcomes.override !== 'success')
     || (mode === 'dismiss' && outcomes.dismiss !== 'success')
-    || (mode === 'threads' && outcomes.threads !== 'success');
+    || (mode === 'threads' && outcomes.threads !== 'success')
+    || (mode === 'recover' && outcomes.recover !== 'success')
+    || (mode === 'deep_review_stale' && outcomes.failDeep !== 'success');
 
   if (isFailure) {
     return {

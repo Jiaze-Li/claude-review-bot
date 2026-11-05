@@ -118,6 +118,8 @@ test('successful review publication is silent because PR review and session comm
         claudePublish: 'success',
         override: 'success',
         dismiss: 'success',
+        recover: 'success',
+        failDeep: 'success',
       },
       hasSessionComment: true,
       sourceCommentId: '404',
@@ -178,4 +180,47 @@ test('extractSourceCommentMarkers extracts both new and old marker formats witho
   assert.deepEqual(markers, ['1001', '1002']);
   assert.deepEqual(extractSourceCommentMarkers(''), []);
   assert.deepEqual(extractSourceCommentMarkers(null), []);
+});
+
+test("recover mode notification policy: success is silent, failure/skipped is POST_ERROR", () => {
+  const success = decideNotificationAction({
+    stage: "finished",
+    mode: "recover",
+    outcomes: { recover: "success" },
+    hasSessionComment: true,
+  });
+  assert.equal(success.action, NOTIFICATION_ACTIONS.SILENT);
+
+  for (const outcome of ["failure", "cancelled", "skipped", undefined]) {
+    const failed = decideNotificationAction({
+      stage: "finished",
+      mode: "recover",
+      outcomes: { recover: outcome },
+      hasSessionComment: true,
+    });
+    assert.equal(failed.action, NOTIFICATION_ACTIONS.POST_ERROR);
+    assert.match(failed.reason, /execution failure/);
+  }
+});
+
+test("deep_review_stale mode notification policy: success records marker or silent, failure is POST_ERROR", () => {
+  const withMarker = decideNotificationAction({
+    stage: "finished",
+    mode: "deep_review_stale",
+    outcomes: { failDeep: "success" },
+    hasSessionComment: true,
+    sourceCommentId: "909",
+  });
+  assert.equal(withMarker.action, NOTIFICATION_ACTIONS.RECORD_SESSION_MARKER);
+
+  for (const outcome of ["failure", "cancelled", "skipped", undefined]) {
+    const failed = decideNotificationAction({
+      stage: "finished",
+      mode: "deep_review_stale",
+      outcomes: { failDeep: outcome },
+      hasSessionComment: true,
+    });
+    assert.equal(failed.action, NOTIFICATION_ACTIONS.POST_ERROR);
+    assert.match(failed.reason, /execution failure/);
+  }
 });

@@ -143,6 +143,8 @@ export async function publishRunStatus({ env = process.env, fetchImpl = fetch, p
       override: env.OVERRIDE_OUTCOME,
       dismiss: env.DISMISS_OUTCOME,
       threads: env.THREADS_OUTCOME,
+      recover: env.RECOVER_OUTCOME,
+      failDeep: env.FAIL_DEEP_OUTCOME,
     },
     hasSessionComment,
     sourceCommentId: env.SOURCE_COMMENT_ID,
@@ -184,6 +186,12 @@ export async function publishRunStatus({ env = process.env, fetchImpl = fetch, p
     state = env.OVERRIDE_OUTCOME !== 'success'
       ? 'Manual override was not confirmed. Check the workflow run.'
       : 'Manual override recorded.';
+  } else if (mode === 'recover') {
+    state = 'Session recovery was not confirmed. Check the workflow run; no successful recovery is being claimed.'
+      + failure;
+  } else if (mode === 'deep_review_stale') {
+    state = 'Stale deep review cleanup was not confirmed. Check the workflow run.'
+      + failure;
   } else {
     state = 'Review publication was not confirmed. Check the workflow run; no successful publication is being claimed.'
       + failure;
