@@ -113,8 +113,11 @@ several users but not documented by GitHub, so the first run after the change is
    (`id: thread-token`, `continue-on-error: true`, same inputs as that step but `permission-contents: write` and
    `permission-pull-requests: write`), then set `GH_TOKEN: ${{ steps.thread-token.outputs.token || steps.app-token.outputs.token }}`
    on the two steps "Apply review-thread decisions" and "Resolve review threads for closed findings" only.
-4. Trigger a review on a PR with a closed finding and check the Job Summary: no
-   "Review thread sync did not fully complete" section means it worked.
+4. Verify with a real change, not just an empty summary. On a test PR with a bot thread whose finding is closed
+   (FIXED/DISMISSED/WAIVED), trigger a review and confirm **both**: (a) the run's log says `Review threads: N resolved`
+   with N ≥ 1 and the thread now shows as resolved on the PR; and (b) a thread a person resolved while its finding is
+   still open (run a verification) is reopened with the bot's "Reopened:" reply. No "did not fully complete" section in
+   the Job Summary is necessary but not sufficient: a run that had nothing to change also has none.
 
 * Convergence: only 2 verification rounds; each finding needs a concrete `failurePath` (trigger state → wrong result)
   or it is demoted to non-blocking P3; concerns already dismissed or settled are shown to every reviewer and an exact

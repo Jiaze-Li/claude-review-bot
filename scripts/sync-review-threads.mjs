@@ -1,6 +1,5 @@
-import { appendFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
-import { fetchReviewThreads, replyToThread, resolveThread, threadsByFinding, unresolveThread } from './review-threads.mjs';
+import { fetchReviewThreads, replyToThread, reportThreadProblem, resolveThread, threadsByFinding, unresolveThread } from './review-threads.mjs';
 import { latestSession } from './sync-commit-status.mjs';
 
 // Keeps the PR's review threads in step with the durable session at the end of a review run.
@@ -83,28 +82,21 @@ export async function syncReviewThreads({ env = process.env, fetchImpl = fetch, 
   const closed = wantsResolved.length;
   log.log?.(`Review threads: ${resolved} resolved for closed findings${reopened ? `, ${reopened} reopened because the finding is still open` : ''}${failed ? `, ${failed} could not be updated` : ''}${skipped ? `, ${skipped} not tried after the token was refused` : ''}.`);
   const result = { resolved, reopened, failed, skipped, replyFailed, closed, permissionDenied: denied, errors };
-  if (failed || skipped || replyFailed) reportProblem({ env, log, result });
+  if (needsAttention(result)) reportProblem({ env, log, result });
   return result;
 }
 
-// Thread sync is housekeeping next to the review: its trouble goes to the Actions log, an annotation and the Job
-// Summary (never a PR comment) and never touches the review session.
+export const needsAttention = (result) => Boolean(result.failed || result.skipped || result.replyFailed);
+
 function reportProblem({ env, log, result }) {
-  const lines = [
-    '### Review thread sync did not fully complete',
-    '',
-    `- Resolved: ${result.resolved}, reopened: ${result.reopened}, failed: ${result.failed}, not tried: ${result.skipped}${result.replyFailed ? `, reopen notes not posted: ${result.replyFailed}` : ''}`,
-    ...result.errors.map((message) => `- GitHub said: ${message}`),
-  ];
-  if (result.permissionDenied) {
-    lines.push('', 'GitHub refused the thread change for this token. Resolving/reopening a review thread is reported to need the App\'s **Contents: Read and write** besides **Pull requests: Read and write**'
-      + ' (this workflow\'s token has Contents: read).'
-      + ' The review result itself is unaffected; threads can be resolved by hand. See the README for the one-time App setup.');
-  }
-  log.warn?.(`::warning title=Review thread sync incomplete::${result.failed} failed, ${result.skipped} not tried${result.permissionDenied ? ' (permission refused by GitHub)' : ''}. The review result is unaffected.`);
-  if (env.GITHUB_STEP_SUMMARY) {
-    try { appendFileSync(env.GITHUB_STEP_SUMMARY, `${lines.join('\n')}\n`); } catch { /* summary is optional */ }
-  }
+  reportThreadProblem({
+    env, log,
+    heading: 'Review thread sync did not fully complete',
+    counts: `Resolved: ${result.resolved}, reopened: ${result.reopened}, failed: ${result.failed}, not tried: ${result.skipped}${result.replyFailed ? `, reopen notes not posted: ${result.replyFailed}` : ''}`,
+    errors: result.errors,
+    permissionDenied: result.permissionDenied,
+    warning: `${result.failed} failed, ${result.skipped} not tried${result.replyFailed ? `, ${result.replyFailed} reopen note(s) not posted` : ''}${result.permissionDenied ? ' (permission refused by GitHub)' : ''}.`,
+  });
 }
 
 function required(env, key) {
@@ -117,7 +109,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   try {
     const result = await syncReviewThreads();
     // A red step (the workflow keeps it from failing the job) so a partial or total failure is never shown as success.
-    if (result.failed || result.skipped) process.exitCode = 1;
+    if (needsAttention(result)) process.exitCode = 1;
   } catch (error) {
     console.error(error.message);
     process.exitCode = 1;

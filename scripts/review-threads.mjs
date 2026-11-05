@@ -1,4 +1,5 @@
 // The bot's review threads, read and changed through GitHub's GraphQL API, and how they map to findings.
+import { appendFileSync } from 'node:fs';
 import { findingKey, markerKey } from './review-anchors.mjs';
 
 const THREADS_QUERY = `query($owner:String!,$repo:String!,$number:Int!,$after:String){
@@ -112,4 +113,18 @@ function threadApiError(message, permission) {
   const error = new Error(message);
   error.permissionDenied = permission;
   return error;
+}
+
+// Thread housekeeping trouble goes to the Actions log, an annotation and the Job Summary (never a PR comment) and
+// never touches the review session.
+export function reportThreadProblem({ env, log, heading, counts, errors = [], permissionDenied = false, warning }) {
+  const lines = [`### ${heading}`, '', `- ${counts}`, ...errors.map((message) => `- GitHub said: ${message}`)];
+  if (permissionDenied) {
+    lines.push('', 'GitHub refused the thread change for this token. Resolving/reopening a review thread is reported to need the App\'s **Contents: Read and write** besides **Pull requests: Read and write** (this workflow\'s token has Contents: read).'
+      + ' The review result itself is unaffected; threads can be resolved by hand. See the README for the one-time App setup.');
+  }
+  log.warn?.(`::warning title=${heading}::${warning} The review result is unaffected.`);
+  if (env.GITHUB_STEP_SUMMARY) {
+    try { appendFileSync(env.GITHUB_STEP_SUMMARY, `${lines.join('\n')}\n`); } catch { /* summary is optional */ }
+  }
 }

@@ -229,4 +229,8 @@ test('thread decisions are announced as needing no model, and the outcome is sta
   assert.match(sent[0],/Applying review-thread decisions \(no model call\)/);
   assert.match(sent[1],/Review-thread decisions applied\. No model quota was spent/);
   assert.match(sent[2],/not confirmed/);
+  await publishRunStatus({env:{...base,STATUS_STAGE:'finished',THREADS_OUTCOME:'success',THREAD_PROBLEMS:'2'},fetchImpl});
+  assert.match(sent[3],/Review-thread decisions applied/);
+  assert.match(sent[3],/Some review threads could not be changed.*review result is unaffected/);
+  assert.doesNotMatch(sent[1],/could not be changed/);
 });

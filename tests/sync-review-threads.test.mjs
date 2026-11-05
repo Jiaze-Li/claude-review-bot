@@ -199,3 +199,38 @@ test('the workflow never widens the token itself: Contents stays read-only', asy
   assert.doesNotMatch(yml, /permission-contents: write/);
   assert.match(yml, /permission-contents: read\n\s+permission-pull-requests: write\n\s+permission-issues: read/);
 });
+
+test('a reply-only failure still makes the CLI step exit non-zero, like any other incomplete sync', async () => {
+  const { needsAttention } = await import('../scripts/sync-review-threads.mjs');
+  const base = { resolved: 1, reopened: 1, failed: 0, skipped: 0, replyFailed: 0 };
+  assert.equal(needsAttention(base), false);
+  assert.equal(needsAttention({ ...base, replyFailed: 1 }), true);
+  assert.equal(needsAttention({ ...base, failed: 1 }), true);
+  assert.equal(needsAttention({ ...base, skipped: 1 }), true);
+
+  // end to end through the real CLI entry point, with fetch stubbed by a preload
+  const { mkdtempSync, writeFileSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { spawnSync } = await import('node:child_process');
+  const dir = mkdtempSync(`${tmpdir()}/cli-`);
+  const sess = session({ 'Open bug': 'OPEN' });
+  const byPerson = { ...thread('T1', 'Open bug', { resolved: true }), resolvedBy: { login: 'jiaze-li' } };
+  const gh = fakeGitHub(sess, [byPerson]);
+  writeFileSync(`${dir}/stub.mjs`, `
+    const sessionBody = ${JSON.stringify(renderSessionComment(sess))};
+    const thread = ${JSON.stringify(byPerson)};
+    globalThis.fetch = async (url, init = {}) => {
+      if (url.includes('/issues/7/comments')) return Response.json([{ id: 5, user: { login: '${BOT}[bot]' }, body: sessionBody }]);
+      if (url.endsWith('/graphql')) {
+        if (/unresolveReviewThread/.test(init.body)) return Response.json({ data: {} });
+        return Response.json({ data: { repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage: false }, nodes: [thread] } } } } });
+      }
+      return new Response('no', { status: 500 }); // the reply
+    };`);
+  void gh;
+  const run = spawnSync(process.execPath, ['--import', `${dir}/stub.mjs`, new URL('../scripts/sync-review-threads.mjs', import.meta.url).pathname], {
+    env: { ...process.env, ...env, REVIEW_MODE: 'verification', GITHUB_STEP_SUMMARY: `${dir}/summary.md` }, encoding: 'utf8',
+  });
+  assert.equal(run.status, 1);
+  assert.match(run.stderr, /::warning/);
+});
