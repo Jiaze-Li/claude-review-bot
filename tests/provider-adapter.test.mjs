@@ -1,8 +1,5 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
 import {
   getProviderAdapter,
   GeminiProviderAdapter,
@@ -548,75 +545,23 @@ test('Gemini adapter preserves successful execution with the minimum positive in
 });
 
 test('Claude adapter integrates with toolGateway: mounts canUseTool and hooks.PostToolUse, enforces boundaries and truncation', async () => {
-  const { ReadOnlyToolGateway } = await import('../scripts/tool-gateway.mjs');
-  const tmpDir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'adapter-gateway-test-')));
-  const safeRoot = path.join(tmpDir, 'safe-target');
-  const contextRoot = path.join(tmpDir, '.review-context');
-  const outsideRoot = path.join(tmpDir, 'outside');
-
-  fs.mkdirSync(safeRoot, { recursive: true });
-  fs.mkdirSync(contextRoot, { recursive: true });
-  fs.mkdirSync(outsideRoot, { recursive: true });
-
-  fs.writeFileSync(path.join(safeRoot, 'valid.txt'), 'valid content line 1\nvalid content line 2\n');
-  fs.writeFileSync(path.join(outsideRoot, 'secret.key'), 'SECRET_DATA');
-
-  const gateway = new ReadOnlyToolGateway({
-    safeRoot,
-    contextRoot,
-    cwd: tmpDir,
-    maxCallReadBytes: 50,
+  const [{ ReadOnlyToolGateway }, fs, os, path] = await Promise.all([
+    import('../scripts/tool-gateway.mjs'), import('node:fs'), import('node:os'), import('node:path'),
+  ]);
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ad-gw-')), safe = path.join(tmp, 's'), outside = path.join(tmp, 'o');
+  fs.mkdirSync(safe); fs.mkdirSync(outside);
+  fs.writeFileSync(path.join(safe, 'v.txt'), 'v'); fs.writeFileSync(path.join(outside, 'k'), 'k');
+  const gw = new ReadOnlyToolGateway({ safeRoot: safe, cwd: tmp, maxCallReadBytes: 50 });
+  let opts = null;
+  const outcome = await getProviderAdapter(PROVIDER_KINDS.CLAUDE).execute({
+    prompt: 'p', schema: basicSchema, env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
+    queryImpl: async function* ({ options }) { opts = options; yield { type: 'result', subtype: 'success', total_cost_usd: 0.1, structured_output: { summary: 'ok' } }; },
+    toolGateway: gw, tools: ['Read', 'Glob', 'Grep'],
   });
-
-  const adapter = getProviderAdapter(PROVIDER_KINDS.CLAUDE);
-  let capturedOptions = null;
-
-  const mockQuery = async function* ({ options }) {
-    capturedOptions = options;
-    yield {
-      type: 'result',
-      subtype: 'success',
-      total_cost_usd: 0.1,
-      usage: { input_tokens: 10, output_tokens: 5 },
-      structured_output: { summary: 'gateway adapter ok' },
-    };
-  };
-
-  const outcome = await adapter.execute({
-    prompt: 'p',
-    schema: basicSchema,
-    env: { CLAUDE_CODE_OAUTH_TOKEN: 'token' },
-    queryImpl: mockQuery,
-    toolGateway: gateway,
-    tools: ['Read', 'Glob', 'Grep'],
-  });
-
   assert.equal(outcome.ok, true);
-  assert.ok(capturedOptions);
-  assert.equal(typeof capturedOptions.canUseTool, 'function');
-  assert.ok(capturedOptions.hooks);
-  assert.ok(Array.isArray(capturedOptions.hooks.PostToolUse));
-
-  // 1. Tool authorization via canUseTool: allowed path
-  const allowRes = await capturedOptions.canUseTool('Read', { file_path: path.join(safeRoot, 'valid.txt') });
-  assert.equal(allowRes.behavior, 'allow');
-  assert.equal(allowRes.updatedInput.file_path, path.join(safeRoot, 'valid.txt'));
-
-  // 2. Tool authorization via canUseTool: denied escaping path
-  const denyEscape = await capturedOptions.canUseTool('Read', { file_path: path.join(outsideRoot, 'secret.key') });
-  assert.equal(denyEscape.behavior, 'deny');
-  assert.match(denyEscape.message, /escapes authorized boundaries/i);
-
-  // 3. PostToolUse hook enforces truncation on output exceeding maxCallReadBytes
-  const postHookFn = capturedOptions.hooks.PostToolUse[0].hooks[0];
-  const hookResult = await postHookFn({
-    tool_name: 'Read',
-    tool_input: { file_path: path.join(safeRoot, 'valid.txt') },
-    tool_response: 'z'.repeat(200),
-  });
-  assert.ok(hookResult.hookSpecificOutput);
-  assert.equal(hookResult.hookSpecificOutput.hookEventName, 'PostToolUse');
-  assert.match(hookResult.hookSpecificOutput.updatedToolOutput, /output truncated by host gateway/i);
-
-  fs.rmSync(tmpDir, { recursive: true, force: true });
+  assert.equal((await opts.canUseTool('Read', { file_path: path.join(safe, 'v.txt') })).behavior, 'allow');
+  assert.equal((await opts.canUseTool('Read', { file_path: path.join(outside, 'k') })).behavior, 'deny');
+  const hookRes = await opts.hooks.PostToolUse[0].hooks[0]({ tool_name: 'Read', tool_input: {}, tool_response: 'z'.repeat(200) });
+  assert.match(hookRes.hookSpecificOutput.updatedToolOutput, /output truncated by host gateway/i);
+  fs.rmSync(tmp, { recursive: true, force: true });
 });

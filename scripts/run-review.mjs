@@ -445,15 +445,36 @@ function readLines(file) {
   return readText(file).split('\n').map((line) => line.trim()).filter(Boolean);
 }
 
-const defaultToolGateway = new ReadOnlyToolGateway({
-  safeRoot,
-  contextRoot,
-  cwd,
-  ignorePatterns,
-});
+const defaultToolGateway = new ReadOnlyToolGateway({ safeRoot, contextRoot, cwd, ignorePatterns });
 
 async function authorizeTool(toolName, input) {
   return defaultToolGateway.authorize(toolName, input);
+}
+
+function resolveAllowedExisting(requestedPath, roots) {
+  if (typeof requestedPath !== 'string' || !requestedPath || requestedPath.includes('\0')) return null;
+  const absolute = path.isAbsolute(requestedPath)
+    ? path.normalize(requestedPath)
+    : path.resolve(cwd, requestedPath);
+
+  let real;
+  try {
+    real = fs.realpathSync.native(absolute);
+  } catch {
+    return null;
+  }
+
+  return roots.some((root) => isInside(root, real)) ? real : null;
+}
+
+function isInside(root, candidate) {
+  return candidate === root || candidate.startsWith(`${root}${path.sep}`);
+}
+
+function isSafeGlob(value) {
+  if (typeof value !== 'string' || !value || value.includes('\0') || path.isAbsolute(value)) return false;
+  const parts = value.split(/[\\/]+/);
+  return !parts.includes('..');
 }
 
 function runtimeFromResult(message, model, maxTurns) {

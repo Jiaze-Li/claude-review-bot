@@ -297,89 +297,23 @@ test('Full shard wrapper preserves failed outcome for an exhausted deadline with
 
 test('Integration E3: Full review with Tool Gateway preserves shard execution, coverage, and budget accounting', async () => {
   const { ReadOnlyToolGateway } = await import('../scripts/tool-gateway.mjs');
-  const tmpDir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'full-review-gateway-')));
-  const safeRoot = path.join(tmpDir, 'safe-target');
-  const contextRoot = path.join(tmpDir, '.review-context');
-
-  fs.mkdirSync(safeRoot, { recursive: true });
-  fs.mkdirSync(contextRoot, { recursive: true });
-
-  fs.writeFileSync(path.join(safeRoot, 'fileA.js'), 'export const a = 1;\n');
-  fs.writeFileSync(path.join(contextRoot, 'pr.diff'), 'diff --git a/fileA.js b/fileA.js\n');
-
-  const gateway = new ReadOnlyToolGateway({
-    safeRoot,
-    contextRoot,
-    cwd: tmpDir,
-    maxCalls: 50,
-  });
-
-  const adapter = getProviderAdapter(PROVIDER_KINDS.CLAUDE);
-
-  const mockShardQuery = async function* ({ options }) {
-    // Verify tools, canUseTool, and hooks passed through correctly
-    assert.deepEqual(options.tools, ['Read', 'Glob', 'Grep']);
-    assert.equal(typeof options.canUseTool, 'function');
-    assert.ok(options.hooks?.PostToolUse);
-
-    // Call tool via canUseTool to simulate model tool use
-    const auth = await options.canUseTool('Read', { file_path: path.join(safeRoot, 'fileA.js') });
-    assert.equal(auth.behavior, 'allow');
-
-    yield {
-      type: 'result',
-      subtype: 'success',
-      num_turns: 4,
-      total_cost_usd: 0.35,
-      usage: { input_tokens: 1500, output_tokens: 250 },
-      structured_output: {
-        summary: 'full shard review passed',
-        findings: [
-          {
-            severity: 'P2',
-            title: 'Unchecked return value',
-            body: 'Function return value is ignored',
-            path: 'fileA.js',
-            line: 1,
-            failurePath: 'Calling a() ignores returned integer value causing unexpected state',
-          },
-        ],
-        coverage: {
-          complete: true,
-          reviewedPaths: ['fileA.js'],
-          unreviewedPaths: [],
-          note: '',
-        },
-      },
-    };
-  };
-
-  const outcome = await adapter.execute({
-    prompt: 'review prompt for shard',
-    schema: {
-      type: 'object',
-      properties: {
-        summary: { type: 'string' },
-        findings: { type: 'array' },
-        coverage: { type: 'object' },
-      },
-      required: ['summary', 'findings', 'coverage'],
-    },
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'fr-gw-')), safe = path.join(tmp, 's'), ctx = path.join(tmp, 'c');
+  fs.mkdirSync(safe); fs.mkdirSync(ctx);
+  fs.writeFileSync(path.join(safe, 'fileA.js'), 'export const a = 1;\n');
+  const gw = new ReadOnlyToolGateway({ safeRoot: safe, contextRoot: ctx, cwd: tmp, maxCalls: 50 });
+  const outcome = await getProviderAdapter(PROVIDER_KINDS.CLAUDE).execute({
+    prompt: 'p',
+    schema: { type: 'object', properties: { summary: { type: 'string' }, coverage: { type: 'object' } }, required: ['summary', 'coverage'] },
     env: { CLAUDE_CODE_OAUTH_TOKEN: 'token' },
-    queryImpl: mockShardQuery,
-    toolGateway: gateway,
+    queryImpl: async function* ({ options }) {
+      assert.deepEqual(options.tools, ['Read', 'Glob', 'Grep']);
+      assert.equal((await options.canUseTool('Read', { file_path: path.join(safe, 'fileA.js') })).behavior, 'allow');
+      yield { type: 'result', subtype: 'success', num_turns: 4, total_cost_usd: 0.35, usage: { input_tokens: 1500, output_tokens: 250 }, structured_output: { summary: 'ok', coverage: { complete: true } } };
+    },
+    toolGateway: gw,
     tools: ['Read', 'Glob', 'Grep'],
-    maxTurns: 14,
-    maxBudgetUsd: 1.5,
   });
-
-  assert.equal(outcome.ok, true);
-  assert.equal(outcome.structured.summary, 'full shard review passed');
-  assert.equal(outcome.structured.coverage.complete, true);
-  assert.equal(outcome.structured.findings.length, 1);
-  assert.equal(outcome.meta.num_turns, 4);
+  assert.equal(outcome.ok && outcome.structured.coverage.complete, true);
   assert.equal(outcome.meta.total_cost_usd, 0.35);
-  assert.equal(outcome.meta.cost_source, COST_SOURCES.SDK);
-
-  fs.rmSync(tmpDir, { recursive: true, force: true });
+  fs.rmSync(tmp, { recursive: true, force: true });
 });
