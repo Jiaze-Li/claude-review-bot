@@ -1535,7 +1535,7 @@ test('Regression F004: Context limit classifies as unavailable for fallback and 
     const gw = new ReadOnlyToolGateway({ safeRoot: f.safeRoot, cwd: f.tmpDir });
     const adapter = getProviderAdapter(PROVIDER_KINDS.GEMINI);
 
-    // Initial prompt exceeding context limit returns kind: failed (not unavailable) so Gemini is not switched off
+    // Initial prompt exceeding context limit returns kind: unavailable so caller can fall back
     const hugePrompt = 'x'.repeat(1_600_000);
     const outcome = await adapter.execute({
       prompt: hugePrompt,
@@ -1546,8 +1546,7 @@ test('Regression F004: Context limit classifies as unavailable for fallback and 
     });
 
     eq(outcome.ok, false);
-    eq(outcome.kind, OUTCOME_KINDS.FAILED);
-    eq(outcome.subtype, 'error_context_limit');
+    eq(outcome.kind, OUTCOME_KINDS.UNAVAILABLE);
     assert.match(outcome.error, /context exceeds.*bytes/i);
   } finally {
     f.cleanup();
