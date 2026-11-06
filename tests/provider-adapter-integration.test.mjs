@@ -408,3 +408,51 @@ test('Integration E4: Gemini shard review with Tool Gateway explores files and r
 
   fs.rmSync(tmp, { recursive: true, force: true });
 });
+
+test('Integration E5: Incremental review with SAFE_REPO_DIR configures toolGateway without ReferenceError on diffName', async () => {
+  const dir = createReviewContext('incremental');
+  const safeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'safe-test-'));
+  fs.writeFileSync(path.join(safeDir, 'app.js'), 'export function test() {}');
+  try {
+    let fetchCount = 0;
+    const mockFetch = async () => {
+      fetchCount += 1;
+      return Response.json({
+        candidates: [
+          {
+            content: {
+              parts: [
+                {
+                  text: JSON.stringify({
+                    summary: 'Safe target incremental clean',
+                    findings: [],
+                  }),
+                },
+              ],
+            },
+          },
+        ],
+        usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 20, totalTokenCount: 120 },
+      });
+    };
+
+    const result = await runGeminiReview({
+      env: {
+        GEMINI_API_KEY: 'test-key',
+        TARGET_REPO: 'owner/repo',
+        PR_NUMBER: '1',
+        HEAD_SHA: HEAD_A,
+        REVIEW_CONTEXT_DIR: dir,
+        SAFE_REPO_DIR: safeDir,
+      },
+      fetchImpl: mockFetch,
+      logImpl: () => {},
+    });
+
+    assert.equal(result.summary, 'Safe target incremental clean');
+    assert.deepEqual(result.findings, []);
+    assert.equal(fetchCount, 1);
+  } finally {
+    fs.rmSync(safeDir, { recursive: true, force: true });
+  }
+});
