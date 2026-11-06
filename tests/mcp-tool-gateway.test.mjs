@@ -385,3 +385,20 @@ test('Host MCP tool result never exceeds maxCallReadBytes, including truncation 
     assert.ok(Buffer.byteLength(result.content[0].text, 'utf8') <= 85, name + ' exceeded 85 bytes');
   }
 }));
+test('AC3: parallel MCP results cannot overdraw shared cumulative byte budget', () => withFixture(async (f) => {
+  fs.writeFileSync(pj(f.safeRoot, 'quota-long.txt'), 'q'.repeat(800));
+  const gw = new ReadOnlyToolGateway({
+    safeRoot: f.safeRoot, cwd: f.tmpDir,
+    maxCallReadBytes: 85, maxTotalReadBytes: 85, maxCalls: 4,
+  });
+  const { handlers } = getHandlers(gw);
+  const input = { file_path: pj(f.safeRoot, 'quota-long.txt') };
+  const results = await Promise.all([handlers.Read(input), handlers.Read(input), handlers.Read(input)]);
+  const successes = results.filter((r) => !r.isError);
+  const failures = results.filter((r) => r.isError);
+  eq(successes.length, 1);
+  eq(failures.length, 2);
+  assert.ok(failures.every((r) => /quota|budget/i.test(r.content[0].text)));
+  assert.ok(Buffer.byteLength(successes[0].content[0].text, 'utf8') <= 85);
+  assert.ok(gw.getDiagnostics().totalReadBytes <= 85, 'cumulative output bytes exceeded cap');
+}));

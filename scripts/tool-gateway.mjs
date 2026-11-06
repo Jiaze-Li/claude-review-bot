@@ -169,6 +169,18 @@ export class ReadOnlyToolGateway {
     this.quotaExhausted = false;
     this.rejections = [];
     this.history = [];
+    this._toolQueue = Promise.resolve();
+  }
+
+  // Serialize Host MCP executions so overlapping calls cannot all spend the
+  // same snapshot of remaining byte quota before any one of them is charged.
+  async runExclusive(operation) {
+    const prior = this._toolQueue;
+    let release;
+    this._toolQueue = new Promise((resolve) => { release = resolve; });
+    await prior;
+    try { return await operation(); }
+    finally { release(); }
   }
 
   getDiagnostics() {
@@ -652,7 +664,7 @@ export function createGatewayMcpServer(gateway, serverName = 'gateway') {
       start_column: z.number().int().positive().optional().describe('1-based character position; pass the col from a Read [more offset=.. col=..] cursor'),
     },
     async (args) => {
-      const res = await gateway.executeRead(args);
+      const res = await gateway.runExclusive(() => gateway.executeRead(args));
       if (!res.ok) {
         return {
           isError: true,
@@ -673,7 +685,7 @@ export function createGatewayMcpServer(gateway, serverName = 'gateway') {
       path: z.string().optional().describe('Directory to search in (must be within repository)'),
     },
     async (args) => {
-      const res = await gateway.executeGlob(args);
+      const res = await gateway.runExclusive(() => gateway.executeGlob(args));
       if (!res.ok) {
         return {
           isError: true,
@@ -695,7 +707,7 @@ export function createGatewayMcpServer(gateway, serverName = 'gateway') {
       mode: z.string().optional().describe('Output mode alias'),
     },
     async (args) => {
-      const res = await gateway.executeGrep(args);
+      const res = await gateway.runExclusive(() => gateway.executeGrep(args));
       if (!res.ok) {
         return {
           isError: true,
