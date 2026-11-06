@@ -606,7 +606,6 @@ export class GeminiProviderAdapter extends ProviderAdapter {
       if (requestBytes > GEMINI_MAX_CONTEXT_BYTES) {
         const err = new Error(`Gemini review context exceeds ${GEMINI_MAX_CONTEXT_BYTES} bytes (${requestBytes} bytes)`);
         err.name = 'ContextLimitExceeded';
-        err.isUnavailable = true;
         throw err;
       }
 
@@ -650,11 +649,13 @@ export class GeminiProviderAdapter extends ProviderAdapter {
       try {
         payload = await sendRequest(requestPayload);
       } catch (err) {
+        const isContextLimit = err?.name === 'ContextLimitExceeded';
         const isTimeout = err?.name === 'TimeoutError' || String(err?.message ?? '').includes('timed out');
         const isUnavailable = Boolean(err?.isUnavailable);
         const isConfig = Boolean(err?.isConfig);
         const kind = isUnavailable ? OUTCOME_KINDS.UNAVAILABLE : isConfig ? OUTCOME_KINDS.CONFIG : OUTCOME_KINDS.FAILED;
         const errorKind = isUnavailable ? ERROR_KINDS.UNAVAILABLE : isConfig ? ERROR_KINDS.CONFIG : isTimeout ? ERROR_KINDS.TIMEOUT : ERROR_KINDS.EXECUTION;
+        const subtype = isContextLimit ? 'error_context_limit' : (isTimeout ? 'error_timeout' : null);
         return {
           ok: false,
           kind,
@@ -662,7 +663,7 @@ export class GeminiProviderAdapter extends ProviderAdapter {
           provider: this.provider,
           status: err?.status || null,
           error: err?.message ?? String(err),
-          subtype: null,
+          subtype,
           errors: err?.message ?? String(err),
           structured: null,
           meta: makeMeta(),
@@ -841,11 +842,13 @@ export class GeminiProviderAdapter extends ProviderAdapter {
     try {
       structuredResultPayload = await sendRequest(structuredPayload);
     } catch (err) {
+      const isContextLimit = err?.name === 'ContextLimitExceeded';
       const isTimeout = err?.name === 'TimeoutError' || String(err?.message ?? '').includes('timed out');
       const isUnavailable = Boolean(err?.isUnavailable);
       const isConfig = Boolean(err?.isConfig);
       const kind = isUnavailable ? OUTCOME_KINDS.UNAVAILABLE : isConfig ? OUTCOME_KINDS.CONFIG : OUTCOME_KINDS.FAILED;
       const errorKind = isUnavailable ? ERROR_KINDS.UNAVAILABLE : isConfig ? ERROR_KINDS.CONFIG : isTimeout ? ERROR_KINDS.TIMEOUT : ERROR_KINDS.EXECUTION;
+      const subtype = isContextLimit ? 'error_context_limit' : (isTimeout ? 'error_timeout' : null);
       return {
         ok: false,
         kind,
@@ -853,7 +856,7 @@ export class GeminiProviderAdapter extends ProviderAdapter {
         provider: this.provider,
         status: err?.status || null,
         error: err?.message ?? String(err),
-        subtype: null,
+        subtype,
         errors: err?.message ?? String(err),
         structured: null,
         meta: makeMeta(),
