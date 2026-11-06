@@ -96,8 +96,6 @@ export class ReadOnlyToolGateway {
     this.quotaExhausted = false;
     this.rejections = [];
     this.history = [];
-    this.cachedExecutions = new Map();
-    this.emptySandboxDir = null;
   }
 
   getDiagnostics() {
@@ -370,35 +368,10 @@ export class ReadOnlyToolGateway {
     return true;
   }
 
-  getEmptySandbox() {
-    if (!this.emptySandboxDir) {
-      this.emptySandboxDir = path.join(this.safeRoot || this.cwd, '.empty-tool-sandbox');
-      if (!fs.existsSync(this.emptySandboxDir)) {
-        try { fs.mkdirSync(this.emptySandboxDir, { recursive: true }); } catch {}
-      }
-    }
-    return this.emptySandboxDir;
-  }
-
   createCanUseTool() {
     const gateway = this;
-    return async (toolName, input, options = {}) => {
-      const auth = await gateway.authorize(toolName, input);
-      if (auth.behavior !== 'allow') return auth;
-
-      let hostResult = null;
-      if (toolName === TOOL_NAMES.READ) hostResult = await gateway.executeRead(input);
-      else if (toolName === TOOL_NAMES.GLOB) hostResult = await gateway.executeGlob(input);
-      else if (toolName === TOOL_NAMES.GREP) hostResult = await gateway.executeGrep(input);
-
-      const toolUseId = options?.toolUseID || options?.tool_use_id;
-      if (toolUseId) gateway.cachedExecutions.set(toolUseId, hostResult);
-      gateway.cachedExecutions.set(`${toolName}:${JSON.stringify(input)}`, hostResult);
-
-      if (toolName === TOOL_NAMES.GLOB || toolName === TOOL_NAMES.GREP) {
-        return { behavior: 'allow', updatedInput: { ...auth.updatedInput, path: gateway.getEmptySandbox() } };
-      }
-      return auth;
+    return async (toolName, input) => {
+      return gateway.authorize(toolName, input);
     };
   }
 
@@ -424,27 +397,7 @@ export class ReadOnlyToolGateway {
     return {
       matcher: 'Read|Glob|Grep',
       hooks: [
-        async ({ tool_name, tool_input, tool_response: resp, tool_use_id }) => {
-          const cached = (tool_use_id && gateway.cachedExecutions.get(tool_use_id))
-            || gateway.cachedExecutions.get(`${tool_name}:${JSON.stringify(tool_input)}`);
-          if (tool_use_id) gateway.cachedExecutions.delete(tool_use_id);
-          gateway.cachedExecutions.delete(`${tool_name}:${JSON.stringify(tool_input)}`);
-
-          if (cached) {
-            let output;
-            if (!cached.ok) output = { error: cached.error };
-            else if (tool_name === TOOL_NAMES.READ) output = cached.content;
-            else if (tool_name === TOOL_NAMES.GLOB) output = cached.matches;
-            else if (tool_name === TOOL_NAMES.GREP) {
-              if (tool_input?.output_mode === 'files_with_matches' || !tool_input?.output_mode) {
-                output = [...new Set(cached.matches.map((m) => m.path))].join('\n');
-              } else {
-                output = cached.matches.map((m) => `${m.path}:${m.line}:${m.text}`).join('\n');
-              }
-            }
-            return { hookSpecificOutput: { hookEventName: 'PostToolUse', updatedToolOutput: output } };
-          }
-
+        async ({ tool_name, tool_input, tool_response: resp }) => {
           if (!resp || (Array.isArray(resp) && resp.length === 0)) {
             gateway.recordSuccess(tool_name, tool_input, 0, false, { incrementCalls: false });
             return {};
@@ -478,7 +431,10 @@ export class ReadOnlyToolGateway {
           const limit = Math.min(gateway.maxCallReadBytes, Math.max(0, gateway.maxTotalReadBytes - gateway.totalReadBytes));
           const str = typeof sanitized === 'string' ? sanitized : JSON.stringify(sanitized);
           const byteLen = Buffer.byteLength(str, 'utf8');
-          if (byteLen <= limit && sanitized === resp) {
+          const isIdentical = (sanitized === resp) || (
+            Array.isArray(resp) && Array.isArray(sanitized) && resp.length === sanitized.length && resp.every((v, i) => v === sanitized[i])
+          );
+          if (byteLen <= limit && isIdentical) {
             gateway.recordSuccess(tool_name, tool_input, byteLen, false, { incrementCalls: false });
             return {};
           }

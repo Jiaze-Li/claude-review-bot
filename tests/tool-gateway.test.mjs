@@ -190,19 +190,19 @@ test('Regression: authorize Grep allows files_with_matches and content modes, fo
   }
   eq((await gw.authorize('Grep', { pattern: '(a+)+' })).behavior, 'deny');
 
-  // Verify Host-enforced bridge pre-computation and empty-sandbox isolation:
+  // Verify Host-enforced bridge delegating to authorize and PostToolHook sanitization:
+  const prevCount = gw.getDiagnostics().callCount;
   const canUseTool = gw.createCanUseTool(), hookFn = gw.createPostToolHook().hooks[0];
-  const canRes = await canUseTool('Grep', { pattern: 'search_term_target', output_mode: 'files_with_matches' }, { toolUseID: 'call-1' });
+  const canRes = await canUseTool('Grep', { pattern: 'search_term_target', output_mode: 'files_with_matches' });
   eq(canRes.behavior, 'allow');
-  eq(canRes.updatedInput.path, gw.getEmptySandbox()); // Built-in tool routed to empty sandbox
-
-  const hookRes = await hookFn({ tool_name: 'Grep', tool_input: { pattern: 'search_term_target', output_mode: 'files_with_matches' }, tool_response: '', tool_use_id: 'call-1' });
-  assert.ok(['src/app.js', 'safe-link.js'].some((p) => hookRes.hookSpecificOutput.updatedToolOutput.includes(p)));
+  eq(canRes.updatedInput.path, f.safeRoot);
+  eq(gw.getDiagnostics().callCount, prevCount + 1);
 
   // Verify fallback plain-path sanitization in files_with_matches mode:
   const rawFiles = 'index.js\nCLAUDE.md\nleak-link.txt\nsrc/app.js';
   const sanitizedFiles = await hookFn({ tool_name: 'Grep', tool_input: {}, tool_response: rawFiles });
   deq(sanitizedFiles.hookSpecificOutput.updatedToolOutput, 'index.js\nsrc/app.js');
+  eq(gw.getDiagnostics().callCount, prevCount + 1);
 }));
 
 test('PR5 compatibility: getToolDeclarations returns valid schema definitions for Read, Glob, Grep', () => {
