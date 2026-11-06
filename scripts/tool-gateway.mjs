@@ -131,8 +131,11 @@ export class ReadOnlyToolGateway {
     if (this.logImpl) this.logImpl(`[ToolGateway] REJECT ${toolName}: ${reason}`);
   }
 
-  recordSuccess(toolName, input, bytes, truncated = false) {
-    this.callCount += 1;
+  recordSuccess(toolName, input, bytes, truncated = false, { incrementCalls = true } = {}) {
+    if (incrementCalls) {
+      this.callCount += 1;
+      if (this.callCount >= this.maxCalls) this.quotaExhausted = true;
+    }
     this.totalReadBytes += bytes;
     if (this.totalReadBytes >= this.maxTotalReadBytes) this.quotaExhausted = true;
     this.history.push({ toolName, input, bytes, truncated, timestamp: Date.now(), status: 'success' });
@@ -140,8 +143,15 @@ export class ReadOnlyToolGateway {
   }
 
   async authorize(toolName, input) {
+    if (this.callCount >= this.maxCalls) {
+      this.quotaExhausted = true;
+      return this.denyAndRecord(toolName, input, `Tool invocation limit exceeded: reached ${this.maxCalls} calls.`);
+    }
     const quota = this.checkQuota();
     if (!quota.ok) return this.denyAndRecord(toolName, input, quota.reason);
+
+    this.callCount += 1;
+    if (this.callCount >= this.maxCalls) this.quotaExhausted = true;
 
     if (toolName === TOOL_NAMES.READ) {
       if (!this.readRoots.length) return this.denyAndRecord(toolName, input, 'No authorized read roots configured.');
@@ -188,7 +198,7 @@ export class ReadOnlyToolGateway {
         if (typeof input?.pattern !== 'string' || input.pattern.includes('\0') || !input.pattern) return this.denyAndRecord(toolName, input, 'Invalid Grep pattern.');
         if (isDangerousRegexPattern(input.pattern)) return this.denyAndRecord(toolName, input, 'Invalid Grep pattern: complex or potential ReDoS pattern rejected.');
         if (input?.glob && !isSafeGlobPattern(input.glob)) return this.denyAndRecord(toolName, input, 'Grep glob escapes the sanitized repository.');
-        if (input?.mode === 'count' || input?.mode === 'stats' || input?.mode === 'content' || input?.count || input?.stats || input?.output_format || input?.outputFormat) {
+        if (input?.output_mode === 'content' || input?.output_mode === 'count' || input?.mode === 'count' || input?.mode === 'stats' || input?.mode === 'content' || input?.count || input?.stats || input?.output_format || input?.outputFormat) {
           return this.denyAndRecord(toolName, input, 'Grep count, stats, or content-only mode is forbidden: only standard prefixed matches allowed.');
         }
       }
@@ -255,7 +265,7 @@ export class ReadOnlyToolGateway {
         text = `${Buffer.from(text, 'utf8').subarray(0, prep.maxBytes).toString('utf8')}${truncMsg(prep.maxBytes)}`;
         byteLen = Buffer.byteLength(text, 'utf8');
       }
-      this.recordSuccess(TOOL_NAMES.READ, rawInput, byteLen, truncated);
+      this.recordSuccess(TOOL_NAMES.READ, rawInput, byteLen, truncated, { incrementCalls: false });
       return { ok: true, content: text, lines: sel.length, totalLines: all.length, offset, limit, truncated, bytesRead: byteLen };
     } catch (err) {
       this.recordRejection(TOOL_NAMES.READ, rawInput, err?.message ?? String(err));
@@ -285,7 +295,7 @@ export class ReadOnlyToolGateway {
         while (matches.length > 0 && Buffer.byteLength(JSON.stringify(matches), 'utf8') > prep.maxBytes) matches.pop();
         byteLen = Buffer.byteLength(JSON.stringify(matches), 'utf8');
       }
-      this.recordSuccess(TOOL_NAMES.GLOB, rawInput, byteLen, truncated);
+      this.recordSuccess(TOOL_NAMES.GLOB, rawInput, byteLen, truncated, { incrementCalls: false });
       return { ok: true, matches, count: matches.length, truncated, bytes: byteLen };
     } catch (err) {
       this.recordRejection(TOOL_NAMES.GLOB, rawInput, err?.message ?? String(err));
@@ -326,7 +336,7 @@ export class ReadOnlyToolGateway {
           return false;
         },
       });
-      this.recordSuccess(TOOL_NAMES.GREP, rawInput, totalBytes, truncated);
+      this.recordSuccess(TOOL_NAMES.GREP, rawInput, totalBytes, truncated, { incrementCalls: false });
       return { ok: true, matches, count: matches.length, truncated, bytes: totalBytes };
     } catch (err) {
       this.recordRejection(TOOL_NAMES.GREP, rawInput, err?.message ?? String(err));
@@ -364,7 +374,13 @@ export class ReadOnlyToolGateway {
 
   createPostToolHook() {
     const gateway = this;
-    const sanitizePath = (p) => typeof p === 'string' && p && gateway.isPathAllowed(p);
+    const sanitizePath = (p) => typeof p === 'string' && Boolean(p) && gateway.isPathAllowed(p);
+    const extractGrepLine = (line) => {
+      const trimmed = line.trim();
+      if (!trimmed) return null;
+      const m = trimmed.match(/^(.+?)(?::\d+:|-\d+-)/);
+      return m && sanitizePath(m[1].trim()) ? trimmed : null;
+    };
     const filterItem = (item) => {
       if (typeof item === 'string') return sanitizePath(item);
       if (item && typeof item === 'object') {
@@ -378,7 +394,7 @@ export class ReadOnlyToolGateway {
       hooks: [
         async ({ tool_name, tool_input, tool_response: resp }) => {
           if (!resp || (Array.isArray(resp) && resp.length === 0)) {
-            gateway.recordSuccess(tool_name, tool_input, 0, false);
+            gateway.recordSuccess(tool_name, tool_input, 0, false, { incrementCalls: false });
             return {};
           }
 
@@ -389,27 +405,19 @@ export class ReadOnlyToolGateway {
             if (tool_name === TOOL_NAMES.GLOB) {
               sanitized = resp.split('\n').filter((l) => sanitizePath(l.trim())).join('\n');
             } else if (tool_name === TOOL_NAMES.GREP) {
-              sanitized = resp.split('\n').filter((l) => {
-                const t = l.trim();
-                const idx = t.indexOf(':');
-                return idx !== -1 && sanitizePath(t.slice(0, idx).trim());
-              }).join('\n');
+              sanitized = resp.split('\n').map(extractGrepLine).filter(Boolean).join('\n');
             }
           } else if (resp && typeof resp === 'object') {
             const obj = {};
             for (const [k, v] of Object.entries(resp)) {
-              if (Array.isArray(v) && (k === 'filenames' || k === 'files' || k === 'paths' || k === 'matches')) {
+              if (Array.isArray(v) && /^(filenames|files|paths|matches)$/.test(k)) {
                 obj[k] = v.filter(filterItem);
-              } else if (typeof v === 'string' && (k === 'content' || k === 'output' || k === 'matches')) {
-                if (tool_name === TOOL_NAMES.GLOB) {
-                  obj[k] = v.split('\n').filter((l) => sanitizePath(l.trim())).join('\n');
-                } else if (tool_name === TOOL_NAMES.GREP) {
-                  obj[k] = v.split('\n').filter((l) => {
-                    const t = l.trim();
-                    const idx = t.indexOf(':');
-                    return idx !== -1 && sanitizePath(t.slice(0, idx).trim());
-                  }).join('\n');
-                } else obj[k] = v;
+              } else if (typeof v === 'string' && /^(content|output|matches)$/.test(k)) {
+                obj[k] = tool_name === TOOL_NAMES.GLOB
+                  ? v.split('\n').filter((l) => sanitizePath(l.trim())).join('\n')
+                  : tool_name === TOOL_NAMES.GREP
+                    ? v.split('\n').map(extractGrepLine).filter(Boolean).join('\n')
+                    : v;
               }
             }
             sanitized = obj;
@@ -419,7 +427,7 @@ export class ReadOnlyToolGateway {
           const str = typeof sanitized === 'string' ? sanitized : JSON.stringify(sanitized);
           const byteLen = Buffer.byteLength(str, 'utf8');
           if (byteLen <= limit && sanitized === resp) {
-            gateway.recordSuccess(tool_name, tool_input, byteLen, false);
+            gateway.recordSuccess(tool_name, tool_input, byteLen, false, { incrementCalls: false });
             return {};
           }
 
@@ -444,7 +452,7 @@ export class ReadOnlyToolGateway {
           }
 
           const rec = Math.min(limit, Buffer.byteLength(JSON.stringify(out) || String(out), 'utf8'));
-          gateway.recordSuccess(tool_name, tool_input, rec, truncated);
+          gateway.recordSuccess(tool_name, tool_input, rec, truncated, { incrementCalls: false });
           return { hookSpecificOutput: { hookEventName: 'PostToolUse', updatedToolOutput: out } };
         },
       ],

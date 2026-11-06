@@ -149,9 +149,19 @@ test('Claude canUseTool and PostToolHook integration bridges with Array and Obje
   deq((await hookFn({ tool_name: 'Glob', tool_input: {}, tool_response: rawGlob })).hookSpecificOutput.updatedToolOutput, ['index.js']);
   deq((await hookFn({ tool_name: 'Glob', tool_input: {}, tool_response: { filenames: rawGlob, other: 'drop' } })).hookSpecificOutput.updatedToolOutput, { filenames: ['index.js'] });
   deq((await hookFn({ tool_name: 'Grep', tool_input: {}, tool_response: { content: 'index.js:1: valid\nCLAUDE.md:1: secret\nleak-link.txt:1: key' } })).hookSpecificOutput.updatedToolOutput, { content: 'index.js:1: valid' });
-  const callsBefore = gw.getDiagnostics().callCount;
-  await hookFn({ tool_name: 'Glob', tool_input: {}, tool_response: [] });
-  eq(gw.getDiagnostics().callCount, callsBefore + 1);
+  const grepContext = await hookFn({ tool_name: 'Grep', tool_input: {}, tool_response: 'index.js-1-ctx\nCLAUDE.md-1-secret' });
+  deq(grepContext.hookSpecificOutput.updatedToolOutput, 'index.js-1-ctx');
+}));
+
+test('Regression: authorize increments callCount immediately to prevent concurrent/batched quota bypass', () => withFixture(async (f) => {
+  const p = pj(f.safeRoot, 'index.js');
+  const gw = new ToolGW({ safeRoot: f.safeRoot, cwd: f.tmpDir, maxCalls: 2 });
+  eq((await gw.authorize('Read', { file_path: p })).behavior, 'allow');
+  eq(gw.getDiagnostics().callCount, 1);
+  eq((await gw.authorize('Read', { file_path: p })).behavior, 'allow');
+  eq(gw.getDiagnostics().callCount, 2);
+  eq((await gw.authorize('Read', { file_path: p })).behavior, 'deny');
+  eq(gw.getDiagnostics().quotaExhausted, true);
 }));
 
 test('Regression: authorize Read checks symlink alias against ignorePatterns and enforces maxFileSizeBytes', () => withFixture(async (f) => {
@@ -169,7 +179,7 @@ test('Regression: authorize Read checks symlink alias against ignorePatterns and
 
 test('Regression: authorize Grep forbids count/stats modes and unauthorized symlink/control paths', () => withFixture(async (f) => {
   const gw = new ToolGW({ safeRoot: f.safeRoot, cwd: f.tmpDir, ignorePatterns: ['ignored.log'] });
-  for (const extra of [{ mode: 'count' }, { count: true }, { stats: true }, { mode: 'content' }]) {
+  for (const extra of [{ mode: 'count' }, { count: true }, { stats: true }, { mode: 'content' }, { output_mode: 'content' }, { output_mode: 'count' }]) {
     eq((await gw.authorize('Grep', { pattern: 'test', ...extra })).behavior, 'deny');
   }
   for (const badPath of ['CLAUDE.md', 'ignored.log', 'leak-link.txt']) {
