@@ -112,7 +112,7 @@ function cappedText(text, maxBytes, truncated = false) {
  * backtracking regexp can consume its worker's CPU, but cannot block the host
  * event loop. Timeout terminates the worker, including its synchronous regexp.
  */
-const GREP_WORKER_SOURCE = "const { parentPort, workerData } = require('node:worker_threads');\nconst fs = require('node:fs');\nconst path = require('node:path');\nconst inside = (root, file) => file === root || file.startsWith(root + path.sep);\nconst { pattern, safeRoot, files, maxMatches, maxBytes, maxFileBytes } = workerData;\nlet rx;\ntry { rx = new RegExp(pattern); } catch {\n  rx = new RegExp(pattern.replace(/[.*+?^$()|[\\]{}]/g, (ch) => '\\\\' + ch));\n}\nconst matches = [];\nlet bytes = 0, truncated = false;\nouter: for (const item of files) {\n  let real, stat;\n  try {\n    real = fs.realpathSync.native(item.realPath);\n    if (!inside(safeRoot, real)) continue;\n    stat = fs.statSync(real);\n    if (!stat.isFile() || stat.size > maxFileBytes) continue;\n  } catch { continue; }\n  let lines;\n  try { lines = fs.readFileSync(real, 'utf8').split(/\\r?\\n/); } catch { continue; }\n  for (let i = 0; i < lines.length; i++) {\n    const candidate = lines[i].slice(0, 2000);\n    if (!rx.test(candidate)) continue;\n    const entry = { path: item.relToRepo, line: i + 1, text: candidate.slice(0, 1000) };\n    const entryBytes = Buffer.byteLength(JSON.stringify(entry), 'utf8');\n    if (bytes + entryBytes > maxBytes || matches.length >= maxMatches) {\n      truncated = true;\n      break outer;\n    }\n    matches.push(entry);\n    bytes += entryBytes;\n  }\n}\nparentPort.postMessage({ matches, bytes, truncated });";
+const GREP_WORKER_SOURCE = "const { parentPort, workerData } = require('node:worker_threads');\nconst fs = require('node:fs');\nconst path = require('node:path');\nconst inside = (root, file) => file === root || file.startsWith(root + path.sep);\nconst { pattern, safeRoot, files, maxMatches, maxBytes, maxFileBytes, ignoreCase } = workerData;\nlet rx;\ntry { rx = new RegExp(pattern, ignoreCase ? 'i' : ''); } catch {\n  rx = new RegExp(pattern.replace(/[.*+?^$()|[\\]{}]/g, (ch) => '\\\\' + ch), ignoreCase ? 'i' : '');\n}\nconst matches = [];\nlet bytes = 0, truncated = false;\nouter: for (const item of files) {\n  let real, stat;\n  try {\n    real = fs.realpathSync.native(item.realPath);\n    if (!inside(safeRoot, real)) continue;\n    stat = fs.statSync(real);\n    if (!stat.isFile() || stat.size > maxFileBytes) continue;\n  } catch { continue; }\n  let lines;\n  try { lines = fs.readFileSync(real, 'utf8').split(/\\r?\\n/); } catch { continue; }\n  for (let i = 0; i < lines.length; i++) {\n    const candidate = lines[i].slice(0, 2000);\n    if (!rx.test(candidate)) continue;\n    const entry = { path: item.relToRepo, line: i + 1, text: candidate.slice(0, 1000) };\n    const entryBytes = Buffer.byteLength(JSON.stringify(entry), 'utf8');\n    if (bytes + entryBytes > maxBytes || matches.length >= maxMatches) {\n      truncated = true;\n      break outer;\n    }\n    matches.push(entry);\n    bytes += entryBytes;\n  }\n}\nparentPort.postMessage({ matches, bytes, truncated });";
 
 function boundedGrepWorker(data, timeoutMs) {
   return new Promise((resolve, reject) => {
@@ -306,20 +306,46 @@ export class ReadOnlyToolGateway {
         if (typeof input?.pattern !== 'string' || input.pattern.includes('\0') || !input.pattern) return this.denyAndRecord(toolName, input, 'Invalid Grep pattern.');
         if (isDangerousRegexPattern(input.pattern)) return this.denyAndRecord(toolName, input, 'Invalid Grep pattern: complex or potential ReDoS pattern rejected.');
         if (input?.glob && !isSafeGlobPattern(input.glob)) return this.denyAndRecord(toolName, input, 'Grep glob escapes the sanitized repository.');
+        const unsupported = ['-A', '-B', '-C', 'multiline', 'type', 'offset']
+          .filter((key) => input?.[key] !== undefined);
+        if (input?.['-n'] === false) unsupported.push('-n=false');
+        if (unsupported.length) {
+          return this.denyAndRecord(toolName, input,
+            `Grep options not supported by Host Gateway: ${unsupported.join(', ')}. Use supported -i, head_limit, pattern, path, glob or output_mode.`);
+        }
+        if (input?.['-i'] !== undefined && typeof input['-i'] !== 'boolean') {
+          return this.denyAndRecord(toolName, input, 'Grep -i must be a boolean.');
+        }
+        if (input?.head_limit !== undefined && (!Number.isInteger(input.head_limit) || input.head_limit < 1)) {
+          return this.denyAndRecord(toolName, input, 'Grep head_limit must be a positive integer.');
+        }
+        if (input?.output_mode !== undefined && !['content', 'files_with_matches'].includes(input.output_mode)) {
+          return this.denyAndRecord(toolName, input, `Grep output_mode is unsupported: ${input.output_mode}`);
+        }
+        if (input?.mode !== undefined && !['content', 'files_with_matches'].includes(input.mode) && !['count', 'stats'].includes(input.mode)) {
+          return this.denyAndRecord(toolName, input, `Grep mode is unsupported: ${input.mode}`);
+        }
         if (input?.output_mode === 'count' || input?.mode === 'count' || input?.mode === 'stats' || input?.count || input?.stats) {
           return this.denyAndRecord(toolName, input, 'Grep count or stats mode is forbidden: use files_with_matches or content mode.');
         }
       }
+      let searchRoot = { ok: true, realPath: this.searchRoots[0] };
+      let lexicalBase = this.cwd;
       if (input?.path) {
         const rawP = String(input.path);
+        searchRoot = resolveAllowedPath(rawP, this.searchRoots, { mustExist: true, cwd: this.cwd });
+        if (!searchRoot.ok && this.safeRoot && !path.isAbsolute(rawP)) {
+          const fallback = resolveAllowedPath(rawP, this.searchRoots, { mustExist: true, cwd: this.safeRoot });
+          if (fallback.ok) { searchRoot = fallback; lexicalBase = this.safeRoot; }
+        }
+        if (!searchRoot.ok) return this.denyAndRecord(toolName, input, `${toolName} is restricted to safe-target/.`);
         if (isControlPath(rawP)) return this.denyAndRecord(toolName, input, 'Access to control path is forbidden.');
-        const relP = path.relative(this.safeRoot || this.cwd, path.resolve(this.cwd, rawP)).replace(/\\/g, '/');
+        const relP = path.relative(this.safeRoot || this.cwd, path.resolve(lexicalBase, rawP)).replace(/\\/g, '/');
         if (matchesIgnore(relP, this.ignorePatterns) || matchesIgnore(`${relP}/`, this.ignorePatterns) || matchesIgnore(rawP.replace(/\\/g, '/'), this.ignorePatterns)) {
           return this.denyAndRecord(toolName, input, `${toolName} is denied for ignored path: ${input.path}`);
         }
       }
-      const searchRoot = input?.path ? resolveAllowedPath(input.path, this.searchRoots, { mustExist: true, cwd: this.cwd }) : { ok: true, realPath: this.searchRoots[0] };
-      if (!searchRoot.ok) return this.denyAndRecord(toolName, input, `${toolName} is restricted to safe-target/.`);
+      // Search roots are already resolved against cwd or safeRoot above.
       if (isControlPath(searchRoot.realPath)) return this.denyAndRecord(toolName, input, 'Access to control path is forbidden.');
       const relReal = path.relative(this.safeRoot || this.cwd, searchRoot.realPath).replace(/\\/g, '/');
       if (matchesIgnore(relReal, this.ignorePatterns) || matchesIgnore(`${relReal}/`, this.ignorePatterns)) {
@@ -327,9 +353,10 @@ export class ReadOnlyToolGateway {
       }
       if (input?.path) {
         try {
-          const lstat = fs.lstatSync(path.resolve(this.cwd, String(input.path)));
+          const lexicalPath = path.resolve(lexicalBase, String(input.path));
+          const lstat = fs.lstatSync(lexicalPath);
           if (lstat.isSymbolicLink()) {
-            const real = fs.realpathSync.native(path.resolve(this.cwd, String(input.path)));
+            const real = fs.realpathSync.native(lexicalPath);
             const relSym = path.relative(this.safeRoot || this.cwd, real).replace(/\\/g, '/');
             if (this.safeRoot && (!isInside(this.safeRoot, real) || isControlPath(real) || matchesIgnore(relSym, this.ignorePatterns))) {
               return this.denyAndRecord(toolName, input, `${toolName} is denied for unauthorized symlink target: ${input.path}`);
@@ -502,7 +529,8 @@ export class ReadOnlyToolGateway {
           safeRoot: this.safeRoot,
           pattern,
           files: candidates,
-          maxMatches: this.maxGrepMatches,
+          maxMatches: Math.min(this.maxGrepMatches, prep.input?.head_limit ?? this.maxGrepMatches),
+          ignoreCase: prep.input?.['-i'] === true,
           maxBytes: prep.maxBytes,
           maxFileBytes: this.maxGrepFileBytes,
         }, remainingMs);
@@ -720,6 +748,17 @@ export function createGatewayMcpServer(gateway, serverName = 'gateway') {
       glob: z.string().optional().describe('Glob pattern to filter files'),
       output_mode: z.string().optional().describe('Output mode: files_with_matches or content'),
       mode: z.string().optional().describe('Output mode alias'),
+      '-i': z.boolean().optional().describe('Case-insensitive matching, supported'),
+      '-n': z.boolean().optional().describe('Line numbers are always included; false is rejected'),
+      head_limit: z.number().int().positive().optional().describe('Bound number of Grep matches'),
+      '-A': z.number().int().nonnegative().optional().describe('Unsupported: context lines (returns an explicit error)'),
+      '-B': z.number().int().nonnegative().optional().describe('Unsupported: context lines (returns an explicit error)'),
+      '-C': z.number().int().nonnegative().optional().describe('Unsupported: context lines (returns an explicit error)'),
+      multiline: z.boolean().optional().describe('Unsupported: multiline searches (returns an explicit error)'),
+      type: z.string().optional().describe('Unsupported: file type filter (returns an explicit error)'),
+      offset: z.number().int().nonnegative().optional().describe('Unsupported: result offset (returns an explicit error)'),
+      count: z.boolean().optional().describe('Unsupported: count mode is rejected'),
+      stats: z.boolean().optional().describe('Unsupported: stats mode is rejected'),
     },
     async (args) => {
       const res = await gateway.runExclusive(() => gateway.executeGrep(args));

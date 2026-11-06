@@ -33,6 +33,9 @@ jobs:
           node --check scripts/recover-review-session.mjs
           node --check scripts/detect-review-risk.mjs
           node --check scripts/run-gemini-review.mjs
+          node --check scripts/run-review.mjs
+          node --check scripts/provider-adapter.mjs
+          node --check scripts/tool-gateway.mjs
           node --check scripts/validate-gemini-findings.mjs
           node --check scripts/publish-gemini-review.mjs
           node --check scripts/publish-review.mjs

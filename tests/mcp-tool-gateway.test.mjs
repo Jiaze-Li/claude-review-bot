@@ -349,15 +349,16 @@ test('F002: catastrophic alternative regex is killed without blocking host event
   fs.writeFileSync(pj(f.safeRoot, 'evil.txt'), 'a'.repeat(1999) + '!');
   const gw = new ReadOnlyToolGateway({ safeRoot: f.safeRoot, cwd: f.tmpDir, timeoutMs: 600 });
   const { handlers } = getHandlers(gw);
-  const call = handlers.Grep({ pattern: '(a|aa)+b', path: pj(f.safeRoot, 'evil.txt') });
-  const responsiveness = await Promise.race([
-    call.then(() => 'completed'),
-    new Promise((resolve) => setTimeout(() => resolve('responsive'), 35)),
-  ]);
-  eq(responsiveness, 'responsive', 'malicious pattern must run off main thread');
-  const result = await call;
-  eq(result.isError, true);
-  assert.match(result.content[0].text, /timed out/i);
+  let heartbeats = 0;
+  const heartbeat = setInterval(() => { heartbeats += 1; }, 20);
+  try {
+    const result = await handlers.Grep({ pattern: '(a|aa)+b', path: pj(f.safeRoot, 'evil.txt') });
+    eq(result.isError, true);
+    assert.match(result.content[0].text, /timed out/i);
+    assert.ok(heartbeats >= 2, 'Host event loop must process heartbeats while untrusted regex runs');
+  } finally {
+    clearInterval(heartbeat);
+  }
 }));
 
 test('F003: Read reports line numbers and a next-offset cursor', () => withFixture(async (f) => {
@@ -456,4 +457,45 @@ test('P3: safeRoot-relative Glob and Grep results can be passed directly to Read
   assert.match(readAfterGrep.content[0].text, /2: \/\/ search_term_target/);
   const escape = await handlers.Read({ file_path: '../outside/secret.key' });
   eq(escape.isError, true);
+}));
+test('Grep -i and head_limit are forwarded through MCP Handler, with explicit unsupported-option errors', () => withFixture(async (f) => {
+  const gw = new ReadOnlyToolGateway({ safeRoot: f.safeRoot, cwd: f.tmpDir });
+  const { handlers } = getHandlers(gw);
+  const noFlag = await handlers.Grep({ pattern: 'SEARCH_TERM_TARGET', path: 'src' });
+  eq(noFlag.isError, undefined);
+  assert.match(noFlag.content[0].text, /No matches found/);
+  const insensitive = await handlers.Grep({ pattern: 'SEARCH_TERM_TARGET', path: 'src', '-i': true });
+  eq(insensitive.isError, undefined);
+  assert.match(insensitive.content[0].text, /src\/app\.js:2/);
+  const bounded = await handlers.Grep({ pattern: 'line', head_limit: 1 });
+  eq(bounded.isError, undefined);
+  assert.ok(bounded.content[0].text.split('\n').filter((s) => s.includes(':')).length <= 1);
+  for (const args of [
+    { multiline: true }, { type: 'js' }, { '-C': 2 }, { '-A': 1 },
+    { '-B': 1 }, { '-n': false }, { offset: 2 },
+  ]) {
+    const result = await handlers.Grep({ pattern: 'run', ...args });
+    eq(result.isError, true);
+    assert.match(result.content[0].text, /not supported|unsupported/i);
+  }
+}));
+
+test('Glob and Grep accept safeRoot-relative directory and enforce ignored paths', () => withFixture(async (f) => {
+  const gw = new ReadOnlyToolGateway({
+    safeRoot: f.safeRoot, cwd: f.tmpDir, ignorePatterns: ['src/blocked/**'],
+  });
+  const { handlers } = getHandlers(gw);
+  const glob = await handlers.Glob({ pattern: '*.js', path: 'src' });
+  eq(glob.isError, undefined);
+  assert.match(glob.content[0].text, /src\/app\.js/);
+  const grep = await handlers.Grep({ pattern: 'search_term_target', path: 'src' });
+  eq(grep.isError, undefined);
+  assert.match(grep.content[0].text, /src\/app\.js:2/);
+  const outside = await handlers.Grep({ pattern: 'SECRET', path: '../outside' });
+  eq(outside.isError, true);
+  const ignoredDir = pj(f.safeRoot, 'src', 'blocked');
+  fs.mkdirSync(ignoredDir, { recursive: true });
+  fs.writeFileSync(pj(ignoredDir, 'hidden.js'), 'secret');
+  const denied = await handlers.Glob({ pattern: '*.js', path: 'src/blocked' });
+  eq(denied.isError, true);
 }));
