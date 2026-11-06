@@ -319,7 +319,7 @@ export class ReadOnlyToolGateway {
         if (input?.head_limit !== undefined && (!Number.isInteger(input.head_limit) || input.head_limit < 1)) {
           return this.denyAndRecord(toolName, input, 'Grep head_limit must be a positive integer.');
         }
-        if (input?.output_mode !== undefined && !['content', 'files_with_matches'].includes(input.output_mode)) {
+        if (input?.output_mode !== undefined && !['content', 'files_with_matches', 'count'].includes(input.output_mode)) {
           return this.denyAndRecord(toolName, input, `Grep output_mode is unsupported: ${input.output_mode}`);
         }
         if (input?.mode !== undefined && !['content', 'files_with_matches'].includes(input.mode) && !['count', 'stats'].includes(input.mode)) {
