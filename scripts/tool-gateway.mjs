@@ -145,17 +145,37 @@ export class ReadOnlyToolGateway {
 
     if (toolName === TOOL_NAMES.READ) {
       if (!this.readRoots.length) return this.denyAndRecord(toolName, input, 'No authorized read roots configured.');
-      const resolved = resolveAllowedPath(input?.file_path, this.readRoots, { mustExist: true, cwd: this.cwd });
+      const rawPath = typeof input?.file_path === 'string' ? input.file_path : '';
+      if (!rawPath || rawPath.includes('\0')) return this.denyAndRecord(toolName, input, 'Invalid file path for Read.');
+      if (isControlPath(rawPath)) return this.denyAndRecord(toolName, input, 'Access to control path is forbidden.');
+
+      const resolved = resolveAllowedPath(rawPath, this.readRoots, { mustExist: true, cwd: this.cwd });
       if (!resolved.ok) return this.denyAndRecord(toolName, input, resolved.error);
+
       const relToRoot = path.relative(resolved.matchedRoot, resolved.realPath).replace(/\\/g, '/');
-      if (matchesIgnore(relToRoot, this.ignorePatterns)) return this.denyAndRecord(toolName, input, `Read is denied for ignored path: ${input?.file_path}`);
+      if (isControlPath(resolved.realPath) || isControlPath(relToRoot)) {
+        return this.denyAndRecord(toolName, input, 'Access to control path is forbidden.');
+      }
+      if (matchesIgnore(relToRoot, this.ignorePatterns)) {
+        return this.denyAndRecord(toolName, input, `Read is denied for ignored path: ${rawPath}`);
+      }
+
+      const relLex = path.relative(resolved.matchedRoot, path.resolve(this.cwd, rawPath)).replace(/\\/g, '/');
+      if (matchesIgnore(relLex, this.ignorePatterns) || matchesIgnore(rawPath.replace(/\\/g, '/'), this.ignorePatterns)) {
+        return this.denyAndRecord(toolName, input, `Read is denied for ignored path alias: ${rawPath}`);
+      }
+
       try {
         const stat = fs.statSync(resolved.realPath);
-        if (!stat.isFile()) return this.denyAndRecord(toolName, input, `Read target is not a regular file: ${input?.file_path}`);
+        if (!stat.isFile()) return this.denyAndRecord(toolName, input, `Read target is not a regular file: ${rawPath}`);
         if (stat.size > this.maxFileSizeBytes) return this.denyAndRecord(toolName, input, `File size exceeds safety limit of ${this.maxFileSizeBytes} bytes.`);
       } catch (err) {
-        return this.denyAndRecord(toolName, input, `Cannot stat file ${input?.file_path}: ${err?.message ?? err}`);
+        return this.denyAndRecord(toolName, input, `Cannot stat file ${rawPath}: ${err?.message ?? err}`);
       }
+
+      const rem = Math.max(0, this.maxTotalReadBytes - this.totalReadBytes);
+      if (rem <= 0) return this.denyAndRecord(toolName, input, `Read byte quota exceeded: ${this.totalReadBytes}/${this.maxTotalReadBytes} bytes used.`);
+
       const offset = positiveInt(input?.offset, 1);
       const limit = Math.min(positiveInt(input?.limit, this.maxReadLines), this.maxReadLines);
       return { behavior: 'allow', updatedInput: { ...input, file_path: resolved.realPath, offset, limit } };
@@ -168,15 +188,40 @@ export class ReadOnlyToolGateway {
         if (typeof input?.pattern !== 'string' || input.pattern.includes('\0') || !input.pattern) return this.denyAndRecord(toolName, input, 'Invalid Grep pattern.');
         if (isDangerousRegexPattern(input.pattern)) return this.denyAndRecord(toolName, input, 'Invalid Grep pattern: complex or potential ReDoS pattern rejected.');
         if (input?.glob && !isSafeGlobPattern(input.glob)) return this.denyAndRecord(toolName, input, 'Grep glob escapes the sanitized repository.');
+        if (input?.mode === 'count' || input?.mode === 'stats' || input?.mode === 'content' || input?.count || input?.stats || input?.output_format || input?.outputFormat) {
+          return this.denyAndRecord(toolName, input, 'Grep count, stats, or content-only mode is forbidden: only standard prefixed matches allowed.');
+        }
       }
-      const searchRoot = input?.path ? resolveAllowedPath(input.path, this.searchRoots, { mustExist: true, cwd: this.cwd }) : { ok: true, realPath: this.searchRoots[0] };
-      if (!searchRoot.ok) return this.denyAndRecord(toolName, input, `${toolName} is restricted to safe-target/.`);
       if (input?.path) {
-        const rel = path.relative(this.safeRoot || this.cwd, searchRoot.realPath).replace(/\\/g, '/');
-        if (matchesIgnore(rel, this.ignorePatterns) || matchesIgnore(`${rel}/`, this.ignorePatterns)) {
+        const rawP = String(input.path);
+        if (isControlPath(rawP)) return this.denyAndRecord(toolName, input, 'Access to control path is forbidden.');
+        const relP = path.relative(this.safeRoot || this.cwd, path.resolve(this.cwd, rawP)).replace(/\\/g, '/');
+        if (matchesIgnore(relP, this.ignorePatterns) || matchesIgnore(`${relP}/`, this.ignorePatterns) || matchesIgnore(rawP.replace(/\\/g, '/'), this.ignorePatterns)) {
           return this.denyAndRecord(toolName, input, `${toolName} is denied for ignored path: ${input.path}`);
         }
       }
+      const searchRoot = input?.path ? resolveAllowedPath(input.path, this.searchRoots, { mustExist: true, cwd: this.cwd }) : { ok: true, realPath: this.searchRoots[0] };
+      if (!searchRoot.ok) return this.denyAndRecord(toolName, input, `${toolName} is restricted to safe-target/.`);
+      if (isControlPath(searchRoot.realPath)) return this.denyAndRecord(toolName, input, 'Access to control path is forbidden.');
+      const relReal = path.relative(this.safeRoot || this.cwd, searchRoot.realPath).replace(/\\/g, '/');
+      if (matchesIgnore(relReal, this.ignorePatterns) || matchesIgnore(`${relReal}/`, this.ignorePatterns)) {
+        return this.denyAndRecord(toolName, input, `${toolName} is denied for ignored path: ${input?.path || relReal}`);
+      }
+      if (input?.path) {
+        try {
+          const lstat = fs.lstatSync(path.resolve(this.cwd, String(input.path)));
+          if (lstat.isSymbolicLink()) {
+            const real = fs.realpathSync.native(path.resolve(this.cwd, String(input.path)));
+            const relSym = path.relative(this.safeRoot || this.cwd, real).replace(/\\/g, '/');
+            if (this.safeRoot && (!isInside(this.safeRoot, real) || isControlPath(real) || matchesIgnore(relSym, this.ignorePatterns))) {
+              return this.denyAndRecord(toolName, input, `${toolName} is denied for unauthorized symlink target: ${input.path}`);
+            }
+          }
+        } catch (err) {
+          return this.denyAndRecord(toolName, input, `Cannot verify path ${input.path}: ${err?.message ?? err}`);
+        }
+      }
+
       return { behavior: 'allow', updatedInput: { ...input, path: searchRoot.realPath } };
     }
 
@@ -297,14 +342,16 @@ export class ReadOnlyToolGateway {
   }
 
   isPathAllowed(candidatePath) {
-    if (typeof candidatePath !== 'string' || !candidatePath) return false;
-    const clean = candidatePath.replace(/\\/g, '/');
-    if (isControlPath(clean)) return false;
+    if (typeof candidatePath !== 'string' || !candidatePath.trim()) return false;
+    const clean = candidatePath.trim().replace(/\\/g, '/');
+    if (clean.includes('\0') || isControlPath(clean)) return false;
     const rel = this.safeRoot ? path.relative(this.safeRoot, path.resolve(this.safeRoot, clean)).replace(/\\/g, '/') : clean;
     if (isControlPath(rel) || matchesIgnore(rel, this.ignorePatterns)) return false;
     if (this.safeRoot) {
       try {
-        const real = fs.realpathSync.native(path.resolve(this.safeRoot, clean));
+        const full = path.resolve(this.safeRoot, clean);
+        if (!fs.existsSync(full)) return false;
+        const real = fs.realpathSync.native(full);
         if (!isInside(this.safeRoot, real) || isControlPath(real) || matchesIgnore(path.relative(this.safeRoot, real).replace(/\\/g, '/'), this.ignorePatterns)) return false;
       } catch { return false; }
     }
@@ -317,6 +364,15 @@ export class ReadOnlyToolGateway {
 
   createPostToolHook() {
     const gateway = this;
+    const sanitizePath = (p) => typeof p === 'string' && p && gateway.isPathAllowed(p);
+    const filterItem = (item) => {
+      if (typeof item === 'string') return sanitizePath(item);
+      if (item && typeof item === 'object') {
+        const p = item.path || item.filePath || item.file || item.filename;
+        return sanitizePath(p);
+      }
+      return false;
+    };
     return {
       matcher: 'Read|Glob|Grep',
       hooks: [
@@ -327,17 +383,36 @@ export class ReadOnlyToolGateway {
           }
 
           let sanitized = resp;
-          if (tool_name === TOOL_NAMES.GLOB) {
-            if (Array.isArray(resp)) sanitized = resp.filter((item) => gateway.isPathAllowed(typeof item === 'string' ? item : item?.path));
-            else if (typeof resp === 'string') sanitized = resp.split('\n').filter((l) => gateway.isPathAllowed(l.trim())).join('\n');
-          } else if (tool_name === TOOL_NAMES.GREP) {
-            if (Array.isArray(resp)) sanitized = resp.filter((item) => gateway.isPathAllowed(item?.path || item?.file));
-            else if (typeof resp === 'string') {
+          if (Array.isArray(resp)) {
+            sanitized = resp.filter(filterItem);
+          } else if (typeof resp === 'string') {
+            if (tool_name === TOOL_NAMES.GLOB) {
+              sanitized = resp.split('\n').filter((l) => sanitizePath(l.trim())).join('\n');
+            } else if (tool_name === TOOL_NAMES.GREP) {
               sanitized = resp.split('\n').filter((l) => {
-                const idx = l.indexOf(':');
-                return idx === -1 || gateway.isPathAllowed(l.slice(0, idx).trim());
+                const t = l.trim();
+                const idx = t.indexOf(':');
+                return idx !== -1 && sanitizePath(t.slice(0, idx).trim());
               }).join('\n');
             }
+          } else if (resp && typeof resp === 'object') {
+            const obj = {};
+            for (const [k, v] of Object.entries(resp)) {
+              if (Array.isArray(v) && (k === 'filenames' || k === 'files' || k === 'paths' || k === 'matches')) {
+                obj[k] = v.filter(filterItem);
+              } else if (typeof v === 'string' && (k === 'content' || k === 'output' || k === 'matches')) {
+                if (tool_name === TOOL_NAMES.GLOB) {
+                  obj[k] = v.split('\n').filter((l) => sanitizePath(l.trim())).join('\n');
+                } else if (tool_name === TOOL_NAMES.GREP) {
+                  obj[k] = v.split('\n').filter((l) => {
+                    const t = l.trim();
+                    const idx = t.indexOf(':');
+                    return idx !== -1 && sanitizePath(t.slice(0, idx).trim());
+                  }).join('\n');
+                } else obj[k] = v;
+              }
+            }
+            sanitized = obj;
           }
 
           const limit = Math.min(gateway.maxCallReadBytes, Math.max(0, gateway.maxTotalReadBytes - gateway.totalReadBytes));

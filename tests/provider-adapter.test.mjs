@@ -561,7 +561,10 @@ test('Claude adapter integrates with toolGateway: mounts canUseTool and hooks.Po
   assert.equal(outcome.ok, true);
   assert.equal((await opts.canUseTool('Read', { file_path: path.join(safe, 'v.txt') })).behavior, 'allow');
   assert.equal((await opts.canUseTool('Read', { file_path: path.join(outside, 'k') })).behavior, 'deny');
+  assert.equal((await opts.canUseTool('Grep', { pattern: 'v', mode: 'count' })).behavior, 'deny');
   const hookRes = await opts.hooks.PostToolUse[0].hooks[0]({ tool_name: 'Read', tool_input: {}, tool_response: 'z'.repeat(200) });
   assert.match(hookRes.hookSpecificOutput.updatedToolOutput, /output truncated by host gateway/i);
+  const hookObj = await opts.hooks.PostToolUse[0].hooks[0]({ tool_name: 'Glob', tool_input: {}, tool_response: { filenames: ['v.txt', '../o/k'] } });
+  assert.deepEqual(hookObj.hookSpecificOutput.updatedToolOutput, { filenames: ['v.txt'] });
   fs.rmSync(tmp, { recursive: true, force: true });
 });
