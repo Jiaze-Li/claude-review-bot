@@ -424,6 +424,30 @@ export class ClaudeProviderAdapter extends ProviderAdapter {
       ? { PATH: env?.PATH, HOME: env?.HOME, TMPDIR: env?.TMPDIR, ...(env?.CLAUDE_CODE_OAUTH_TOKEN ? { CLAUDE_CODE_OAUTH_TOKEN: env.CLAUDE_CODE_OAUTH_TOKEN } : {}) }
       : env;
 
+    let resolvedTools = tools;
+    let resolvedMcpServers = {};
+    let resolvedAllowedTools = undefined;
+    let resolvedPermissionMode = permissionMode;
+    let resolvedToolAliases = undefined;
+
+    if (toolGateway) {
+      const serverName = 'gateway';
+      const mcpServer = toolGateway.createMcpServer ? toolGateway.createMcpServer(serverName) : null;
+      resolvedTools = [];
+      resolvedMcpServers = mcpServer ? { [serverName]: mcpServer } : {};
+      resolvedAllowedTools = toolGateway.getMcpToolNames ? toolGateway.getMcpToolNames(serverName) : [
+        `mcp__${serverName}__Read`,
+        `mcp__${serverName}__Glob`,
+        `mcp__${serverName}__Grep`,
+      ];
+      resolvedPermissionMode = permissionMode === 'default' ? 'dontAsk' : permissionMode;
+      resolvedToolAliases = {
+        Read: `mcp__${serverName}__Read`,
+        Glob: `mcp__${serverName}__Glob`,
+        Grep: `mcp__${serverName}__Grep`,
+      };
+    }
+
     const toolAuthorizer = canUseTool ?? (toolGateway ? toolGateway.createCanUseTool() : async () => ({ behavior: 'deny', message: 'No tools available in this review.' }));
     const resolvedHooks = hooks ?? (toolGateway ? { PostToolUse: [toolGateway.createPostToolHook()] } : undefined);
 
@@ -443,9 +467,11 @@ export class ClaudeProviderAdapter extends ProviderAdapter {
           env: subprocessEnv,
           settingSources: [],
           strictMcpConfig: true,
-          mcpServers: {},
-          tools,
-          permissionMode,
+          mcpServers: resolvedMcpServers,
+          tools: resolvedTools,
+          ...(resolvedAllowedTools ? { allowedTools: resolvedAllowedTools } : {}),
+          ...(resolvedToolAliases ? { toolAliases: resolvedToolAliases } : {}),
+          permissionMode: resolvedPermissionMode,
           model,
           effort,
           maxTurns,

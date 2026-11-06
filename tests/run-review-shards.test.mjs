@@ -42,6 +42,18 @@ export async function* query({ prompt, options }) {
     structured_output: { summary: 'shard ' + myCall + ' ok', findings: myCall === 1 ? [{ severity: 'P2', title: 'Real bug', body: 'b', path: files[0] ?? 'x', line: null }] : [],
       coverage: { complete: true, reviewedPaths: files, unreviewedPaths: [], note: '' } } };
 }
+export function tool(name, description, inputSchema, handler) {
+  return { name, description, inputSchema, handler };
+}
+export function createSdkMcpServer({ name, tools }) {
+  return {
+    type: 'sdk',
+    name,
+    instance: {
+      _registeredTools: Object.fromEntries((tools || []).map((t) => [t.name, t])),
+    },
+  };
+}
 `;
 
 function setup(fileSizes, session = null, ignore = null) {
@@ -52,6 +64,9 @@ function setup(fileSizes, session = null, ignore = null) {
   fs.mkdirSync(sdk, { recursive: true });
   fs.writeFileSync(path.join(sdk, 'package.json'), JSON.stringify({ name: '@anthropic-ai/claude-agent-sdk', type: 'module', main: 'index.js', exports: './index.js' }));
   fs.writeFileSync(path.join(sdk, 'index.js'), FAKE_SDK);
+  try {
+    fs.symlinkSync(path.resolve('node_modules/zod'), path.join(root, 'node_modules/zod'), 'junction');
+  } catch {}
   fs.mkdirSync(path.join(root, 'safe-target'));
   fs.mkdirSync(path.join(root, '.review-context'));
   if (session) fs.writeFileSync(path.join(root, '.review-context/session-plan.json'), JSON.stringify({ session }));

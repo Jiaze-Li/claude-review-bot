@@ -306,12 +306,17 @@ test('Integration E3: Full review with Tool Gateway preserves shard execution, c
     schema: { type: 'object', properties: { summary: { type: 'string' }, coverage: { type: 'object' } }, required: ['summary', 'coverage'] },
     env: { CLAUDE_CODE_OAUTH_TOKEN: 'token' },
     queryImpl: async function* ({ options }) {
-      assert.deepEqual(options.tools, ['Read', 'Glob', 'Grep']);
+      assert.deepEqual(options.tools, []);
+      assert.ok(options.mcpServers && options.mcpServers.gateway);
+      assert.deepEqual(options.allowedTools, ['mcp__gateway__Read', 'mcp__gateway__Glob', 'mcp__gateway__Grep']);
+      assert.equal(options.permissionMode, 'dontAsk');
+      assert.equal(options.strictMcpConfig, true);
+      assert.deepEqual(options.settingSources, []);
       assert.equal((await options.canUseTool('Read', { file_path: path.join(safe, 'fileA.js') })).behavior, 'allow');
       yield { type: 'result', subtype: 'success', num_turns: 4, total_cost_usd: 0.35, usage: { input_tokens: 1500, output_tokens: 250 }, structured_output: { summary: 'ok', coverage: { complete: true } } };
     },
     toolGateway: gw,
-    tools: ['Read', 'Glob', 'Grep'],
+    tools: [],
   });
   assert.equal(outcome.ok && outcome.structured.coverage.complete, true);
   assert.equal(outcome.meta.total_cost_usd, 0.35);

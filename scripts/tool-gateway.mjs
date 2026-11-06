@@ -1,5 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { tool, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
+import { z } from 'zod';
 import { matchesIgnore } from './review-shards.mjs';
 
 export const TOOL_NAMES = Object.freeze({ READ: 'Read', GLOB: 'Glob', GREP: 'Grep' });
@@ -91,6 +93,9 @@ export class ReadOnlyToolGateway {
     this.logImpl = typeof options.logImpl === 'function' ? options.logImpl : null;
     this.readRoots = [this.safeRoot, this.contextRoot].filter(Boolean);
     this.searchRoots = [this.safeRoot].filter(Boolean);
+    this.allowedContextFiles = Array.isArray(options.allowedContextFiles)
+      ? new Set(options.allowedContextFiles.map((f) => f.replace(/\\/g, '/')))
+      : (options.allowedContextFiles instanceof Set ? options.allowedContextFiles : null);
     this.callCount = 0;
     this.totalReadBytes = 0;
     this.quotaExhausted = false;
@@ -161,6 +166,14 @@ export class ReadOnlyToolGateway {
 
       const resolved = resolveAllowedPath(rawPath, this.readRoots, { mustExist: true, cwd: this.cwd });
       if (!resolved.ok) return this.denyAndRecord(toolName, input, resolved.error);
+
+      if (this.contextRoot && resolved.matchedRoot === this.contextRoot && this.allowedContextFiles) {
+        const relContext = path.relative(this.contextRoot, resolved.realPath).replace(/\\/g, '/');
+        const isAllowed = this.allowedContextFiles.has(relContext) || this.allowedContextFiles.has(path.basename(relContext));
+        if (!isAllowed) {
+          return this.denyAndRecord(toolName, input, `Read is denied for unauthorized context file: ${rawPath}`);
+        }
+      }
 
       const relToRoot = path.relative(resolved.matchedRoot, resolved.realPath).replace(/\\/g, '/');
       if (isControlPath(resolved.realPath) || isControlPath(relToRoot)) {
@@ -283,6 +296,7 @@ export class ReadOnlyToolGateway {
       safeWalk({
         searchRoot, safeRoot: this.safeRoot, ignorePatterns: this.ignorePatterns, timeoutMs: this.timeoutMs,
         onFile: ({ fullPath, relToRepo, entryName }) => {
+          if (!this.isPathAllowed(relToRepo)) return false;
           if (matches.length >= this.maxGlobMatches) { truncated = true; return true; }
           const relSearch = path.relative(searchRoot, fullPath).replace(/\\/g, '/');
           if (regex.test(relSearch) || regex.test(relToRepo) || regex.test(entryName)) matches.push(relToRepo);
@@ -315,6 +329,7 @@ export class ReadOnlyToolGateway {
       safeWalk({
         searchRoot, safeRoot: this.safeRoot, ignorePatterns: this.ignorePatterns, timeoutMs: this.timeoutMs,
         onFile: ({ realPath, relToRepo, stat, entryName, fullPath }) => {
+          if (!this.isPathAllowed(relToRepo)) return false;
           if (matches.length >= this.maxGrepMatches || totalBytes >= prep.maxBytes) { truncated = true; return true; }
           const relSearch = path.relative(searchRoot, fullPath).replace(/\\/g, '/');
           if (globRegex && !globRegex.test(relSearch) && !globRegex.test(relToRepo) && !globRegex.test(entryName)) return false;
@@ -467,6 +482,18 @@ export class ReadOnlyToolGateway {
     };
   }
 
+  createMcpServer(serverName = 'gateway') {
+    return createGatewayMcpServer(this, serverName).server;
+  }
+
+  createMcpTools(serverName = 'gateway') {
+    return createGatewayMcpServer(this, serverName).tools;
+  }
+
+  getMcpToolNames(serverName = 'gateway') {
+    return createGatewayMcpServer(this, serverName).toolNames;
+  }
+
   static getToolDeclarations() {
     return [
       { name: 'Read', description: 'Read file contents.', parameters: { type: 'object', properties: { file_path: { type: 'string' }, offset: { type: 'integer' }, limit: { type: 'integer' } }, required: ['file_path'] } },
@@ -474,6 +501,113 @@ export class ReadOnlyToolGateway {
       { name: 'Grep', description: 'Search pattern across files.', parameters: { type: 'object', properties: { pattern: { type: 'string' }, path: { type: 'string' }, glob: { type: 'string' } }, required: ['pattern'] } },
     ];
   }
+}
+
+export function createGatewayMcpServer(gateway, serverName = 'gateway') {
+  const readTool = tool(
+    TOOL_NAMES.READ,
+    'Read file contents from the repository or authorized review context.',
+    {
+      file_path: z.string().describe('Path to the file to read (must be within repository or authorized review context)'),
+      offset: z.number().int().optional().describe('1-based line number to start reading from'),
+      limit: z.number().int().optional().describe('Number of lines to read'),
+    },
+    async (args) => {
+      const res = await gateway.executeRead(args);
+      if (!res.ok) {
+        return {
+          isError: true,
+          content: [{ type: 'text', text: res.error || res.reason || 'Read failed' }],
+        };
+      }
+      return {
+        content: [{ type: 'text', text: res.content }],
+      };
+    }
+  );
+
+  const globTool = tool(
+    TOOL_NAMES.GLOB,
+    'Find files matching a glob pattern within the repository.',
+    {
+      pattern: z.string().describe('Glob pattern to match files against'),
+      path: z.string().optional().describe('Directory to search in (must be within repository)'),
+    },
+    async (args) => {
+      const res = await gateway.executeGlob(args);
+      if (!res.ok) {
+        return {
+          isError: true,
+          content: [{ type: 'text', text: res.error || res.reason || 'Glob failed' }],
+        };
+      }
+      const text = res.matches.length > 0 ? res.matches.join('\n') : 'No files matched the pattern.';
+      const limit = Math.min(gateway.maxCallReadBytes, Math.max(0, gateway.maxTotalReadBytes - gateway.totalReadBytes + res.bytes));
+      let outText = res.truncated ? `${text}${truncMsg(limit)}` : text;
+      const bLen = Buffer.byteLength(outText, 'utf8');
+      if (bLen > limit) {
+        outText = `${Buffer.from(outText, 'utf8').subarray(0, Math.max(0, limit - 100)).toString('utf8')}${truncMsg(limit)}`;
+      }
+      return {
+        content: [{ type: 'text', text: outText }],
+      };
+    }
+  );
+
+  const grepTool = tool(
+    TOOL_NAMES.GREP,
+    'Search for pattern across files in the repository.',
+    {
+      pattern: z.string().describe('Pattern or regular expression to search for'),
+      path: z.string().optional().describe('Directory to search in (must be within repository)'),
+      glob: z.string().optional().describe('Glob pattern to filter files'),
+      output_mode: z.string().optional().describe('Output mode: files_with_matches or content'),
+      mode: z.string().optional().describe('Output mode alias'),
+    },
+    async (args) => {
+      const res = await gateway.executeGrep(args);
+      if (!res.ok) {
+        return {
+          isError: true,
+          content: [{ type: 'text', text: res.error || res.reason || 'Grep failed' }],
+        };
+      }
+      let text;
+      const isFilesOnly = args?.output_mode === 'files_with_matches' || args?.mode === 'files_with_matches';
+      if (isFilesOnly) {
+        const files = [...new Set(res.matches.map((m) => m.path))];
+        text = files.length > 0 ? files.join('\n') : 'No files matched.';
+      } else {
+        text = res.matches.length > 0
+          ? res.matches.map((m) => `${m.path}:${m.line}: ${m.text}`).join('\n')
+          : 'No matches found.';
+      }
+      const limit = Math.min(gateway.maxCallReadBytes, Math.max(0, gateway.maxTotalReadBytes - gateway.totalReadBytes + res.bytes));
+      let outText = res.truncated ? `${text}${truncMsg(limit)}` : text;
+      const bLen = Buffer.byteLength(outText, 'utf8');
+      if (bLen > limit) {
+        outText = `${Buffer.from(outText, 'utf8').subarray(0, Math.max(0, limit - 100)).toString('utf8')}${truncMsg(limit)}`;
+      }
+      return {
+        content: [{ type: 'text', text: outText }],
+      };
+    }
+  );
+
+  const server = createSdkMcpServer({
+    name: serverName,
+    tools: [readTool, globTool, grepTool],
+  });
+
+  return {
+    server,
+    tools: [readTool, globTool, grepTool],
+    toolNames: [
+      `mcp__${serverName}__${TOOL_NAMES.READ}`,
+      `mcp__${serverName}__${TOOL_NAMES.GLOB}`,
+      `mcp__${serverName}__${TOOL_NAMES.GREP}`,
+    ],
+  };
 }
 
 function realDirPath(v) {
