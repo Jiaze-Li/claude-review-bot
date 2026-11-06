@@ -40,7 +40,24 @@ export function resolveAllowedPath(requestedPath, allowedRoots, { mustExist = tr
 }
 
 function isDangerousRegexPattern(p) {
-  return typeof p !== 'string' || p.length > 500 || /\([^)]*[*+][^)]*\)[*+]/.test(p) || /([*+])\s*([*+])/.test(p);
+  if (typeof p !== 'string' || p.length > 500) return true;
+  // Ignore escaped literal metacharacters and bracket expressions when
+  // detecting adjacent quantifiers. The actual regex runs in a timed worker.
+  let escaped = false, inClass = false, previousQuantifier = false;
+  for (const char of p) {
+    if (escaped) { escaped = false; previousQuantifier = false; continue; }
+    if (char === '\\') { escaped = true; previousQuantifier = false; continue; }
+    if (char === '[' && !inClass) { inClass = true; previousQuantifier = false; continue; }
+    if (char === ']' && inClass) { inClass = false; previousQuantifier = false; continue; }
+    if (inClass) continue;
+    if (char === '*' || char === '+') {
+      if (previousQuantifier) return true;
+      previousQuantifier = true;
+    } else if (!/\s/.test(char)) {
+      previousQuantifier = false;
+    }
+  }
+  return /\([^)]*[*+][^)]*\)[*+]/.test(p);
 }
 
 function safeWalk({ searchRoot, safeRoot, ignorePatterns, timeoutMs, onFile }) {
@@ -112,7 +129,7 @@ function cappedText(text, maxBytes, truncated = false) {
  * backtracking regexp can consume its worker's CPU, but cannot block the host
  * event loop. Timeout terminates the worker, including its synchronous regexp.
  */
-const GREP_WORKER_SOURCE = "const { parentPort, workerData } = require('node:worker_threads');\nconst fs = require('node:fs');\nconst path = require('node:path');\nconst inside = (root, file) => file === root || file.startsWith(root + path.sep);\nconst { pattern, safeRoot, files, maxMatches, maxBytes, maxFileBytes, ignoreCase } = workerData;\nlet rx;\ntry { rx = new RegExp(pattern, ignoreCase ? 'i' : ''); } catch {\n  rx = new RegExp(pattern.replace(/[.*+?^$()|[\\]{}]/g, (ch) => '\\\\' + ch), ignoreCase ? 'i' : '');\n}\nconst matches = [];\nlet bytes = 0, truncated = false;\nouter: for (const item of files) {\n  let real, stat;\n  try {\n    real = fs.realpathSync.native(item.realPath);\n    if (!inside(safeRoot, real)) continue;\n    stat = fs.statSync(real);\n    if (!stat.isFile() || stat.size > maxFileBytes) continue;\n  } catch { continue; }\n  let lines;\n  try { lines = fs.readFileSync(real, 'utf8').split(/\\r?\\n/); } catch { continue; }\n  for (let i = 0; i < lines.length; i++) {\n    const candidate = lines[i].slice(0, 2000);\n    if (!rx.test(candidate)) continue;\n    const entry = { path: item.relToRepo, line: i + 1, text: candidate.slice(0, 1000) };\n    const entryBytes = Buffer.byteLength(JSON.stringify(entry), 'utf8');\n    if (bytes + entryBytes > maxBytes || matches.length >= maxMatches) {\n      truncated = true;\n      break outer;\n    }\n    matches.push(entry);\n    bytes += entryBytes;\n  }\n}\nparentPort.postMessage({ matches, bytes, truncated });";
+const GREP_WORKER_SOURCE = "const { parentPort, workerData } = require('node:worker_threads');\nconst fs = require('node:fs');\nconst path = require('node:path');\nconst inside = (root, file) => file === root || file.startsWith(root + path.sep);\nconst { pattern, safeRoot, files, maxMatches, maxBytes, maxFileBytes, ignoreCase, fixedString } = workerData;\nconst flags = ignoreCase ? 'iu' : 'u';\nconst escapeLiteral = (value) => [...value].map((ch) => '.*+?^$()|[]{}\\\\'.includes(ch) ? '\\\\' + ch : ch).join('');\nlet rx;\ntry {\n  rx = new RegExp(fixedString ? escapeLiteral(pattern) : pattern, flags);\n} catch (error) {\n  throw new Error('Invalid JavaScript regular expression: ' + error.message + '; use fixed_string: true to match literal text');\n}\nconst matches = [];\nlet bytes = 0, truncated = false;\nouter: for (const item of files) {\n  let real, stat;\n  try {\n    real = fs.realpathSync.native(item.realPath);\n    if (!inside(safeRoot, real)) continue;\n    stat = fs.statSync(real);\n    if (!stat.isFile() || stat.size > maxFileBytes) continue;\n  } catch { continue; }\n  let lines;\n  try { lines = fs.readFileSync(real, 'utf8').split(/\\r?\\n/); } catch { continue; }\n  for (let i = 0; i < lines.length; i++) {\n    const candidate = lines[i].slice(0, 2000);\n    if (!rx.test(candidate)) continue;\n    const entry = { path: item.relToRepo, line: i + 1, text: candidate.slice(0, 1000) };\n    const entryBytes = Buffer.byteLength(JSON.stringify(entry), 'utf8');\n    if (bytes + entryBytes > maxBytes || matches.length >= maxMatches) {\n      truncated = true;\n      break outer;\n    }\n    matches.push(entry);\n    bytes += entryBytes;\n  }\n}\nparentPort.postMessage({ matches, bytes, truncated });";
 
 function boundedGrepWorker(data, timeoutMs) {
   return new Promise((resolve, reject) => {
@@ -304,7 +321,10 @@ export class ReadOnlyToolGateway {
       if (toolName === TOOL_NAMES.GLOB && !isSafeGlobPattern(input?.pattern)) return this.denyAndRecord(toolName, input, 'Glob pattern escapes the sanitized repository.');
       if (toolName === TOOL_NAMES.GREP) {
         if (typeof input?.pattern !== 'string' || input.pattern.includes('\0') || !input.pattern) return this.denyAndRecord(toolName, input, 'Invalid Grep pattern.');
-        if (isDangerousRegexPattern(input.pattern)) return this.denyAndRecord(toolName, input, 'Invalid Grep pattern: complex or potential ReDoS pattern rejected.');
+        if (input?.fixed_string !== true && isDangerousRegexPattern(input.pattern)) return this.denyAndRecord(toolName, input, 'Invalid Grep pattern: complex or potential ReDoS pattern rejected.');
+        if (input?.fixed_string !== undefined && typeof input.fixed_string !== 'boolean') {
+          return this.denyAndRecord(toolName, input, 'Grep fixed_string must be a boolean.');
+        }
         if (input?.glob && !isSafeGlobPattern(input.glob)) return this.denyAndRecord(toolName, input, 'Grep glob escapes the sanitized repository.');
         const unsupported = ['-A', '-B', '-C', 'multiline', 'type', 'offset']
           .filter((key) => input?.[key] !== undefined);
@@ -473,9 +493,11 @@ export class ReadOnlyToolGateway {
         searchRoot, safeRoot: this.safeRoot, ignorePatterns: this.ignorePatterns, timeoutMs: this.timeoutMs,
         onFile: ({ fullPath, relToRepo, entryName }) => {
           if (!this.isPathAllowed(relToRepo)) return false;
-          if (matches.length >= this.maxGlobMatches) { truncated = true; return true; }
           const relSearch = path.relative(searchRoot, fullPath).replace(/\\/g, '/');
-          if (regex.test(relSearch) || regex.test(relToRepo) || regex.test(entryName)) matches.push(relToRepo);
+          if (regex.test(relSearch) || regex.test(relToRepo) || regex.test(entryName)) {
+            if (matches.length >= this.maxGlobMatches) { truncated = true; return true; }
+            matches.push(relToRepo);
+          }
           return false;
         },
       });
@@ -531,6 +553,7 @@ export class ReadOnlyToolGateway {
           files: candidates,
           maxMatches: Math.min(this.maxGrepMatches, prep.input?.head_limit ?? this.maxGrepMatches),
           ignoreCase: prep.input?.['-i'] === true,
+          fixedString: prep.input?.fixed_string === true,
           maxBytes: prep.maxBytes,
           maxFileBytes: this.maxGrepFileBytes,
         }, remainingMs);
@@ -741,7 +764,7 @@ export function createGatewayMcpServer(gateway, serverName = 'gateway') {
 
   const grepTool = tool(
     TOOL_NAMES.GREP,
-    'Search for pattern across files in the repository.',
+    'Search with JavaScript regex syntax (Unicode mode) or fixed_string=true for literal text; unsupported regex syntax returns an error, never an empty result.',
     {
       pattern: z.string().describe('Pattern or regular expression to search for'),
       path: z.string().optional().describe('Directory to search in (must be within repository)'),
@@ -749,6 +772,7 @@ export function createGatewayMcpServer(gateway, serverName = 'gateway') {
       output_mode: z.string().optional().describe('Output mode: files_with_matches or content'),
       mode: z.string().optional().describe('Output mode alias'),
       '-i': z.boolean().optional().describe('Case-insensitive matching, supported'),
+      fixed_string: z.boolean().optional().describe('Use literal text instead of a JS regex; malformed regex patterns otherwise return an explicit error'),
       '-n': z.boolean().optional().describe('Line numbers are always included; false is rejected'),
       head_limit: z.number().int().positive().optional().describe('Bound number of Grep matches'),
       '-A': z.number().int().nonnegative().optional().describe('Unsupported: context lines (returns an explicit error)'),

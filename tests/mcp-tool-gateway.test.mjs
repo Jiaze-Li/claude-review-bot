@@ -409,7 +409,7 @@ test('F005: invalid regex is escaped as literal text inside bounded Grep worker'
   const gw = new ReadOnlyToolGateway({ safeRoot: f.safeRoot, cwd: f.tmpDir });
   const { handlers } = getHandlers(gw);
   for (const literal of ['foo(', 'a[']) {
-    const result = await handlers.Grep({ pattern: literal, path: file });
+    const result = await handlers.Grep({ pattern: literal, path: file, fixed_string: true });
     eq(result.isError, undefined);
     assert.match(result.content[0].text, /literal-patterns\.txt/);
     assert.ok(result.content[0].text.includes(literal), 'fallback must match the literal characters');
@@ -498,4 +498,44 @@ test('Glob and Grep accept safeRoot-relative directory and enforce ignored paths
   fs.writeFileSync(pj(ignoredDir, 'hidden.js'), 'secret');
   const denied = await handlers.Glob({ pattern: '*.js', path: 'src/blocked' });
   eq(denied.isError, true);
+}));
+test('F001: malformed regex fails explicitly unless fixed_string is requested', () => withFixture(async (f) => {
+  const file = pj(f.safeRoot, 'regex-modes.txt');
+  fs.writeFileSync(file, 'literal foo( and a[ plus Unicode ünicode text\n');
+  const gw = new ReadOnlyToolGateway({ safeRoot: f.safeRoot, cwd: f.tmpDir });
+  const { handlers } = getHandlers(gw);
+  for (const pattern of ['foo(', 'a[', '(?i)foo', '(?s)foo', 'foo++']) {
+    const result = await handlers.Grep({ pattern, path: file });
+    eq(result.isError, true, pattern + ' must not silently become a literal search');
+    assert.match(result.content[0].text, /invalid.*regular expression|potential ReDoS/i);
+  }
+  const fixed = await handlers.Grep({ pattern: 'foo(', fixed_string: true, path: file });
+  eq(fixed.isError, undefined);
+  assert.match(fixed.content[0].text, /regex-modes\.txt/);
+}));
+
+test('Glob truncation is true only when an additional matching file exists', () => withFixture(async (f) => {
+  const dir = pj(f.safeRoot, 'one-match');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(pj(dir, 'a.js'), 'one');
+  fs.writeFileSync(pj(dir, 'b.txt'), 'two');
+  fs.writeFileSync(pj(dir, 'c.log'), 'three');
+  const gw = new ReadOnlyToolGateway({ safeRoot: f.safeRoot, cwd: f.tmpDir, maxGlobMatches: 1 });
+  const { handlers } = getHandlers(gw);
+  const res = await handlers.Glob({ pattern: '*.js', path: dir });
+  eq(res.isError, undefined);
+  eq(gw.getDiagnostics().history.find((x) => x.toolName === 'Glob')?.truncated, false);
+  assert.match(res.content[0].text, /one-match\/a\.js/);
+}));
+
+test('Grep accepts literal metacharacters without false ReDoS denials', () => withFixture(async (f) => {
+  const file = pj(f.safeRoot, 'operators.txt');
+  fs.writeFileSync(file, '***++\n');
+  const gw = new ReadOnlyToolGateway({ safeRoot: f.safeRoot, cwd: f.tmpDir });
+  const { handlers } = getHandlers(gw);
+  for (const pattern of ['[*+]', '\\*+', '\\*\\*+']) {
+    const res = await handlers.Grep({ pattern, path: file });
+    eq(res.isError, undefined, 'Unexpected rejection of ' + pattern);
+    assert.match(res.content[0].text, /operators\.txt/);
+  }
 }));
