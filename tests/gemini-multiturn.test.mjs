@@ -1552,3 +1552,367 @@ test('Regression F004: Context limit classifies as unavailable for fallback and 
     f.cleanup();
   }
 });
+
+test('F1: maxTurns=1 fails closed when tool call requested, preserving usage', async () => {
+  const f = createTestFixture();
+  try {
+    const gw = new ReadOnlyToolGateway({ safeRoot: f.safeRoot, cwd: f.tmpDir });
+    let fetchCount = 0;
+    const mockFetch = async () => {
+      fetchCount += 1;
+      return Response.json({
+        candidates: [{
+          content: {
+            role: 'model',
+            parts: [{ functionCall: { name: 'Read', args: { file_path: pj(f.safeRoot, 'index.js') }, id: 'c1' } }],
+          },
+        }],
+        usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 20, totalTokenCount: 120 },
+      });
+    };
+
+    const adapter = getProviderAdapter(PROVIDER_KINDS.GEMINI);
+    const outcome = await adapter.execute({
+      prompt: 'Review index.js',
+      schema: REVIEW_SCHEMA,
+      maxTurns: 1,
+      env: { GEMINI_API_KEY: 'test-key' },
+      fetchImpl: mockFetch,
+      toolGateway: gw,
+    });
+
+    eq(outcome.ok, false);
+    eq(outcome.subtype, 'error_max_turns');
+    eq(fetchCount, 1, 'Only 1 request must be made when maxTurns=1');
+    eq(outcome.meta.num_turns, 1);
+    eq(outcome.meta.max_turns, 1);
+    eq(outcome.meta.usage.total_tokens, 120);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('F1: maxTurns=1 fails closed when Stage A returns non-structured text and Stage B is blocked', async () => {
+  const f = createTestFixture();
+  try {
+    const gw = new ReadOnlyToolGateway({ safeRoot: f.safeRoot, cwd: f.tmpDir });
+    let fetchCount = 0;
+    const mockFetch = async () => {
+      fetchCount += 1;
+      return Response.json({
+        candidates: [{
+          content: {
+            role: 'model',
+            parts: [{ text: 'I examined the code but this is not JSON.' }],
+          },
+        }],
+        usageMetadata: { promptTokenCount: 80, candidatesTokenCount: 15, totalTokenCount: 95 },
+      });
+    };
+
+    const adapter = getProviderAdapter(PROVIDER_KINDS.GEMINI);
+    const outcome = await adapter.execute({
+      prompt: 'Review index.js',
+      schema: REVIEW_SCHEMA,
+      maxTurns: 1,
+      env: { GEMINI_API_KEY: 'test-key' },
+      fetchImpl: mockFetch,
+      toolGateway: gw,
+    });
+
+    eq(outcome.ok, false);
+    eq(outcome.subtype, 'error_max_turns');
+    assert.match(outcome.error, /exceeded total turn limit of 1 turns/i);
+    eq(fetchCount, 1, 'Stage B must NOT be called when maxTurns=1 is exhausted');
+    eq(outcome.meta.num_turns, 1);
+    eq(outcome.meta.usage.total_tokens, 95);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('F1: maxTurns=1 succeeds when model produces valid structured review directly on turn 1', async () => {
+  const f = createTestFixture();
+  try {
+    const gw = new ReadOnlyToolGateway({ safeRoot: f.safeRoot, cwd: f.tmpDir });
+    let fetchCount = 0;
+    const mockFetch = async () => {
+      fetchCount += 1;
+      return Response.json({
+        candidates: [{
+          content: {
+            role: 'model',
+            parts: [{
+              text: JSON.stringify({
+                summary: 'Single turn ok',
+                findings: [],
+                coverage: { complete: true, reviewedPaths: [], unreviewedPaths: [], note: '' },
+              }),
+            }],
+          },
+        }],
+        usageMetadata: { promptTokenCount: 50, candidatesTokenCount: 25, totalTokenCount: 75 },
+      });
+    };
+
+    const adapter = getProviderAdapter(PROVIDER_KINDS.GEMINI);
+    const outcome = await adapter.execute({
+      prompt: 'Review index.js',
+      schema: REVIEW_SCHEMA,
+      maxTurns: 1,
+      env: { GEMINI_API_KEY: 'test-key' },
+      fetchImpl: mockFetch,
+      toolGateway: gw,
+    });
+
+    eq(outcome.ok, true);
+    eq(fetchCount, 1);
+    eq(outcome.meta.num_turns, 1);
+    eq(outcome.meta.usage.total_tokens, 75);
+    eq(outcome.structured.summary, 'Single turn ok');
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('F1: maxTurns=2 fails closed when Stage A uses 2 turns and Stage B is blocked from extra turn', async () => {
+  const f = createTestFixture();
+  try {
+    const gw = new ReadOnlyToolGateway({ safeRoot: f.safeRoot, cwd: f.tmpDir });
+    let turn = 0;
+    const mockFetch = async () => {
+      turn += 1;
+      if (turn === 1) {
+        return Response.json({
+          candidates: [{
+            content: {
+              role: 'model',
+              parts: [{ functionCall: { name: 'Read', args: { file_path: pj(f.safeRoot, 'index.js') }, id: 'c1' } }],
+            },
+          }],
+          usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 20, totalTokenCount: 120 },
+        });
+      }
+      if (turn === 2) {
+        // Model receives tool output and returns conversational non-JSON text
+        return Response.json({
+          candidates: [{
+            content: {
+              role: 'model',
+              parts: [{ text: 'I finished reading index.js. Ready to review.' }],
+            },
+          }],
+          usageMetadata: { promptTokenCount: 150, candidatesTokenCount: 30, totalTokenCount: 180 },
+        });
+      }
+      throw new Error(`Turn ${turn} should never be reached under maxTurns=2`);
+    };
+
+    const adapter = getProviderAdapter(PROVIDER_KINDS.GEMINI);
+    const outcome = await adapter.execute({
+      prompt: 'Review index.js',
+      schema: REVIEW_SCHEMA,
+      maxTurns: 2,
+      env: { GEMINI_API_KEY: 'test-key' },
+      fetchImpl: mockFetch,
+      toolGateway: gw,
+    });
+
+    eq(outcome.ok, false);
+    eq(outcome.subtype, 'error_max_turns');
+    assert.match(outcome.error, /exceeded total turn limit of 2 turns/i);
+    eq(turn, 2, 'Total API requests must be capped at maxTurns=2');
+    eq(outcome.meta.num_turns, 2);
+    eq(outcome.meta.max_turns, 2);
+    eq(outcome.meta.usage.total_tokens, 120 + 180);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('F1: maxTurns=2 succeeds when Stage A takes 1 turn and Stage B takes turn 2', async () => {
+  const f = createTestFixture();
+  try {
+    const gw = new ReadOnlyToolGateway({ safeRoot: f.safeRoot, cwd: f.tmpDir });
+    let turn = 0;
+    const mockFetch = async () => {
+      turn += 1;
+      if (turn === 1) {
+        // Model returns non-structured text on turn 1
+        return Response.json({
+          candidates: [{
+            content: {
+              role: 'model',
+              parts: [{ text: 'No tools needed, exploring in mind.' }],
+            },
+          }],
+          usageMetadata: { promptTokenCount: 50, candidatesTokenCount: 10, totalTokenCount: 60 },
+        });
+      }
+      if (turn === 2) {
+        // Stage B returns structured review on turn 2
+        return Response.json({
+          candidates: [{
+            content: {
+              role: 'model',
+              parts: [{
+                text: JSON.stringify({
+                  summary: 'Turn 2 structured ok',
+                  findings: [],
+                  coverage: { complete: true, reviewedPaths: [], unreviewedPaths: [], note: '' },
+                }),
+              }],
+            },
+          }],
+          usageMetadata: { promptTokenCount: 70, candidatesTokenCount: 30, totalTokenCount: 100 },
+        });
+      }
+      throw new Error(`Unexpected turn ${turn}`);
+    };
+
+    const adapter = getProviderAdapter(PROVIDER_KINDS.GEMINI);
+    const outcome = await adapter.execute({
+      prompt: 'Review index.js',
+      schema: REVIEW_SCHEMA,
+      maxTurns: 2,
+      env: { GEMINI_API_KEY: 'test-key' },
+      fetchImpl: mockFetch,
+      toolGateway: gw,
+    });
+
+    eq(outcome.ok, true);
+    eq(turn, 2);
+    eq(outcome.meta.num_turns, 2);
+    eq(outcome.meta.max_turns, 2);
+    eq(outcome.meta.usage.total_tokens, 60 + 100);
+    eq(outcome.structured.summary, 'Turn 2 structured ok');
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('F2: validateStructuredReview strictly enforces nested required fields', () => {
+  // Missing line in finding
+  const missingLine = {
+    summary: 'Test',
+    findings: [{ severity: 'P1', title: 'T', body: 'B', path: 'src/app.js', failurePath: 'fp' }],
+    coverage: { complete: true, reviewedPaths: [], unreviewedPaths: [], note: '' },
+  };
+  const resLine = validateStructuredReview(missingLine, REVIEW_SCHEMA);
+  eq(resLine.ok, false);
+  assert.match(resLine.error, /finding missing required field: line/i);
+
+  // Missing failurePath in finding
+  const missingFailurePath = {
+    summary: 'Test',
+    findings: [{ severity: 'P1', title: 'T', body: 'B', path: 'src/app.js', line: 10 }],
+    coverage: { complete: true, reviewedPaths: [], unreviewedPaths: [], note: '' },
+  };
+  const resFp = validateStructuredReview(missingFailurePath, REVIEW_SCHEMA);
+  eq(resFp.ok, false);
+  assert.match(resFp.error, /finding missing required field: failurePath/i);
+
+  // Invalid line (string or negative)
+  const invalidLine = {
+    summary: 'Test',
+    findings: [{ severity: 'P1', title: 'T', body: 'B', path: 'src/app.js', line: '10', failurePath: 'fp' }],
+    coverage: { complete: true, reviewedPaths: [], unreviewedPaths: [], note: '' },
+  };
+  const resInvLine = validateStructuredReview(invalidLine, REVIEW_SCHEMA);
+  eq(resInvLine.ok, false);
+  assert.match(resInvLine.error, /finding line must be a positive integer or null/i);
+
+  // Missing coverage subfield note
+  const missingNote = {
+    summary: 'Test',
+    findings: [],
+    coverage: { complete: true, reviewedPaths: [], unreviewedPaths: [] },
+  };
+  const resNote = validateStructuredReview(missingNote, REVIEW_SCHEMA);
+  eq(resNote.ok, false);
+  assert.match(resNote.error, /coverage missing required field: note/i);
+
+  // Missing coverage subfield complete
+  const missingComplete = {
+    summary: 'Test',
+    findings: [],
+    coverage: { reviewedPaths: [], unreviewedPaths: [], note: '' },
+  };
+  const resComplete = validateStructuredReview(missingComplete, REVIEW_SCHEMA);
+  eq(resComplete.ok, false);
+  assert.match(resComplete.error, /coverage missing required field: complete/i);
+
+  // Valid review passes
+  const valid = {
+    summary: 'Test',
+    findings: [{ severity: 'P2', title: 'T', body: 'B', path: 'src/app.js', line: null, failurePath: 'fp' }],
+    coverage: { complete: true, reviewedPaths: ['src/app.js'], unreviewedPaths: [], note: 'all done' },
+  };
+  const resValid = validateStructuredReview(valid, REVIEW_SCHEMA);
+  eq(resValid.ok, true);
+});
+
+test('F2: Stage A shallow JSON missing required fields cannot bypass Stage B', async () => {
+  const f = createTestFixture();
+  try {
+    const gw = new ReadOnlyToolGateway({ safeRoot: f.safeRoot, cwd: f.tmpDir });
+    let turn = 0;
+    const mockFetch = async () => {
+      turn += 1;
+      if (turn === 1) {
+        // Stage A returns JSON missing line and failurePath
+        return Response.json({
+          candidates: [{
+            content: {
+              role: 'model',
+              parts: [{
+                text: JSON.stringify({
+                  summary: 'Shallow json attempt',
+                  findings: [{ severity: 'P1', title: 'T', body: 'B', path: 'x.js' }], // missing line & failurePath
+                  coverage: { complete: true, reviewedPaths: [], unreviewedPaths: [], note: '' },
+                }),
+              }],
+            },
+          }],
+          usageMetadata: { promptTokenCount: 50, candidatesTokenCount: 20, totalTokenCount: 70 },
+        });
+      }
+      if (turn === 2) {
+        // Stage B is called and produces fully valid review
+        return Response.json({
+          candidates: [{
+            content: {
+              role: 'model',
+              parts: [{
+                text: JSON.stringify({
+                  summary: 'Strict Stage B output',
+                  findings: [{ severity: 'P1', title: 'T', body: 'B', path: 'x.js', line: 5, failurePath: 'Valid failure path' }],
+                  coverage: { complete: true, reviewedPaths: [], unreviewedPaths: [], note: '' },
+                }),
+              }],
+            },
+          }],
+          usageMetadata: { promptTokenCount: 80, candidatesTokenCount: 30, totalTokenCount: 110 },
+        });
+      }
+      throw new Error(`Unexpected turn ${turn}`);
+    };
+
+    const adapter = getProviderAdapter(PROVIDER_KINDS.GEMINI);
+    const outcome = await adapter.execute({
+      prompt: 'Review code',
+      schema: REVIEW_SCHEMA,
+      maxTurns: 3,
+      env: { GEMINI_API_KEY: 'test-key' },
+      fetchImpl: mockFetch,
+      toolGateway: gw,
+    });
+
+    eq(outcome.ok, true);
+    eq(turn, 2, 'Stage B must be invoked because Stage A output lacked required fields');
+    eq(outcome.structured.summary, 'Strict Stage B output');
+    eq(outcome.structured.findings[0].line, 5);
+  } finally {
+    f.cleanup();
+  }
+});

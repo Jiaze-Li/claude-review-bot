@@ -15,6 +15,8 @@ export function validateStructuredReview(value, schema = null) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     return { ok: false, error: 'Structured output must be an object' };
   }
+
+  // 1. Root required fields from schema
   if (schema?.required && Array.isArray(schema.required)) {
     for (const req of schema.required) {
       if (value[req] === undefined) {
@@ -22,36 +24,80 @@ export function validateStructuredReview(value, schema = null) {
       }
     }
   }
-  if (value.summary !== undefined && (typeof value.summary !== 'string' || !value.summary.trim())) {
-    return { ok: false, error: 'summary must be a non-empty string' };
+
+  // 2. Summary validation
+  if (value.summary !== undefined) {
+    if (typeof value.summary !== 'string' || !value.summary.trim()) {
+      return { ok: false, error: 'summary must be a non-empty string' };
+    }
   }
+
+  // 3. Findings validation (strictly validate nested required fields, types, and enums)
   if (value.findings !== undefined) {
     if (!Array.isArray(value.findings)) return { ok: false, error: 'findings must be an array' };
+    const findingRequired = schema?.properties?.findings?.items?.required ?? ['severity', 'title', 'body', 'path', 'line', 'failurePath'];
     for (const f of value.findings) {
       if (!f || typeof f !== 'object' || Array.isArray(f)) return { ok: false, error: 'finding must be an object' };
-      if (!['P0', 'P1', 'P2', 'P3'].includes(f.severity)) return { ok: false, error: `Invalid finding severity: ${f.severity}` };
-      if (typeof f.title !== 'string' || !f.title.trim()) return { ok: false, error: 'finding title must be a non-empty string' };
-      if (typeof f.body !== 'string' || !f.body.trim()) return { ok: false, error: 'finding body must be a non-empty string' };
-      if (typeof f.path !== 'string' || !f.path.trim()) return { ok: false, error: 'finding path must be a non-empty string' };
-      if (f.line !== null && f.line !== undefined && (!Number.isInteger(f.line) || f.line < 1)) {
+
+      for (const req of findingRequired) {
+        if (f[req] === undefined) {
+          return { ok: false, error: `finding missing required field: ${req}` };
+        }
+      }
+
+      if (!['P0', 'P1', 'P2', 'P3'].includes(f.severity)) {
+        return { ok: false, error: `Invalid finding severity: ${f.severity}` };
+      }
+      if (typeof f.title !== 'string' || !f.title.trim()) {
+        return { ok: false, error: 'finding title must be a non-empty string' };
+      }
+      if (typeof f.body !== 'string' || !f.body.trim()) {
+        return { ok: false, error: 'finding body must be a non-empty string' };
+      }
+      if (typeof f.path !== 'string' || !f.path.trim()) {
+        return { ok: false, error: 'finding path must be a non-empty string' };
+      }
+      if (f.line !== null && (!Number.isInteger(f.line) || f.line < 1)) {
         return { ok: false, error: `finding line must be a positive integer or null: ${f.line}` };
       }
-      if (f.failurePath !== undefined && typeof f.failurePath !== 'string') {
+      if (typeof f.failurePath !== 'string') {
         return { ok: false, error: 'finding failurePath must be a string' };
       }
     }
   }
+
+  // 4. Coverage validation (strictly validate complete, reviewedPaths, unreviewedPaths, and note)
   if (value.coverage !== undefined) {
     if (!value.coverage || typeof value.coverage !== 'object' || Array.isArray(value.coverage)) {
       return { ok: false, error: 'coverage must be an object' };
     }
-    if (typeof value.coverage.complete !== 'boolean') return { ok: false, error: 'coverage.complete must be a boolean' };
-    if (!Array.isArray(value.coverage.reviewedPaths)) return { ok: false, error: 'coverage.reviewedPaths must be an array' };
-    if (!Array.isArray(value.coverage.unreviewedPaths)) return { ok: false, error: 'coverage.unreviewedPaths must be an array' };
-    if (value.coverage.note !== undefined && typeof value.coverage.note !== 'string') {
+    const covRequired = schema?.properties?.coverage?.required ?? ['complete', 'reviewedPaths', 'unreviewedPaths', 'note'];
+    for (const req of covRequired) {
+      if (value.coverage[req] === undefined) {
+        return { ok: false, error: `coverage missing required field: ${req}` };
+      }
+    }
+    if (typeof value.coverage.complete !== 'boolean') {
+      return { ok: false, error: 'coverage.complete must be a boolean' };
+    }
+    if (!Array.isArray(value.coverage.reviewedPaths)) {
+      return { ok: false, error: 'coverage.reviewedPaths must be an array' };
+    }
+    for (const p of value.coverage.reviewedPaths) {
+      if (typeof p !== 'string') return { ok: false, error: 'coverage.reviewedPaths items must be strings' };
+    }
+    if (!Array.isArray(value.coverage.unreviewedPaths)) {
+      return { ok: false, error: 'coverage.unreviewedPaths must be an array' };
+    }
+    for (const p of value.coverage.unreviewedPaths) {
+      if (typeof p !== 'string') return { ok: false, error: 'coverage.unreviewedPaths items must be strings' };
+    }
+    if (typeof value.coverage.note !== 'string') {
       return { ok: false, error: 'coverage.note must be a string' };
     }
   }
+
+  // 5. Verification results validation
   if (value.verifications !== undefined) {
     if (!Array.isArray(value.verifications)) return { ok: false, error: 'verifications must be an array' };
     for (const v of value.verifications) {
@@ -751,6 +797,23 @@ export class GeminiProviderAdapter extends ProviderAdapter {
           };
         }
       } catch {}
+    }
+
+    // Stage B requires an additional API turn. Total turns (Stage A + Stage B) must NOT exceed maxTurns.
+    if (turnCount >= maxTurns) {
+      const errorMsg = `Gemini review exceeded total turn limit of ${maxTurns} turns before structured review could be generated`;
+      return {
+        ok: false,
+        kind: OUTCOME_KINDS.FAILED,
+        errorKind: ERROR_KINDS.EXECUTION,
+        provider: this.provider,
+        status: null,
+        error: errorMsg,
+        subtype: 'error_max_turns',
+        errors: errorMsg,
+        structured: null,
+        meta: makeMeta(),
+      };
     }
 
     turnCount += 1;
