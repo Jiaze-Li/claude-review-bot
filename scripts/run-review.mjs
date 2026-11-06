@@ -133,13 +133,7 @@ Severity: P0 catastrophic/release-blocking; P1 high-impact bug/security; P2 norm
 }
 
 async function runClaudeShard({ prompt, maxTurns, maxBudgetUsd, timeoutMs }) {
-  const toolGateway = new ReadOnlyToolGateway({
-    safeRoot,
-    contextRoot,
-    cwd,
-    ignorePatterns,
-    maxCalls: maxTurns * 4,
-  });
+  const toolGateway = new ReadOnlyToolGateway({ safeRoot, contextRoot, cwd, ignorePatterns, maxCalls: maxTurns * 4 });
   const adapter = getProviderAdapter(PROVIDER_KINDS.CLAUDE, {
     defaultModel: REVIEW_MODEL,
     defaultEffort: REVIEW_EFFORT,
