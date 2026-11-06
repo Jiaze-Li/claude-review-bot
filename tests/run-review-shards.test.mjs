@@ -64,9 +64,8 @@ function setup(fileSizes, session = null, ignore = null) {
   fs.mkdirSync(sdk, { recursive: true });
   fs.writeFileSync(path.join(sdk, 'package.json'), JSON.stringify({ name: '@anthropic-ai/claude-agent-sdk', type: 'module', main: 'index.js', exports: './index.js' }));
   fs.writeFileSync(path.join(sdk, 'index.js'), FAKE_SDK);
-  try {
-    fs.symlinkSync(path.resolve('node_modules/zod'), path.join(root, 'node_modules/zod'), 'junction');
-  } catch {}
+  const zodDir = fs.realpathSync.native(new URL('../node_modules/zod', import.meta.url));
+  fs.symlinkSync(zodDir, path.join(root, 'node_modules/zod'), 'junction');
   fs.mkdirSync(path.join(root, 'safe-target'));
   fs.mkdirSync(path.join(root, '.review-context'));
   if (session) fs.writeFileSync(path.join(root, '.review-context/session-plan.json'), JSON.stringify({ session }));

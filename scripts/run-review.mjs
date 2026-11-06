@@ -132,8 +132,12 @@ Always report honest coverage: list in coverage.reviewedPaths every assigned fil
 Severity: P0 catastrophic/release-blocking; P1 high-impact bug/security; P2 normal actionable bug/regression; P3 low-impact but concrete defect.`;
 }
 
-async function runClaudeShard({ prompt, maxTurns, maxBudgetUsd, timeoutMs }) {
-  const toolGateway = new ReadOnlyToolGateway({ safeRoot, contextRoot, cwd, ignorePatterns, maxCalls: maxTurns * 4 });
+async function runClaudeShard({ prompt, maxTurns, maxBudgetUsd, timeoutMs, diffPath }) {
+  const shardContextPath = path.relative(contextRoot, path.resolve(cwd, diffPath)).replace(/\\/g, '/');
+  const toolGateway = new ReadOnlyToolGateway({
+    safeRoot, contextRoot, cwd, ignorePatterns, maxCalls: maxTurns * 4,
+    allowedContextFiles: [shardContextPath, 'changed-files.txt', 'diff-stat.txt', 'pr.json', 'skipped-files.txt'],
+  });
   const adapter = getProviderAdapter(PROVIDER_KINDS.CLAUDE, {
     defaultModel: REVIEW_MODEL,
     defaultEffort: REVIEW_EFFORT,
@@ -215,7 +219,7 @@ async function tryGemini(index, prompt) {
   return { ok: false, error: outcome.error, provider: 'gemini' };
 }
 
-async function tryClaude(index, makePrompt) {
+async function tryClaude(index, makePrompt, diffPath) {
   // Wait for budget a running Claude shard may still release; give up when none can.
   let cap = 0;
   for (;;) {
@@ -230,7 +234,7 @@ async function tryClaude(index, makePrompt) {
   inflightUsd += cap;
   let charged = cap;
   try {
-    const run = await runClaudeShard({ prompt: makePrompt(cap), maxTurns: SHARD_MAX_TURNS, maxBudgetUsd: cap, timeoutMs: timeLeftMs() - 30_000 });
+    const run = await runClaudeShard({ prompt: makePrompt(cap), maxTurns: SHARD_MAX_TURNS, maxBudgetUsd: cap, timeoutMs: timeLeftMs() - 30_000, diffPath });
     charged = run.meta?.total_cost_usd ?? cap; // unknown spend is charged at the allotted cap
     if (run.meta) metas.push(run.meta);
     return run.subtype === 'success' && run.structured
@@ -263,7 +267,7 @@ async function reviewUnit(index, unit, providers, suffix = '', retries = 2) {
       }
       result = await tryGemini(index, buildPrompt({ ...common, inlineDiff: unit.diff }));
     } else {
-      result = await tryClaude(index, (budgetUsd) => buildPrompt({ ...common, maxTurns: SHARD_MAX_TURNS, budgetUsd }));
+      result = await tryClaude(index, (budgetUsd) => buildPrompt({ ...common, maxTurns: SHARD_MAX_TURNS, budgetUsd }), diffPath);
     }
     if (!result.ok) {
       notes.push(`${provider}: ${result.error}`);

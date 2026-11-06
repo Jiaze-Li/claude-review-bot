@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { Worker } from 'node:worker_threads';
 import { tool, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 import { matchesIgnore } from './review-shards.mjs';
@@ -69,10 +70,41 @@ function safeWalk({ searchRoot, safeRoot, ignorePatterns, timeoutMs, onFile }) {
       }
     }
   };
+  // A file is an allowed search root for targeted Grep/Glob.
+  const rootStat = fs.statSync(searchRoot);
+  if (rootStat.isFile()) {
+    const real = fs.realpathSync.native(searchRoot);
+    if (safeRoot && !isInside(safeRoot, real)) return;
+    const relToRepo = path.relative(safeRoot || path.dirname(searchRoot), searchRoot).replace(/\\/g, '/');
+    const relReal = path.relative(safeRoot || path.dirname(searchRoot), real).replace(/\\/g, '/');
+    if (isControlPath(relToRepo) || isControlPath(relReal) || matchesIgnore(relToRepo, ignorePatterns) || matchesIgnore(relReal, ignorePatterns)) return;
+    onFile({ fullPath: searchRoot, realPath: real, relToRepo, stat: rootStat, entryName: path.basename(searchRoot) });
+    return;
+  }
+  if (!rootStat.isDirectory()) throw new Error('Search root must be a regular file or directory.');
   walk(searchRoot);
 }
 
-const truncMsg = (n) => `\n[... output truncated by host gateway: exceeded limit of ${n} bytes ...]`;
+const truncMsg = (n) => `\n[TRUNCATED: host limit ${n} bytes]`;
+
+// Avoid creating invalid UTF-8 when clipping a returned tool result.
+function clipUtf8(value, maxBytes) {
+  if (maxBytes <= 0) return '';
+  const bytes = Buffer.from(value, 'utf8');
+  if (bytes.length <= maxBytes) return value;
+  let end = maxBytes;
+  while (end > 0 && (bytes[end] & 0xC0) === 0x80) end -= 1;
+  return bytes.subarray(0, end).toString('utf8');
+}
+
+function cappedText(text, maxBytes, truncated = false) {
+  const size = Buffer.byteLength(text, 'utf8');
+  if (!truncated && size <= maxBytes) return { content: text, truncated: false };
+  const marker = '\n[TRUNCATED]';
+  const markerBytes = Buffer.byteLength(marker, 'utf8');
+  if (maxBytes <= markerBytes) return { content: clipUtf8(marker, maxBytes), truncated: true };
+  return { content: clipUtf8(text, maxBytes - markerBytes) + marker, truncated: true };
+}
 
 export class ReadOnlyToolGateway {
   constructor(options = {}) {
@@ -93,9 +125,10 @@ export class ReadOnlyToolGateway {
     this.logImpl = typeof options.logImpl === 'function' ? options.logImpl : null;
     this.readRoots = [this.safeRoot, this.contextRoot].filter(Boolean);
     this.searchRoots = [this.safeRoot].filter(Boolean);
-    this.allowedContextFiles = Array.isArray(options.allowedContextFiles)
-      ? new Set(options.allowedContextFiles.map((f) => f.replace(/\\/g, '/')))
-      : (options.allowedContextFiles instanceof Set ? options.allowedContextFiles : null);
+    // No implicit read permission for review-context: grant exact paths only.
+    const contextFiles = options.allowedContextFiles instanceof Set
+      ? [...options.allowedContextFiles] : (Array.isArray(options.allowedContextFiles) ? options.allowedContextFiles : []);
+    this.allowedContextFiles = new Set(contextFiles.map((f) => String(f).replace(/\\/g, '/')));
     this.callCount = 0;
     this.totalReadBytes = 0;
     this.quotaExhausted = false;
@@ -167,9 +200,9 @@ export class ReadOnlyToolGateway {
       const resolved = resolveAllowedPath(rawPath, this.readRoots, { mustExist: true, cwd: this.cwd });
       if (!resolved.ok) return this.denyAndRecord(toolName, input, resolved.error);
 
-      if (this.contextRoot && resolved.matchedRoot === this.contextRoot && this.allowedContextFiles) {
+      if (this.contextRoot && resolved.matchedRoot === this.contextRoot) {
         const relContext = path.relative(this.contextRoot, resolved.realPath).replace(/\\/g, '/');
-        const isAllowed = this.allowedContextFiles.has(relContext) || this.allowedContextFiles.has(path.basename(relContext));
+        const isAllowed = this.allowedContextFiles.has(relContext);
         if (!isAllowed) {
           return this.denyAndRecord(toolName, input, `Read is denied for unauthorized context file: ${rawPath}`);
         }
@@ -271,15 +304,69 @@ export class ReadOnlyToolGateway {
     try {
       const raw = fs.readFileSync(filePath, 'utf8').replace(/\r?\n$/, '');
       const all = raw.length ? raw.split(/\r?\n/) : [];
-      const sel = all.slice(Math.max(0, offset - 1), Math.max(0, offset - 1) + limit);
-      let text = sel.join('\n'), truncated = false, byteLen = Buffer.byteLength(text, 'utf8');
-      if (byteLen > prep.maxBytes) {
-        truncated = true;
-        text = `${Buffer.from(text, 'utf8').subarray(0, prep.maxBytes).toString('utf8')}${truncMsg(prep.maxBytes)}`;
-        byteLen = Buffer.byteLength(text, 'utf8');
+      const startColumn = positiveInt(rawInput?.start_column, 1);
+      const startIndex = Math.max(0, offset - 1);
+      const stop = Math.min(all.length, startIndex + limit);
+      const budget = prep.maxBytes;
+      const header = `[Read total_lines=${all.length}]\n`;
+      let entries = [], nextOffset = offset, nextColumn = startColumn, truncated = false;
+
+      if (budget < Buffer.byteLength(header + '[next offset=1]', 'utf8')) {
+        return this.denyAndRecord(TOOL_NAMES.READ, rawInput, 'Read output budget too small for continuation metadata.');
       }
-      this.recordSuccess(TOOL_NAMES.READ, rawInput, byteLen, truncated, { incrementCalls: false });
-      return { ok: true, content: text, lines: sel.length, totalLines: all.length, offset, limit, truncated, bytesRead: byteLen };
+      for (let i = startIndex; i < stop; i++) {
+        const prefix = `${i + 1}: `;
+        const line = i === startIndex ? all[i].slice(startColumn - 1) : all[i];
+        const entry = prefix + line;
+        const candidate = [...entries, entry];
+        const after = i + 1 < all.length
+          ? `\n[next offset=${i + 2}; truncated]`
+          : '\n[EOF]';
+        if (Buffer.byteLength(header + candidate.join('\n') + after, 'utf8') <= budget) {
+          entries = candidate;
+          nextOffset = i + 2;
+          nextColumn = 1;
+          continue;
+        }
+
+        truncated = true;
+        if (entries.length === 0) {
+          // Preserve a resumable column cursor for a single overlong line.
+          let low = 0, high = line.length, best = 0;
+          while (low <= high) {
+            const mid = Math.floor((low + high) / 2);
+            const segment = line.slice(0, mid);
+            const footer = `\n[TRUNCATED next offset=${i + 1} start_column=${startColumn + mid}]`;
+            if (Buffer.byteLength(header + prefix + segment + footer, 'utf8') <= budget) {
+              best = mid; low = mid + 1;
+            } else high = mid - 1;
+          }
+          if (best <= 0) return this.denyAndRecord(TOOL_NAMES.READ, rawInput, 'Read output budget too small for this line and continuation cursor.');
+          entries = [prefix + line.slice(0, best)];
+          nextOffset = i + 1;
+          nextColumn = startColumn + best;
+        }
+        break;
+      }
+
+      const hasMore = nextColumn > 1 || nextOffset <= all.length;
+      let footer = hasMore
+        ? `\n[${truncated ? 'TRUNCATED ' : ''}next offset=${nextOffset}${nextColumn > 1 ? ` start_column=${nextColumn}` : ''}]`
+        : '\n[EOF]';
+      let text = header + entries.join('\n') + footer;
+      if (Buffer.byteLength(text, 'utf8') > budget) {
+        // Always preserve a bounded continuation cursor; never silently omit lines.
+        footer = `\n[next offset=${nextOffset}${nextColumn > 1 ? ` start_column=${nextColumn}` : ''}]`;
+        const room = budget - Buffer.byteLength(header + footer, 'utf8');
+        if (room < 0) return this.denyAndRecord(TOOL_NAMES.READ, rawInput, 'Read byte budget too small for continuation cursor.');
+        text = header + clipUtf8(entries.join('\n'), room) + footer;
+        truncated = true;
+      }
+      const bytesRead = Buffer.byteLength(text, 'utf8');
+      this.recordSuccess(TOOL_NAMES.READ, rawInput, bytesRead, truncated || hasMore, { incrementCalls: false });
+      return { ok: true, content: text, lines: entries.length, totalLines: all.length,
+        offset, limit, nextOffset: hasMore ? nextOffset : null, nextColumn: hasMore ? nextColumn : null,
+        truncated: truncated || hasMore, bytesRead };
     } catch (err) {
       this.recordRejection(TOOL_NAMES.READ, rawInput, err?.message ?? String(err));
       return { ok: false, error: `Failed to read file ${filePath}: ${err?.message ?? err}`, kind: 'io_error' };
@@ -309,8 +396,11 @@ export class ReadOnlyToolGateway {
         while (matches.length > 0 && Buffer.byteLength(JSON.stringify(matches), 'utf8') > prep.maxBytes) matches.pop();
         byteLen = Buffer.byteLength(JSON.stringify(matches), 'utf8');
       }
-      this.recordSuccess(TOOL_NAMES.GLOB, rawInput, byteLen, truncated, { incrementCalls: false });
-      return { ok: true, matches, count: matches.length, truncated, bytes: byteLen };
+      const text = matches.length ? matches.join('\n') : 'No files matched the pattern.';
+      const formatted = cappedText(text, prep.maxBytes, truncated);
+      byteLen = Buffer.byteLength(formatted.content, 'utf8');
+      this.recordSuccess(TOOL_NAMES.GLOB, rawInput, byteLen, formatted.truncated, { incrementCalls: false });
+      return { ok: true, matches, content: formatted.content, count: matches.length, truncated: formatted.truncated, bytes: byteLen };
     } catch (err) {
       this.recordRejection(TOOL_NAMES.GLOB, rawInput, err?.message ?? String(err));
       return { ok: false, error: `Glob execution failed: ${err?.message ?? err}`, kind: String(err?.message ?? '').includes('timed out') ? 'timeout' : 'io_error' };
@@ -351,8 +441,14 @@ export class ReadOnlyToolGateway {
           return false;
         },
       });
-      this.recordSuccess(TOOL_NAMES.GREP, rawInput, totalBytes, truncated, { incrementCalls: false });
-      return { ok: true, matches, count: matches.length, truncated, bytes: totalBytes };
+      const filesOnly = rawInput?.output_mode === 'files_with_matches' || rawInput?.mode === 'files_with_matches';
+      const text = filesOnly
+        ? [...new Set(matches.map((m) => m.path))].join('\n') || 'No files matched.'
+        : matches.map((m) => `${m.path}:${m.line}: ${m.text}`).join('\n') || 'No matches found.';
+      const formatted = cappedText(text, prep.maxBytes, truncated);
+      const bytes = Buffer.byteLength(formatted.content, 'utf8');
+      this.recordSuccess(TOOL_NAMES.GREP, rawInput, bytes, formatted.truncated, { incrementCalls: false });
+      return { ok: true, matches, content: formatted.content, count: matches.length, truncated: formatted.truncated, bytes };
     } catch (err) {
       this.recordRejection(TOOL_NAMES.GREP, rawInput, err?.message ?? String(err));
       return { ok: false, error: `Grep execution failed: ${err?.message ?? err}`, kind: String(err?.message ?? '').includes('timed out') ? 'timeout' : 'io_error' };
@@ -511,6 +607,7 @@ export function createGatewayMcpServer(gateway, serverName = 'gateway') {
       file_path: z.string().describe('Path to the file to read (must be within repository or authorized review context)'),
       offset: z.number().int().optional().describe('1-based line number to start reading from'),
       limit: z.number().int().optional().describe('Number of lines to read'),
+      start_column: z.number().int().positive().optional().describe('1-based character position when continuing a long line'),
     },
     async (args) => {
       const res = await gateway.executeRead(args);
@@ -541,16 +638,7 @@ export function createGatewayMcpServer(gateway, serverName = 'gateway') {
           content: [{ type: 'text', text: res.error || res.reason || 'Glob failed' }],
         };
       }
-      const text = res.matches.length > 0 ? res.matches.join('\n') : 'No files matched the pattern.';
-      const limit = Math.min(gateway.maxCallReadBytes, Math.max(0, gateway.maxTotalReadBytes - gateway.totalReadBytes + res.bytes));
-      let outText = res.truncated ? `${text}${truncMsg(limit)}` : text;
-      const bLen = Buffer.byteLength(outText, 'utf8');
-      if (bLen > limit) {
-        outText = `${Buffer.from(outText, 'utf8').subarray(0, Math.max(0, limit - 100)).toString('utf8')}${truncMsg(limit)}`;
-      }
-      return {
-        content: [{ type: 'text', text: outText }],
-      };
+      return { content: [{ type: 'text', text: res.content }] };
     }
   );
 
@@ -572,25 +660,7 @@ export function createGatewayMcpServer(gateway, serverName = 'gateway') {
           content: [{ type: 'text', text: res.error || res.reason || 'Grep failed' }],
         };
       }
-      let text;
-      const isFilesOnly = args?.output_mode === 'files_with_matches' || args?.mode === 'files_with_matches';
-      if (isFilesOnly) {
-        const files = [...new Set(res.matches.map((m) => m.path))];
-        text = files.length > 0 ? files.join('\n') : 'No files matched.';
-      } else {
-        text = res.matches.length > 0
-          ? res.matches.map((m) => `${m.path}:${m.line}: ${m.text}`).join('\n')
-          : 'No matches found.';
-      }
-      const limit = Math.min(gateway.maxCallReadBytes, Math.max(0, gateway.maxTotalReadBytes - gateway.totalReadBytes + res.bytes));
-      let outText = res.truncated ? `${text}${truncMsg(limit)}` : text;
-      const bLen = Buffer.byteLength(outText, 'utf8');
-      if (bLen > limit) {
-        outText = `${Buffer.from(outText, 'utf8').subarray(0, Math.max(0, limit - 100)).toString('utf8')}${truncMsg(limit)}`;
-      }
-      return {
-        content: [{ type: 'text', text: outText }],
-      };
+      return { content: [{ type: 'text', text: res.content }] };
     }
   );
 

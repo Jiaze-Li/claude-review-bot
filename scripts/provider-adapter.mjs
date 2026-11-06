@@ -448,8 +448,15 @@ export class ClaudeProviderAdapter extends ProviderAdapter {
       };
     }
 
-    const toolAuthorizer = canUseTool ?? (toolGateway ? toolGateway.createCanUseTool() : async () => ({ behavior: 'deny', message: 'No tools available in this review.' }));
-    const resolvedHooks = hooks ?? (toolGateway ? { PostToolUse: [toolGateway.createPostToolHook()] } : undefined);
+    // MCP handlers enforce path and quota policy. The permission callback only
+    // allows the registered MCP tools; do not double-authorize or double-charge them.
+    const toolAuthorizer = toolGateway
+      ? async (name) => resolvedAllowedTools.includes(name)
+        ? { behavior: 'allow' }
+        : { behavior: 'deny', message: 'Only Host Gateway MCP tools are available.' }
+      : (canUseTool ?? (async () => ({ behavior: 'deny', message: 'No tools available in this review.' })));
+    // MCP handlers return their own already-bounded output. No PostToolUse rewrite.
+    const resolvedHooks = toolGateway ? undefined : (hooks ?? undefined);
 
     let resolvedModel = null;
     let resultMessage = null;

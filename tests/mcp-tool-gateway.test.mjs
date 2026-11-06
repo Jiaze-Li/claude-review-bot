@@ -37,13 +37,20 @@ function createFixture() {
   };
 }
 
+const openServers = new Set();
 const withFixture = async (fn) => {
   const f = createFixture();
-  try { return await fn(f); } finally { f.cleanup(); }
+  try { return await fn(f); } finally {
+    for (const server of openServers) {
+      try { await server.instance?.close?.(); } finally { openServers.delete(server); }
+    }
+    f.cleanup();
+  }
 };
 
 function getHandlers(gateway, serverName = 'gateway') {
   const { tools, toolNames, server } = createGatewayMcpServer(gateway, serverName);
+  openServers.add(server);
   const map = Object.fromEntries(tools.map((t) => [t.name, t.handler]));
   return { handlers: map, toolNames, server, tools };
 }
@@ -94,12 +101,12 @@ test('AC2 & AC7: Host actually executes MCP Grep tool in content and files_with_
 }));
 
 test('AC4: Read can access authorized contextRoot files', () => withFixture(async (f) => {
-  // Case A: default contextRoot access (when allowedContextFiles not restricted)
+  // Case A: default access is denied; allowlist is mandatory.
   const gwDefault = new ReadOnlyToolGateway({ safeRoot: f.safeRoot, contextRoot: f.contextRoot, cwd: f.tmpDir });
   const { handlers: hDef } = getHandlers(gwDefault);
   const resDef = await hDef.Read({ file_path: pj(f.contextRoot, 'pr.diff') });
-  eq(resDef.isError, undefined);
-  assert.match(resDef.content[0].text, /diff content for review/);
+  eq(resDef.isError, true);
+  assert.match(resDef.content[0].text, /unauthorized context file/i);
 
   // Case B: explicit allowedContextFiles restriction
   const gwRestricted = new ReadOnlyToolGateway({
@@ -282,6 +289,7 @@ test('AC1 & AC8: Claude provider adapter mounts MCP Gateway with tools: [], stri
     toolGateway: gw,
     queryImpl: async function* ({ options }) {
       capturedOptions = options;
+      openServers.add(options.mcpServers.gateway);
       yield {
         type: 'result',
         subtype: 'success',
