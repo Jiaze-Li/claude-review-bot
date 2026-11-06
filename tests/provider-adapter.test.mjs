@@ -543,3 +543,35 @@ test('Gemini adapter preserves successful execution with the minimum positive in
   assert.equal(outcome.kind, OUTCOME_KINDS.OK);
   assert.equal(requests, 1);
 });
+
+test('Claude adapter allows only Host Gateway MCP tools, never built-in tool aliases', async () => {
+  const [{ ReadOnlyToolGateway }, fs, os, path] = await Promise.all([
+    import('../scripts/tool-gateway.mjs'), import('node:fs'), import('node:os'), import('node:path'),
+  ]);
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ad-gw-')), safe = path.join(tmp, 's'), outside = path.join(tmp, 'o');
+  fs.mkdirSync(safe); fs.mkdirSync(outside);
+  fs.writeFileSync(path.join(safe, 'v.txt'), 'v'); fs.writeFileSync(path.join(outside, 'k'), 'k');
+  const gw = new ReadOnlyToolGateway({ safeRoot: safe, cwd: tmp, maxCallReadBytes: 50 });
+  let opts = null;
+  try {
+    const outcome = await getProviderAdapter(PROVIDER_KINDS.CLAUDE).execute({
+      prompt: 'p', schema: basicSchema, env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
+      queryImpl: async function* ({ options }) {
+        opts = options;
+        yield { type: 'result', subtype: 'success', total_cost_usd: 0.1, structured_output: { summary: 'ok' } };
+      },
+      toolGateway: gw, tools: ['Read', 'Glob', 'Grep'],
+    });
+    assert.equal(outcome.ok, true);
+    assert.deepEqual(opts.tools, []);
+    assert.deepEqual(opts.allowedTools, ['mcp__gateway__Read', 'mcp__gateway__Glob', 'mcp__gateway__Grep']);
+    assert.equal((await opts.canUseTool('mcp__gateway__Read', { file_path: path.join(safe, 'v.txt') })).behavior, 'allow');
+    assert.equal((await opts.canUseTool('Read', { file_path: path.join(safe, 'v.txt') })).behavior, 'deny');
+    assert.equal((await opts.canUseTool('Bash', { command: 'cat /etc/passwd' })).behavior, 'deny');
+    assert.equal(opts.hooks, undefined, 'Host MCP tools must not rely on output rewrites');
+  } finally {
+    await opts?.mcpServers?.gateway?.instance?.close?.();
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+

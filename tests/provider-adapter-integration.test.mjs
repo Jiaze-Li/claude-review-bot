@@ -6,7 +6,7 @@ import path from 'node:path';
 import { runGeminiReview, buildGeminiRequest } from '../scripts/run-gemini-review.mjs';
 import { runGeminiShard } from '../scripts/gemini-shard.mjs';
 import { runClaudeStructured } from '../scripts/claude-fallback.mjs';
-import { getProviderAdapter, PROVIDER_KINDS, OUTCOME_KINDS } from '../scripts/provider-adapter.mjs';
+import { getProviderAdapter, PROVIDER_KINDS, OUTCOME_KINDS, COST_SOURCES } from '../scripts/provider-adapter.mjs';
 
 const HEAD_A = 'a'.repeat(40);
 const BASE_B = 'b'.repeat(40);
@@ -293,4 +293,34 @@ test('Full shard wrapper preserves failed outcome for an exhausted deadline with
   assert.equal(outcome.kind, 'failed');
   assert.match(outcome.error, /invalid or exhausted timeout budget/);
   assert.equal(requests, 0);
+});
+
+test('Integration E3: Full review with Tool Gateway preserves shard execution, coverage, and budget accounting', async () => {
+  const { ReadOnlyToolGateway } = await import('../scripts/tool-gateway.mjs');
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'fr-gw-')), safe = path.join(tmp, 's'), ctx = path.join(tmp, 'c');
+  fs.mkdirSync(safe); fs.mkdirSync(ctx);
+  fs.writeFileSync(path.join(safe, 'fileA.js'), 'export const a = 1;\n');
+  const gw = new ReadOnlyToolGateway({ safeRoot: safe, contextRoot: ctx, cwd: tmp, maxCalls: 50 });
+  const outcome = await getProviderAdapter(PROVIDER_KINDS.CLAUDE).execute({
+    prompt: 'p',
+    schema: { type: 'object', properties: { summary: { type: 'string' }, coverage: { type: 'object' } }, required: ['summary', 'coverage'] },
+    env: { CLAUDE_CODE_OAUTH_TOKEN: 'token' },
+    queryImpl: async function* ({ options }) {
+      assert.deepEqual(options.tools, []);
+      assert.ok(options.mcpServers && options.mcpServers.gateway);
+      assert.deepEqual(options.allowedTools, ['mcp__gateway__Read', 'mcp__gateway__Glob', 'mcp__gateway__Grep']);
+      assert.equal(options.permissionMode, 'dontAsk');
+      assert.equal(options.strictMcpConfig, true);
+      assert.deepEqual(options.settingSources, []);
+      assert.equal((await options.canUseTool('mcp__gateway__Read', { file_path: path.join(safe, 'fileA.js') })).behavior, 'allow');
+      assert.equal((await options.canUseTool('Read', { file_path: path.join(safe, 'fileA.js') })).behavior, 'deny');
+      await options.mcpServers.gateway.instance?.close?.();
+      yield { type: 'result', subtype: 'success', num_turns: 4, total_cost_usd: 0.35, usage: { input_tokens: 1500, output_tokens: 250 }, structured_output: { summary: 'ok', coverage: { complete: true } } };
+    },
+    toolGateway: gw,
+    tools: [],
+  });
+  assert.equal(outcome.ok && outcome.structured.coverage.complete, true);
+  assert.equal(outcome.meta.total_cost_usd, 0.35);
+  fs.rmSync(tmp, { recursive: true, force: true });
 });

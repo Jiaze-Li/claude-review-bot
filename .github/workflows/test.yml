@@ -19,8 +19,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      # Tests use only Node built-ins and mocked GitHub calls. No Claude quota,
-      # installation tokens, npm dependency installation or Cloudflare access.
+      # MCP Handler tests import the real SDK and zod. Install pinned
+      # dependencies; no Claude credentials or paid model calls are used.
+      - run: npm ci --legacy-peer-deps --ignore-scripts --no-audit --no-fund
       - run: npm test
       - name: Syntax-check review service scripts
         run: |
@@ -32,6 +33,9 @@ jobs:
           node --check scripts/recover-review-session.mjs
           node --check scripts/detect-review-risk.mjs
           node --check scripts/run-gemini-review.mjs
+          node --check scripts/run-review.mjs
+          node --check scripts/provider-adapter.mjs
+          node --check scripts/tool-gateway.mjs
           node --check scripts/validate-gemini-findings.mjs
           node --check scripts/publish-gemini-review.mjs
           node --check scripts/publish-review.mjs
