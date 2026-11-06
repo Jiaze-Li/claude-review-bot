@@ -5,6 +5,7 @@ import { CLAUDE_AUTO_MIN_BUDGET_USD, DEEP_REVIEW_MANUAL_RUN_BUDGET_USD, GEMINI_M
 import {isGeminiUnavailableStatus,runClaudeStructured} from './claude-fallback.mjs';
 import {geminiBaseUrl} from './gemini-config.mjs';
 import {MAX_SHARDS,dropIgnoredFiles,planShards,splitDiffByFile} from './review-shards.mjs';
+import {getProviderAdapter, PROVIDER_KINDS, OUTCOME_KINDS} from './provider-adapter.mjs';
 
 // Moving alias: always resolves to Google's current Flash model. Override with GEMINI_MODEL to pin.
 export const GEMINI_MODEL='gemini-flash-latest';
@@ -212,91 +213,52 @@ async function reviewPart(ctx,diff,shared){
   const thinking = mode==='incremental' ? INCREMENTAL_THINKING : GEMINI_THINKING;
   const maxOutputTokens = 16384;
   const timeoutMs=resolveGeminiTimeoutMs({env});
-  const requestBody=JSON.stringify({
-    contents:[{role:'user',parts:[{text:built.prompt}]}],
-    generationConfig:{
-      thinkingConfig:{thinkingLevel:thinking},
-      responseFormat:{
-        text:{
-          mimeType:'APPLICATION_JSON',
-          schema:toGeminiJsonSchema(built.schema),
-        },
-      },
-      maxOutputTokens,
-    },
-  });
-  const requestBytes=Buffer.byteLength(requestBody,'utf8');
-  const usageTotals={
-    promptTokenCount:0,
-    candidatesTokenCount:0,
-    thoughtsTokenCount:0,
-    totalTokenCount:0,
+  let usageTotals={
+    input_tokens:0,
+    output_tokens:0,
+    thoughts_tokens:0,
+    total_tokens:0,
   };
   let result=null;
   let attempts=0;
   let servedModel=null;
-  let lastStructuredError=null;
   // Why Gemini could not do this request, when it could not: { status, message }.
   let failed=claudeOnly
     ? {status:0,message:'Claude was requested',requested:true}
     : shared.geminiOff?{status:shared.geminiOff.status,message:shared.geminiOff.message,carried:true}:null;
 
-  for(let attempt=1;!failed&&attempt<=2;attempt+=1){
-    attempts=attempt;
-    const startedAt=Date.now();
-    const signal=AbortSignal.timeout(timeoutMs);
-    logImpl(`Gemini request started: mode=${mode} attempt=${attempt} model=${model} thinking=${thinking} timeout_ms=${timeoutMs} context_bytes=${contextBytes} request_bytes=${requestBytes}`);
-    let payload;
-    try{
-      const response=await fetchImpl(`${geminiBaseUrl(env)}/v1beta/models/${encodeURIComponent(model)}:generateContent`,{
-        method:'POST',
-        headers:{'Content-Type':'application/json','x-goog-api-key':apiKey},
-        body:requestBody,
-        signal,
-      });
-      if(!response.ok){
-        const body=await response.text();
-        const message=`Gemini API failed (HTTP ${response.status}): ${body.slice(0,500)}`;
-        // Out of credits, rate limited, down, or a wrong key/model: Gemini will not work for the rest
-        // of this review either, so every later part goes straight to Claude.
-        if(isGeminiUnavailableStatus(response.status)||[400,401,403,404].includes(response.status)){
-          shared.geminiOff={status:response.status,message};
-        }
-        failed={status:response.status,message};
-        break;
+  if(!failed){
+    const adapter = getProviderAdapter(PROVIDER_KINDS.GEMINI, {
+      defaultModel: model,
+      defaultEffort: thinking,
+    });
+    const outcome = await adapter.execute({
+      prompt: built.prompt,
+      schema: built.schema,
+      model,
+      effort: thinking,
+      timeoutMs,
+      maxOutputTokens,
+      env,
+      fetchImpl,
+      maxAttempts: 2,
+      logImpl,
+      metadata: { mode, contextBytes },
+    });
+    if(outcome.ok){
+      result = outcome.structured;
+      servedModel = outcome.meta.resolved_model;
+      attempts = outcome.meta.num_turns;
+      usageTotals = outcome.meta.usage;
+    }else{
+      const isOff = outcome.kind === OUTCOME_KINDS.UNAVAILABLE || outcome.kind === OUTCOME_KINDS.CONFIG;
+      if(isOff){
+        shared.geminiOff = { status: outcome.status, message: outcome.error };
       }
-      payload=await response.json();
-    }catch(error){
-      const timedOut=error?.name==='TimeoutError' || (signal.aborted && signal.reason?.name==='TimeoutError');
-      const message=timedOut
-        ? `Gemini ${mode} request timed out after ${Date.now()-startedAt}ms (timeout_ms=${timeoutMs}, context_bytes=${contextBytes}, request_bytes=${requestBytes}, attempt=${attempt})`
-        : `Gemini request failed: ${error?.message??error}`;
-      failed={status:0,message};
-      break;
-    }
-    logImpl(`Gemini request completed: mode=${mode} attempt=${attempt} elapsed_ms=${Date.now()-startedAt}`);
-    if(typeof payload.modelVersion==='string'&&payload.modelVersion) servedModel=payload.modelVersion;
-    for(const key of Object.keys(usageTotals)){
-      const value=payload.usageMetadata?.[key];
-      if(typeof value==='number'&&Number.isFinite(value)&&value>=0) usageTotals[key]+=value;
-    }
-    const text=(payload.candidates?.[0]?.content?.parts??[]).map(p=>typeof p.text==='string'?p.text:'').join('');
-    try{
-      if(!text) throw new Error('returned no structured text');
-      result=JSON.parse(text);
-      break;
-    }catch(error){
-      lastStructuredError=error;
-      if(attempt===1){
-        console.warn(`Gemini review returned malformed structured output; retrying once: ${error.message}`);
-      }
+      failed = { status: outcome.status || 0, message: outcome.error };
+      if(!shared.geminiOff && ++shared.geminiFailures >= 2) shared.geminiOff = { status: failed.status, message: failed.message };
     }
   }
-  if(!failed&&!result){
-    failed={status:0,message:`Gemini structured output is invalid after one retry: ${lastStructuredError?.message||'unknown error'}`};
-  }
-  // Two failures that are not credit/config problems (timeouts, malformed output) also stop trying Gemini.
-  if(failed&&!failed.carried&&!failed.requested&&!shared.geminiOff&&++shared.geminiFailures>=2) shared.geminiOff={status:failed.status,message:failed.message};
 
   if(failed){
     // Any Gemini failure hands the work to Claude, loudly: the review records why. Only a manual review
@@ -364,10 +326,10 @@ async function reviewPart(ctx,diff,shared){
     timeout_ms:timeoutMs,
     risk_profile:riskProfile,
     usage:{
-      input_tokens:nonnegative(usageTotals.promptTokenCount),
-      output_tokens:nonnegative(usageTotals.candidatesTokenCount),
-      thoughts_tokens:nonnegative(usageTotals.thoughtsTokenCount),
-      total_tokens:nonnegative(usageTotals.totalTokenCount),
+      input_tokens:nonnegative(usageTotals.input_tokens ?? usageTotals.promptTokenCount),
+      output_tokens:nonnegative(usageTotals.output_tokens ?? usageTotals.candidatesTokenCount),
+      thoughts_tokens:nonnegative(usageTotals.thoughts_tokens ?? usageTotals.thoughtsTokenCount),
+      total_tokens:nonnegative(usageTotals.total_tokens ?? usageTotals.totalTokenCount),
     },
   };
   return result;
