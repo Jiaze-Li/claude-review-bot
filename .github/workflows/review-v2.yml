@@ -277,9 +277,9 @@ jobs:
           npm ci --legacy-peer-deps --ignore-scripts --no-audit --no-fund --omit=dev
           node --input-type=module -e "const m = await import('@anthropic-ai/claude-agent-sdk'); if (typeof m.query !== 'function') throw new Error('Claude Agent SDK query export unavailable')"
 
-      - name: Materialize safe source snapshot only for Claude deep review
+      - name: Materialize safe source snapshot
         id: snapshot
-        if: steps.dedupe.outputs.duplicate != 'true' && steps.plan.outputs.mode == 'claude'
+        if: steps.dedupe.outputs.duplicate != 'true' && (steps.plan.outputs.mode == 'claude' || steps.plan.outputs.mode == 'incremental' || steps.plan.outputs.mode == 'verification')
         env:
           HEAD_SHA: ${{ inputs.head_sha }}
           SOURCE_REPO_DIR: target
@@ -396,6 +396,7 @@ jobs:
           TARGET_REPO: ${{ inputs.target_repo }}
           PR_NUMBER: ${{ inputs.pr_number }}
           HEAD_SHA: ${{ inputs.head_sha }}
+          SAFE_REPO_DIR: safe-target
           SOURCE_KIND: ${{ inputs.source_kind }}
           REVIEW_CONTEXT_DIR: .review-context
           REVIEW_OUTPUT_PATH: .review-context/review.json

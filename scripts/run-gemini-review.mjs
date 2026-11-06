@@ -6,6 +6,7 @@ import {isGeminiUnavailableStatus,runClaudeStructured} from './claude-fallback.m
 import {geminiBaseUrl} from './gemini-config.mjs';
 import {MAX_SHARDS,dropIgnoredFiles,planShards,splitDiffByFile} from './review-shards.mjs';
 import {getProviderAdapter, PROVIDER_KINDS, OUTCOME_KINDS} from './provider-adapter.mjs';
+import {ReadOnlyToolGateway} from './tool-gateway.mjs';
 
 // Moving alias: always resolves to Google's current Flash model. Override with GEMINI_MODEL to pin.
 export const GEMINI_MODEL='gemini-flash-latest';
@@ -232,6 +233,15 @@ async function reviewPart(ctx,diff,shared){
       defaultModel: model,
       defaultEffort: thinking,
     });
+    const safeDir = env.SAFE_REPO_DIR || 'safe-target';
+    const safePath = path.resolve(safeDir);
+    const safeRoot = fs.existsSync(safePath) ? safePath : null;
+    const toolGateway = safeRoot ? new ReadOnlyToolGateway({
+      safeRoot,
+      contextRoot,
+      cwd: process.cwd(),
+      allowedContextFiles: [diffName, 'changed-files.txt', 'diff-stat.txt', 'pr.json', 'skipped-files.txt', 'repair.diff', 'pr.diff'],
+    }) : null;
     const outcome = await adapter.execute({
       prompt: built.prompt,
       schema: built.schema,
@@ -244,6 +254,7 @@ async function reviewPart(ctx,diff,shared){
       maxAttempts: 2,
       logImpl,
       metadata: { mode, contextBytes },
+      toolGateway,
     });
     if(outcome.ok){
       result = outcome.structured;

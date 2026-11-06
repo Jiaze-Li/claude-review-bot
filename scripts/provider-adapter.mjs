@@ -6,6 +6,66 @@
 import { isGeminiUnavailableStatus, FALLBACK_UNKNOWN_COST_USD } from './claude-fallback.mjs';
 import { geminiBaseUrl } from './gemini-config.mjs';
 import { GEMINI_MODEL, toGeminiJsonSchema } from './run-gemini-review.mjs';
+import { GEMINI_MAX_CONTEXT_BYTES } from './review-session-core.mjs';
+import { ReadOnlyToolGateway } from './tool-gateway.mjs';
+
+export const AUTHORIZED_GEMINI_TOOLS = Object.freeze(['Read', 'Glob', 'Grep']);
+
+export function validateStructuredReview(value, schema = null) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return { ok: false, error: 'Structured output must be an object' };
+  }
+  if (schema?.required && Array.isArray(schema.required)) {
+    for (const req of schema.required) {
+      if (value[req] === undefined) {
+        return { ok: false, error: `Missing required field: ${req}` };
+      }
+    }
+  }
+  if (value.summary !== undefined && (typeof value.summary !== 'string' || !value.summary.trim())) {
+    return { ok: false, error: 'summary must be a non-empty string' };
+  }
+  if (value.findings !== undefined) {
+    if (!Array.isArray(value.findings)) return { ok: false, error: 'findings must be an array' };
+    for (const f of value.findings) {
+      if (!f || typeof f !== 'object' || Array.isArray(f)) return { ok: false, error: 'finding must be an object' };
+      if (!['P0', 'P1', 'P2', 'P3'].includes(f.severity)) return { ok: false, error: `Invalid finding severity: ${f.severity}` };
+      if (typeof f.title !== 'string' || !f.title.trim()) return { ok: false, error: 'finding title must be a non-empty string' };
+      if (typeof f.body !== 'string' || !f.body.trim()) return { ok: false, error: 'finding body must be a non-empty string' };
+      if (typeof f.path !== 'string' || !f.path.trim()) return { ok: false, error: 'finding path must be a non-empty string' };
+      if (f.line !== null && f.line !== undefined && (!Number.isInteger(f.line) || f.line < 1)) {
+        return { ok: false, error: `finding line must be a positive integer or null: ${f.line}` };
+      }
+      if (f.failurePath !== undefined && typeof f.failurePath !== 'string') {
+        return { ok: false, error: 'finding failurePath must be a string' };
+      }
+    }
+  }
+  if (value.coverage !== undefined) {
+    if (!value.coverage || typeof value.coverage !== 'object' || Array.isArray(value.coverage)) {
+      return { ok: false, error: 'coverage must be an object' };
+    }
+    if (typeof value.coverage.complete !== 'boolean') return { ok: false, error: 'coverage.complete must be a boolean' };
+    if (!Array.isArray(value.coverage.reviewedPaths)) return { ok: false, error: 'coverage.reviewedPaths must be an array' };
+    if (!Array.isArray(value.coverage.unreviewedPaths)) return { ok: false, error: 'coverage.unreviewedPaths must be an array' };
+    if (value.coverage.note !== undefined && typeof value.coverage.note !== 'string') {
+      return { ok: false, error: 'coverage.note must be a string' };
+    }
+  }
+  if (value.verifications !== undefined) {
+    if (!Array.isArray(value.verifications)) return { ok: false, error: 'verifications must be an array' };
+    for (const v of value.verifications) {
+      if (!v || typeof v !== 'object' || Array.isArray(v)) return { ok: false, error: 'verification must be an object' };
+      const id = v.findingId || v.id;
+      if (!id || typeof id !== 'string') return { ok: false, error: 'verification findingId must be a string' };
+      const status = String(v.status || v.verdict || '').toUpperCase();
+      if (!['FIXED', 'STILL_OPEN', 'UNCERTAIN'].includes(status)) {
+        return { ok: false, error: `Invalid verification status: ${v.status || v.verdict}` };
+      }
+    }
+  }
+  return { ok: true };
+}
 
 export const PROVIDER_KINDS = {
   GEMINI: 'gemini',
@@ -102,7 +162,14 @@ export class GeminiProviderAdapter extends ProviderAdapter {
     this.defaultEffort = options.defaultEffort || 'medium';
   }
 
-  async execute({
+  async execute(request) {
+    if (request?.toolGateway) {
+      return this._executeMultiTurn(request);
+    }
+    return this._executeSingleTurn(request);
+  }
+
+  async _executeSingleTurn({
     prompt,
     schema,
     model = null,
@@ -279,6 +346,8 @@ export class GeminiProviderAdapter extends ProviderAdapter {
       try {
         if (!text) throw new Error('returned no structured text');
         const structured = JSON.parse(text);
+        const validation = validateStructuredReview(structured, schema);
+        if (!validation.ok) throw new Error(validation.error);
         return {
           ok: true,
           kind: OUTCOME_KINDS.OK,
@@ -352,6 +421,405 @@ export class GeminiProviderAdapter extends ProviderAdapter {
         model_usage: {},
       },
     };
+  }
+
+  async _executeMultiTurn({
+    prompt,
+    schema,
+    model = null,
+    effort = this.defaultEffort,
+    timeoutMs = 480_000,
+    maxOutputTokens = 16384,
+    env = process.env,
+    fetchImpl = fetch,
+    maxAttempts = 2,
+    logImpl = null,
+    metadata = null,
+    toolGateway = null,
+    maxTurns = 10,
+    maxToolCalls = 40,
+    systemPrompt = null,
+  }) {
+    const targetModel = model || env?.GEMINI_MODEL || this.defaultModel;
+    const apiKey = env?.GEMINI_API_KEY;
+    const startedAt = Date.now();
+    const invalidTimeout = !Number.isInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 0xFFFFFFFF;
+
+    if (!apiKey) {
+      return {
+        ok: false,
+        kind: OUTCOME_KINDS.CONFIG,
+        errorKind: ERROR_KINDS.CONFIG,
+        provider: this.provider,
+        status: null,
+        error: 'GEMINI_API_KEY is not set',
+        subtype: null,
+        errors: '',
+        structured: null,
+        meta: {
+          provider: this.provider,
+          requested_model: targetModel,
+          resolved_model: targetModel,
+          effort,
+          num_turns: 0,
+          max_turns: maxTurns,
+          tool_calls: 0,
+          duration_ms: 0,
+          duration_api_ms: 0,
+          total_cost_usd: 0,
+          cost_source: COST_SOURCES.ZERO,
+          usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, thoughts_tokens: null, total_tokens: null },
+          model_usage: {},
+        },
+      };
+    }
+
+    if (invalidTimeout) {
+      const errorMsg = `Gemini request skipped: invalid or exhausted timeout budget (${timeoutMs}ms)`;
+      return {
+        ok: false,
+        kind: OUTCOME_KINDS.FAILED,
+        errorKind: ERROR_KINDS.TIMEOUT,
+        provider: this.provider,
+        status: null,
+        error: errorMsg,
+        subtype: null,
+        errors: errorMsg,
+        structured: null,
+        meta: {
+          provider: this.provider,
+          requested_model: targetModel,
+          resolved_model: targetModel,
+          effort,
+          num_turns: 0,
+          max_turns: maxTurns,
+          tool_calls: 0,
+          duration_ms: 0,
+          duration_api_ms: 0,
+          total_cost_usd: 0,
+          cost_source: COST_SOURCES.ZERO,
+          usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, thoughts_tokens: null, total_tokens: null },
+          model_usage: {},
+        },
+      };
+    }
+
+    const deadline = startedAt + timeoutMs;
+    let turnCount = 0;
+    let toolCallCount = 0;
+    let servedModel = null;
+    const usageTotals = {
+      promptTokenCount: 0,
+      candidatesTokenCount: 0,
+      thoughtsTokenCount: 0,
+      totalTokenCount: 0,
+    };
+
+    const makeMeta = (numTurns = turnCount, toolCalls = toolCallCount) => ({
+      provider: this.provider,
+      requested_model: targetModel,
+      resolved_model: servedModel || targetModel,
+      effort,
+      num_turns: numTurns,
+      max_turns: maxTurns,
+      tool_calls: toolCalls,
+      duration_ms: Date.now() - startedAt,
+      duration_api_ms: Date.now() - startedAt,
+      total_cost_usd: 0,
+      cost_source: COST_SOURCES.ZERO,
+      usage: {
+        input_tokens: usageTotals.promptTokenCount,
+        output_tokens: usageTotals.candidatesTokenCount,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+        thoughts_tokens: usageTotals.thoughtsTokenCount || null,
+        total_tokens: usageTotals.totalTokenCount || null,
+      },
+      model_usage: {},
+      tool_diagnostics: toolGateway && typeof toolGateway.getDiagnostics === 'function' ? toolGateway.getDiagnostics() : null,
+    });
+
+    const toolDeclarations = ReadOnlyToolGateway.getToolDeclarations().map((decl) => ({
+      name: decl.name,
+      description: decl.description,
+      parameters: toGeminiJsonSchema(decl.parameters),
+    }));
+    const tools = [{ functionDeclarations: toolDeclarations }];
+
+    const contents = [{ role: 'user', parts: [{ text: prompt }] }];
+
+    const sendRequest = async (bodyObj) => {
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) {
+        const err = new Error(`Gemini request timed out after ${timeoutMs}ms`);
+        err.name = 'TimeoutError';
+        throw err;
+      }
+      const bodyStr = JSON.stringify(bodyObj);
+      const requestBytes = Buffer.byteLength(bodyStr, 'utf8');
+      if (requestBytes > GEMINI_MAX_CONTEXT_BYTES) {
+        const err = new Error(`Gemini review context exceeds ${GEMINI_MAX_CONTEXT_BYTES} bytes (${requestBytes} bytes)`);
+        err.name = 'ContextLimitExceeded';
+        throw err;
+      }
+
+      const signal = AbortSignal.timeout(remainingMs);
+      const response = await fetchImpl(`${geminiBaseUrl(env)}/v1beta/models/${encodeURIComponent(targetModel)}:generateContent`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+        body: bodyStr,
+        signal,
+      });
+
+      if (!response.ok) {
+        const text = (await response.text()).slice(0, 500);
+        const err = new Error(`Gemini HTTP ${response.status}: ${text}`);
+        err.status = response.status;
+        err.isUnavailable = isGeminiUnavailableStatus(response.status);
+        err.isConfig = [400, 401, 403, 404].includes(response.status);
+        throw err;
+      }
+
+      return response.json();
+    };
+
+    // Stage A: Multi-turn Tool Exploration
+    let lastCandidate = null;
+    let finishedToolTurns = false;
+
+    while (turnCount < maxTurns) {
+      turnCount += 1;
+      const requestPayload = {
+        contents,
+        tools,
+        generationConfig: {
+          thinkingConfig: { thinkingLevel: effort },
+          maxOutputTokens,
+        },
+        ...(systemPrompt ? { systemInstruction: { parts: [{ text: systemPrompt }] } } : {}),
+      };
+
+      let payload;
+      try {
+        payload = await sendRequest(requestPayload);
+      } catch (err) {
+        const isTimeout = err?.name === 'TimeoutError' || String(err?.message ?? '').includes('timed out');
+        const isUnavailable = Boolean(err?.isUnavailable);
+        const isConfig = Boolean(err?.isConfig);
+        const kind = isUnavailable ? OUTCOME_KINDS.UNAVAILABLE : isConfig ? OUTCOME_KINDS.CONFIG : OUTCOME_KINDS.FAILED;
+        const errorKind = isUnavailable ? ERROR_KINDS.UNAVAILABLE : isConfig ? ERROR_KINDS.CONFIG : isTimeout ? ERROR_KINDS.TIMEOUT : ERROR_KINDS.EXECUTION;
+        return {
+          ok: false,
+          kind,
+          errorKind,
+          provider: this.provider,
+          status: err?.status || null,
+          error: err?.message ?? String(err),
+          subtype: null,
+          errors: err?.message ?? String(err),
+          structured: null,
+          meta: makeMeta(),
+        };
+      }
+
+      if (typeof payload?.modelVersion === 'string' && payload.modelVersion) servedModel = payload.modelVersion;
+      const inp = payload?.usageMetadata?.promptTokenCount;
+      const outp = payload?.usageMetadata?.candidatesTokenCount;
+      const th = payload?.usageMetadata?.thoughtsTokenCount;
+      const tot = payload?.usageMetadata?.totalTokenCount;
+      if (Number.isFinite(inp)) usageTotals.promptTokenCount += inp;
+      if (Number.isFinite(outp)) usageTotals.candidatesTokenCount += outp;
+      if (Number.isFinite(th)) usageTotals.thoughtsTokenCount += th;
+      if (Number.isFinite(tot)) usageTotals.totalTokenCount += tot;
+
+      const candidate = payload?.candidates?.[0];
+      lastCandidate = candidate;
+      const parts = candidate?.content?.parts ?? [];
+      const functionCallParts = parts.filter((p) => Boolean(p.functionCall));
+
+      if (functionCallParts.length === 0) {
+        contents.push({ role: 'model', parts: parts.map((p) => ({ ...p })) });
+        finishedToolTurns = true;
+        break;
+      }
+
+      // Preserve all model parts (including thoughtSignature, functionCall with id, etc.)
+      contents.push({ role: 'model', parts: parts.map((p) => ({ ...p })) });
+
+      if (toolCallCount + functionCallParts.length > maxToolCalls) {
+        const errorMsg = `Tool invocation limit exceeded: reached ${maxToolCalls} tool calls across turns.`;
+        return {
+          ok: false,
+          kind: OUTCOME_KINDS.FAILED,
+          errorKind: ERROR_KINDS.EXECUTION,
+          provider: this.provider,
+          status: null,
+          error: errorMsg,
+          subtype: 'error_max_tool_calls',
+          errors: errorMsg,
+          structured: null,
+          meta: makeMeta(),
+        };
+      }
+
+      const functionResponseParts = [];
+      for (const part of functionCallParts) {
+        const call = part.functionCall;
+        toolCallCount += 1;
+        const { name, args, id } = call;
+        let res;
+        if (!AUTHORIZED_GEMINI_TOOLS.includes(name)) {
+          res = { ok: false, error: `Tool ${name} is not available. Only ${AUTHORIZED_GEMINI_TOOLS.join(', ')} are supported.`, kind: 'unknown_tool' };
+        } else {
+          res = await toolGateway.runExclusive(() => toolGateway.executeTool(name, args || {}));
+        }
+
+        const responseObj = res.ok
+          ? { output: res.content }
+          : { error: res.error || res.message || 'Tool execution failed' };
+
+        functionResponseParts.push({
+          functionResponse: {
+            name,
+            response: responseObj,
+            ...(id ? { id } : {}),
+          },
+        });
+      }
+
+      contents.push({
+        role: 'user',
+        parts: functionResponseParts,
+      });
+    }
+
+    if (!finishedToolTurns) {
+      const errorMsg = `Gemini tool exploration exceeded turn limit of ${maxTurns} turns`;
+      return {
+        ok: false,
+        kind: OUTCOME_KINDS.FAILED,
+        errorKind: ERROR_KINDS.EXECUTION,
+        provider: this.provider,
+        status: null,
+        error: errorMsg,
+        subtype: 'error_max_turns',
+        errors: errorMsg,
+        structured: null,
+        meta: makeMeta(),
+      };
+    }
+
+    // Stage B: Structured Output Phase
+    const lastParts = lastCandidate?.content?.parts ?? [];
+    const modelText = lastParts.map((p) => (typeof p.text === 'string' ? p.text : '')).join('').trim();
+    if (modelText.startsWith('{') && modelText.endsWith('}')) {
+      try {
+        const parsed = JSON.parse(modelText);
+        const validation = validateStructuredReview(parsed, schema);
+        if (validation.ok) {
+          return {
+            ok: true,
+            kind: OUTCOME_KINDS.OK,
+            errorKind: ERROR_KINDS.NONE,
+            provider: this.provider,
+            status: 200,
+            error: null,
+            subtype: 'success',
+            errors: '',
+            structured: parsed,
+            meta: makeMeta(),
+          };
+        }
+      } catch {}
+    }
+
+    turnCount += 1;
+    contents.push({
+      role: 'user',
+      parts: [{ text: 'Based on the code exploration above, provide the final structured review JSON conforming strictly to the requested schema.' }],
+    });
+
+    const structuredPayload = {
+      contents,
+      generationConfig: {
+        thinkingConfig: { thinkingLevel: effort },
+        responseFormat: { text: { mimeType: 'APPLICATION_JSON', schema: toGeminiJsonSchema(schema) } },
+        maxOutputTokens,
+      },
+      ...(systemPrompt ? { systemInstruction: { parts: [{ text: systemPrompt }] } } : {}),
+    };
+
+    let structuredResultPayload;
+    try {
+      structuredResultPayload = await sendRequest(structuredPayload);
+    } catch (err) {
+      const isTimeout = err?.name === 'TimeoutError' || String(err?.message ?? '').includes('timed out');
+      const isUnavailable = Boolean(err?.isUnavailable);
+      const isConfig = Boolean(err?.isConfig);
+      const kind = isUnavailable ? OUTCOME_KINDS.UNAVAILABLE : isConfig ? OUTCOME_KINDS.CONFIG : OUTCOME_KINDS.FAILED;
+      const errorKind = isUnavailable ? ERROR_KINDS.UNAVAILABLE : isConfig ? ERROR_KINDS.CONFIG : isTimeout ? ERROR_KINDS.TIMEOUT : ERROR_KINDS.EXECUTION;
+      return {
+        ok: false,
+        kind,
+        errorKind,
+        provider: this.provider,
+        status: err?.status || null,
+        error: err?.message ?? String(err),
+        subtype: null,
+        errors: err?.message ?? String(err),
+        structured: null,
+        meta: makeMeta(),
+      };
+    }
+
+    if (typeof structuredResultPayload?.modelVersion === 'string' && structuredResultPayload.modelVersion) {
+      servedModel = structuredResultPayload.modelVersion;
+    }
+    const sInp = structuredResultPayload?.usageMetadata?.promptTokenCount;
+    const sOutp = structuredResultPayload?.usageMetadata?.candidatesTokenCount;
+    const sTh = structuredResultPayload?.usageMetadata?.thoughtsTokenCount;
+    const sTot = structuredResultPayload?.usageMetadata?.totalTokenCount;
+    if (Number.isFinite(sInp)) usageTotals.promptTokenCount += sInp;
+    if (Number.isFinite(sOutp)) usageTotals.candidatesTokenCount += sOutp;
+    if (Number.isFinite(sTh)) usageTotals.thoughtsTokenCount += sTh;
+    if (Number.isFinite(sTot)) usageTotals.totalTokenCount += sTot;
+
+    const candidate = structuredResultPayload?.candidates?.[0];
+    const text = (candidate?.content?.parts ?? []).map((part) => (typeof part.text === 'string' ? part.text : '')).join('');
+    try {
+      if (!text) throw new Error('returned no structured text');
+      const structured = JSON.parse(text);
+      const validation = validateStructuredReview(structured, schema);
+      if (!validation.ok) {
+        throw new Error(validation.error);
+      }
+      return {
+        ok: true,
+        kind: OUTCOME_KINDS.OK,
+        errorKind: ERROR_KINDS.NONE,
+        provider: this.provider,
+        status: 200,
+        error: null,
+        subtype: 'success',
+        errors: '',
+        structured,
+        meta: makeMeta(),
+      };
+    } catch (parseErr) {
+      const errorMsg = `Gemini returned malformed structured output: ${parseErr.message}`;
+      return {
+        ok: false,
+        kind: OUTCOME_KINDS.FAILED,
+        errorKind: ERROR_KINDS.MALFORMED,
+        provider: this.provider,
+        status: null,
+        error: errorMsg,
+        subtype: null,
+        errors: errorMsg,
+        structured: null,
+        meta: makeMeta(),
+      };
+    }
   }
 }
 

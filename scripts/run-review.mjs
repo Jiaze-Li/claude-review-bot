@@ -9,7 +9,7 @@ import { GEMINI_SHARD_MAX_BYTES, GEMINI_SHARD_TIMEOUT_MS, runGeminiShard } from 
 import { DEFAULT_IGNORE, matchesIgnore, mergeShardResults, parseIgnorePatterns, planShards, reconcileCoverage, splitDiffByFile } from './review-shards.mjs';
 
 const cwd = process.cwd();
-const safeRoot = realDir(process.env.SAFE_REPO_DIR ?? 'safe-target');
+const safeRoot = optionalRealDir(process.env.SAFE_REPO_DIR ?? 'safe-target');
 const contextRoot = realDir(process.env.REVIEW_CONTEXT_DIR ?? '.review-context');
 const outputPath = path.resolve(process.env.REVIEW_OUTPUT_PATH ?? '.review-context/review.json');
 
@@ -77,18 +77,23 @@ const schema = {
 };
 
 // Prompts are the same for every provider; only how the diff and context reach the model differs.
-// inlineDiff === null: Claude, which reads the shard diff and the repository with tools.
-// inlineDiff is a string: Gemini, which has no tools, so the diff is part of the prompt.
-function buildPrompt({ shard, index, count, diffPath, maxTurns, budgetUsd, knownIssues, riskNotes = '', inlineDiff = null }) {
+// inlineDiff === null: reads the shard diff and the repository with tools.
+// inlineDiff is a string: diff is part of the prompt.
+// hasTools: whether Host-enforced Read, Glob, Grep tools are available.
+function buildPrompt({ shard, index, count, diffPath, maxTurns, budgetUsd, knownIssues, riskNotes = '', inlineDiff = null, hasTools = false }) {
   const assignedFiles = `Assigned files:\n${shard.files.map((file) => `- ${file}`).join('\n')}`;
   const scope = count > 1
     ? `This is a LARGE pull request reviewed in ${count} independent shards. You are reviewing shard ${index + 1} of ${count}. Review ONLY the ${shard.files.length} file(s) assigned to you below.`
     : `Review ONLY the ${shard.files.length} file(s) assigned to you below; other changed files in this PR, if any, are already reviewed or deliberately skipped.`;
   const boundary = `DIFF-${randomUUID()}`;
   const diffBlock = inlineDiff === null
-    ? `Their complete diff is in ${diffPath}; do not read pr.diff. You may Grep/Read other files in safe-target/ for context, but do not report findings for files outside your list.`
-    : `Their complete diff follows between the two ${boundary} markers. It shows 80 lines of context around each change. You cannot open any other file, so do not report anything you cannot support from this diff; if you need code you cannot see, say so in coverage.note instead of guessing.\n<<<${boundary}\n${inlineDiff}\n${boundary}>>>`;
-  const toolContext = inlineDiff === null
+    ? (hasTools
+      ? `Their complete diff is in ${diffPath}; do not read pr.diff. You may Grep/Read other files in safe-target/ for context, but do not report findings for files outside your list.`
+      : `Their complete diff is in ${diffPath}; do not read pr.diff.`)
+    : (hasTools
+      ? `Their complete diff follows between the two ${boundary} markers. It shows 80 lines of context around each change. You may also use the available Read, Glob, and Grep tools to inspect safe-target/ and context files, but do not report findings for files outside your list.\n<<<${boundary}\n${inlineDiff}\n${boundary}>>>`
+      : `Their complete diff follows between the two ${boundary} markers. It shows 80 lines of context around each change. You cannot open any other file, so do not report anything you cannot support from this diff; if you need code you cannot see, say so in coverage.note instead of guessing.\n<<<${boundary}\n${inlineDiff}\n${boundary}>>>`);
+  const toolContext = hasTools
     ? `Trusted review context is in .review-context/:
 - pr.diff
 - changed-files.txt
@@ -100,16 +105,14 @@ A sanitized snapshot of the target repository is in safe-target/. It contains on
 
 `
     : '';
-  const effort = inlineDiff === null
-    ? `Your assigned diff file can be longer than one Read returns. Read it in successive chunks (offset and limit) until you reach its end before you report coverage, and never list a file as unreviewed just because you stopped reading. Do not say you ran out of budget or turns unless a tool or the system actually told you so.
-
-Start from the diff. Do NOT read every changed file or scan the whole repository by default. Read complete files and related unchanged code only when needed to prove or disprove a concrete failure mode. Prefer targeted Grep/Read operations and batch independent tool calls in the same turn when possible.
+  const effort = hasTools
+    ? `${inlineDiff === null ? 'Your assigned diff file can be longer than one Read returns. Read it in successive chunks (offset and limit) until you reach its end before you report coverage, and never list a file as unreviewed just because you stopped reading. Do not say you ran out of budget or turns unless a tool or the system actually told you so.\n\n' : ''}Start from the diff. Do NOT read every changed file or scan the whole repository by default. Read complete files and related unchanged code only when needed to prove or disprove a concrete failure mode. Prefer targeted Grep/Read operations and batch independent tool calls in the same turn when possible.
 
 You have a strict ${maxTurns}-turn agent budget. Spend the early turns on the highest-risk changes first. By turn ${Math.max(1, Math.floor(maxTurns * 0.75))}, stop broad exploration and use the remaining budget to produce the final structured review. A focused completed review is better than an exhaustive search that hits the turn limit and returns nothing.
 
 You may only inspect files using the available Read, Glob, and Grep tools. Host-side policy restricts those tools to the sanitized repository snapshot and trusted review context. Do not attempt to access any other path.
 
-Your spend ceiling is $${budgetUsd.toFixed(2)}. `
+${typeof budgetUsd === 'number' && Number.isFinite(budgetUsd) ? `Your spend ceiling is $${budgetUsd.toFixed(2)}. ` : ''}`
     : '';
   return `You are reviewing pull request ${targetRepo}#${prNumber} at exact head SHA ${headSha}.
 
@@ -207,8 +210,14 @@ function timeLeftMs() {
   return startedAt + DEADLINE_MS - Date.now();
 }
 
-async function tryGemini(index, prompt) {
-  const outcome = await runGeminiShard({ prompt, schema, timeoutMs: Math.min(GEMINI_SHARD_TIMEOUT_MS, timeLeftMs() - 30_000) });
+async function tryGemini(index, prompt, toolGateway = null) {
+  const outcome = await runGeminiShard({
+    prompt,
+    schema,
+    timeoutMs: Math.min(GEMINI_SHARD_TIMEOUT_MS, timeLeftMs() - 30_000),
+    toolGateway,
+    maxTurns: SHARD_MAX_TURNS,
+  });
   if (outcome.kind === 'ok') {
     metas.push(outcome.meta);
     return { ok: true, structured: outcome.structured, provider: 'gemini' };
@@ -261,13 +270,45 @@ async function reviewUnit(index, unit, providers, suffix = '', retries = 2) {
     const provider = providers[position];
     let result;
     if (provider === 'gemini') {
-      if (gemini.off || unit.bytes > GEMINI_SHARD_MAX_BYTES) {
-        notes.push(`gemini: ${gemini.off ?? 'shard too large for Gemini'}`);
+      if (gemini.off) {
+        notes.push(`gemini: ${gemini.off}`);
         continue;
       }
-      result = await tryGemini(index, buildPrompt({ ...common, inlineDiff: unit.diff }));
+      const shardContextPath = path.relative(contextRoot, path.resolve(cwd, diffPath)).replace(/\\/g, '/');
+      const toolGateway = safeRoot ? new ReadOnlyToolGateway({
+        safeRoot, contextRoot, cwd, ignorePatterns, maxCalls: SHARD_MAX_TURNS * 4,
+        allowedContextFiles: [shardContextPath, 'changed-files.txt', 'diff-stat.txt', 'pr.json', 'skipped-files.txt'],
+      }) : null;
+      if (!toolGateway && unit.bytes > GEMINI_SHARD_MAX_BYTES) {
+        notes.push('gemini: shard too large for Gemini without tools');
+        continue;
+      }
+      const inlineDiff = unit.bytes <= GEMINI_SHARD_MAX_BYTES ? unit.diff : null;
+      result = await tryGemini(
+        index,
+        buildPrompt({
+          ...common,
+          maxTurns: SHARD_MAX_TURNS,
+          inlineDiff,
+          hasTools: Boolean(toolGateway),
+        }),
+        toolGateway,
+      );
     } else {
-      result = await tryClaude(index, (budgetUsd) => buildPrompt({ ...common, maxTurns: SHARD_MAX_TURNS, budgetUsd }), diffPath);
+      if (!safeRoot) {
+        notes.push('claude: safe-target repository snapshot is not available for Claude review');
+        continue;
+      }
+      result = await tryClaude(
+        index,
+        (budgetUsd) => buildPrompt({
+          ...common,
+          maxTurns: SHARD_MAX_TURNS,
+          budgetUsd,
+          hasTools: Boolean(safeRoot),
+        }),
+        diffPath,
+      );
     }
     if (!result.ok) {
       notes.push(`${provider}: ${result.error}`);
@@ -549,6 +590,18 @@ function realDir(value) {
   const resolved = fs.realpathSync.native(path.resolve(value));
   if (!fs.statSync(resolved).isDirectory()) throw new Error(`${value} is not a directory`);
   return resolved;
+}
+
+function optionalRealDir(value) {
+  if (!value) return null;
+  const target = path.resolve(value);
+  if (!fs.existsSync(target)) return null;
+  try {
+    const resolved = fs.realpathSync.native(target);
+    return fs.statSync(resolved).isDirectory() ? resolved : null;
+  } catch {
+    return null;
+  }
 }
 
 function allow(updatedInput) {
