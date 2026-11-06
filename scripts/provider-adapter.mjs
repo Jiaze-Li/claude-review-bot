@@ -71,6 +71,11 @@ export function sanitizeModelUsage(value) {
   return out;
 }
 
+export function firstModelName(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  return Object.keys(value).find(Boolean) ?? null;
+}
+
 /**
  * Base Provider Adapter defining the common review request contract.
  */
@@ -100,7 +105,7 @@ export class GeminiProviderAdapter extends ProviderAdapter {
   async execute({
     prompt,
     schema,
-    model = this.defaultModel,
+    model = null,
     effort = this.defaultEffort,
     timeoutMs = 480_000,
     maxOutputTokens = 16384,
@@ -110,6 +115,7 @@ export class GeminiProviderAdapter extends ProviderAdapter {
     logImpl = null,
     metadata = null,
   }) {
+    const targetModel = model || env?.GEMINI_MODEL || this.defaultModel;
     const apiKey = env?.GEMINI_API_KEY;
     if (!apiKey) {
       return {
@@ -124,8 +130,8 @@ export class GeminiProviderAdapter extends ProviderAdapter {
         structured: null,
         meta: {
           provider: this.provider,
-          requested_model: model,
-          resolved_model: model,
+          requested_model: targetModel,
+          resolved_model: targetModel,
           effort,
           num_turns: 0,
           max_turns: 1,
@@ -167,11 +173,11 @@ export class GeminiProviderAdapter extends ProviderAdapter {
       if (typeof logImpl === 'function') {
         const mode = metadata?.mode ?? 'review';
         const contextBytes = metadata?.contextBytes ?? 0;
-        logImpl(`Gemini request started: mode=${mode} attempt=${attempt} model=${model} thinking=${effort} timeout_ms=${timeoutMs} context_bytes=${contextBytes} request_bytes=${requestBytes}`);
+        logImpl(`Gemini request started: mode=${mode} attempt=${attempt} model=${targetModel} thinking=${effort} timeout_ms=${timeoutMs} context_bytes=${contextBytes} request_bytes=${requestBytes}`);
       }
 
       try {
-        const response = await fetchImpl(`${geminiBaseUrl(env)}/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+        const response = await fetchImpl(`${geminiBaseUrl(env)}/v1beta/models/${encodeURIComponent(targetModel)}:generateContent`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
           body: requestBody,
@@ -198,8 +204,8 @@ export class GeminiProviderAdapter extends ProviderAdapter {
             structured: null,
             meta: {
               provider: this.provider,
-              requested_model: model,
-              resolved_model: model,
+              requested_model: targetModel,
+              resolved_model: targetModel,
               effort,
               num_turns: attempt,
               max_turns: 1,
@@ -232,8 +238,8 @@ export class GeminiProviderAdapter extends ProviderAdapter {
           structured: null,
           meta: {
             provider: this.provider,
-            requested_model: model,
-            resolved_model: model,
+            requested_model: targetModel,
+            resolved_model: targetModel,
             effort,
             num_turns: attempt,
             max_turns: 1,
@@ -278,8 +284,8 @@ export class GeminiProviderAdapter extends ProviderAdapter {
           structured,
           meta: {
             provider: this.provider,
-            requested_model: model,
-            resolved_model: servedModel || model,
+            requested_model: targetModel,
+            resolved_model: servedModel || targetModel,
             effort,
             num_turns: attempt,
             max_turns: 1,
@@ -319,8 +325,8 @@ export class GeminiProviderAdapter extends ProviderAdapter {
       structured: null,
       meta: {
         provider: this.provider,
-        requested_model: model,
-        resolved_model: servedModel || model,
+        requested_model: targetModel,
+        resolved_model: servedModel || targetModel,
         effort,
         num_turns: maxAttempts,
         max_turns: 1,
@@ -368,9 +374,10 @@ export class ClaudeProviderAdapter extends ProviderAdapter {
     permissionMode = 'default',
     queryImpl = null,
     logImpl = null,
-    fallbackUnknownCostUsd = FALLBACK_UNKNOWN_COST_USD,
+    fallbackUnknownCostUsd = null,
     isolateEnv = false,
     requireAuthToken = false,
+    allowZeroCost = true,
   }) {
     if (requireAuthToken && !env?.CLAUDE_CODE_OAUTH_TOKEN && !queryImpl) {
       return {
@@ -392,8 +399,8 @@ export class ClaudeProviderAdapter extends ProviderAdapter {
           num_turns: 0,
           duration_ms: 0,
           duration_api_ms: 0,
-          total_cost_usd: fallbackUnknownCostUsd,
-          cost_source: COST_SOURCES.RESERVE,
+          total_cost_usd: typeof fallbackUnknownCostUsd === 'number' ? fallbackUnknownCostUsd : null,
+          cost_source: typeof fallbackUnknownCostUsd === 'number' ? COST_SOURCES.RESERVE : COST_SOURCES.UNKNOWN,
           usage: { input_tokens: null, output_tokens: null, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, thoughts_tokens: null, total_tokens: null },
           model_usage: {},
         },
@@ -472,8 +479,10 @@ export class ClaudeProviderAdapter extends ProviderAdapter {
           num_turns: null,
           duration_ms: Date.now() - startedAt,
           duration_api_ms: Date.now() - startedAt,
-          total_cost_usd: Number.isFinite(maxBudgetUsd) && maxBudgetUsd > 0 ? maxBudgetUsd : fallbackUnknownCostUsd,
-          cost_source: COST_SOURCES.RESERVE,
+          total_cost_usd: Number.isFinite(maxBudgetUsd) && maxBudgetUsd > 0
+            ? maxBudgetUsd
+            : (typeof fallbackUnknownCostUsd === 'number' ? fallbackUnknownCostUsd : null),
+          cost_source: (Number.isFinite(maxBudgetUsd) && maxBudgetUsd > 0) || typeof fallbackUnknownCostUsd === 'number' ? COST_SOURCES.RESERVE : COST_SOURCES.UNKNOWN,
           usage: { input_tokens: null, output_tokens: null, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, thoughts_tokens: null, total_tokens: null },
           model_usage: {},
         },
@@ -483,6 +492,7 @@ export class ClaudeProviderAdapter extends ProviderAdapter {
     }
 
     if (!resultMessage) {
+      const missingCost = typeof fallbackUnknownCostUsd === 'number' ? fallbackUnknownCostUsd : null;
       return {
         ok: false,
         kind: OUTCOME_KINDS.FAILED,
@@ -502,25 +512,29 @@ export class ClaudeProviderAdapter extends ProviderAdapter {
           num_turns: null,
           duration_ms: Date.now() - startedAt,
           duration_api_ms: Date.now() - startedAt,
-          total_cost_usd: fallbackUnknownCostUsd,
-          cost_source: COST_SOURCES.RESERVE,
+          total_cost_usd: missingCost,
+          cost_source: missingCost != null ? COST_SOURCES.RESERVE : COST_SOURCES.UNKNOWN,
           usage: { input_tokens: null, output_tokens: null, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, thoughts_tokens: null, total_tokens: null },
           model_usage: {},
         },
       };
     }
 
-    // Determine cost provenance: if SDK reported cost > 0 use it, else fallback reserve
+    // Determine cost provenance: if SDK reported cost (and >= 0 when allowZeroCost, or > 0 otherwise) use it
     const sdkCost = nonnegativeNumber(resultMessage.total_cost_usd);
-    const hasSdkCost = typeof sdkCost === 'number' && sdkCost > 0;
-    const total_cost_usd = hasSdkCost ? sdkCost : (fallbackUnknownCostUsd ?? (Number.isFinite(maxBudgetUsd) && maxBudgetUsd > 0 ? maxBudgetUsd : 0));
-    const cost_source = hasSdkCost ? COST_SOURCES.SDK : COST_SOURCES.RESERVE;
+    const hasSdkCost = typeof sdkCost === 'number' && (allowZeroCost ? sdkCost >= 0 : sdkCost > 0);
+    const total_cost_usd = hasSdkCost
+      ? sdkCost
+      : (typeof fallbackUnknownCostUsd === 'number' && Number.isFinite(fallbackUnknownCostUsd) ? fallbackUnknownCostUsd : null);
+    const cost_source = hasSdkCost
+      ? COST_SOURCES.SDK
+      : (total_cost_usd != null ? COST_SOURCES.RESERVE : COST_SOURCES.UNKNOWN);
 
     const rawUsage = resultMessage.usage || {};
     const meta = {
       provider: this.provider,
       requested_model: model,
-      resolved_model: resolvedModel || model,
+      resolved_model: resolvedModel || firstModelName(resultMessage.modelUsage) || model,
       effort,
       max_turns: maxTurns,
       num_turns: nonnegativeInteger(resultMessage.num_turns),

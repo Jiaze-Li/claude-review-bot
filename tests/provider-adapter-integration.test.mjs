@@ -229,3 +229,51 @@ test('Integration E2: Provider failure fallback to Claude maintains identical do
   assert.equal(result._meta.cost_source, 'sdk');
   assert.equal(result._meta.resolved_model, 'claude-3-7-sonnet-20250219');
 });
+
+test('Integration: runGeminiShard honors env.GEMINI_MODEL in Full Review shards', async () => {
+  let calledUrl = null;
+  const mockFetch = async (url) => {
+    calledUrl = url;
+    return Response.json({
+      candidates: [{ content: { parts: [{ text: JSON.stringify({ summary: 'custom model ok', findings: [], coverage: { complete: true, reviewedPaths: [], unreviewedPaths: [], note: '' } }) }] } }],
+      usageMetadata: {},
+    });
+  };
+
+  const outcome = await runGeminiShard({
+    prompt: 'shard prompt',
+    schema: { type: 'object', properties: { summary: { type: 'string' } }, required: ['summary'] },
+    env: { GEMINI_API_KEY: 'key', GEMINI_MODEL: 'gemini-2.0-pro-exp-override' },
+    fetchImpl: mockFetch,
+  });
+
+  assert.equal(outcome.kind, 'ok');
+  assert.match(calledUrl, /\/models\/gemini-2\.0-pro-exp-override:generateContent$/);
+  assert.equal(outcome.meta.requested_model, 'gemini-2.0-pro-exp-override');
+});
+
+test('Integration: runClaudeStructured preserves conservative reserve cost when SDK reports 0', async () => {
+  const fakeZeroCostQuery = async function* () {
+    yield { type: 'system', subtype: 'init', model: 'claude-sonnet' };
+    yield {
+      type: 'result',
+      subtype: 'success',
+      total_cost_usd: 0, // explicit 0 from SDK
+      structured_output: { summary: 'fallback zero cost' },
+    };
+  };
+
+  const outcome = await runClaudeStructured({
+    prompt: 'fallback prompt',
+    schema: { type: 'object', properties: { summary: { type: 'string' } }, required: ['summary'] },
+    timeoutMs: 5000,
+    maxBudgetUsd: 1.0,
+    env: { CLAUDE_CODE_OAUTH_TOKEN: 'valid-token' },
+    queryImpl: fakeZeroCostQuery,
+    logImpl: () => {},
+  });
+
+  assert.equal(outcome.structured.summary, 'fallback zero cost');
+  assert.equal(outcome.meta.total_cost_usd, 0.5); // Fallback preserves conservative reserve
+  assert.equal(outcome.meta.cost_source, 'reserve');
+});

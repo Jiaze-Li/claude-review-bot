@@ -51,8 +51,10 @@ export async function runClaudeStructured({
     model: CLAUDE_FALLBACK_MODEL,
     effort: CLAUDE_FALLBACK_EFFORT,
     maxTurns: CLAUDE_FALLBACK_MAX_TURNS,
+    allowZeroCost: false,
     fallbackUnknownCostUsd: FALLBACK_UNKNOWN_COST_USD,
     isolateEnv: true,
+    requireAuthToken: true,
     tools: [],
     canUseTool: async () => ({ behavior: 'deny', message: 'No tools are available in fallback review.' }),
   });

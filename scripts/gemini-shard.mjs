@@ -16,10 +16,12 @@ export { geminiBaseUrl };
 // kind: 'ok' | 'unavailable' (402/429/5xx: stop using Gemini) | 'config' (400/401/403/404: the key or
 // model is wrong, stop using Gemini) | 'failed' (timeout, network, malformed output: this shard only).
 export async function runGeminiShard({ prompt, schema, env = process.env, fetchImpl = fetch, timeoutMs = GEMINI_SHARD_TIMEOUT_MS }) {
-  const adapter = getProviderAdapter(PROVIDER_KINDS.GEMINI, { defaultEffort: GEMINI_SHARD_THINKING });
+  const model = env?.GEMINI_MODEL || GEMINI_MODEL;
+  const adapter = getProviderAdapter(PROVIDER_KINDS.GEMINI, { defaultModel: model, defaultEffort: GEMINI_SHARD_THINKING });
   const outcome = await adapter.execute({
     prompt,
     schema,
+    model,
     env,
     fetchImpl,
     timeoutMs,

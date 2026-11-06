@@ -346,3 +346,120 @@ test('Claude adapter classifies failure modes: turn limit, budget exhausted, mis
   assert.equal(missingOutput.kind, OUTCOME_KINDS.FAILED);
   assert.equal(missingOutput.errorKind, ERROR_KINDS.MALFORMED);
 });
+
+test('Gemini adapter respects GEMINI_MODEL override in env and targets custom model URL', async () => {
+  const adapter = getProviderAdapter(PROVIDER_KINDS.GEMINI);
+  let requestedUrl = null;
+
+  const mockFetch = async (url) => {
+    requestedUrl = url;
+    return Response.json({
+      candidates: [{ content: { parts: [{ text: JSON.stringify({ summary: 'custom model ok', findings: [] }) }] } }],
+      usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 5 },
+    });
+  };
+
+  const outcome = await adapter.execute({
+    prompt: 'p',
+    schema: basicSchema,
+    env: { GEMINI_API_KEY: 'test-key', GEMINI_MODEL: 'custom-gemini-preview' },
+    fetchImpl: mockFetch,
+  });
+
+  assert.equal(outcome.ok, true);
+  assert.match(requestedUrl, /\/models\/custom-gemini-preview:generateContent$/);
+  assert.equal(outcome.meta.requested_model, 'custom-gemini-preview');
+  assert.equal(outcome.meta.resolved_model, 'custom-gemini-preview');
+});
+
+test('Claude adapter handles explicit zero cost vs missing cost based on allowZeroCost', async () => {
+  const adapter = getProviderAdapter(PROVIDER_KINDS.CLAUDE);
+
+  // 1. Explicit zero cost with allowZeroCost: true (Full Review behavior)
+  const zeroCostQuery = async function* () {
+    yield {
+      type: 'result',
+      subtype: 'success',
+      total_cost_usd: 0,
+      usage: { input_tokens: 10, output_tokens: 5 },
+      structured_output: { summary: 'zero cost ok' },
+    };
+  };
+
+  const fullReviewZeroCost = await adapter.execute({
+    prompt: 'p',
+    schema: basicSchema,
+    env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
+    queryImpl: zeroCostQuery,
+    allowZeroCost: true,
+    fallbackUnknownCostUsd: null,
+  });
+  assert.equal(fullReviewZeroCost.ok, true);
+  assert.equal(fullReviewZeroCost.meta.total_cost_usd, 0);
+  assert.equal(fullReviewZeroCost.meta.cost_source, COST_SOURCES.SDK);
+
+  // 2. Explicit zero cost with allowZeroCost: false (Delta fallback behavior)
+  const deltaFallbackZeroCost = await adapter.execute({
+    prompt: 'p',
+    schema: basicSchema,
+    env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
+    queryImpl: zeroCostQuery,
+    allowZeroCost: false,
+    fallbackUnknownCostUsd: 0.5,
+  });
+  assert.equal(deltaFallbackZeroCost.ok, true);
+  assert.equal(deltaFallbackZeroCost.meta.total_cost_usd, 0.5);
+  assert.equal(deltaFallbackZeroCost.meta.cost_source, COST_SOURCES.RESERVE);
+
+  // 3. Missing cost with allowZeroCost: true (Full Review behavior -> null cost, unknown provenance)
+  const missingCostQuery = async function* () {
+    yield {
+      type: 'result',
+      subtype: 'success',
+      total_cost_usd: null,
+      usage: { input_tokens: 10, output_tokens: 5 },
+      structured_output: { summary: 'missing cost' },
+    };
+  };
+
+  const fullReviewMissingCost = await adapter.execute({
+    prompt: 'p',
+    schema: basicSchema,
+    env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
+    queryImpl: missingCostQuery,
+    allowZeroCost: true,
+    fallbackUnknownCostUsd: null,
+  });
+  assert.equal(fullReviewMissingCost.ok, true);
+  assert.equal(fullReviewMissingCost.meta.total_cost_usd, null);
+  assert.equal(fullReviewMissingCost.meta.cost_source, COST_SOURCES.UNKNOWN);
+});
+
+test('Claude adapter infers resolved_model from modelUsage when system.init event is missing', async () => {
+  const adapter = getProviderAdapter(PROVIDER_KINDS.CLAUDE);
+
+  const missingInitQuery = async function* () {
+    // No system init event yielded
+    yield {
+      type: 'result',
+      subtype: 'success',
+      total_cost_usd: 0.1,
+      modelUsage: {
+        'claude-3-7-sonnet-inferred': { inputTokens: 100, outputTokens: 20 },
+      },
+      structured_output: { summary: 'inferred model ok' },
+    };
+  };
+
+  const outcome = await adapter.execute({
+    prompt: 'p',
+    schema: basicSchema,
+    env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
+    queryImpl: missingInitQuery,
+    model: 'sonnet',
+  });
+
+  assert.equal(outcome.ok, true);
+  assert.equal(outcome.meta.requested_model, 'sonnet');
+  assert.equal(outcome.meta.resolved_model, 'claude-3-7-sonnet-inferred');
+});
