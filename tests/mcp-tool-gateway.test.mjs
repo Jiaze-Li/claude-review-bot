@@ -414,3 +414,46 @@ test('F005: invalid regex is escaped as literal text inside bounded Grep worker'
     assert.ok(result.content[0].text.includes(literal), 'fallback must match the literal characters');
   }
 }));
+test('P3: authorized context diff is unaffected by target repository ignore patterns', () => withFixture(async (f) => {
+  const shard = pj(f.contextRoot, 'shards', 'shard-1.diff');
+  fs.mkdirSync(path.dirname(shard), { recursive: true });
+  fs.writeFileSync(shard, 'diff --git a/target.js b/target.js\n');
+  const gw = new ReadOnlyToolGateway({
+    safeRoot: f.safeRoot, contextRoot: f.contextRoot, cwd: f.tmpDir,
+    ignorePatterns: ['*.diff', '*.json', 'shards/'],
+    allowedContextFiles: ['shards/shard-1.diff', 'pr.diff'],
+  });
+  const { handlers } = getHandlers(gw);
+  for (const file of [shard, pj(f.contextRoot, 'pr.diff')]) {
+    const res = await handlers.Read({ file_path: file });
+    eq(res.isError, undefined);
+  }
+  const unlisted = await handlers.Read({ file_path: pj(f.contextRoot, 'unauthorized-ctx.txt') });
+  eq(unlisted.isError, true);
+  const targetDiff = pj(f.safeRoot, 'target.diff');
+  fs.writeFileSync(targetDiff, 'repo diff must remain ignored');
+  const ignored = await handlers.Read({ file_path: targetDiff });
+  eq(ignored.isError, true);
+}));
+
+test('P3: safeRoot-relative Glob and Grep results can be passed directly to Read', () => withFixture(async (f) => {
+  const gw = new ReadOnlyToolGateway({ safeRoot: f.safeRoot, contextRoot: f.contextRoot, cwd: f.tmpDir });
+  const { handlers } = getHandlers(gw);
+  const glob = await handlers.Glob({ pattern: 'src/*.js' });
+  eq(glob.isError, undefined);
+  const found = glob.content[0].text.split('\n').find((p) => p === 'src/app.js');
+  eq(found, 'src/app.js');
+  const read = await handlers.Read({ file_path: found });
+  eq(read.isError, undefined);
+  assert.match(read.content[0].text, /search_term_target/);
+
+  const grep = await handlers.Grep({ pattern: 'search_term_target', output_mode: 'files_with_matches' });
+  eq(grep.isError, undefined);
+  const grepPath = grep.content[0].text.split('\n').find((p) => p === 'src/app.js');
+  eq(grepPath, 'src/app.js');
+  const readAfterGrep = await handlers.Read({ file_path: grepPath });
+  eq(readAfterGrep.isError, undefined);
+  assert.match(readAfterGrep.content[0].text, /2: \/\/ search_term_target/);
+  const escape = await handlers.Read({ file_path: '../outside/secret.key' });
+  eq(escape.isError, true);
+}));

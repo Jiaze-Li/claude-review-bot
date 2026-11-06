@@ -244,10 +244,21 @@ export class ReadOnlyToolGateway {
       if (!rawPath || rawPath.includes('\0')) return this.denyAndRecord(toolName, input, 'Invalid file path for Read.');
       if (isControlPath(rawPath)) return this.denyAndRecord(toolName, input, 'Access to control path is forbidden.');
 
-      const resolved = resolveAllowedPath(rawPath, this.readRoots, { mustExist: true, cwd: this.cwd });
+      let resolved = resolveAllowedPath(rawPath, this.readRoots, { mustExist: true, cwd: this.cwd });
+      let repoRelativeRead = false;
+      // Glob/Grep output is safeRoot-relative. Let Read consume those paths
+      // directly while preserving the same realpath/ignore boundary checks.
+      if (!resolved.ok && this.safeRoot && !path.isAbsolute(rawPath)) {
+        const fallback = resolveAllowedPath(rawPath, [this.safeRoot], { mustExist: true, cwd: this.safeRoot });
+        if (fallback.ok) {
+          resolved = fallback;
+          repoRelativeRead = true;
+        }
+      }
       if (!resolved.ok) return this.denyAndRecord(toolName, input, resolved.error);
+      const trustedContextRead = Boolean(this.contextRoot && resolved.matchedRoot === this.contextRoot);
 
-      if (this.contextRoot && resolved.matchedRoot === this.contextRoot) {
+      if (trustedContextRead) {
         const relContext = path.relative(this.contextRoot, resolved.realPath).replace(/\\/g, '/');
         const isAllowed = this.allowedContextFiles.has(relContext);
         if (!isAllowed) {
@@ -259,12 +270,16 @@ export class ReadOnlyToolGateway {
       if (isControlPath(resolved.realPath) || isControlPath(relToRoot)) {
         return this.denyAndRecord(toolName, input, 'Access to control path is forbidden.');
       }
-      if (matchesIgnore(relToRoot, this.ignorePatterns)) {
+      // .reviewbotignore describes target-repo files only. An exact allowlist
+      // authorizes trusted context independently, so repo rules cannot mask
+      // the shard diff or review metadata.
+      if (!trustedContextRead && matchesIgnore(relToRoot, this.ignorePatterns)) {
         return this.denyAndRecord(toolName, input, `Read is denied for ignored path: ${rawPath}`);
       }
 
-      const relLex = path.relative(resolved.matchedRoot, path.resolve(this.cwd, rawPath)).replace(/\\/g, '/');
-      if (matchesIgnore(relLex, this.ignorePatterns) || matchesIgnore(rawPath.replace(/\\/g, '/'), this.ignorePatterns)) {
+      const lexicalBase = repoRelativeRead ? this.safeRoot : this.cwd;
+      const relLex = path.relative(resolved.matchedRoot, path.resolve(lexicalBase, rawPath)).replace(/\\/g, '/');
+      if (!trustedContextRead && (matchesIgnore(relLex, this.ignorePatterns) || matchesIgnore(rawPath.replace(/\\/g, '/'), this.ignorePatterns))) {
         return this.denyAndRecord(toolName, input, `Read is denied for ignored path alias: ${rawPath}`);
       }
 
