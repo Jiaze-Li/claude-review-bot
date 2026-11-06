@@ -1546,8 +1546,7 @@ test('Regression F004: Context limit classifies as unavailable for fallback and 
     });
 
     eq(outcome.ok, false);
-    eq(outcome.kind, OUTCOME_KINDS.FAILED);
-    eq(outcome.subtype, 'error_context_limit');
+    eq(outcome.kind, OUTCOME_KINDS.UNAVAILABLE);
     assert.match(outcome.error, /context exceeds.*bytes/i);
   } finally {
     f.cleanup();
