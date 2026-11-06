@@ -67,7 +67,8 @@ test('AC2 & AC7: Host actually executes MCP Read tool returning real file conten
 
   const resPaged = await handlers.Read({ file_path: pj(f.safeRoot, 'index.js'), offset: 2, limit: 1 });
   eq(resPaged.isError, undefined);
-  eq(resPaged.content[0].text, 'line2');
+  assert.match(resPaged.content[0].text, /2: line2/);
+  assert.match(resPaged.content[0].text, /next offset=3/);
 }));
 
 test('AC2 & AC7: Host actually executes MCP Glob tool returning matching files from safeRoot', () => withFixture(async (f) => {
@@ -217,8 +218,8 @@ test('AC3 & Req 5: Output size truncation and quota limits enforced before tool 
   // Call 1: Read long file - must be truncated to within maxCallReadBytes and contain truncation note
   const r1 = await handlers.Read({ file_path: longFile });
   eq(r1.isError, undefined);
-  assert.match(r1.content[0].text, /output truncated by host gateway/i);
-  assert.ok(Buffer.byteLength(r1.content[0].text, 'utf8') <= 200);
+  assert.match(r1.content[0].text, /more offset=1 col=/i);
+  assert.ok(Buffer.byteLength(r1.content[0].text, 'utf8') <= 60);
 
   // Call 2: Glob
   const r2 = await handlers.Glob({ pattern: '**/*.js' });
@@ -235,15 +236,17 @@ test('AC3 & Req 5: Output size truncation and quota limits enforced before tool 
 }));
 
 test('AC3 & Req 5: Total byte budget exhaustion fails closed', () => withFixture(async (f) => {
+  const longFile = pj(f.safeRoot, 'long-quota.txt');
+  fs.writeFileSync(longFile, 'z'.repeat(500));
   const gw = new ReadOnlyToolGateway({
     safeRoot: f.safeRoot,
     cwd: f.tmpDir,
-    maxCallReadBytes: 100,
-    maxTotalReadBytes: 20, // small total byte budget
+    maxCallReadBytes: 80,
+    maxTotalReadBytes: 80, // first long line fills the bounded result
   });
   const { handlers } = getHandlers(gw);
 
-  const r1 = await handlers.Read({ file_path: pj(f.safeRoot, 'index.js') });
+  const r1 = await handlers.Read({ file_path: longFile });
   eq(r1.isError, undefined);
 
   // Second call fails because byte quota is exhausted

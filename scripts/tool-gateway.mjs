@@ -85,7 +85,7 @@ function safeWalk({ searchRoot, safeRoot, ignorePatterns, timeoutMs, onFile }) {
   walk(searchRoot);
 }
 
-const truncMsg = (n) => `\n[TRUNCATED: host limit ${n} bytes]`;
+const truncMsg = (n) => `\n[... output truncated by host gateway: exceeded limit of ${n} bytes ...]`;
 
 // Avoid creating invalid UTF-8 when clipping a returned tool result.
 function clipUtf8(value, maxBytes) {
@@ -343,7 +343,7 @@ export class ReadOnlyToolGateway {
       const startIndex = Math.max(0, offset - 1);
       const stop = Math.min(all.length, startIndex + limit);
       const budget = prep.maxBytes;
-      const header = `[Read total_lines=${all.length}]\n`;
+      const header = `[lines=${all.length}]\n`;
       let entries = [], nextOffset = offset, nextColumn = startColumn, truncated = false;
 
       if (budget < Buffer.byteLength(header + '[next offset=1]', 'utf8')) {
@@ -355,7 +355,7 @@ export class ReadOnlyToolGateway {
         const entry = prefix + line;
         const candidate = [...entries, entry];
         const after = i + 1 < all.length
-          ? `\n[next offset=${i + 2}; truncated]`
+          ? `\n[next offset=${i + 2}]`
           : '\n[EOF]';
         if (Buffer.byteLength(header + candidate.join('\n') + after, 'utf8') <= budget) {
           entries = candidate;
@@ -371,7 +371,7 @@ export class ReadOnlyToolGateway {
           while (low <= high) {
             const mid = Math.floor((low + high) / 2);
             const segment = line.slice(0, mid);
-            const footer = `\n[TRUNCATED next offset=${i + 1} start_column=${startColumn + mid}]`;
+            const footer = `\n[more offset=${i + 1} col=${startColumn + mid}]`;
             if (Buffer.byteLength(header + prefix + segment + footer, 'utf8') <= budget) {
               best = mid; low = mid + 1;
             } else high = mid - 1;
@@ -386,12 +386,12 @@ export class ReadOnlyToolGateway {
 
       const hasMore = nextColumn > 1 || nextOffset <= all.length;
       let footer = hasMore
-        ? `\n[${truncated ? 'TRUNCATED ' : ''}next offset=${nextOffset}${nextColumn > 1 ? ` start_column=${nextColumn}` : ''}]`
+        ? (nextColumn > 1 ? `\n[more offset=${nextOffset} col=${nextColumn}]` : `\n[next offset=${nextOffset}]`)
         : '\n[EOF]';
       let text = header + entries.join('\n') + footer;
       if (Buffer.byteLength(text, 'utf8') > budget) {
         // Always preserve a bounded continuation cursor; never silently omit lines.
-        footer = `\n[next offset=${nextOffset}${nextColumn > 1 ? ` start_column=${nextColumn}` : ''}]`;
+        footer = nextColumn > 1 ? `\n[more offset=${nextOffset} col=${nextColumn}]` : `\n[next offset=${nextOffset}]`;
         const room = budget - Buffer.byteLength(header + footer, 'utf8');
         if (room < 0) return this.denyAndRecord(TOOL_NAMES.READ, rawInput, 'Read byte budget too small for continuation cursor.');
         text = header + clipUtf8(entries.join('\n'), room) + footer;
@@ -649,7 +649,7 @@ export function createGatewayMcpServer(gateway, serverName = 'gateway') {
       file_path: z.string().describe('Path to the file to read (must be within repository or authorized review context)'),
       offset: z.number().int().optional().describe('1-based line number to start reading from'),
       limit: z.number().int().optional().describe('Number of lines to read'),
-      start_column: z.number().int().positive().optional().describe('1-based character position when continuing a long line'),
+      start_column: z.number().int().positive().optional().describe('1-based character position; pass the col from a Read [more offset=.. col=..] cursor'),
     },
     async (args) => {
       const res = await gateway.executeRead(args);

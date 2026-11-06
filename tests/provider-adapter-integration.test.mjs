@@ -312,7 +312,9 @@ test('Integration E3: Full review with Tool Gateway preserves shard execution, c
       assert.equal(options.permissionMode, 'dontAsk');
       assert.equal(options.strictMcpConfig, true);
       assert.deepEqual(options.settingSources, []);
-      assert.equal((await options.canUseTool('Read', { file_path: path.join(safe, 'fileA.js') })).behavior, 'allow');
+      assert.equal((await options.canUseTool('mcp__gateway__Read', { file_path: path.join(safe, 'fileA.js') })).behavior, 'allow');
+      assert.equal((await options.canUseTool('Read', { file_path: path.join(safe, 'fileA.js') })).behavior, 'deny');
+      await options.mcpServers.gateway.instance?.close?.();
       yield { type: 'result', subtype: 'success', num_turns: 4, total_cost_usd: 0.35, usage: { input_tokens: 1500, output_tokens: 250 }, structured_output: { summary: 'ok', coverage: { complete: true } } };
     },
     toolGateway: gw,

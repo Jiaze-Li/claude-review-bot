@@ -544,7 +544,7 @@ test('Gemini adapter preserves successful execution with the minimum positive in
   assert.equal(requests, 1);
 });
 
-test('Claude adapter integrates with toolGateway: mounts canUseTool and hooks.PostToolUse, enforces boundaries and truncation', async () => {
+test('Claude adapter allows only Host Gateway MCP tools, never built-in tool aliases', async () => {
   const [{ ReadOnlyToolGateway }, fs, os, path] = await Promise.all([
     import('../scripts/tool-gateway.mjs'), import('node:fs'), import('node:os'), import('node:path'),
   ]);
@@ -553,18 +553,25 @@ test('Claude adapter integrates with toolGateway: mounts canUseTool and hooks.Po
   fs.writeFileSync(path.join(safe, 'v.txt'), 'v'); fs.writeFileSync(path.join(outside, 'k'), 'k');
   const gw = new ReadOnlyToolGateway({ safeRoot: safe, cwd: tmp, maxCallReadBytes: 50 });
   let opts = null;
-  const outcome = await getProviderAdapter(PROVIDER_KINDS.CLAUDE).execute({
-    prompt: 'p', schema: basicSchema, env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
-    queryImpl: async function* ({ options }) { opts = options; yield { type: 'result', subtype: 'success', total_cost_usd: 0.1, structured_output: { summary: 'ok' } }; },
-    toolGateway: gw, tools: ['Read', 'Glob', 'Grep'],
-  });
-  assert.equal(outcome.ok, true);
-  assert.equal((await opts.canUseTool('Read', { file_path: path.join(safe, 'v.txt') })).behavior, 'allow');
-  assert.equal((await opts.canUseTool('Read', { file_path: path.join(outside, 'k') })).behavior, 'deny');
-  assert.equal((await opts.canUseTool('Grep', { pattern: 'v', mode: 'count' })).behavior, 'deny');
-  const hookRes = await opts.hooks.PostToolUse[0].hooks[0]({ tool_name: 'Read', tool_input: {}, tool_response: 'z'.repeat(200) });
-  assert.match(hookRes.hookSpecificOutput.updatedToolOutput, /output truncated by host gateway/i);
-  const hookObj = await opts.hooks.PostToolUse[0].hooks[0]({ tool_name: 'Glob', tool_input: {}, tool_response: { filenames: ['v.txt', '../o/k'] } });
-  assert.deepEqual(hookObj.hookSpecificOutput.updatedToolOutput, { filenames: ['v.txt'] });
-  fs.rmSync(tmp, { recursive: true, force: true });
+  try {
+    const outcome = await getProviderAdapter(PROVIDER_KINDS.CLAUDE).execute({
+      prompt: 'p', schema: basicSchema, env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
+      queryImpl: async function* ({ options }) {
+        opts = options;
+        yield { type: 'result', subtype: 'success', total_cost_usd: 0.1, structured_output: { summary: 'ok' } };
+      },
+      toolGateway: gw, tools: ['Read', 'Glob', 'Grep'],
+    });
+    assert.equal(outcome.ok, true);
+    assert.deepEqual(opts.tools, []);
+    assert.deepEqual(opts.allowedTools, ['mcp__gateway__Read', 'mcp__gateway__Glob', 'mcp__gateway__Grep']);
+    assert.equal((await opts.canUseTool('mcp__gateway__Read', { file_path: path.join(safe, 'v.txt') })).behavior, 'allow');
+    assert.equal((await opts.canUseTool('Read', { file_path: path.join(safe, 'v.txt') })).behavior, 'deny');
+    assert.equal((await opts.canUseTool('Bash', { command: 'cat /etc/passwd' })).behavior, 'deny');
+    assert.equal(opts.hooks, undefined, 'Host MCP tools must not rely on output rewrites');
+  } finally {
+    await opts?.mcpServers?.gateway?.instance?.close?.();
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
 });
+

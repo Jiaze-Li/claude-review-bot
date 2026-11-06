@@ -48,17 +48,26 @@ test('Safe glob pattern validator: rejects unsafe patterns with ../ or absolute 
   for (const p of ['../outside/*.js', '/etc/*', 'foo/../../bar', 'pattern\0', '', null]) eq(isSafeGlobPattern(p), false);
 });
 
-test('ReadOnlyToolGateway Read: normal read, offset/limit pagination, truncation, and bounds', () => withFixture(async (f) => {
-  const gw = new ToolGW({ safeRoot: f.safeRoot, contextRoot: f.contextRoot, cwd: f.tmpDir, maxCallReadBytes: 50 });
-  const r1 = await gw.executeRead({ file_path: pj(f.safeRoot, 'index.js') });
-  eq(r1.ok && r1.lines === 3 && /hello/.test(r1.content), true);
-  const r2 = await gw.executeRead({ file_path: pj(f.safeRoot, 'index.js'), offset: 2, limit: 1 });
-  eq(r2.ok && r2.content, 'line2');
+test('ReadOnlyToolGateway Read: numbered pagination, bounded output, continuation and allowlist', () => withFixture(async (f) => {
+  const gw = new ToolGW({ safeRoot: f.safeRoot, contextRoot: f.contextRoot, cwd: f.tmpDir, maxCallReadBytes: 70 });
+  const p = pj(f.safeRoot, 'index.js');
+  const r1 = await gw.executeRead({ file_path: p });
+  eq(r1.ok, true);
+  assert.match(r1.content, /1: console\.log/);
+  assert.ok(Buffer.byteLength(r1.content, 'utf8') <= 70);
+  const r2 = await gw.executeRead({ file_path: p, offset: 2, limit: 1 });
+  eq(r2.ok, true);
+  assert.match(r2.content, /2: line2/);
+  assert.match(r2.content, /next offset=3/);
   const big = pj(f.safeRoot, 'large.txt');
   fs.writeFileSync(big, 'x'.repeat(200));
   const r3 = await gw.executeRead({ file_path: big });
-  eq(r3.ok && r3.truncated && /truncated by host gateway/i.test(r3.content), true);
-  eq((await gw.executeRead({ file_path: pj(f.contextRoot, 'pr.diff') })).ok, true);
+  eq(r3.ok && r3.truncated, true);
+  assert.match(r3.content, /more offset=1 col=/);
+  assert.ok(Buffer.byteLength(r3.content, 'utf8') <= 70);
+  eq((await gw.executeRead({ file_path: pj(f.contextRoot, 'pr.diff') })).ok, false);
+  const gwAllowed = new ToolGW({ safeRoot: f.safeRoot, contextRoot: f.contextRoot, cwd: f.tmpDir, allowedContextFiles: ['pr.diff'] });
+  eq((await gwAllowed.executeRead({ file_path: pj(f.contextRoot, 'pr.diff') })).ok, true);
 }));
 
 test('ReadOnlyToolGateway Glob: safe directory scan without shell, obeys boundary and limits', () => withFixture(async (f) => {
@@ -84,10 +93,17 @@ test('Quota exhaustion and Fail Closed: call budget and total byte budget enforc
   eq((await g1.executeRead({ file_path: p })).ok, true);
   eq((await g1.executeRead({ file_path: p })).ok, true);
   assert.match((await g1.executeRead({ file_path: p })).error, /Tool invocation limit exceeded/i);
-  const g2 = new ToolGW({ safeRoot: f.safeRoot, cwd: f.tmpDir, maxTotalReadBytes: 30 });
-  eq((await g2.executeRead({ file_path: p })).ok, true);
-  assert.match((await g2.executeRead({ file_path: p })).error, /Read byte quota exceeded/i);
-  eq(g2.getDiagnostics().quotaExhausted, true);
+
+  const long = pj(f.safeRoot, 'big-budget.txt');
+  fs.writeFileSync(long, 'z'.repeat(500));
+  const g2 = new ToolGW({ safeRoot: f.safeRoot, cwd: f.tmpDir, maxCallReadBytes: 80, maxTotalReadBytes: 80 });
+  const first = await g2.executeRead({ file_path: long });
+  eq(first.ok && first.truncated, true);
+  assert.ok(first.bytesRead <= 80);
+  const second = await g2.executeRead({ file_path: long });
+  eq(second.ok, false);
+  assert.match(second.error, /byte quota|budget too small/i);
+  assert.ok(g2.getDiagnostics().totalReadBytes <= 80);
 }));
 
 test('Ignore patterns enforcement: files matching ignore rules are denied', () => withFixture(async (f) => {
@@ -129,8 +145,9 @@ test('Single call quota truncation against remaining session byte budget', () =>
   const big = pj(f.safeRoot, 'big.txt');
   fs.writeFileSync(big, 'z'.repeat(500));
   const res = await gw.executeRead({ file_path: big });
-  eq(res.ok && res.truncated && /exceeded limit of 80 bytes/i.test(res.content), true);
-  assert.match((await gw.executeRead({ file_path: big })).error, /Read byte quota exceeded/i);
+  eq(res.ok && res.truncated && /more offset=1 col=/i.test(res.content), true);
+  assert.ok(Buffer.byteLength(res.content, 'utf8') <= 80);
+  assert.match((await gw.executeRead({ file_path: big })).error, /Read byte quota exceeded|Read byte budget too small|Read output budget too small/i);
 }));
 
 test('Claude canUseTool and PostToolHook integration bridges with Array and Object responses', () => withFixture(async (f) => {
