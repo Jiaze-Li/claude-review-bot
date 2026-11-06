@@ -250,7 +250,7 @@ test('F001 & F003: tool-gateway and provider-adapter have no static ESM imports 
   const loaderUrl = 'data:text/javascript,' + encodeURIComponent(loaderCode);
 
   // Importing tool-gateway and provider-adapter must NOT trigger SDK or zod resolution
-  execSync(`node --no-warnings --loader "${loaderUrl}" -e "await import('./scripts/tool-gateway.mjs'); await import('./scripts/provider-adapter.mjs');"`, {
+  execSync(`node --no-warnings --loader "${loaderUrl}" --input-type=module -e "await import('./scripts/tool-gateway.mjs'); await import('./scripts/provider-adapter.mjs');"`, {
     cwd: process.cwd(),
     stdio: 'pipe',
   });
@@ -258,7 +258,7 @@ test('F001 & F003: tool-gateway and provider-adapter have no static ESM imports 
   // Verify that the blocking loader indeed catches static imports of zod or the SDK
   let blocked = false;
   try {
-    execSync(`node --no-warnings --loader "${loaderUrl}" -e "import 'zod';"`, {
+    execSync(`node --no-warnings --loader "${loaderUrl}" --input-type=module -e "import 'zod';"`, {
       cwd: process.cwd(),
       stdio: 'pipe',
     });

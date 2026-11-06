@@ -610,7 +610,6 @@ export class GeminiProviderAdapter extends ProviderAdapter {
       if (requestBytes > GEMINI_MAX_CONTEXT_BYTES) {
         const err = new Error(`Gemini review context exceeds ${GEMINI_MAX_CONTEXT_BYTES} bytes (${requestBytes} bytes)`);
         err.name = 'ContextLimitExceeded';
-        err.isUnavailable = true;
         throw err;
       }
 
