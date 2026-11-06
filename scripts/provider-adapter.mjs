@@ -169,7 +169,11 @@ export class GeminiProviderAdapter extends ProviderAdapter {
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       let payload;
       const attemptStart = Date.now();
-      const signal = AbortSignal.timeout(timeoutMs);
+      // Full Review passes the remaining deadline minus its reserve; near the deadline
+      // that budget can be zero or negative. Fail through the normal outcome contract
+      // without starting a request or throwing out of the adapter.
+      const invalidTimeout = !Number.isInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 0xFFFFFFFF;
+      let signal = null;
       if (typeof logImpl === 'function') {
         const mode = metadata?.mode ?? 'review';
         const contextBytes = metadata?.contextBytes ?? 0;
@@ -177,6 +181,8 @@ export class GeminiProviderAdapter extends ProviderAdapter {
       }
 
       try {
+        if (invalidTimeout) throw new RangeError(`Invalid or exhausted Gemini timeout budget: ${timeoutMs}ms`);
+        signal = AbortSignal.timeout(timeoutMs);
         const response = await fetchImpl(`${geminiBaseUrl(env)}/v1beta/models/${encodeURIComponent(targetModel)}:generateContent`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
@@ -221,9 +227,10 @@ export class GeminiProviderAdapter extends ProviderAdapter {
 
         payload = await response.json();
       } catch (err) {
-        const timedOut = err?.name === 'TimeoutError' || (signal.aborted && signal.reason?.name === 'TimeoutError');
-        const errorMsg = timedOut
-          ? `Gemini request timed out after ${timeoutMs}ms`
+        const timedOut = invalidTimeout || err?.name === 'TimeoutError' || (signal?.aborted && signal.reason?.name === 'TimeoutError');
+        const errorMsg = invalidTimeout
+          ? `Gemini request skipped: invalid or exhausted timeout budget (${timeoutMs}ms)`
+          : timedOut ? `Gemini request timed out after ${timeoutMs}ms`
           : `Gemini request failed: ${err?.message ?? err}`;
 
         return {
@@ -241,10 +248,10 @@ export class GeminiProviderAdapter extends ProviderAdapter {
             requested_model: targetModel,
             resolved_model: targetModel,
             effort,
-            num_turns: attempt,
+            num_turns: invalidTimeout ? 0 : attempt,
             max_turns: 1,
             duration_ms: Date.now() - startedAt,
-            duration_api_ms: Date.now() - attemptStart,
+            duration_api_ms: invalidTimeout ? 0 : Date.now() - attemptStart,
             total_cost_usd: 0,
             cost_source: COST_SOURCES.ZERO,
             usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, thoughts_tokens: null, total_tokens: null },

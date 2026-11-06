@@ -277,3 +277,20 @@ test('Integration: runClaudeStructured preserves conservative reserve cost when 
   assert.equal(outcome.meta.total_cost_usd, 0.5); // Fallback preserves conservative reserve
   assert.equal(outcome.meta.cost_source, 'reserve');
 });
+
+test('Full shard wrapper preserves failed outcome for an exhausted deadline without invoking Gemini', async () => {
+  let requests = 0;
+  const outcome = await runGeminiShard({
+    prompt: 'full shard nearing deadline',
+    schema: { type: 'object', properties: { summary: { type: 'string' } }, required: ['summary'] },
+    timeoutMs: -30_000,
+    env: { GEMINI_API_KEY: 'test-key' },
+    fetchImpl: async () => {
+      requests += 1;
+      throw new Error('Should not fetch with expired deadline');
+    },
+  });
+  assert.equal(outcome.kind, 'failed');
+  assert.match(outcome.error, /invalid or exhausted timeout budget/);
+  assert.equal(requests, 0);
+});

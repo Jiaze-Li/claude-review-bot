@@ -501,3 +501,45 @@ test('Claude adapter keeps ordinary SDK exceptions distinct from timeout and Del
   assert.equal(timeout.subtype, 'error_timeout');
   assert.match(timeout.error, /Claude timed out/);
 });
+
+test('Gemini adapter returns failed outcome without a request for invalid or exhausted timeout budgets', async () => {
+  const adapter = getProviderAdapter(PROVIDER_KINDS.GEMINI);
+  let requests = 0;
+  const mockFetch = async () => {
+    requests += 1;
+    throw new Error('Network request must not be sent for invalid timeouts');
+  };
+
+  for (const timeoutMs of [-30_000, -1, 0, NaN, Infinity, 1.5, 0x100000000]) {
+    const outcome = await adapter.execute({
+      prompt: 'p',
+      schema: basicSchema,
+      timeoutMs,
+      env: { GEMINI_API_KEY: 'test-key' },
+      fetchImpl: mockFetch,
+    });
+    assert.equal(outcome.ok, false, `timeoutMs=${timeoutMs}`);
+    assert.equal(outcome.kind, OUTCOME_KINDS.FAILED);
+    assert.equal(outcome.errorKind, ERROR_KINDS.TIMEOUT);
+    assert.match(outcome.error, /invalid or exhausted timeout budget/);
+    assert.equal(outcome.meta.num_turns, 0);
+    assert.equal(outcome.meta.total_cost_usd, 0);
+  }
+  assert.equal(requests, 0, 'exhausted budgets must not send HTTP requests');
+});
+
+test('Gemini adapter preserves successful execution with the minimum positive integer timeout', async () => {
+  const adapter = getProviderAdapter(PROVIDER_KINDS.GEMINI);
+  let requests = 0;
+  const outcome = await adapter.execute({
+    prompt: 'p', schema: basicSchema, timeoutMs: 1,
+    env: { GEMINI_API_KEY: 'test-key' },
+    fetchImpl: async () => {
+      requests += 1;
+      return Response.json({ candidates: [{ content: { parts: [{ text: JSON.stringify({ summary: 'ok', findings: [] }) }] } }] });
+    },
+  });
+  assert.equal(outcome.ok, true);
+  assert.equal(outcome.kind, OUTCOME_KINDS.OK);
+  assert.equal(requests, 1);
+});
