@@ -227,3 +227,20 @@ test('PR5 compatibility: getToolDeclarations returns valid schema definitions fo
   eq(decls.length, 3);
   deq(decls.map((d) => d.name), ['Read', 'Glob', 'Grep']);
 });
+
+test('F001: tool-gateway does not load Claude SDK or Zod until createGatewayMcpServer is invoked', async () => {
+  const { execSync } = await import('node:child_process');
+  const code = `
+    const { createRequire } = await import('node:module');
+    const require = createRequire(import.meta.url);
+    await import('./scripts/tool-gateway.mjs');
+    await import('./scripts/provider-adapter.mjs');
+    const cached = Object.keys(require.cache || {});
+    const sdkCached = cached.filter((p) => p.includes('claude-agent-sdk') || p.includes('zod'));
+    if (sdkCached.length > 0) {
+      console.error('Claude SDK / Zod loaded prematurely:', sdkCached);
+      process.exit(1);
+    }
+  `;
+  execSync(`node --input-type=module -e "${code.replace(/\n/g, ' ')}"`, { cwd: process.cwd(), stdio: 'pipe' });
+});

@@ -1,8 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { Worker } from 'node:worker_threads';
-import { tool, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
-import { z } from 'zod';
+import { createRequire } from 'node:module';
 import { matchesIgnore } from './review-shards.mjs';
 
 export const TOOL_NAMES = Object.freeze({ READ: 'Read', GLOB: 'Glob', GREP: 'Grep' });
@@ -761,7 +760,23 @@ export class ReadOnlyToolGateway {
   }
 }
 
+let _claudeSdkModules = null;
+function getClaudeSdkModules() {
+  if (!_claudeSdkModules) {
+    const require = createRequire(import.meta.url);
+    const sdk = require('@anthropic-ai/claude-agent-sdk');
+    const zodMod = require('zod');
+    _claudeSdkModules = {
+      tool: sdk.tool,
+      createSdkMcpServer: sdk.createSdkMcpServer,
+      z: zodMod.z || zodMod,
+    };
+  }
+  return _claudeSdkModules;
+}
+
 export function createGatewayMcpServer(gateway, serverName = 'gateway') {
+  const { tool, createSdkMcpServer, z } = getClaudeSdkModules();
   const readTool = tool(
     TOOL_NAMES.READ,
     'Read file contents from the repository or authorized review context.',
