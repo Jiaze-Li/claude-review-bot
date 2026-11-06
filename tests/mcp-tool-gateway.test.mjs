@@ -402,3 +402,15 @@ test('AC3: parallel MCP results cannot overdraw shared cumulative byte budget', 
   assert.ok(Buffer.byteLength(successes[0].content[0].text, 'utf8') <= 85);
   assert.ok(gw.getDiagnostics().totalReadBytes <= 85, 'cumulative output bytes exceeded cap');
 }));
+test('F005: invalid regex is escaped as literal text inside bounded Grep worker', () => withFixture(async (f) => {
+  const file = pj(f.safeRoot, 'literal-patterns.txt');
+  fs.writeFileSync(file, 'literal foo( occurs here\nand a[ also occurs\n');
+  const gw = new ReadOnlyToolGateway({ safeRoot: f.safeRoot, cwd: f.tmpDir });
+  const { handlers } = getHandlers(gw);
+  for (const literal of ['foo(', 'a[']) {
+    const result = await handlers.Grep({ pattern: literal, path: file });
+    eq(result.isError, undefined);
+    assert.match(result.content[0].text, /literal-patterns\.txt/);
+    assert.ok(result.content[0].text.includes(literal), 'fallback must match the literal characters');
+  }
+}));
