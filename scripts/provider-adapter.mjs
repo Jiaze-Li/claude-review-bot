@@ -560,6 +560,7 @@ export class GeminiProviderAdapter extends ProviderAdapter {
       if (requestBytes > GEMINI_MAX_CONTEXT_BYTES) {
         const err = new Error(`Gemini review context exceeds ${GEMINI_MAX_CONTEXT_BYTES} bytes (${requestBytes} bytes)`);
         err.name = 'ContextLimitExceeded';
+        err.isUnavailable = true;
         throw err;
       }
 
@@ -638,13 +639,17 @@ export class GeminiProviderAdapter extends ProviderAdapter {
       const functionCallParts = parts.filter((p) => Boolean(p.functionCall));
 
       if (functionCallParts.length === 0) {
-        contents.push({ role: 'model', parts: parts.map((p) => ({ ...p })) });
+        if (parts.length > 0) {
+          contents.push({ role: 'model', parts: parts.map((p) => ({ ...p })) });
+        }
         finishedToolTurns = true;
         break;
       }
 
       // Preserve all model parts (including thoughtSignature, functionCall with id, etc.)
-      contents.push({ role: 'model', parts: parts.map((p) => ({ ...p })) });
+      if (parts.length > 0) {
+        contents.push({ role: 'model', parts: parts.map((p) => ({ ...p })) });
+      }
 
       if (toolCallCount + functionCallParts.length > maxToolCalls) {
         const errorMsg = `Tool invocation limit exceeded: reached ${maxToolCalls} tool calls across turns.`;
@@ -678,6 +683,14 @@ export class GeminiProviderAdapter extends ProviderAdapter {
           ? { output: res.content }
           : { error: res.error || res.message || 'Tool execution failed' };
 
+        if (responseObj.output && typeof responseObj.output === 'string') {
+          const currentBytes = Buffer.byteLength(JSON.stringify(contents), 'utf8');
+          const maxRemaining = Math.max(2048, GEMINI_MAX_CONTEXT_BYTES - currentBytes - 100_000);
+          if (Buffer.byteLength(responseObj.output, 'utf8') > maxRemaining) {
+            responseObj.output = responseObj.output.slice(0, Math.floor(maxRemaining / 2)) + '\n... [output truncated to stay within Gemini context limit]';
+          }
+        }
+
         functionResponseParts.push({
           functionResponse: {
             name,
@@ -691,6 +704,13 @@ export class GeminiProviderAdapter extends ProviderAdapter {
         role: 'user',
         parts: functionResponseParts,
       });
+
+      // If accumulated history approaches the context limit, stop tool turns and fall through to Stage B
+      const historyBytes = Buffer.byteLength(JSON.stringify(contents), 'utf8');
+      if (historyBytes >= GEMINI_MAX_CONTEXT_BYTES - 100_000) {
+        finishedToolTurns = true;
+        break;
+      }
     }
 
     if (!finishedToolTurns) {
@@ -734,10 +754,15 @@ export class GeminiProviderAdapter extends ProviderAdapter {
     }
 
     turnCount += 1;
-    contents.push({
-      role: 'user',
-      parts: [{ text: 'Based on the code exploration above, provide the final structured review JSON conforming strictly to the requested schema.' }],
-    });
+    const structuredInstruction = 'Based on the code exploration above, provide the final structured review JSON conforming strictly to the requested schema.';
+    if (contents.length > 0 && contents[contents.length - 1].role === 'user') {
+      contents[contents.length - 1].parts.push({ text: structuredInstruction });
+    } else {
+      contents.push({
+        role: 'user',
+        parts: [{ text: structuredInstruction }],
+      });
+    }
 
     const structuredPayload = {
       contents,

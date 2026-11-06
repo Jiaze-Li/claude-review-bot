@@ -1461,3 +1461,94 @@ test('E12: Shard Coverage, Session and Budget with Gemini tool loop without regr
     f.cleanup();
   }
 });
+
+test('Regression F003: Empty parts candidate does not produce empty parts array or invalid history', async () => {
+  const f = createTestFixture();
+  try {
+    const gw = new ReadOnlyToolGateway({ safeRoot: f.safeRoot, cwd: f.tmpDir });
+    let turn = 0;
+    let turn2Body = null;
+
+    const mockFetch = async (_url, init) => {
+      turn += 1;
+      const body = JSON.parse(init.body);
+      if (turn === 1) {
+        // Model returns candidate with empty parts (e.g. SAFETY or empty turn)
+        return Response.json({
+          candidates: [
+            {
+              finishReason: 'STOP',
+              content: { role: 'model', parts: [] },
+            },
+          ],
+          usageMetadata: { promptTokenCount: 50, candidatesTokenCount: 0, totalTokenCount: 50 },
+        });
+      }
+      if (turn === 2) {
+        turn2Body = body;
+        return Response.json({
+          candidates: [
+            {
+              content: {
+                role: 'model',
+                parts: [
+                  {
+                    text: JSON.stringify({
+                      summary: 'Clean review after empty turn',
+                      findings: [],
+                      coverage: { complete: true, reviewedPaths: [], unreviewedPaths: [], note: '' },
+                    }),
+                  },
+                ],
+              },
+            },
+          ],
+          usageMetadata: { promptTokenCount: 80, candidatesTokenCount: 20, totalTokenCount: 100 },
+        });
+      }
+      throw new Error(`Unexpected turn ${turn}`);
+    };
+
+    const adapter = getProviderAdapter(PROVIDER_KINDS.GEMINI);
+    const outcome = await adapter.execute({
+      prompt: 'Test empty parts resilience',
+      schema: REVIEW_SCHEMA,
+      env: { GEMINI_API_KEY: 'test-key' },
+      fetchImpl: mockFetch,
+      toolGateway: gw,
+    });
+
+    eq(outcome.ok, true);
+    eq(outcome.structured.summary, 'Clean review after empty turn');
+    // Ensure no entry in turn 2 contents has empty parts
+    for (const c of turn2Body.contents) {
+      assert.ok(Array.isArray(c.parts) && c.parts.length > 0, 'Every content entry must have non-empty parts');
+    }
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('Regression F004: Context limit classifies as unavailable for fallback and tool result is bounded', async () => {
+  const f = createTestFixture();
+  try {
+    const gw = new ReadOnlyToolGateway({ safeRoot: f.safeRoot, cwd: f.tmpDir });
+    const adapter = getProviderAdapter(PROVIDER_KINDS.GEMINI);
+
+    // Initial prompt exceeding context limit returns kind: unavailable so caller can fall back
+    const hugePrompt = 'x'.repeat(1_600_000);
+    const outcome = await adapter.execute({
+      prompt: hugePrompt,
+      schema: REVIEW_SCHEMA,
+      env: { GEMINI_API_KEY: 'test-key' },
+      fetchImpl: async () => Response.json({}),
+      toolGateway: gw,
+    });
+
+    eq(outcome.ok, false);
+    eq(outcome.kind, OUTCOME_KINDS.UNAVAILABLE);
+    assert.match(outcome.error, /context exceeds.*bytes/i);
+  } finally {
+    f.cleanup();
+  }
+});
