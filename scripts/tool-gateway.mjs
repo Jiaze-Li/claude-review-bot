@@ -106,6 +106,41 @@ function cappedText(text, maxBytes, truncated = false) {
   return { content: clipUtf8(text, maxBytes - markerBytes) + marker, truncated: true };
 }
 
+
+/*
+ * Untrusted Grep expressions run in a disposable worker thread. A catastrophic
+ * backtracking regexp can consume its worker's CPU, but cannot block the host
+ * event loop. Timeout terminates the worker, including its synchronous regexp.
+ */
+const GREP_WORKER_SOURCE = "const { parentPort, workerData } = require('node:worker_threads');\nconst fs = require('node:fs');\nconst path = require('node:path');\nconst inside = (root, file) => file === root || file.startsWith(root + path.sep);\nconst { pattern, safeRoot, files, maxMatches, maxBytes, maxFileBytes } = workerData;\nlet rx;\ntry { rx = new RegExp(pattern); } catch {\n  rx = new RegExp(pattern.replace(/[.*+?^$()|[\\]{}]/g, '\\\\export class ReadOnlyToolGateway {'));\n}\nconst matches = [];\nlet bytes = 0, truncated = false;\nouter: for (const item of files) {\n  let real, stat;\n  try {\n    real = fs.realpathSync.native(item.realPath);\n    if (!inside(safeRoot, real)) continue;\n    stat = fs.statSync(real);\n    if (!stat.isFile() || stat.size > maxFileBytes) continue;\n  } catch { continue; }\n  let lines;\n  try { lines = fs.readFileSync(real, 'utf8').split(/\\r?\\n/); } catch { continue; }\n  for (let i = 0; i < lines.length; i++) {\n    const candidate = lines[i].slice(0, 2000);\n    if (!rx.test(candidate)) continue;\n    const entry = { path: item.relToRepo, line: i + 1, text: candidate.slice(0, 1000) };\n    const entryBytes = Buffer.byteLength(JSON.stringify(entry), 'utf8');\n    if (bytes + entryBytes > maxBytes || matches.length >= maxMatches) {\n      truncated = true;\n      break outer;\n    }\n    matches.push(entry);\n    bytes += entryBytes;\n  }\n}\nparentPort.postMessage({ matches, bytes, truncated });";
+
+function boundedGrepWorker(data, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(GREP_WORKER_SOURCE, {
+      eval: true,
+      workerData: data,
+      resourceLimits: { maxOldGenerationSizeMb: 64 },
+    });
+    let settled = false;
+    const finish = (error, result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      worker.removeAllListeners();
+      void worker.terminate().catch(() => {});
+      if (error) reject(error);
+      else resolve(result);
+    };
+    const timer = setTimeout(
+      () => finish(new Error(`Operation timed out after ${timeoutMs}ms`)),
+      timeoutMs,
+    );
+    worker.once('message', (result) => finish(null, result));
+    worker.once('error', (error) => finish(error));
+    worker.once('exit', (code) => finish(new Error(`Grep worker exited unexpectedly (code ${code})`)));
+  });
+}
+
 export class ReadOnlyToolGateway {
   constructor(options = {}) {
     this.safeRoot = options.safeRoot ? realDirPath(options.safeRoot) : null;
@@ -411,36 +446,43 @@ export class ReadOnlyToolGateway {
     const prep = await this.prepareExecution(TOOL_NAMES.GREP, rawInput);
     if (!prep.ok) return prep;
     const { pattern, path: searchRoot, glob: fileGlob } = prep.input;
-    let regex;
-    try { regex = new RegExp(pattern); } catch { regex = new RegExp(escapeRegExp(pattern)); }
-    const globRegex = fileGlob ? globToRegExp(fileGlob) : null, matches = [];
-    let truncated = false, totalBytes = 0;
+    const globRegex = fileGlob ? globToRegExp(fileGlob) : null;
+    const candidates = [];
+    let truncated = false;
+    const startedAt = Date.now();
+
     try {
       safeWalk({
-        searchRoot, safeRoot: this.safeRoot, ignorePatterns: this.ignorePatterns, timeoutMs: this.timeoutMs,
+        searchRoot,
+        safeRoot: this.safeRoot,
+        ignorePatterns: this.ignorePatterns,
+        timeoutMs: this.timeoutMs,
         onFile: ({ realPath, relToRepo, stat, entryName, fullPath }) => {
           if (!this.isPathAllowed(relToRepo)) return false;
-          if (matches.length >= this.maxGrepMatches || totalBytes >= prep.maxBytes) { truncated = true; return true; }
           const relSearch = path.relative(searchRoot, fullPath).replace(/\\/g, '/');
           if (globRegex && !globRegex.test(relSearch) && !globRegex.test(relToRepo) && !globRegex.test(entryName)) return false;
           if (stat.size > this.maxGrepFileBytes) return false;
-          try {
-            const lines = fs.readFileSync(realPath, 'utf8').split(/\r?\n/);
-            for (let lineNum = 1; lineNum <= lines.length; lineNum += 1) {
-              const testLine = lines[lineNum - 1].slice(0, 2000);
-              if (regex.test(testLine)) {
-                const match = { path: relToRepo, line: lineNum, text: testLine.slice(0, 1000) };
-                const entryBytes = Buffer.byteLength(JSON.stringify(match), 'utf8');
-                if (totalBytes + entryBytes > prep.maxBytes) { truncated = true; return true; }
-                matches.push(match);
-                totalBytes += entryBytes;
-                if (matches.length >= this.maxGrepMatches) { truncated = true; return true; }
-              }
-            }
-          } catch {}
+          if (candidates.length >= 3000) { truncated = true; return true; }
+          candidates.push({ realPath, relToRepo });
           return false;
         },
       });
+
+      let matches = [];
+      if (candidates.length) {
+        const remainingMs = Math.max(1, this.timeoutMs - (Date.now() - startedAt));
+        const result = await boundedGrepWorker({
+          safeRoot: this.safeRoot,
+          pattern,
+          files: candidates,
+          maxMatches: this.maxGrepMatches,
+          maxBytes: prep.maxBytes,
+          maxFileBytes: this.maxGrepFileBytes,
+        }, remainingMs);
+        matches = result.matches;
+        truncated = truncated || result.truncated;
+      }
+
       const filesOnly = rawInput?.output_mode === 'files_with_matches' || rawInput?.mode === 'files_with_matches';
       const text = filesOnly
         ? [...new Set(matches.map((m) => m.path))].join('\n') || 'No files matched.'

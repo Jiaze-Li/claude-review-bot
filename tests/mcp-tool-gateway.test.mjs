@@ -330,3 +330,55 @@ test('AC1 & AC8: Claude provider adapter mounts MCP Gateway with tools: [], stri
   eq(capturedOptions.strictMcpConfig, true);
   assert.deepEqual(capturedOptions.settingSources, []);
 }));
+test('F001: explicit single-file paths work for Grep and Glob without ENOTDIR', () => withFixture(async (f) => {
+  const gw = new ReadOnlyToolGateway({ safeRoot: f.safeRoot, cwd: f.tmpDir });
+  const { handlers } = getHandlers(gw);
+  const file = pj(f.safeRoot, 'src/app.js');
+  const grep = await handlers.Grep({ pattern: 'search_term_target', path: file });
+  eq(grep.isError, undefined);
+  assert.match(grep.content[0].text, /src\/app\.js:2/);
+  const glob = await handlers.Glob({ pattern: '*.js', path: file });
+  eq(glob.isError, undefined);
+  assert.match(glob.content[0].text, /src\/app\.js/);
+}));
+
+test('F002: catastrophic alternative regex is killed without blocking host event loop', () => withFixture(async (f) => {
+  fs.writeFileSync(pj(f.safeRoot, 'evil.txt'), 'a'.repeat(1999) + '!');
+  const gw = new ReadOnlyToolGateway({ safeRoot: f.safeRoot, cwd: f.tmpDir, timeoutMs: 600 });
+  const { handlers } = getHandlers(gw);
+  const call = handlers.Grep({ pattern: '(a|aa)+b', path: pj(f.safeRoot, 'evil.txt') });
+  const responsiveness = await Promise.race([
+    call.then(() => 'completed'),
+    new Promise((resolve) => setTimeout(() => resolve('responsive'), 35)),
+  ]);
+  eq(responsiveness, 'responsive', 'malicious pattern must run off main thread');
+  const result = await call;
+  eq(result.isError, true);
+  assert.match(result.content[0].text, /timed out/i);
+}));
+
+test('F003: Read reports line numbers and a next-offset cursor', () => withFixture(async (f) => {
+  const gw = new ReadOnlyToolGateway({ safeRoot: f.safeRoot, cwd: f.tmpDir, maxReadLines: 1 });
+  const { handlers } = getHandlers(gw);
+  const first = await handlers.Read({ file_path: pj(f.safeRoot, 'index.js') });
+  eq(first.isError, undefined);
+  assert.match(first.content[0].text, /1: console\.log/);
+  assert.match(first.content[0].text, /next offset=2/);
+  const second = await handlers.Read({ file_path: pj(f.safeRoot, 'index.js'), offset: 2 });
+  assert.match(second.content[0].text, /2: line2/);
+  assert.match(second.content[0].text, /next offset=3/);
+}));
+
+test('Host MCP tool result never exceeds maxCallReadBytes, including truncation notice', () => withFixture(async (f) => {
+  fs.writeFileSync(pj(f.safeRoot, 'long.txt'), 'x'.repeat(500));
+  const gw = new ReadOnlyToolGateway({ safeRoot: f.safeRoot, cwd: f.tmpDir, maxCallReadBytes: 85 });
+  const { handlers } = getHandlers(gw);
+  for (const name of ['Read', 'Glob', 'Grep']) {
+    const input = name === 'Read'
+      ? { file_path: pj(f.safeRoot, 'long.txt') }
+      : name === 'Glob' ? { pattern: '**/*' } : { pattern: 'x+', path: pj(f.safeRoot, 'long.txt') };
+    const result = await handlers[name](input);
+    eq(result.isError, undefined);
+    assert.ok(Buffer.byteLength(result.content[0].text, 'utf8') <= 85, name + ' exceeded 85 bytes');
+  }
+}));
