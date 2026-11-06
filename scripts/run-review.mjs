@@ -233,7 +233,7 @@ async function tryClaude(index, makePrompt) {
     if (run.meta) metas.push(run.meta);
     return run.subtype === 'success' && run.structured
       ? { ok: true, structured: run.structured, provider: 'claude', facts: claudeFacts(run.meta, SHARD_MAX_TURNS, cap) }
-      : { ok: false, error: run.subtype ? `${run.subtype}${run.errors ? `: ${run.errors}` : ''}` : 'no structured output', provider: 'claude' };
+      : { ok: false, error: run.subtype ? `${run.subtype}${run.errors ? `: ${run.errors}` : ''}` : (run.errors || 'no structured output'), provider: 'claude' };
   } catch (error) {
     return { ok: false, error: error?.message ?? String(error), provider: 'claude' };
   } finally {

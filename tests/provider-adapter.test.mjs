@@ -9,6 +9,7 @@ import {
   ERROR_KINDS,
   COST_SOURCES,
 } from '../scripts/provider-adapter.mjs';
+import { runClaudeStructured } from '../scripts/claude-fallback.mjs';
 
 const basicSchema = {
   type: 'object',
@@ -462,4 +463,41 @@ test('Claude adapter infers resolved_model from modelUsage when system.init even
   assert.equal(outcome.ok, true);
   assert.equal(outcome.meta.requested_model, 'sonnet');
   assert.equal(outcome.meta.resolved_model, 'claude-3-7-sonnet-inferred');
+});
+
+test('Claude adapter keeps ordinary SDK exceptions distinct from timeout and Delta fallback reports cause', async () => {
+  const adapter = getProviderAdapter(PROVIDER_KINDS.CLAUDE);
+  const spawnFailure = async function* () {
+    throw new Error('spawn EACCES');
+  };
+  const env = { CLAUDE_CODE_OAUTH_TOKEN: 'test-token' };
+  const ordinary = await adapter.execute({
+    prompt: 'p', schema: basicSchema, env, queryImpl: spawnFailure,
+    maxBudgetUsd: 1.0,
+  });
+  assert.equal(ordinary.ok, false);
+  assert.equal(ordinary.kind, OUTCOME_KINDS.FAILED);
+  assert.equal(ordinary.errorKind, ERROR_KINDS.EXECUTION);
+  assert.equal(ordinary.subtype, null);
+  assert.match(ordinary.error, /Claude query failed: spawn EACCES/);
+  assert.equal(ordinary.meta.total_cost_usd, 1.0);
+  assert.equal(ordinary.meta.cost_source, COST_SOURCES.RESERVE);
+
+  await assert.rejects(runClaudeStructured({
+    prompt: 'p', schema: basicSchema, env, queryImpl: spawnFailure,
+    timeoutMs: 5000, maxBudgetUsd: 1.0, logImpl: () => {},
+  }), /Claude query failed: spawn EACCES/);
+
+  const timedOutQuery = async function* ({ options }) {
+    options.abortController.abort();
+    throw new Error('aborted');
+  };
+  const timeout = await adapter.execute({
+    prompt: 'p', schema: basicSchema, env, queryImpl: timedOutQuery,
+    timeoutMs: 5000, maxBudgetUsd: 1.0,
+  });
+  assert.equal(timeout.ok, false);
+  assert.equal(timeout.errorKind, ERROR_KINDS.TIMEOUT);
+  assert.equal(timeout.subtype, 'error_timeout');
+  assert.match(timeout.error, /Claude timed out/);
 });

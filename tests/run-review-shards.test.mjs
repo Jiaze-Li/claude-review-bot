@@ -26,6 +26,7 @@ export async function* query({ prompt, options }) {
   fs.writeFileSync(process.env.FAKE_LOG + '.max', String(max));
   if (process.env.FAKE_DELAY) await new Promise((r) => setTimeout(r, Number(process.env.FAKE_DELAY)));
   cur -= 1;
+  if (mode === 'sdk-exception') throw new Error('SDK spawn EACCES');
   yield { type: 'system', subtype: 'init', model: 'claude-fake' };
   if (mode === 'all-fail' || (mode === 'second-fails' && myCall === 2)) {
     yield { type: 'result', subtype: 'error_max_turns', num_turns: options.maxTurns, total_cost_usd: 0.4, errors: ['turn limit'] };
@@ -125,6 +126,17 @@ test('if no shard completes the run fails closed and still records the spend', (
   assert.equal(review, null);
   assert.equal(usage.subtype, 'error');
   assert.equal(usage.total_cost_usd, 0.4);
+});
+
+test('Full review preserves ordinary SDK exception cause and reserves spend on failure', () => {
+  const root = setup({ 'a.swift': 100 });
+  const { result, review, usage } = run(root, 'sdk-exception');
+  assert.notEqual(result.status, 0);
+  assert.equal(review, null);
+  assert.match(result.stderr, /SDK spawn EACCES/);
+  assert.doesNotMatch(result.stderr, /error_timeout/);
+  assert.equal(usage.subtype, 'error');
+  assert.equal(usage.total_cost_usd, 5);
 });
 
 test('earlier dismissals are shown to every shard and an exact repeat is dropped from the result', () => {

@@ -467,7 +467,7 @@ export class ClaudeProviderAdapter extends ProviderAdapter {
         provider: this.provider,
         status: null,
         error: errorMsg,
-        subtype: 'error_timeout',
+        subtype: timedOut ? 'error_timeout' : null,
         errors: errorMsg,
         structured: null,
         meta: {
