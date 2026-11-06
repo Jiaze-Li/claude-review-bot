@@ -96,6 +96,8 @@ export class ReadOnlyToolGateway {
     this.quotaExhausted = false;
     this.rejections = [];
     this.history = [];
+    this.cachedExecutions = new Map();
+    this.emptySandboxDir = null;
   }
 
   getDiagnostics() {
@@ -198,8 +200,8 @@ export class ReadOnlyToolGateway {
         if (typeof input?.pattern !== 'string' || input.pattern.includes('\0') || !input.pattern) return this.denyAndRecord(toolName, input, 'Invalid Grep pattern.');
         if (isDangerousRegexPattern(input.pattern)) return this.denyAndRecord(toolName, input, 'Invalid Grep pattern: complex or potential ReDoS pattern rejected.');
         if (input?.glob && !isSafeGlobPattern(input.glob)) return this.denyAndRecord(toolName, input, 'Grep glob escapes the sanitized repository.');
-        if (input?.output_mode === 'content' || input?.output_mode === 'count' || input?.mode === 'count' || input?.mode === 'stats' || input?.mode === 'content' || input?.count || input?.stats || input?.output_format || input?.outputFormat) {
-          return this.denyAndRecord(toolName, input, 'Grep count, stats, or content-only mode is forbidden: only standard prefixed matches allowed.');
+        if (input?.output_mode === 'count' || input?.mode === 'count' || input?.mode === 'stats' || input?.count || input?.stats) {
+          return this.denyAndRecord(toolName, input, 'Grep count or stats mode is forbidden: use files_with_matches or content mode.');
         }
       }
       if (input?.path) {
@@ -368,8 +370,36 @@ export class ReadOnlyToolGateway {
     return true;
   }
 
+  getEmptySandbox() {
+    if (!this.emptySandboxDir) {
+      this.emptySandboxDir = path.join(this.safeRoot || this.cwd, '.empty-tool-sandbox');
+      if (!fs.existsSync(this.emptySandboxDir)) {
+        try { fs.mkdirSync(this.emptySandboxDir, { recursive: true }); } catch {}
+      }
+    }
+    return this.emptySandboxDir;
+  }
+
   createCanUseTool() {
-    return async (toolName, input) => this.authorize(toolName, input);
+    const gateway = this;
+    return async (toolName, input, options = {}) => {
+      const auth = await gateway.authorize(toolName, input);
+      if (auth.behavior !== 'allow') return auth;
+
+      let hostResult = null;
+      if (toolName === TOOL_NAMES.READ) hostResult = await gateway.executeRead(input);
+      else if (toolName === TOOL_NAMES.GLOB) hostResult = await gateway.executeGlob(input);
+      else if (toolName === TOOL_NAMES.GREP) hostResult = await gateway.executeGrep(input);
+
+      const toolUseId = options?.toolUseID || options?.tool_use_id;
+      if (toolUseId) gateway.cachedExecutions.set(toolUseId, hostResult);
+      gateway.cachedExecutions.set(`${toolName}:${JSON.stringify(input)}`, hostResult);
+
+      if (toolName === TOOL_NAMES.GLOB || toolName === TOOL_NAMES.GREP) {
+        return { behavior: 'allow', updatedInput: { ...auth.updatedInput, path: gateway.getEmptySandbox() } };
+      }
+      return auth;
+    };
   }
 
   createPostToolHook() {
@@ -379,7 +409,9 @@ export class ReadOnlyToolGateway {
       const trimmed = line.trim();
       if (!trimmed) return null;
       const m = trimmed.match(/^(.+?)(?::\d+:|-\d+-)/);
-      return m && sanitizePath(m[1].trim()) ? trimmed : null;
+      if (m && sanitizePath(m[1].trim())) return trimmed;
+      if (sanitizePath(trimmed)) return trimmed;
+      return null;
     };
     const filterItem = (item) => {
       if (typeof item === 'string') return sanitizePath(item);
@@ -392,7 +424,27 @@ export class ReadOnlyToolGateway {
     return {
       matcher: 'Read|Glob|Grep',
       hooks: [
-        async ({ tool_name, tool_input, tool_response: resp }) => {
+        async ({ tool_name, tool_input, tool_response: resp, tool_use_id }) => {
+          const cached = (tool_use_id && gateway.cachedExecutions.get(tool_use_id))
+            || gateway.cachedExecutions.get(`${tool_name}:${JSON.stringify(tool_input)}`);
+          if (tool_use_id) gateway.cachedExecutions.delete(tool_use_id);
+          gateway.cachedExecutions.delete(`${tool_name}:${JSON.stringify(tool_input)}`);
+
+          if (cached) {
+            let output;
+            if (!cached.ok) output = { error: cached.error };
+            else if (tool_name === TOOL_NAMES.READ) output = cached.content;
+            else if (tool_name === TOOL_NAMES.GLOB) output = cached.matches;
+            else if (tool_name === TOOL_NAMES.GREP) {
+              if (tool_input?.output_mode === 'files_with_matches' || !tool_input?.output_mode) {
+                output = [...new Set(cached.matches.map((m) => m.path))].join('\n');
+              } else {
+                output = cached.matches.map((m) => `${m.path}:${m.line}:${m.text}`).join('\n');
+              }
+            }
+            return { hookSpecificOutput: { hookEventName: 'PostToolUse', updatedToolOutput: output } };
+          }
+
           if (!resp || (Array.isArray(resp) && resp.length === 0)) {
             gateway.recordSuccess(tool_name, tool_input, 0, false, { incrementCalls: false });
             return {};
