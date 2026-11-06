@@ -29,12 +29,21 @@ export function validateStructuredReview(value, schema = null) {
     if (typeof value.summary !== 'string' || !value.summary.trim()) {
       return { ok: false, error: 'summary must be a non-empty string' };
     }
+    const maxSummaryLen = schema?.properties?.summary?.maxLength;
+    if (typeof maxSummaryLen === 'number' && value.summary.length > maxSummaryLen) {
+      return { ok: false, error: `summary exceeded maxLength: ${value.summary.length} > ${maxSummaryLen}` };
+    }
   }
 
-  // 3. Findings validation (strictly validate nested required fields, types, and enums)
+  // 3. Findings validation (strictly validate nested required fields, types, enums, maxItems, and maxLengths)
   if (value.findings !== undefined) {
     if (!Array.isArray(value.findings)) return { ok: false, error: 'findings must be an array' };
+    const maxFindings = schema?.properties?.findings?.maxItems;
+    if (typeof maxFindings === 'number' && value.findings.length > maxFindings) {
+      return { ok: false, error: `findings exceeded maxItems: ${value.findings.length} > ${maxFindings}` };
+    }
     const findingRequired = schema?.properties?.findings?.items?.required ?? ['severity', 'title', 'body', 'path', 'line', 'failurePath'];
+    const fProps = schema?.properties?.findings?.items?.properties;
     for (const f of value.findings) {
       if (!f || typeof f !== 'object' || Array.isArray(f)) return { ok: false, error: 'finding must be an object' };
 
@@ -50,17 +59,37 @@ export function validateStructuredReview(value, schema = null) {
       if (typeof f.title !== 'string' || !f.title.trim()) {
         return { ok: false, error: 'finding title must be a non-empty string' };
       }
+      if (typeof fProps?.title?.maxLength === 'number' && f.title.length > fProps.title.maxLength) {
+        return { ok: false, error: `finding title exceeded maxLength: ${f.title.length} > ${fProps.title.maxLength}` };
+      }
       if (typeof f.body !== 'string' || !f.body.trim()) {
         return { ok: false, error: 'finding body must be a non-empty string' };
       }
+      if (typeof fProps?.body?.maxLength === 'number' && f.body.length > fProps.body.maxLength) {
+        return { ok: false, error: `finding body exceeded maxLength: ${f.body.length} > ${fProps.body.maxLength}` };
+      }
       if (typeof f.path !== 'string' || !f.path.trim()) {
         return { ok: false, error: 'finding path must be a non-empty string' };
+      }
+      if (typeof fProps?.path?.maxLength === 'number' && f.path.length > fProps.path.maxLength) {
+        return { ok: false, error: `finding path exceeded maxLength: ${f.path.length} > ${fProps.path.maxLength}` };
       }
       if (f.line !== null && (!Number.isInteger(f.line) || f.line < 1)) {
         return { ok: false, error: `finding line must be a positive integer or null: ${f.line}` };
       }
       if (typeof f.failurePath !== 'string') {
         return { ok: false, error: 'finding failurePath must be a string' };
+      }
+      if (typeof fProps?.failurePath?.maxLength === 'number' && f.failurePath.length > fProps.failurePath.maxLength) {
+        return { ok: false, error: `finding failurePath exceeded maxLength: ${f.failurePath.length} > ${fProps.failurePath.maxLength}` };
+      }
+      if (f.riskClass !== undefined) {
+        if (typeof f.riskClass !== 'string') {
+          return { ok: false, error: 'finding riskClass must be a string' };
+        }
+        if (typeof fProps?.riskClass?.maxLength === 'number' && f.riskClass.length > fProps.riskClass.maxLength) {
+          return { ok: false, error: `finding riskClass exceeded maxLength: ${f.riskClass.length} > ${fProps.riskClass.maxLength}` };
+        }
       }
     }
   }
@@ -99,10 +128,19 @@ export function validateStructuredReview(value, schema = null) {
   // 5. Verification results validation
   if (value.verifications !== undefined) {
     if (!Array.isArray(value.verifications)) return { ok: false, error: 'verifications must be an array' };
+    const maxVerifs = schema?.properties?.verifications?.maxItems;
+    if (typeof maxVerifs === 'number' && value.verifications.length > maxVerifs) {
+      return { ok: false, error: `verifications exceeded maxItems: ${value.verifications.length} > ${maxVerifs}` };
+    }
+    const idPattern = schema?.properties?.verifications?.items?.properties?.findingId?.pattern;
+    const idRegex = idPattern ? new RegExp(idPattern) : null;
     for (const v of value.verifications) {
       if (!v || typeof v !== 'object' || Array.isArray(v)) return { ok: false, error: 'verification must be an object' };
       const id = v.findingId || v.id;
       if (!id || typeof id !== 'string') return { ok: false, error: 'verification findingId must be a string' };
+      if (idRegex && !idRegex.test(id)) {
+        return { ok: false, error: `verification findingId does not match pattern: ${id}` };
+      }
       const status = String(v.status || v.verdict || '').toUpperCase();
       if (!['FIXED', 'STILL_OPEN', 'UNCERTAIN'].includes(status)) {
         return { ok: false, error: `Invalid verification status: ${v.status || v.verdict}` };
@@ -804,24 +842,6 @@ export class GeminiProviderAdapter extends ProviderAdapter {
       } catch {}
     }
 
-    // Stage B requires an additional API turn. Total turns (Stage A + Stage B) must NOT exceed maxTurns.
-    if (turnCount >= maxTurns) {
-      const errorMsg = `Gemini review exceeded total turn limit of ${maxTurns} turns before structured review could be generated`;
-      return {
-        ok: false,
-        kind: OUTCOME_KINDS.FAILED,
-        errorKind: ERROR_KINDS.EXECUTION,
-        provider: this.provider,
-        status: null,
-        error: errorMsg,
-        subtype: 'error_max_turns',
-        errors: errorMsg,
-        structured: null,
-        meta: makeMeta(),
-      };
-    }
-
-    turnCount += 1;
     const structuredInstruction = 'Based on the code exploration above, provide the final structured review JSON conforming strictly to the requested schema.';
     if (contents.length > 0 && contents[contents.length - 1].role === 'user') {
       contents[contents.length - 1].parts.push({ text: structuredInstruction });
@@ -842,79 +862,106 @@ export class GeminiProviderAdapter extends ProviderAdapter {
       ...(systemPrompt ? { systemInstruction: { parts: [{ text: systemPrompt }] } } : {}),
     };
 
-    let structuredResultPayload;
-    try {
-      structuredResultPayload = await sendRequest(structuredPayload);
-    } catch (err) {
-      const isContextLimit = err?.name === 'ContextLimitExceeded';
-      const isTimeout = err?.name === 'TimeoutError' || String(err?.message ?? '').includes('timed out');
-      const isUnavailable = Boolean(err?.isUnavailable);
-      const isConfig = Boolean(err?.isConfig);
-      const kind = isUnavailable ? OUTCOME_KINDS.UNAVAILABLE : isConfig ? OUTCOME_KINDS.CONFIG : OUTCOME_KINDS.FAILED;
-      const errorKind = isUnavailable ? ERROR_KINDS.UNAVAILABLE : isConfig ? ERROR_KINDS.CONFIG : isTimeout ? ERROR_KINDS.TIMEOUT : ERROR_KINDS.EXECUTION;
-      const subtype = isContextLimit ? 'error_context_limit' : (isTimeout ? 'error_timeout' : null);
-      return {
-        ok: false,
-        kind,
-        errorKind,
-        provider: this.provider,
-        status: err?.status || null,
-        error: err?.message ?? String(err),
-        subtype,
-        errors: err?.message ?? String(err),
-        structured: null,
-        meta: makeMeta(),
-      };
-    }
+    const maxStageBAttempts = toolCallCount === 0 ? Math.max(1, maxAttempts - 1) : maxAttempts;
+    let lastParseError = null;
 
-    if (typeof structuredResultPayload?.modelVersion === 'string' && structuredResultPayload.modelVersion) {
-      servedModel = structuredResultPayload.modelVersion;
-    }
-    const sInp = structuredResultPayload?.usageMetadata?.promptTokenCount;
-    const sOutp = structuredResultPayload?.usageMetadata?.candidatesTokenCount;
-    const sTh = structuredResultPayload?.usageMetadata?.thoughtsTokenCount;
-    const sTot = structuredResultPayload?.usageMetadata?.totalTokenCount;
-    if (Number.isFinite(sInp)) usageTotals.promptTokenCount += sInp;
-    if (Number.isFinite(sOutp)) usageTotals.candidatesTokenCount += sOutp;
-    if (Number.isFinite(sTh)) usageTotals.thoughtsTokenCount += sTh;
-    if (Number.isFinite(sTot)) usageTotals.totalTokenCount += sTot;
-
-    const candidate = structuredResultPayload?.candidates?.[0];
-    const text = (candidate?.content?.parts ?? []).map((part) => (typeof part.text === 'string' ? part.text : '')).join('');
-    try {
-      if (!text) throw new Error('returned no structured text');
-      const structured = JSON.parse(text);
-      const validation = validateStructuredReview(structured, schema);
-      if (!validation.ok) {
-        throw new Error(validation.error);
+    for (let stageBAttempt = 1; stageBAttempt <= maxStageBAttempts; stageBAttempt += 1) {
+      if (turnCount >= maxTurns) {
+        const errorMsg = `Gemini review exceeded total turn limit of ${maxTurns} turns before structured review could be generated`;
+        return {
+          ok: false,
+          kind: OUTCOME_KINDS.FAILED,
+          errorKind: ERROR_KINDS.EXECUTION,
+          provider: this.provider,
+          status: null,
+          error: errorMsg,
+          subtype: 'error_max_turns',
+          errors: errorMsg,
+          structured: null,
+          meta: makeMeta(),
+        };
       }
-      return {
-        ok: true,
-        kind: OUTCOME_KINDS.OK,
-        errorKind: ERROR_KINDS.NONE,
-        provider: this.provider,
-        status: 200,
-        error: null,
-        subtype: 'success',
-        errors: '',
-        structured,
-        meta: makeMeta(),
-      };
-    } catch (parseErr) {
-      const errorMsg = `Gemini returned malformed structured output: ${parseErr.message}`;
-      return {
-        ok: false,
-        kind: OUTCOME_KINDS.FAILED,
-        errorKind: ERROR_KINDS.MALFORMED,
-        provider: this.provider,
-        status: null,
-        error: errorMsg,
-        subtype: null,
-        errors: errorMsg,
-        structured: null,
-        meta: makeMeta(),
-      };
+
+      turnCount += 1;
+      let structuredResultPayload;
+      try {
+        structuredResultPayload = await sendRequest(structuredPayload);
+      } catch (err) {
+        const isContextLimit = err?.name === 'ContextLimitExceeded';
+        const isTimeout = err?.name === 'TimeoutError' || String(err?.message ?? '').includes('timed out');
+        const isUnavailable = Boolean(err?.isUnavailable);
+        const isConfig = Boolean(err?.isConfig);
+        const kind = isUnavailable ? OUTCOME_KINDS.UNAVAILABLE : isConfig ? OUTCOME_KINDS.CONFIG : OUTCOME_KINDS.FAILED;
+        const errorKind = isUnavailable ? ERROR_KINDS.UNAVAILABLE : isConfig ? ERROR_KINDS.CONFIG : isTimeout ? ERROR_KINDS.TIMEOUT : ERROR_KINDS.EXECUTION;
+        const subtype = isContextLimit ? 'error_context_limit' : (isTimeout ? 'error_timeout' : null);
+        return {
+          ok: false,
+          kind,
+          errorKind,
+          provider: this.provider,
+          status: err?.status || null,
+          error: err?.message ?? String(err),
+          subtype,
+          errors: err?.message ?? String(err),
+          structured: null,
+          meta: makeMeta(),
+        };
+      }
+
+      if (typeof structuredResultPayload?.modelVersion === 'string' && structuredResultPayload.modelVersion) {
+        servedModel = structuredResultPayload.modelVersion;
+      }
+      const sInp = structuredResultPayload?.usageMetadata?.promptTokenCount;
+      const sOutp = structuredResultPayload?.usageMetadata?.candidatesTokenCount;
+      const sTh = structuredResultPayload?.usageMetadata?.thoughtsTokenCount;
+      const sTot = structuredResultPayload?.usageMetadata?.totalTokenCount;
+      if (Number.isFinite(sInp)) usageTotals.promptTokenCount += sInp;
+      if (Number.isFinite(sOutp)) usageTotals.candidatesTokenCount += sOutp;
+      if (Number.isFinite(sTh)) usageTotals.thoughtsTokenCount += sTh;
+      if (Number.isFinite(sTot)) usageTotals.totalTokenCount += sTot;
+
+      const candidate = structuredResultPayload?.candidates?.[0];
+      const text = (candidate?.content?.parts ?? []).map((part) => (typeof part.text === 'string' ? part.text : '')).join('');
+      try {
+        if (!text) throw new Error('returned no structured text');
+        const structured = JSON.parse(text);
+        const validation = validateStructuredReview(structured, schema);
+        if (!validation.ok) {
+          throw new Error(validation.error);
+        }
+        return {
+          ok: true,
+          kind: OUTCOME_KINDS.OK,
+          errorKind: ERROR_KINDS.NONE,
+          provider: this.provider,
+          status: 200,
+          error: null,
+          subtype: 'success',
+          errors: '',
+          structured,
+          meta: makeMeta(),
+        };
+      } catch (parseErr) {
+        lastParseError = parseErr;
+        if (stageBAttempt < maxStageBAttempts && turnCount < maxTurns) {
+          continue;
+        }
+      }
     }
+
+    const errorMsg = `Gemini returned malformed structured output: ${lastParseError?.message ?? 'unknown parse error'}`;
+    return {
+      ok: false,
+      kind: OUTCOME_KINDS.FAILED,
+      errorKind: ERROR_KINDS.MALFORMED,
+      provider: this.provider,
+      status: null,
+      error: errorMsg,
+      subtype: null,
+      errors: errorMsg,
+      structured: null,
+      meta: makeMeta(),
+    };
   }
 }
 
