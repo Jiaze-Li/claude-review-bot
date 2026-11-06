@@ -41,3 +41,22 @@ jobs:
           node --check scripts/publish-review.mjs
           node --check scripts/github-review-api.mjs
           node --check scripts/apply-override.mjs
+  # Disposable job in PR #64 only. This definition is NOT part of PR4 or main.
+  live-gateway-smoke:
+    if: ${{ github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.number == 64 && github.event.pull_request.head.ref == 'test/pr4-live-mcp-smoke-20261106' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm ci --legacy-peer-deps --ignore-scripts --no-audit --no-fund
+      - name: One-time Claude SDK MCP Read and Grep validation (max $0.45)
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: node scripts/smoke-mcp-gateway.mjs
