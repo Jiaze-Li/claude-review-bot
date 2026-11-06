@@ -7,6 +7,7 @@ import { isGeminiUnavailableStatus, FALLBACK_UNKNOWN_COST_USD } from './claude-f
 import { geminiBaseUrl } from './gemini-config.mjs';
 import { GEMINI_MODEL, toGeminiJsonSchema } from './run-gemini-review.mjs';
 import { GEMINI_MAX_CONTEXT_BYTES } from './review-session-core.mjs';
+import { ReadOnlyToolGateway } from './tool-gateway.mjs';
 
 export const AUTHORIZED_GEMINI_TOOLS = Object.freeze(['Read', 'Glob', 'Grep']);
 
@@ -626,7 +627,7 @@ export class GeminiProviderAdapter extends ProviderAdapter {
       ? toolGateway.getToolDeclarations()
       : (typeof toolGateway?.constructor?.getToolDeclarations === 'function')
         ? toolGateway.constructor.getToolDeclarations()
-        : [];
+        : (typeof ReadOnlyToolGateway?.getToolDeclarations === 'function' ? ReadOnlyToolGateway.getToolDeclarations() : []);
     const toolDeclarations = rawDeclarations.map((decl) => ({
       name: decl.name,
       description: decl.description,
@@ -1043,10 +1044,10 @@ export class ClaudeProviderAdapter extends ProviderAdapter {
 
     if (toolGateway) {
       const serverName = 'gateway';
-      const mcpServer = toolGateway.createMcpServer ? await toolGateway.createMcpServer(serverName) : null;
+      const mcpServer = toolGateway.createMcpServer ? toolGateway.createMcpServer(serverName) : null;
       resolvedTools = [];
       resolvedMcpServers = mcpServer ? { [serverName]: mcpServer } : {};
-      resolvedAllowedTools = toolGateway.getMcpToolNames ? await toolGateway.getMcpToolNames(serverName) : [
+      resolvedAllowedTools = toolGateway.getMcpToolNames ? toolGateway.getMcpToolNames(serverName) : [
         `mcp__${serverName}__Read`,
         `mcp__${serverName}__Glob`,
         `mcp__${serverName}__Grep`,

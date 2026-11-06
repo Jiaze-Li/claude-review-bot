@@ -1,6 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { Worker } from 'node:worker_threads';
+import { tool, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
+import { z } from 'zod';
 import { matchesIgnore } from './review-shards.mjs';
 
 export const TOOL_NAMES = Object.freeze({ READ: 'Read', GLOB: 'Glob', GREP: 'Grep' });
@@ -696,16 +698,16 @@ export class ReadOnlyToolGateway {
     };
   }
 
-  async createMcpServer(serverName = 'gateway') {
-    return (await createGatewayMcpServer(this, serverName)).server;
+  createMcpServer(serverName = 'gateway') {
+    return createGatewayMcpServer(this, serverName).server;
   }
 
-  async createMcpTools(serverName = 'gateway') {
-    return (await createGatewayMcpServer(this, serverName)).tools;
+  createMcpTools(serverName = 'gateway') {
+    return createGatewayMcpServer(this, serverName).tools;
   }
 
-  async getMcpToolNames(serverName = 'gateway') {
-    return (await createGatewayMcpServer(this, serverName)).toolNames;
+  getMcpToolNames(serverName = 'gateway') {
+    return createGatewayMcpServer(this, serverName).toolNames;
   }
 
   static getToolDeclarations() {
@@ -759,24 +761,7 @@ export class ReadOnlyToolGateway {
   }
 }
 
-let _claudeSdkModules = null;
-export async function getClaudeSdkModules() {
-  if (!_claudeSdkModules) {
-    const [{ tool, createSdkMcpServer }, zodMod] = await Promise.all([
-      import('@anthropic-ai/claude-agent-sdk'),
-      import('zod'),
-    ]);
-    _claudeSdkModules = {
-      tool,
-      createSdkMcpServer,
-      z: zodMod.z || zodMod,
-    };
-  }
-  return _claudeSdkModules;
-}
-
-export async function createGatewayMcpServer(gateway, serverName = 'gateway') {
-  const { tool, createSdkMcpServer, z } = await getClaudeSdkModules();
+export function createGatewayMcpServer(gateway, serverName = 'gateway') {
   const readTool = tool(
     TOOL_NAMES.READ,
     'Read file contents from the repository or authorized review context.',

@@ -48,8 +48,8 @@ const withFixture = async (fn) => {
   }
 };
 
-async function getHandlers(gateway, serverName = 'gateway') {
-  const { tools, toolNames, server } = await createGatewayMcpServer(gateway, serverName);
+function getHandlers(gateway, serverName = 'gateway') {
+  const { tools, toolNames, server } = createGatewayMcpServer(gateway, serverName);
   openServers.add(server);
   const map = Object.fromEntries(tools.map((t) => [t.name, t.handler]));
   return { handlers: map, toolNames, server, tools };
@@ -57,7 +57,7 @@ async function getHandlers(gateway, serverName = 'gateway') {
 
 test('AC2 & AC7: Host actually executes MCP Read tool returning real file content and respects pagination', () => withFixture(async (f) => {
   const gw = new ReadOnlyToolGateway({ safeRoot: f.safeRoot, contextRoot: f.contextRoot, cwd: f.tmpDir });
-  const { handlers } = await getHandlers(gw);
+  const { handlers } = getHandlers(gw);
 
   const res1 = await handlers.Read({ file_path: pj(f.safeRoot, 'index.js') });
   eq(res1.isError, undefined);
@@ -73,7 +73,7 @@ test('AC2 & AC7: Host actually executes MCP Read tool returning real file conten
 
 test('AC2 & AC7: Host actually executes MCP Glob tool returning matching files from safeRoot', () => withFixture(async (f) => {
   const gw = new ReadOnlyToolGateway({ safeRoot: f.safeRoot, contextRoot: f.contextRoot, cwd: f.tmpDir });
-  const { handlers } = await getHandlers(gw);
+  const { handlers } = getHandlers(gw);
 
   const res = await handlers.Glob({ pattern: '**/*.js' });
   eq(res.isError, undefined);
@@ -88,7 +88,7 @@ test('AC2 & AC7: Host actually executes MCP Glob tool returning matching files f
 
 test('AC2 & AC7: Host actually executes MCP Grep tool in content and files_with_matches modes', () => withFixture(async (f) => {
   const gw = new ReadOnlyToolGateway({ safeRoot: f.safeRoot, contextRoot: f.contextRoot, cwd: f.tmpDir });
-  const { handlers } = await getHandlers(gw);
+  const { handlers } = getHandlers(gw);
 
   const resContent = await handlers.Grep({ pattern: 'search_term_target' });
   eq(resContent.isError, undefined);
@@ -104,7 +104,7 @@ test('AC2 & AC7: Host actually executes MCP Grep tool in content and files_with_
 test('AC4: Read can access authorized contextRoot files', () => withFixture(async (f) => {
   // Case A: default access is denied; allowlist is mandatory.
   const gwDefault = new ReadOnlyToolGateway({ safeRoot: f.safeRoot, contextRoot: f.contextRoot, cwd: f.tmpDir });
-  const { handlers: hDef } = await getHandlers(gwDefault);
+  const { handlers: hDef } = getHandlers(gwDefault);
   const resDef = await hDef.Read({ file_path: pj(f.contextRoot, 'pr.diff') });
   eq(resDef.isError, true);
   assert.match(resDef.content[0].text, /unauthorized context file/i);
@@ -116,7 +116,7 @@ test('AC4: Read can access authorized contextRoot files', () => withFixture(asyn
     cwd: f.tmpDir,
     allowedContextFiles: ['pr.diff'],
   });
-  const { handlers: hRes } = await getHandlers(gwRestricted);
+  const { handlers: hRes } = getHandlers(gwRestricted);
 
   const resAllowed = await hRes.Read({ file_path: pj(f.contextRoot, 'pr.diff') });
   eq(resAllowed.isError, undefined);
@@ -129,7 +129,7 @@ test('AC4: Read can access authorized contextRoot files', () => withFixture(asyn
 
 test('AC5: Glob and Grep cannot scan contextRoot', () => withFixture(async (f) => {
   const gw = new ReadOnlyToolGateway({ safeRoot: f.safeRoot, contextRoot: f.contextRoot, cwd: f.tmpDir });
-  const { handlers } = await getHandlers(gw);
+  const { handlers } = getHandlers(gw);
 
   // Default scan must not return contextRoot files
   const globDef = await handlers.Glob({ pattern: '**/*' });
@@ -156,7 +156,7 @@ test('AC6: Path traversal, symlink escapes, control files, and ReDoS Fail Closed
     ignorePatterns: ['*.log'],
     maxFileSizeBytes: 100,
   });
-  const { handlers } = await getHandlers(gw);
+  const { handlers } = getHandlers(gw);
 
   // Read ../outside/secret.key
   const rTraversal = await handlers.Read({ file_path: pj(f.safeRoot, '../outside/secret.key') });
@@ -213,7 +213,7 @@ test('AC3 & Req 5: Output size truncation and quota limits enforced before tool 
     maxTotalReadBytes: 200,
     maxCalls: 3,
   });
-  const { handlers } = await getHandlers(gw);
+  const { handlers } = getHandlers(gw);
 
   // Call 1: Read long file - must be truncated to within maxCallReadBytes and contain truncation note
   const r1 = await handlers.Read({ file_path: longFile });
@@ -244,7 +244,7 @@ test('AC3 & Req 5: Total byte budget exhaustion fails closed', () => withFixture
     maxCallReadBytes: 80,
     maxTotalReadBytes: 80, // first long line fills the bounded result
   });
-  const { handlers } = await getHandlers(gw);
+  const { handlers } = getHandlers(gw);
 
   const r1 = await handlers.Read({ file_path: longFile });
   eq(r1.isError, undefined);
@@ -261,7 +261,7 @@ test('Req 5: Concurrent calls share gateway quota safely without race condition 
     cwd: f.tmpDir,
     maxCalls: 2,
   });
-  const { handlers } = await getHandlers(gw);
+  const { handlers } = getHandlers(gw);
 
   const calls = [
     handlers.Read({ file_path: pj(f.safeRoot, 'index.js') }),
@@ -335,7 +335,7 @@ test('AC1 & AC8: Claude provider adapter mounts MCP Gateway with tools: [], stri
 }));
 test('F001: explicit single-file paths work for Grep and Glob without ENOTDIR', () => withFixture(async (f) => {
   const gw = new ReadOnlyToolGateway({ safeRoot: f.safeRoot, cwd: f.tmpDir });
-  const { handlers } = await getHandlers(gw);
+  const { handlers } = getHandlers(gw);
   const file = pj(f.safeRoot, 'src/app.js');
   const grep = await handlers.Grep({ pattern: 'search_term_target', path: file });
   eq(grep.isError, undefined);
@@ -348,7 +348,7 @@ test('F001: explicit single-file paths work for Grep and Glob without ENOTDIR', 
 test('F002: catastrophic alternative regex is killed without blocking host event loop', () => withFixture(async (f) => {
   fs.writeFileSync(pj(f.safeRoot, 'evil.txt'), 'a'.repeat(1999) + '!');
   const gw = new ReadOnlyToolGateway({ safeRoot: f.safeRoot, cwd: f.tmpDir, timeoutMs: 600 });
-  const { handlers } = await getHandlers(gw);
+  const { handlers } = getHandlers(gw);
   let heartbeats = 0;
   const heartbeat = setInterval(() => { heartbeats += 1; }, 20);
   try {
@@ -363,7 +363,7 @@ test('F002: catastrophic alternative regex is killed without blocking host event
 
 test('F003: Read reports line numbers and a next-offset cursor', () => withFixture(async (f) => {
   const gw = new ReadOnlyToolGateway({ safeRoot: f.safeRoot, cwd: f.tmpDir, maxReadLines: 1 });
-  const { handlers } = await getHandlers(gw);
+  const { handlers } = getHandlers(gw);
   const first = await handlers.Read({ file_path: pj(f.safeRoot, 'index.js') });
   eq(first.isError, undefined);
   assert.match(first.content[0].text, /1: console\.log/);
@@ -376,7 +376,7 @@ test('F003: Read reports line numbers and a next-offset cursor', () => withFixtu
 test('Host MCP tool result never exceeds maxCallReadBytes, including truncation notice', () => withFixture(async (f) => {
   fs.writeFileSync(pj(f.safeRoot, 'long.txt'), 'x'.repeat(500));
   const gw = new ReadOnlyToolGateway({ safeRoot: f.safeRoot, cwd: f.tmpDir, maxCallReadBytes: 85 });
-  const { handlers } = await getHandlers(gw);
+  const { handlers } = getHandlers(gw);
   for (const name of ['Read', 'Glob', 'Grep']) {
     const input = name === 'Read'
       ? { file_path: pj(f.safeRoot, 'long.txt') }
@@ -392,7 +392,7 @@ test('AC3: parallel MCP results cannot overdraw shared cumulative byte budget', 
     safeRoot: f.safeRoot, cwd: f.tmpDir,
     maxCallReadBytes: 85, maxTotalReadBytes: 85, maxCalls: 4,
   });
-  const { handlers } = await getHandlers(gw);
+  const { handlers } = getHandlers(gw);
   const input = { file_path: pj(f.safeRoot, 'quota-long.txt') };
   const results = await Promise.all([handlers.Read(input), handlers.Read(input), handlers.Read(input)]);
   const successes = results.filter((r) => !r.isError);
@@ -407,7 +407,7 @@ test('F005: invalid regex is escaped as literal text inside bounded Grep worker'
   const file = pj(f.safeRoot, 'literal-patterns.txt');
   fs.writeFileSync(file, 'literal foo( occurs here\nand a[ also occurs\n');
   const gw = new ReadOnlyToolGateway({ safeRoot: f.safeRoot, cwd: f.tmpDir });
-  const { handlers } = await getHandlers(gw);
+  const { handlers } = getHandlers(gw);
   for (const literal of ['foo(', 'a[']) {
     const result = await handlers.Grep({ pattern: literal, path: file, fixed_string: true });
     eq(result.isError, undefined);
@@ -424,7 +424,7 @@ test('P3: authorized context diff is unaffected by target repository ignore patt
     ignorePatterns: ['*.diff', '*.json', 'shards/'],
     allowedContextFiles: ['shards/shard-1.diff', 'pr.diff'],
   });
-  const { handlers } = await getHandlers(gw);
+  const { handlers } = getHandlers(gw);
   for (const file of [shard, pj(f.contextRoot, 'pr.diff')]) {
     const res = await handlers.Read({ file_path: file });
     eq(res.isError, undefined);
@@ -439,7 +439,7 @@ test('P3: authorized context diff is unaffected by target repository ignore patt
 
 test('P3: safeRoot-relative Glob and Grep results can be passed directly to Read', () => withFixture(async (f) => {
   const gw = new ReadOnlyToolGateway({ safeRoot: f.safeRoot, contextRoot: f.contextRoot, cwd: f.tmpDir });
-  const { handlers } = await getHandlers(gw);
+  const { handlers } = getHandlers(gw);
   const glob = await handlers.Glob({ pattern: 'src/*.js' });
   eq(glob.isError, undefined);
   const found = glob.content[0].text.split('\n').find((p) => p === 'src/app.js');
@@ -460,7 +460,7 @@ test('P3: safeRoot-relative Glob and Grep results can be passed directly to Read
 }));
 test('Grep -i and head_limit are forwarded through MCP Handler, with explicit unsupported-option errors', () => withFixture(async (f) => {
   const gw = new ReadOnlyToolGateway({ safeRoot: f.safeRoot, cwd: f.tmpDir });
-  const { handlers } = await getHandlers(gw);
+  const { handlers } = getHandlers(gw);
   const noFlag = await handlers.Grep({ pattern: 'SEARCH_TERM_TARGET', path: 'src' });
   eq(noFlag.isError, undefined);
   assert.match(noFlag.content[0].text, /No matches found/);
@@ -484,7 +484,7 @@ test('Glob and Grep accept safeRoot-relative directory and enforce ignored paths
   const gw = new ReadOnlyToolGateway({
     safeRoot: f.safeRoot, cwd: f.tmpDir, ignorePatterns: ['src/blocked/**'],
   });
-  const { handlers } = await getHandlers(gw);
+  const { handlers } = getHandlers(gw);
   const glob = await handlers.Glob({ pattern: '*.js', path: 'src' });
   eq(glob.isError, undefined);
   assert.match(glob.content[0].text, /src\/app\.js/);
@@ -503,7 +503,7 @@ test('F001: malformed regex fails explicitly unless fixed_string is requested', 
   const file = pj(f.safeRoot, 'regex-modes.txt');
   fs.writeFileSync(file, 'literal foo( and a[ plus Unicode ünicode text\n');
   const gw = new ReadOnlyToolGateway({ safeRoot: f.safeRoot, cwd: f.tmpDir });
-  const { handlers } = await getHandlers(gw);
+  const { handlers } = getHandlers(gw);
   for (const pattern of ['foo(', 'a[', '(?i)foo', '(?s)foo', 'foo++']) {
     const result = await handlers.Grep({ pattern, path: file });
     eq(result.isError, true, pattern + ' must not silently become a literal search');
@@ -521,7 +521,7 @@ test('Glob truncation is true only when an additional matching file exists', () 
   fs.writeFileSync(pj(dir, 'b.txt'), 'two');
   fs.writeFileSync(pj(dir, 'c.log'), 'three');
   const gw = new ReadOnlyToolGateway({ safeRoot: f.safeRoot, cwd: f.tmpDir, maxGlobMatches: 1 });
-  const { handlers } = await getHandlers(gw);
+  const { handlers } = getHandlers(gw);
   const res = await handlers.Glob({ pattern: '*.js', path: dir });
   eq(res.isError, undefined);
   eq(gw.getDiagnostics().history.find((x) => x.toolName === 'Glob')?.truncated, false);
@@ -532,7 +532,7 @@ test('Grep accepts literal metacharacters without false ReDoS denials', () => wi
   const file = pj(f.safeRoot, 'operators.txt');
   fs.writeFileSync(file, '***++\n');
   const gw = new ReadOnlyToolGateway({ safeRoot: f.safeRoot, cwd: f.tmpDir });
-  const { handlers } = await getHandlers(gw);
+  const { handlers } = getHandlers(gw);
   for (const pattern of ['[*+]', '\\*+', '\\*\\*+']) {
     const res = await handlers.Grep({ pattern, path: file });
     eq(res.isError, undefined, 'Unexpected rejection of ' + pattern);
