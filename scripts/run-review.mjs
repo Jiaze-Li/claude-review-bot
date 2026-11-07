@@ -7,6 +7,7 @@ import { stateIntegrityProcedure } from './review-prompts.mjs';
 import { knownIssuesPromptBlock, matchesKnownDismissal, pathKey } from './review-session-core.mjs';
 import { GEMINI_SHARD_MAX_BYTES, GEMINI_SHARD_TIMEOUT_MS, runGeminiShard } from './gemini-shard.mjs';
 import { DEFAULT_IGNORE, matchesIgnore, mergeShardResults, parseIgnorePatterns, planShards, reconcileCoverage, splitDiffByFile } from './review-shards.mjs';
+import { BudgetManager, CircuitBreaker, DeadlineTracker, runBoundedPool, executeWorkUnit } from './review-orchestrator.mjs';
 
 const cwd = process.cwd();
 const safeRoot = optionalRealDir(process.env.SAFE_REPO_DIR ?? 'safe-target');
@@ -195,67 +196,22 @@ console.log(`${allFiles.length} changed file(s) in ${shards.length} shard(s)${pl
 
 const knownIssues = knownIssuesPromptBlock(session);
 const riskNotes = stateIntegrityProcedure(readJson(path.join(contextRoot, 'risk-profile.json')));
-const startedAt = Date.now();
-const results = [];
+const deadlineTracker = new DeadlineTracker({ totalMs: DEADLINE_MS, minBufferMs: 60_000 });
+let results = [];
 const metas = [];
-let remainingUsd = REVIEW_MAX_BUDGET_USD;
-let inflightUsd = 0;
-let spentUsd = 0;
-let nextIndex = 0;
 // Gemini is switched off for the rest of the run once it is out of credits, rate limited, down, or
 // misconfigured, or after two shard-level failures; Claude then continues with the remaining shards.
-const gemini = { off: !PROVIDERS.includes('gemini') ? 'not requested' : (process.env.GEMINI_API_KEY ? null : 'GEMINI_API_KEY is not configured'), failures: 0 };
+const circuitBreaker = new CircuitBreaker({
+  initialReason: !PROVIDERS.includes('gemini') ? 'not requested' : (process.env.GEMINI_API_KEY ? null : 'GEMINI_API_KEY is not configured'),
+});
+const budgetManager = new BudgetManager({
+  minStartingAllowanceUsd: MIN_SHARD_BUDGET_USD,
+  getAvailableBudget: (pendingUsd) => REVIEW_MAX_BUDGET_USD - pendingUsd,
+  perCallCap: (available) => sharded ? Math.min(available, Math.max(1, REVIEW_MAX_BUDGET_USD / 3)) : available,
+});
 
 function timeLeftMs() {
-  return startedAt + DEADLINE_MS - Date.now();
-}
-
-async function tryGemini(index, prompt, toolGateway = null) {
-  const outcome = await runGeminiShard({
-    prompt,
-    schema,
-    timeoutMs: Math.min(GEMINI_SHARD_TIMEOUT_MS, timeLeftMs() - 30_000),
-    toolGateway,
-    maxTurns: SHARD_MAX_TURNS,
-  });
-  if (outcome.kind === 'ok') {
-    metas.push(outcome.meta);
-    return { ok: true, structured: outcome.structured, provider: 'gemini' };
-  }
-  if (outcome.kind === 'unavailable' || outcome.kind === 'config') gemini.off = outcome.error;
-  else if ((gemini.failures += 1) >= 2) gemini.off = outcome.error;
-  console.warn(`Gemini could not review shard ${index + 1}/${shards.length}: ${outcome.error}`);
-  return { ok: false, error: outcome.error, provider: 'gemini' };
-}
-
-async function tryClaude(index, makePrompt, diffPath) {
-  // Wait for budget a running Claude shard may still release; give up when none can.
-  let cap = 0;
-  for (;;) {
-    const available = remainingUsd - inflightUsd;
-    if (available >= MIN_SHARD_BUDGET_USD) {
-      cap = sharded ? Math.min(available, Math.max(1, REVIEW_MAX_BUDGET_USD / 3)) : available;
-      break;
-    }
-    if (inflightUsd === 0 || timeLeftMs() < 60_000) return { ok: false, error: 'Claude budget for this review is exhausted', provider: 'claude' };
-    await new Promise((resolve) => setTimeout(resolve, 250));
-  }
-  inflightUsd += cap;
-  let charged = cap;
-  try {
-    const run = await runClaudeShard({ prompt: makePrompt(cap), maxTurns: SHARD_MAX_TURNS, maxBudgetUsd: cap, timeoutMs: timeLeftMs() - 30_000, diffPath });
-    charged = run.meta?.total_cost_usd ?? cap; // unknown spend is charged at the allotted cap
-    if (run.meta) metas.push(run.meta);
-    return run.subtype === 'success' && run.structured
-      ? { ok: true, structured: run.structured, provider: 'claude', facts: claudeFacts(run.meta, SHARD_MAX_TURNS, cap) }
-      : { ok: false, error: run.subtype ? `${run.subtype}${run.errors ? `: ${run.errors}` : ''}` : (run.errors || 'no structured output'), provider: 'claude' };
-  } catch (error) {
-    return { ok: false, error: error?.message ?? String(error), provider: 'claude' };
-  } finally {
-    spentUsd += charged;
-    remainingUsd -= charged;
-    inflightUsd -= cap;
-  }
+  return deadlineTracker.timeLeftMs();
 }
 
 // A provider that answers but credits fewer files than it was assigned has not finished: the next
@@ -264,74 +220,93 @@ async function reviewUnit(index, unit, providers, suffix = '', retries = 2) {
   const diffPath = `.review-context/shards/shard-${index + 1}${suffix}.diff`;
   fs.writeFileSync(path.resolve(cwd, diffPath), unit.diff, { mode: 0o600 });
   const common = { shard: unit, index, count: shards.length, diffPath, knownIssues, riskNotes };
-  // Each provider that could not review this unit leaves a note, so the result says who fell back and why.
-  const notes = [];
-  for (let position = 0; position < providers.length; position += 1) {
-    const provider = providers[position];
-    let result;
-    if (provider === 'gemini') {
-      if (gemini.off) {
-        notes.push(`gemini: ${gemini.off}`);
-        continue;
-      }
-      const shardContextPath = path.relative(contextRoot, path.resolve(cwd, diffPath)).replace(/\\/g, '/');
-      const toolGateway = safeRoot ? new ReadOnlyToolGateway({
-        safeRoot, contextRoot, cwd, ignorePatterns, maxCalls: SHARD_MAX_TURNS * 4,
-        allowedContextFiles: [shardContextPath, 'changed-files.txt', 'diff-stat.txt', 'pr.json', 'skipped-files.txt'],
-      }) : null;
-      if (!toolGateway && unit.bytes > GEMINI_SHARD_MAX_BYTES) {
-        notes.push('gemini: shard too large for Gemini without tools');
-        continue;
-      }
-      const inlineDiff = unit.bytes <= GEMINI_SHARD_MAX_BYTES ? unit.diff : null;
-      result = await tryGemini(
-        index,
-        buildPrompt({
+
+  return executeWorkUnit({
+    unit,
+    providers,
+    geminiCircuitBreaker: circuitBreaker,
+    budgetManager,
+    deadlineTracker,
+    canExecute: {
+      claude: () => safeRoot ? true : 'safe-target repository snapshot is not available for Claude review',
+    },
+    executors: {
+      gemini: async ({ unit, timeoutMs }) => {
+        const shardContextPath = path.relative(contextRoot, path.resolve(cwd, diffPath)).replace(/\\/g, '/');
+        const toolGateway = safeRoot ? new ReadOnlyToolGateway({
+          safeRoot, contextRoot, cwd, ignorePatterns, maxCalls: SHARD_MAX_TURNS * 4,
+          allowedContextFiles: [shardContextPath, 'changed-files.txt', 'diff-stat.txt', 'pr.json', 'skipped-files.txt'],
+        }) : null;
+        if (!toolGateway && unit.bytes > GEMINI_SHARD_MAX_BYTES) {
+          return { ok: false, kind: 'skipped', error: 'shard too large for Gemini without tools' };
+        }
+        const inlineDiff = unit.bytes <= GEMINI_SHARD_MAX_BYTES ? unit.diff : null;
+        const prompt = buildPrompt({
           ...common,
           maxTurns: SHARD_MAX_TURNS,
           inlineDiff,
           hasTools: Boolean(toolGateway),
-        }),
-        toolGateway,
-      );
-    } else {
-      if (!safeRoot) {
-        notes.push('claude: safe-target repository snapshot is not available for Claude review');
-        continue;
-      }
-      result = await tryClaude(
-        index,
-        (budgetUsd) => buildPrompt({
+        });
+        const outcome = await runGeminiShard({
+          prompt,
+          schema,
+          timeoutMs: Math.min(GEMINI_SHARD_TIMEOUT_MS, timeoutMs),
+          toolGateway,
+          maxTurns: SHARD_MAX_TURNS,
+        });
+        if (outcome.kind === 'ok') {
+          metas.push(outcome.meta);
+          return { ok: true, structured: outcome.structured, meta: outcome.meta };
+        }
+        console.warn(`Gemini could not review shard ${index + 1}/${shards.length}: ${outcome.error}`);
+        return { ok: false, error: outcome.error, kind: outcome.kind, status: outcome.status };
+      },
+      claude: async ({ unit, timeoutMs, maxBudgetUsd }) => {
+        const prompt = buildPrompt({
           ...common,
           maxTurns: SHARD_MAX_TURNS,
-          budgetUsd,
+          budgetUsd: maxBudgetUsd,
           hasTools: Boolean(safeRoot),
-        }),
-        diffPath,
-      );
-    }
-    if (!result.ok) {
-      notes.push(`${provider}: ${result.error}`);
-      continue;
-    }
-    const coverage = reconcileCoverage(result.structured.coverage, unit.files);
-    const later = providers.slice(position + 1);
-    if (coverage.unreviewedPaths.length && later.length) {
-      const rest = unitFor(coverage.unreviewedPaths);
-      const continued = await reviewUnit(index, rest, later, `${suffix}-rest`);
-      const why = `${provider}: ${coverage.unreviewedPaths.length} of ${unit.files.length} file(s) not covered${coverage.note ? ` (${coverage.note.slice(0, 80)})` : ''}`;
-      return combineUnits(result, coverage, continued, [...notes, why], rest.files);
-    }
-    // The last provider left files but did make progress: it may simply have stopped early, so let the
-    // same provider continue with exactly the files left (a few times at most, only while it advances).
-    if (coverage.unreviewedPaths.length && !later.length && retries > 0 && coverage.reviewedPaths.length > 0 && timeLeftMs() > 120_000) {
-      const rest = unitFor(coverage.unreviewedPaths);
-      const continued = await reviewUnit(index, rest, [provider], `${suffix}-more`, retries - 1);
-      return combineUnits(result, coverage, continued, notes, rest.files);
-    }
-    return notes.length ? { ...result, fellBackFrom: notes.join('; ') } : result;
-  }
-  return { ok: false, error: notes.join('; ') || 'no provider available', provider: null };
+        });
+        const run = await runClaudeShard({
+          prompt,
+          maxTurns: SHARD_MAX_TURNS,
+          maxBudgetUsd,
+          timeoutMs,
+          diffPath,
+        });
+        if (run.meta) metas.push(run.meta);
+        if (run.subtype === 'success' && run.structured) {
+          return {
+            ok: true,
+            structured: run.structured,
+            meta: run.meta,
+            facts: claudeFacts(run.meta, SHARD_MAX_TURNS, maxBudgetUsd),
+          };
+        }
+        return {
+          ok: false,
+          error: run.subtype ? `${run.subtype}${run.errors ? `: ${run.errors}` : ''}` : (run.errors || 'no structured output'),
+          meta: run.meta,
+        };
+      },
+    },
+    onPartialCoverage: async ({ result, unit, currentProvider, remainingProviders, notes }) => {
+      const coverage = reconcileCoverage(result.structured.coverage, unit.files);
+      if (coverage.unreviewedPaths.length && remainingProviders.length) {
+        const rest = unitFor(coverage.unreviewedPaths);
+        const continued = await reviewUnit(index, rest, remainingProviders, `${suffix}-rest`);
+        const why = `${currentProvider}: ${coverage.unreviewedPaths.length} of ${unit.files.length} file(s) not covered${coverage.note ? ` (${coverage.note.slice(0, 80)})` : ''}`;
+        return combineUnits(result, coverage, continued, [...notes, why], rest.files);
+      }
+      if (coverage.unreviewedPaths.length && !remainingProviders.length && retries > 0 && coverage.reviewedPaths.length > 0 && timeLeftMs() > 120_000) {
+        const rest = unitFor(coverage.unreviewedPaths);
+        const continued = await reviewUnit(index, rest, [currentProvider], `${suffix}-more`, retries - 1);
+        return combineUnits(result, coverage, continued, notes, rest.files);
+      }
+      return null;
+    },
+  });
 }
 
 // What actually happened, written by the bot rather than the model: a reviewer that stops early says "out of
@@ -381,26 +356,29 @@ async function reviewShard(index) {
   return reviewUnit(index, shards[index], PROVIDERS);
 }
 
-async function worker() {
-  while (nextIndex < shards.length) {
-    if (timeLeftMs() < 60_000) {
-      console.warn(`Stopping before shard ${nextIndex + 1}/${shards.length}: time budget exhausted.`);
-      return;
-    }
-    const index = nextIndex;
-    nextIndex += 1;
-    try {
-      results[index] = await reviewShard(index);
-    } catch (error) {
-      results[index] = { ok: false, error: error?.message ?? String(error), provider: null };
-    }
-    if (results[index].ok === false) console.warn(`Shard ${index + 1}/${shards.length} did not complete: ${results[index].error}`);
-  }
-}
-
 try {
-  await Promise.all(Array.from({ length: Math.min(SHARD_CONCURRENCY, shards.length) }, () => worker()));
+  results = await runBoundedPool({
+    items: shards,
+    concurrency: SHARD_CONCURRENCY,
+    deadlineTracker,
+    minTimeBufferMs: 60_000,
+    workerFn: async (shard, index) => {
+      let res;
+      try {
+        res = await reviewShard(index);
+      } catch (err) {
+        res = { ok: false, error: err?.message ?? String(err), provider: null };
+      }
+      if (res.ok === false) console.warn(`Shard ${index + 1}/${shards.length} did not complete: ${res.error}`);
+      return res;
+    },
+    onStop: (nextIdx, total) => {
+      console.warn(`Stopping before shard ${nextIdx + 1}/${total}: time budget exhausted.`);
+    },
+    catchErrors: true,
+  });
 } finally {
+  const spentUsd = budgetManager.totalSpentUsd;
   // Spend must be accounted even when shards fail (budget/turn exhaustion still costs). Gemini is not
   // charged to this ledger, so a run that never needed Claude records an explicit 0.
   const succeeded = nothingToDo || results.some((r) => r?.ok);

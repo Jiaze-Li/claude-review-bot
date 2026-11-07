@@ -7,6 +7,7 @@ import {geminiBaseUrl} from './gemini-config.mjs';
 import {MAX_SHARDS,dropIgnoredFiles,planShards,splitDiffByFile} from './review-shards.mjs';
 import {getProviderAdapter, PROVIDER_KINDS, OUTCOME_KINDS} from './provider-adapter.mjs';
 import {ReadOnlyToolGateway} from './tool-gateway.mjs';
+import {BudgetManager, CircuitBreaker, DeadlineTracker, runBoundedPool, executeWorkUnit} from './review-orchestrator.mjs';
 
 // Moving alias: always resolves to Google's current Flash model. Override with GEMINI_MODEL to pin.
 export const GEMINI_MODEL='gemini-flash-latest';
@@ -151,8 +152,18 @@ export async function runGeminiReview({env=process.env,fetchImpl=fetch,logImpl=c
   const riskProfile=fs.existsSync(riskPath)
     ? JSON.parse(fs.readFileSync(riskPath,'utf8'))
     : {version:1,stateIntegrity:false,signals:{synchronization:[],durableState:[],multiActor:[]}};
-  const ctx={claudeOnly,env,fetchImpl,logImpl,queryImpl,apiKey,repo,prNumber,headSha,contextRoot,plan,mode,prJson,session,riskProfile,diffName};
-  const shared={geminiOff:null,geminiFailures:0,charges:[],inflight:0,perCallCap:null};
+  const manual=isManualBudgetExemptReview({sourceKind:env.SOURCE_KIND,requestedMode:plan.requestedMode});
+  const circuitBreaker = new CircuitBreaker();
+  const budgetManager = new BudgetManager({
+    minStartingAllowanceUsd: CLAUDE_AUTO_MIN_BUDGET_USD,
+    getAvailableBudget: (pendingUsd) => {
+      const budgetBase = claudeFallbackCallBudget(plan.session, { manual, pendingUsd });
+      return manual ? Math.min(budgetBase, Math.max(0, DEEP_REVIEW_MANUAL_RUN_BUDGET_USD - pendingUsd)) : budgetBase;
+    },
+    perCallCap: null,
+  });
+  const ctx={claudeOnly,env,fetchImpl,logImpl,queryImpl,apiKey,repo,prNumber,headSha,contextRoot,plan,mode,prJson,session,riskProfile,diffName,manual};
+  const shared={circuitBreaker,budgetManager};
 
   const fixedBytes=Buffer.byteLength(prJson,'utf8')+Buffer.byteLength(JSON.stringify(session??{}),'utf8')+Buffer.byteLength(JSON.stringify(riskProfile),'utf8');
   if(Buffer.byteLength(diff,'utf8')+fixedBytes<=SINGLE_REQUEST_MAX_BYTES){
@@ -162,21 +173,19 @@ export async function runGeminiReview({env=process.env,fetchImpl=fetch,logImpl=c
   const chunks=splitDiffByFile(diff);
   const {shards:parts,deferred}=planShards({files:chunks.map((chunk)=>chunk.path),chunks});
   if(deferred.length||!parts.length) throw new Error(`The ${mode} diff spans too many parts (${parts.length+(deferred.length?'+':'')}) for one staged review even after skipping ignored files; add generated or bulk files to .reviewbotignore, or ask for a sharded review`);
-  shared.perCallCap=PART_CLAUDE_CAP_USD;
+  shared.budgetManager.perCallCap=PART_CLAUDE_CAP_USD;
   logImpl(`Large ${mode} diff: reviewing ${chunks.length} file(s) in ${parts.length} part(s)`);
-  const startedAt=Date.now();
-  const results=new Array(parts.length);
-  let next=0;
-  async function worker(){
-    while(next<parts.length){
-      if(Date.now()-startedAt>PARTS_DEADLINE_MS) return;
-      const index=next;
-      next+=1;
-      results[index]=await reviewPart(ctx,parts[index].diff,shared);
-    }
-  }
+  const deadlineTracker=new DeadlineTracker({totalMs:PARTS_DEADLINE_MS,minBufferMs:0});
+  let results;
   try{
-    await Promise.all(Array.from({length:Math.min(PART_CONCURRENCY,parts.length)},()=>worker()));
+    results=await runBoundedPool({
+      items:parts,
+      concurrency:PART_CONCURRENCY,
+      deadlineTracker,
+      minTimeBufferMs:0,
+      workerFn:async(part)=>reviewPart(ctx,part.diff,shared),
+      onStop:()=>{},
+    });
   }catch(error){
     recordParts(ctx,shared,`part review failed: ${String(error.message||error).slice(0,160)}`);
     throw error;
@@ -191,12 +200,12 @@ export async function runGeminiReview({env=process.env,fetchImpl=fetch,logImpl=c
 
 // Persist what Claude already cost, so a failure part-way never makes spent allowance disappear.
 function recordParts(ctx,shared,reason){
-  if(!shared.charges.length) return;
+  if(!shared.budgetManager.charges.length) return;
   // A stop already recorded with its own reason is more specific than this summary.
   if(fs.existsSync(path.join(ctx.contextRoot,'fallback-unavailable.json'))) return;
   try{
     fs.writeFileSync(path.join(ctx.contextRoot,'fallback-unavailable.json'),
-      JSON.stringify({mode:ctx.mode,headSha:ctx.headSha,reason,spentUsd:shared.charges.reduce((sum,c)=>sum+c.amount,0),costCharges:shared.charges})+'\n',{mode:0o600});
+      JSON.stringify({mode:ctx.mode,headSha:ctx.headSha,reason,spentUsd:shared.budgetManager.charges.reduce((sum,c)=>sum+c.amount,0),costCharges:shared.budgetManager.charges})+'\n',{mode:0o600});
   }catch{
     // best effort
   }
@@ -214,136 +223,148 @@ async function reviewPart(ctx,diff,shared){
   const thinking = mode==='incremental' ? INCREMENTAL_THINKING : GEMINI_THINKING;
   const maxOutputTokens = 16384;
   const timeoutMs=resolveGeminiTimeoutMs({env});
-  let usageTotals={
-    input_tokens:0,
-    output_tokens:0,
-    thoughts_tokens:0,
-    total_tokens:0,
+
+  const recordStop=(reason)=>{
+    fs.writeFileSync(path.join(contextRoot,'fallback-unavailable.json'),
+      JSON.stringify({mode,headSha,reason,
+        spentUsd:shared.budgetManager.charges.reduce((sum,c)=>sum+c.amount,0),costCharges:shared.budgetManager.charges})+'\n',{mode:0o600});
   };
-  let result=null;
-  let attempts=0;
-  let servedModel=null;
-  // Why Gemini could not do this request, when it could not: { status, message }.
-  let failed=claudeOnly
-    ? {status:0,message:'Claude was requested',requested:true}
-    : shared.geminiOff?{status:shared.geminiOff.status,message:shared.geminiOff.message,carried:true}:null;
 
-  if(!failed){
-    const adapter = getProviderAdapter(PROVIDER_KINDS.GEMINI, {
-      defaultModel: model,
-      defaultEffort: thinking,
-    });
-    const safeDir = env.SAFE_REPO_DIR || 'safe-target';
-    const safePath = path.resolve(safeDir);
-    const safeRoot = fs.existsSync(safePath) ? safePath : null;
-    const toolGateway = safeRoot ? new ReadOnlyToolGateway({
-      safeRoot,
-      contextRoot,
-      cwd: process.cwd(),
-      allowedContextFiles: [diffName, 'changed-files.txt', 'diff-stat.txt', 'pr.json', 'skipped-files.txt', 'repair.diff', 'pr.diff'],
-    }) : null;
-    const outcome = await adapter.execute({
-      prompt: built.prompt,
-      schema: built.schema,
-      model,
-      effort: thinking,
-      timeoutMs,
-      maxOutputTokens,
-      env,
-      fetchImpl,
-      maxAttempts: 2,
-      logImpl,
-      metadata: { mode, contextBytes },
-      toolGateway,
-    });
-    if(outcome.ok){
-      result = outcome.structured;
-      servedModel = outcome.meta.resolved_model;
-      attempts = outcome.meta.num_turns;
-      usageTotals = outcome.meta.usage;
-    }else{
-      const isOff = outcome.kind === OUTCOME_KINDS.UNAVAILABLE || outcome.kind === OUTCOME_KINDS.CONFIG;
-      if(isOff){
-        shared.geminiOff = { status: outcome.status, message: outcome.error };
-      }
-      failed = { status: outcome.status || 0, message: outcome.error };
-      if(!shared.geminiOff && ++shared.geminiFailures >= 2) shared.geminiOff = { status: failed.status, message: failed.message };
-    }
-  }
-
-  if(failed){
-    // Any Gemini failure hands the work to Claude, loudly: the review records why. Only a manual review
-    // comment opts out of the per-PR cap; an automatic pull_request event cannot claim this exemption.
-    const reasonText=failed.status?`HTTP ${failed.status}`:failed.message.slice(0,120);
-    const manual=isManualBudgetExemptReview({sourceKind:env.SOURCE_KIND,requestedMode:plan.requestedMode});
-    // Budget that is merely reserved by Claude calls still running comes back when they finish, so a part
-    // that finds too little waits for them instead of failing; only a real shortage stops the review.
-    let budget=0;
-    for(;;){
-      const spentSoFar=shared.charges.reduce((sum,c)=>sum+c.amount,0);
-      const budgetBase=claudeFallbackCallBudget(plan.session,{manual,pendingUsd:spentSoFar});
-      const wholeRun=manual?Math.min(budgetBase,Math.max(0,DEEP_REVIEW_MANUAL_RUN_BUDGET_USD-spentSoFar)):budgetBase;
-      budget=shared.perCallCap?Math.min(wholeRun,shared.perCallCap):wholeRun;
-      if(budget>=CLAUDE_AUTO_MIN_BUDGET_USD||shared.inflight===0) break;
-      await new Promise((resolve)=>setTimeout(resolve,250));
-    }
-    const recordStop=(reason)=>{
-      fs.writeFileSync(path.join(contextRoot,'fallback-unavailable.json'),
-        JSON.stringify({mode,headSha,reason,
-          spentUsd:shared.charges.reduce((sum,c)=>sum+c.amount,0),costCharges:shared.charges})+'\n',{mode:0o600});
-    };
-    if(budget<CLAUDE_AUTO_MIN_BUDGET_USD){
+  const outcome = await executeWorkUnit({
+    unit: { diff },
+    providers: claudeOnly ? ['claude'] : ['gemini', 'claude'],
+    geminiCircuitBreaker: shared.circuitBreaker,
+    budgetManager: shared.budgetManager,
+    defaultTimeoutMs: timeoutMs,
+    throwClaudeErrors: true,
+    executors: {
+      gemini: async ({ unit, timeoutMs: callTimeout }) => {
+        const adapter = getProviderAdapter(PROVIDER_KINDS.GEMINI, {
+          defaultModel: model,
+          defaultEffort: thinking,
+        });
+        const safeDir = env.SAFE_REPO_DIR || 'safe-target';
+        const safePath = path.resolve(safeDir);
+        const safeRoot = fs.existsSync(safePath) ? safePath : null;
+        const toolGateway = safeRoot ? new ReadOnlyToolGateway({
+          safeRoot,
+          contextRoot,
+          cwd: process.cwd(),
+          allowedContextFiles: [diffName, 'changed-files.txt', 'diff-stat.txt', 'pr.json', 'skipped-files.txt', 'repair.diff', 'pr.diff'],
+        }) : null;
+        const res = await adapter.execute({
+          prompt: built.prompt,
+          schema: built.schema,
+          model,
+          effort: thinking,
+          timeoutMs: callTimeout,
+          maxOutputTokens,
+          env,
+          fetchImpl,
+          maxAttempts: 2,
+          logImpl,
+          metadata: { mode, contextBytes },
+          toolGateway,
+        });
+        if (res.ok) {
+          return {
+            ok: true,
+            structured: res.structured,
+            meta: {
+              provider: 'gemini',
+              requested_model: model,
+              resolved_model: res.meta?.resolved_model || model,
+              effort: thinking,
+              mode,
+              attempts: res.meta?.num_turns ?? 1,
+              max_output_tokens: maxOutputTokens,
+              timeout_ms: timeoutMs,
+              risk_profile: riskProfile,
+              usage: {
+                input_tokens: nonnegative(res.meta?.usage?.input_tokens ?? res.meta?.usage?.promptTokenCount),
+                output_tokens: nonnegative(res.meta?.usage?.output_tokens ?? res.meta?.usage?.candidatesTokenCount),
+                thoughts_tokens: nonnegative(res.meta?.usage?.thoughts_tokens ?? res.meta?.usage?.thoughtsTokenCount),
+                total_tokens: nonnegative(res.meta?.usage?.total_tokens ?? res.meta?.usage?.totalTokenCount),
+              },
+            },
+          };
+        }
+        return {
+          ok: false,
+          error: res.error,
+          kind: res.kind,
+          status: res.status,
+          meta: res.meta,
+          attempts: res.meta?.num_turns ?? 0,
+        };
+      },
+      claude: async ({ unit, timeoutMs: callTimeout, maxBudgetUsd, reservation, lastFailed, priorGeminiOutcome }) => {
+        const reasonText = lastFailed?.status ? `HTTP ${lastFailed.status}` : (lastFailed?.message?.slice(0, 120) || (claudeOnly ? 'requested' : 'unknown'));
+        if (!env.CLAUDE_CODE_OAUTH_TOKEN) {
+          shared.budgetManager.cancelReservation(reservation);
+          recordStop(`Gemini ${reasonText}; Claude fallback credential unavailable`);
+          const err = new Error('Claude fallback unavailable: CLAUDE_CODE_OAUTH_TOKEN is not set');
+          err.alreadyRecorded = true;
+          throw err;
+        }
+        logImpl(claudeOnly ? `Claude was requested for this ${mode} review` : `Gemini could not do this ${mode} review (${reasonText}); falling back to Claude`);
+        let fallback;
+        try {
+          fallback = await runClaudeStructured({
+            prompt: built.prompt,
+            schema: built.schema,
+            timeoutMs: callTimeout,
+            maxBudgetUsd,
+            env,
+            logImpl,
+            queryImpl,
+          });
+        } finally {
+          if (fallback?.meta && shared.budgetManager && reservation && !reservation.settled) {
+            shared.budgetManager.settleReservation(reservation, {
+              actualCostUsd: fallback.meta.total_cost_usd,
+              costSource: fallback.meta.cost_source ?? 'reserve',
+              fallbackCostUsd: maxBudgetUsd,
+            });
+          }
+        }
+        if (mode === 'verification') normalizeVerificationResult(fallback.structured); else normalizeReviewResult(fallback.structured);
+        const geminiAttempts = priorGeminiOutcome?.meta?.attempts ?? priorGeminiOutcome?.meta?.num_turns ?? priorGeminiOutcome?.attempts ?? 0;
+        return {
+          ok: true,
+          structured: fallback.structured,
+          meta: {
+            ...fallback.meta,
+            mode,
+            attempts: geminiAttempts,
+            ...(claudeOnly ? {} : { fallback_from: 'gemini', fallback_reason: reasonText }),
+            max_output_tokens: null,
+            timeout_ms: timeoutMs,
+            risk_profile: riskProfile,
+          },
+        };
+      },
+    },
+    onClaudeBudgetBlocked: async ({ notes, lastFailed }) => {
+      const reasonText = lastFailed?.status ? `HTTP ${lastFailed.status}` : (lastFailed?.message?.slice(0, 120) || (claudeOnly ? 'requested' : 'unknown'));
       recordStop(`Gemini ${reasonText}; Claude budget exhausted or below minimum starting allowance`);
       throw new Error('Claude fallback blocked: automatic budget is exhausted or insufficient for a full review; human judgment required');
-    }
-    if(!env.CLAUDE_CODE_OAUTH_TOKEN){
-      recordStop(`Gemini ${reasonText}; Claude fallback credential unavailable`);
-      throw new Error('Claude fallback unavailable: CLAUDE_CODE_OAUTH_TOKEN is not set');
-    }
-    logImpl(failed.requested?`Claude was requested for this ${mode} review`:`Gemini could not do this ${mode} review (${reasonText}); falling back to Claude`);
-    let fallback;
-    // The call's whole budget is reserved while it runs (parts run side by side), then replaced by what it
-    // actually cost. Failed calls with missing SDK usage keep the whole allotted budget.
-    const charge={amount:budget,source:'reserve'};
-    shared.charges.push(charge);
-    shared.inflight+=1;
-    try{
-      fallback=await runClaudeStructured({prompt:built.prompt,schema:built.schema,timeoutMs,
-        maxBudgetUsd:budget,env,logImpl,queryImpl});
-      if(Number.isFinite(fallback.meta?.total_cost_usd)){ charge.amount=fallback.meta.total_cost_usd; charge.source=fallback.meta.cost_source??'reserve'; }
-      // Validate before publication. Invalid output must never be declared READY.
-      if(mode==='verification') normalizeVerificationResult(fallback.structured); else normalizeReviewResult(fallback.structured);
-    }catch(error){
-      recordStop(`Gemini ${reasonText}; Claude fallback failed: `+String(error.message||error).slice(0,160));
-      throw error;
-    }finally{
-      shared.inflight-=1;
-    }
-    return {
-      ...fallback.structured,
-      _meta:{
-        ...fallback.meta,
-        mode,attempts,
-        ...(failed.requested?{}:{fallback_from:'gemini',fallback_reason:reasonText}),
-        max_output_tokens:null,
-        timeout_ms:timeoutMs,
-        risk_profile:riskProfile,
-      },
-    };
-  }
-  result._meta={
-    provider:'gemini',requested_model:model,resolved_model:servedModel||model,effort:thinking,mode,attempts,
-    max_output_tokens:maxOutputTokens,
-    timeout_ms:timeoutMs,
-    risk_profile:riskProfile,
-    usage:{
-      input_tokens:nonnegative(usageTotals.input_tokens ?? usageTotals.promptTokenCount),
-      output_tokens:nonnegative(usageTotals.output_tokens ?? usageTotals.candidatesTokenCount),
-      thoughts_tokens:nonnegative(usageTotals.thoughts_tokens ?? usageTotals.thoughtsTokenCount),
-      total_tokens:nonnegative(usageTotals.total_tokens ?? usageTotals.totalTokenCount),
     },
+    onClaudeError: async ({ error, lastFailed }) => {
+      if (error?.alreadyRecorded) return;
+      const reasonText = lastFailed?.status ? `HTTP ${lastFailed.status}` : (lastFailed?.message?.slice(0, 120) || (claudeOnly ? 'requested' : 'unknown'));
+      recordStop(`Gemini ${reasonText}; Claude fallback failed: ` + String(error?.message || error).slice(0, 160));
+    },
+  });
+
+  if (!outcome.ok) {
+    throw new Error(outcome.error || 'Review failed');
+  }
+
+  return {
+    ...outcome.structured,
+    _meta: outcome.meta,
   };
-  return result;
 }
 
 // ---- Merging the parts of a large diff back into one result of the usual shape ----
