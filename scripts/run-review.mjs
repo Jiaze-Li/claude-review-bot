@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { defaultProviderRegistry, getProviderAdapter, PROVIDER_KINDS } from './provider-adapter.mjs';
+import { defaultProviderRegistry, getProviderAdapter, parseReviewProviders, PROVIDER_KINDS } from './provider-adapter.mjs';
 import { ReadOnlyToolGateway } from './tool-gateway.mjs';
 import { stateIntegrityProcedure } from './review-prompts.mjs';
 import { knownIssuesPromptBlock, matchesKnownDismissal, pathKey } from './review-session-core.mjs';
@@ -36,12 +36,20 @@ const usagePath = path.join(contextRoot, 'claude-usage.json');
 // Who reviews each shard, in order. By default Gemini is listed first and Claude
 // continues whatever Gemini cannot finish; an explicit `@claude review` lists only Claude.
 // Any registered third-party provider can be selected via REVIEW_PROVIDERS.
-const rawProviders = (process.env.REVIEW_PROVIDERS || 'claude')
-  .split(',')
-  .map((name) => name.trim().toLowerCase())
-  .filter(Boolean);
-const validProviders = rawProviders.filter((name) => defaultProviderRegistry.has(name));
-const PROVIDERS = validProviders.length > 0 ? validProviders : ['claude'];
+function readSessionPlan() {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(contextRoot, 'session-plan.json'), 'utf8'));
+  } catch {
+    return null;
+  }
+}
+const sessionPlan = readSessionPlan();
+const claudeOnly = sessionPlan?.requestedMode === 'claude';
+const PROVIDERS = parseReviewProviders(process.env.REVIEW_PROVIDERS, {
+  registry: defaultProviderRegistry,
+  claudeOnly,
+  defaultProviders: ['claude'],
+});
 
 const schema = {
   type: 'object',

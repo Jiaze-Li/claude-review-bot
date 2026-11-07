@@ -5,7 +5,7 @@ import { CLAUDE_AUTO_MIN_BUDGET_USD, DEEP_REVIEW_MANUAL_RUN_BUDGET_USD, GEMINI_M
 import {isGeminiUnavailableStatus,runClaudeStructured} from './claude-fallback.mjs';
 import {geminiBaseUrl} from './gemini-config.mjs';
 import {MAX_SHARDS,dropIgnoredFiles,planShards,splitDiffByFile} from './review-shards.mjs';
-import {defaultProviderRegistry, getProviderAdapter, PROVIDER_KINDS, OUTCOME_KINDS} from './provider-adapter.mjs';
+import {defaultProviderRegistry, getProviderAdapter, parseReviewProviders, PROVIDER_KINDS, OUTCOME_KINDS} from './provider-adapter.mjs';
 import {ReadOnlyToolGateway} from './tool-gateway.mjs';
 import {BudgetManager, CircuitBreaker, DeadlineTracker, runBoundedPool, executeWorkUnit} from './review-orchestrator.mjs';
 
@@ -140,13 +140,11 @@ export async function runGeminiReview({env=process.env,fetchImpl=fetch,logImpl=c
   // `@claude review` asks for Claude alone: Gemini is neither needed nor called.
   const claudeOnly=plan.requestedMode==='claude';
 
-  const configuredProviders=(env.REVIEW_PROVIDERS||'')
-    .split(',')
-    .map((p)=>p.trim().toLowerCase())
-    .filter((p)=>defaultProviderRegistry.has(p));
-  const providers=configuredProviders.length>0
-    ? configuredProviders
-    : (claudeOnly ? ['claude'] : ['gemini', 'claude']);
+  const providers = parseReviewProviders(env.REVIEW_PROVIDERS, {
+    registry: defaultProviderRegistry,
+    claudeOnly,
+    defaultProviders: claudeOnly ? ['claude'] : ['gemini', 'claude'],
+  });
 
   const needsGemini=providers.includes('gemini');
   const apiKey=needsGemini?(env.GEMINI_API_KEY?required(env,'GEMINI_API_KEY'):required(env,'GEMINI_API_KEY')):(env.GEMINI_API_KEY||'');

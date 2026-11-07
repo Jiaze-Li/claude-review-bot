@@ -10,6 +10,7 @@ import {
   registerProvider,
   getProviderDescriptor,
   listProviders,
+  parseReviewProviders,
   PROVIDER_KINDS,
   OUTCOME_KINDS,
   ERROR_KINDS,
@@ -692,5 +693,33 @@ test('defaultProviderRegistry includes Gemini and Claude with capability and pol
   assert.equal(claudeAdapter.capabilities.hostSecurity, 'host-enforced');
   assert.equal(claudeAdapter.policy.budgetType, 'usd-ledger');
 });
+
+test('parseReviewProviders: validates unknown providers, deduplicates repeated names, and enforces claudeOnly', () => {
+  // 1. Unknown provider throws explicit error
+  assert.throws(
+    () => parseReviewProviders('gemini,unknown-provider'),
+    /Unknown review provider "unknown-provider"/
+  );
+  assert.throws(
+    () => parseReviewProviders('invalid'),
+    /Unknown review provider "invalid"/
+  );
+
+  // 2. Repeated providers are deduplicated preserving order
+  assert.deepEqual(parseReviewProviders('gemini,gemini'), ['gemini']);
+  assert.deepEqual(parseReviewProviders('claude,gemini,claude'), ['claude', 'gemini']);
+  assert.deepEqual(parseReviewProviders('gemini,claude,gemini'), ['gemini', 'claude']);
+
+  // 3. Explicit @claude review (claudeOnly: true) strictly returns ['claude']
+  assert.deepEqual(parseReviewProviders('gemini,claude', { claudeOnly: true }), ['claude']);
+  assert.deepEqual(parseReviewProviders('', { claudeOnly: true }), ['claude']);
+  assert.deepEqual(parseReviewProviders('unknown', { claudeOnly: true }), ['claude']);
+
+  // 4. Default fallbacks when empty/omitted
+  assert.deepEqual(parseReviewProviders('', { defaultProviders: ['gemini', 'claude'] }), ['gemini', 'claude']);
+  assert.deepEqual(parseReviewProviders(null, { defaultProviders: ['claude'] }), ['claude']);
+  assert.deepEqual(parseReviewProviders('   ', { defaultProviders: ['claude'] }), ['claude']);
+});
+
 
 

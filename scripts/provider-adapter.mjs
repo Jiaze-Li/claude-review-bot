@@ -1491,3 +1491,43 @@ defaultProviderRegistry.register(PROVIDER_KINDS.CLAUDE, ClaudeProviderAdapter, {
 export function getProviderAdapter(provider, options = {}) {
   return defaultProviderRegistry.createAdapter(provider, options);
 }
+
+/**
+ * Parse, validate, and normalize a REVIEW_PROVIDERS configuration string.
+ *
+ * Rules:
+ * 1. If claudeOnly is true, returns ['claude'] unconditionally.
+ * 2. If raw is omitted or whitespace-only, returns defaultProviders.
+ * 3. Rejects unknown provider names with an explicit Error.
+ * 4. Deduplicates repeated names preserving order.
+ */
+export function parseReviewProviders(raw, {
+  registry = defaultProviderRegistry,
+  claudeOnly = false,
+  defaultProviders = ['claude'],
+} = {}) {
+  if (claudeOnly) {
+    return ['claude'];
+  }
+  if (!raw || typeof raw !== 'string' || !raw.trim()) {
+    return [...defaultProviders];
+  }
+  const parts = raw.split(',').map((p) => p.trim().toLowerCase()).filter(Boolean);
+  if (!parts.length) {
+    return [...defaultProviders];
+  }
+
+  const seen = new Set();
+  const out = [];
+  for (const name of parts) {
+    if (!registry.has(name)) {
+      throw new Error(`Unknown review provider "${name}"; registered providers are: ${registry.list().join(', ')}`);
+    }
+    if (!seen.has(name)) {
+      seen.add(name);
+      out.push(name);
+    }
+  }
+  return out;
+}
+
