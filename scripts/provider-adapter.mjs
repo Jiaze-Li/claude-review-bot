@@ -11,6 +11,23 @@ import { ReadOnlyToolGateway } from './tool-gateway.mjs';
 
 export const AUTHORIZED_GEMINI_TOOLS = Object.freeze(['Read', 'Glob', 'Grep']);
 
+function checkCheckedText(value, max, name) {
+  if (typeof value !== 'string') {
+    return `${name} must be a string`;
+  }
+  const text = value.trim();
+  if (!text) {
+    return `${name} must be a non-empty string`;
+  }
+  if (text.length > max) {
+    return `${name} exceeded maximum length of ${max} characters`;
+  }
+  if (value.includes('\0')) {
+    return `${name} must not contain null bytes`;
+  }
+  return null;
+}
+
 export function validateStructuredReview(value, schema = null) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     return { ok: false, error: 'Structured output must be an object' };
@@ -25,16 +42,26 @@ export function validateStructuredReview(value, schema = null) {
     }
   }
 
-  // 2. Summary validation
+  // 2. Summary validation (checkedText max: 4000)
   if (value.summary !== undefined) {
-    if (typeof value.summary !== 'string' || !value.summary.trim()) {
-      return { ok: false, error: 'summary must be a non-empty string' };
-    }
+    const summaryErr = checkCheckedText(value.summary, 4000, 'summary');
+    if (summaryErr) return { ok: false, error: summaryErr };
   }
 
-  // 3. Findings validation (strictly validate nested required fields, types, and enums)
+  const isVerification = value.verifications !== undefined || schema?.properties?.verifications !== undefined;
+  const maxFindings = typeof schema?.properties?.findings?.maxItems === 'number'
+    ? schema.properties.findings.maxItems
+    : (isVerification ? 3 : 6);
+  const maxVerifications = typeof schema?.properties?.verifications?.maxItems === 'number'
+    ? schema.properties.verifications.maxItems
+    : 16;
+
+  // 3. Findings validation (strictly validate nested required fields, types, and downstream checkedText)
   if (value.findings !== undefined) {
     if (!Array.isArray(value.findings)) return { ok: false, error: 'findings must be an array' };
+    if (value.findings.length > maxFindings) {
+      return { ok: false, error: `findings exceeded maximum count of ${maxFindings} entries: received ${value.findings.length}` };
+    }
     const findingRequired = schema?.properties?.findings?.items?.required ?? ['severity', 'title', 'body', 'path', 'line', 'failurePath'];
     for (const f of value.findings) {
       if (!f || typeof f !== 'object' || Array.isArray(f)) return { ok: false, error: 'finding must be an object' };
@@ -48,23 +75,28 @@ export function validateStructuredReview(value, schema = null) {
       if (!['P0', 'P1', 'P2', 'P3'].includes(f.severity)) {
         return { ok: false, error: `Invalid finding severity: ${f.severity}` };
       }
-      if (typeof f.title !== 'string' || !f.title.trim()) {
-        return { ok: false, error: 'finding title must be a non-empty string' };
+      const titleErr = checkCheckedText(f.title, 300, 'finding title');
+      if (titleErr) return { ok: false, error: titleErr };
+
+      const bodyErr = checkCheckedText(f.body, 4000, 'finding body');
+      if (bodyErr) return { ok: false, error: bodyErr };
+
+      const pathErr = checkCheckedText(f.path, 1000, 'finding path');
+      if (pathErr) return { ok: false, error: pathErr };
+      const trimmedPath = f.path.trim();
+      if (trimmedPath.startsWith('/') || trimmedPath.split('/').includes('..')) {
+        return { ok: false, error: 'finding path must be repository-relative' };
       }
-      if (typeof f.body !== 'string' || !f.body.trim()) {
-        return { ok: false, error: 'finding body must be a non-empty string' };
-      }
-      if (typeof f.path !== 'string' || !f.path.trim()) {
-        return { ok: false, error: 'finding path must be a non-empty string' };
-      }
+
       if (f.line !== null && (!Number.isInteger(f.line) || f.line < 1)) {
         return { ok: false, error: `finding line must be a positive integer or null: ${f.line}` };
       }
       if (typeof f.failurePath !== 'string') {
         return { ok: false, error: 'finding failurePath must be a string' };
       }
-      if (f.riskClass !== undefined && typeof f.riskClass !== 'string') {
-        return { ok: false, error: 'finding riskClass must be a string' };
+      if (f.riskClass !== undefined) {
+        const riskErr = checkCheckedText(f.riskClass, 120, 'finding riskClass');
+        if (riskErr) return { ok: false, error: riskErr };
       }
     }
   }
@@ -103,18 +135,38 @@ export function validateStructuredReview(value, schema = null) {
   // 5. Verification results validation
   if (value.verifications !== undefined) {
     if (!Array.isArray(value.verifications)) return { ok: false, error: 'verifications must be an array' };
+    if (value.verifications.length > maxVerifications) {
+      return { ok: false, error: `verifications exceeded maximum count of ${maxVerifications} entries: received ${value.verifications.length}` };
+    }
     const idPattern = schema?.properties?.verifications?.items?.properties?.findingId?.pattern;
     const idRegex = idPattern ? new RegExp(idPattern) : null;
+    const verifRequired = schema?.properties?.verifications?.items?.required;
+    const seenVerifs = new Set();
     for (const v of value.verifications) {
       if (!v || typeof v !== 'object' || Array.isArray(v)) return { ok: false, error: 'verification must be an object' };
-      const id = v.findingId || v.id;
-      if (!id || typeof id !== 'string') return { ok: false, error: 'verification findingId must be a string' };
-      if (idRegex && !idRegex.test(id)) {
+      if (verifRequired && Array.isArray(verifRequired)) {
+        for (const req of verifRequired) {
+          if (v[req] === undefined && (req !== 'findingId' || v.id === undefined) && (req !== 'status' || v.verdict === undefined)) {
+            return { ok: false, error: `verification missing required field: ${req}` };
+          }
+        }
+      }
+      const id = String(v.findingId || v.id || '').trim();
+      if (!id) return { ok: false, error: 'verification findingId must be a string' };
+      if (!/^F\d{3,}$/.test(id) || (idRegex && !idRegex.test(id))) {
         return { ok: false, error: `verification findingId does not match pattern: ${id}` };
       }
-      const status = String(v.status || v.verdict || '').toUpperCase();
+      if (seenVerifs.has(id)) {
+        return { ok: false, error: `duplicate verification findingId: ${id}` };
+      }
+      seenVerifs.add(id);
+      const status = String(v.status || v.verdict || '').trim().toUpperCase();
       if (!['FIXED', 'STILL_OPEN', 'UNCERTAIN'].includes(status)) {
         return { ok: false, error: `Invalid verification status: ${v.status || v.verdict}` };
+      }
+      if (v.reason !== undefined) {
+        const reasonErr = checkCheckedText(v.reason, 2000, 'verification reason');
+        if (reasonErr) return { ok: false, error: reasonErr };
       }
     }
   }

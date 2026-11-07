@@ -1916,3 +1916,384 @@ test('F2: Stage A shallow JSON missing required fields cannot bypass Stage B', a
     f.cleanup();
   }
 });
+
+const INCREMENTAL_TEST_SCHEMA = {
+  type: 'object',
+  properties: {
+    summary: { type: 'string', maxLength: 1500 },
+    findings: {
+      type: 'array',
+      maxItems: 6,
+      items: {
+        type: 'object',
+        properties: {
+          severity: { type: 'string', enum: ['P0', 'P1', 'P2', 'P3'] },
+          title: { type: 'string' },
+          body: { type: 'string' },
+          path: { type: 'string' },
+          line: { type: ['integer', 'null'] },
+          failurePath: { type: 'string' },
+        },
+        required: ['severity', 'title', 'body', 'path', 'line', 'failurePath'],
+      },
+    },
+  },
+  required: ['summary', 'findings'],
+};
+
+const VERIFICATION_TEST_SCHEMA = {
+  type: 'object',
+  properties: {
+    summary: { type: 'string', maxLength: 1500 },
+    verifications: {
+      type: 'array',
+      maxItems: 16,
+      items: {
+        type: 'object',
+        properties: {
+          findingId: { type: 'string' },
+          status: { type: 'string', enum: ['FIXED', 'STILL_OPEN', 'UNCERTAIN'] },
+          reason: { type: 'string' },
+        },
+        required: ['findingId', 'status', 'reason'],
+      },
+    },
+    findings: {
+      type: 'array',
+      maxItems: 3,
+      items: {
+        type: 'object',
+        properties: {
+          severity: { type: 'string', enum: ['P0', 'P1', 'P2', 'P3'] },
+          title: { type: 'string' },
+          body: { type: 'string' },
+          path: { type: 'string' },
+          line: { type: ['integer', 'null'] },
+          failurePath: { type: 'string' },
+        },
+        required: ['severity', 'title', 'body', 'path', 'line', 'failurePath'],
+      },
+    },
+  },
+  required: ['summary', 'verifications', 'findings'],
+};
+
+test('F2 regression: Non-relative finding path is rejected even with whitespace', () => {
+  const res1 = validateStructuredReview({
+    summary: 'Test',
+    findings: [{ severity: 'P1', title: 'T', body: 'B', path: ' /etc/passwd', line: 1, failurePath: 'fp' }],
+  }, INCREMENTAL_TEST_SCHEMA);
+  eq(res1.ok, false);
+  assert.match(res1.error, /finding path must be repository-relative/i);
+
+  const res2 = validateStructuredReview({
+    summary: 'Test',
+    findings: [{ severity: 'P1', title: 'T', body: 'B', path: ' foo/../bar', line: 1, failurePath: 'fp' }],
+  }, INCREMENTAL_TEST_SCHEMA);
+  eq(res2.ok, false);
+  assert.match(res2.error, /finding path must be repository-relative/i);
+});
+
+test('F2 regression: Incremental 7 Findings is rejected and fails closed', async () => {
+  const findings7 = Array.from({ length: 7 }, (_, i) => ({
+    severity: 'P2',
+    title: `Issue ${i + 1}`,
+    body: `Body ${i + 1}`,
+    path: `src/file${i + 1}.js`,
+    line: i + 1,
+    failurePath: `failure path ${i + 1}`,
+  }));
+  const res = validateStructuredReview({ summary: 'Incremental review', findings: findings7 }, INCREMENTAL_TEST_SCHEMA);
+  eq(res.ok, false);
+  assert.match(res.error, /findings exceeded maximum count of 6/i);
+
+  // Verify adapter fails closed without marking ok:true
+  const f = createTestFixture();
+  try {
+    const gw = new ReadOnlyToolGateway({ safeRoot: f.safeRoot, cwd: f.tmpDir });
+    const mockFetch = async () => Response.json({
+      candidates: [{
+        content: {
+          role: 'model',
+          parts: [{
+            text: JSON.stringify({ summary: 'Incremental 7 findings', findings: findings7 }),
+          }],
+        },
+      }],
+      usageMetadata: { promptTokenCount: 50, candidatesTokenCount: 50, totalTokenCount: 100 },
+    });
+    const adapter = getProviderAdapter(PROVIDER_KINDS.GEMINI);
+    const outcome = await adapter.execute({
+      prompt: 'Review incremental',
+      schema: INCREMENTAL_TEST_SCHEMA,
+      maxTurns: 2,
+      env: { GEMINI_API_KEY: 'test-key' },
+      fetchImpl: mockFetch,
+      toolGateway: gw,
+    });
+    eq(outcome.ok, false);
+    assert.match(outcome.error, /findings exceeded maximum count of 6/i);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('F2 regression: Verification 4 Findings is rejected and fails closed', async () => {
+  const findings4 = Array.from({ length: 4 }, (_, i) => ({
+    severity: 'P2',
+    title: `Issue ${i + 1}`,
+    body: `Body ${i + 1}`,
+    path: `src/file${i + 1}.js`,
+    line: i + 1,
+    failurePath: `failure path ${i + 1}`,
+  }));
+  const res = validateStructuredReview({
+    summary: 'Verification review',
+    verifications: [{ findingId: 'F001', status: 'FIXED', reason: 'repaired' }],
+    findings: findings4,
+  }, VERIFICATION_TEST_SCHEMA);
+  eq(res.ok, false);
+  assert.match(res.error, /findings exceeded maximum count of 3/i);
+
+  const f = createTestFixture();
+  try {
+    const gw = new ReadOnlyToolGateway({ safeRoot: f.safeRoot, cwd: f.tmpDir });
+    const mockFetch = async () => Response.json({
+      candidates: [{
+        content: {
+          role: 'model',
+          parts: [{
+            text: JSON.stringify({
+              summary: 'Verification 4 findings',
+              verifications: [{ findingId: 'F001', status: 'FIXED', reason: 'repaired' }],
+              findings: findings4,
+            }),
+          }],
+        },
+      }],
+      usageMetadata: { promptTokenCount: 50, candidatesTokenCount: 50, totalTokenCount: 100 },
+    });
+    const adapter = getProviderAdapter(PROVIDER_KINDS.GEMINI);
+    const outcome = await adapter.execute({
+      prompt: 'Review verification',
+      schema: VERIFICATION_TEST_SCHEMA,
+      maxTurns: 2,
+      env: { GEMINI_API_KEY: 'test-key' },
+      fetchImpl: mockFetch,
+      toolGateway: gw,
+    });
+    eq(outcome.ok, false);
+    assert.match(outcome.error, /findings exceeded maximum count of 3/i);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('F2 regression: Verification 17 Verifications is rejected and fails closed', async () => {
+  const verifications17 = Array.from({ length: 17 }, (_, i) => ({
+    findingId: `F${String(i + 1).padStart(3, '0')}`,
+    status: 'FIXED',
+    reason: `repaired finding ${i + 1}`,
+  }));
+  const res = validateStructuredReview({
+    summary: 'Verification review',
+    verifications: verifications17,
+    findings: [],
+  }, VERIFICATION_TEST_SCHEMA);
+  eq(res.ok, false);
+  assert.match(res.error, /verifications exceeded maximum count of 16/i);
+
+  const f = createTestFixture();
+  try {
+    const gw = new ReadOnlyToolGateway({ safeRoot: f.safeRoot, cwd: f.tmpDir });
+    const mockFetch = async () => Response.json({
+      candidates: [{
+        content: {
+          role: 'model',
+          parts: [{
+            text: JSON.stringify({
+              summary: 'Verification 17 verifications',
+              verifications: verifications17,
+              findings: [],
+            }),
+          }],
+        },
+      }],
+      usageMetadata: { promptTokenCount: 50, candidatesTokenCount: 50, totalTokenCount: 100 },
+    });
+    const adapter = getProviderAdapter(PROVIDER_KINDS.GEMINI);
+    const outcome = await adapter.execute({
+      prompt: 'Review verification',
+      schema: VERIFICATION_TEST_SCHEMA,
+      maxTurns: 2,
+      env: { GEMINI_API_KEY: 'test-key' },
+      fetchImpl: mockFetch,
+      toolGateway: gw,
+    });
+    eq(outcome.ok, false);
+    assert.match(outcome.error, /verifications exceeded maximum count of 16/i);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('F2 regression: Summary exceeding 4000 characters is rejected and fails closed', async () => {
+  const longSummary = 'S'.repeat(4001);
+  const res = validateStructuredReview({
+    summary: longSummary,
+    findings: [],
+  }, INCREMENTAL_TEST_SCHEMA);
+  eq(res.ok, false);
+  assert.match(res.error, /summary exceeded maximum length of 4000/i);
+
+  const f = createTestFixture();
+  try {
+    const gw = new ReadOnlyToolGateway({ safeRoot: f.safeRoot, cwd: f.tmpDir });
+    const mockFetch = async () => Response.json({
+      candidates: [{
+        content: {
+          role: 'model',
+          parts: [{
+            text: JSON.stringify({
+              summary: longSummary,
+              findings: [],
+            }),
+          }],
+        },
+      }],
+      usageMetadata: { promptTokenCount: 50, candidatesTokenCount: 50, totalTokenCount: 100 },
+    });
+    const adapter = getProviderAdapter(PROVIDER_KINDS.GEMINI);
+    const outcome = await adapter.execute({
+      prompt: 'Review incremental with long summary',
+      schema: INCREMENTAL_TEST_SCHEMA,
+      maxTurns: 2,
+      env: { GEMINI_API_KEY: 'test-key' },
+      fetchImpl: mockFetch,
+      toolGateway: gw,
+    });
+    eq(outcome.ok, false);
+    assert.match(outcome.error, /summary exceeded maximum length of 4000/i);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('F2 regression: Legal boundary values pass validation and execute cleanly', async () => {
+  // Boundary 1: Summary exactly 4000 characters (including with surrounding whitespace matching downstream checkedText)
+  const summary4000 = 'S'.repeat(4000);
+  const resSummary = validateStructuredReview({
+    summary: summary4000,
+    findings: [],
+  }, INCREMENTAL_TEST_SCHEMA);
+  eq(resSummary.ok, true);
+
+  const summaryWithWhitespace = `  \n${'S'.repeat(4000)}\n\t  `;
+  const resSummaryWs = validateStructuredReview({
+    summary: summaryWithWhitespace,
+    findings: [],
+  }, INCREMENTAL_TEST_SCHEMA);
+  eq(resSummaryWs.ok, true);
+
+  // Boundary 2: Incremental with exactly 6 findings
+  const findings6 = Array.from({ length: 6 }, (_, i) => ({
+    severity: 'P2',
+    title: `Issue ${i + 1}`,
+    body: `Body ${i + 1}`,
+    path: `src/file${i + 1}.js`,
+    line: i + 1,
+    failurePath: `failure path ${i + 1}`,
+  }));
+  const resInc6 = validateStructuredReview({
+    summary: 'Incremental with 6 findings',
+    findings: findings6,
+  }, INCREMENTAL_TEST_SCHEMA);
+  eq(resInc6.ok, true);
+
+  // Boundary 3: Verification with exactly 16 verifications and 3 findings
+  const verifications16 = Array.from({ length: 16 }, (_, i) => ({
+    findingId: `F${String(i + 1).padStart(3, '0')}`,
+    status: 'FIXED',
+    reason: `repaired finding ${i + 1}`,
+  }));
+  const findings3 = Array.from({ length: 3 }, (_, i) => ({
+    severity: 'P1',
+    title: `Issue ${i + 1}`,
+    body: `Body ${i + 1}`,
+    path: `src/file${i + 1}.js`,
+    line: i + 1,
+    failurePath: `failure path ${i + 1}`,
+  }));
+  const resVerifBoundary = validateStructuredReview({
+    summary: 'Verification boundary test',
+    verifications: verifications16,
+    findings: findings3,
+  }, VERIFICATION_TEST_SCHEMA);
+  eq(resVerifBoundary.ok, true);
+
+  // Boundary 4: Finding body > 1200 chars but <= 4000 chars (advisory limit relaxation)
+  const longBodyFinding = [{
+    severity: 'P1',
+    title: 'Long body issue',
+    body: 'B'.repeat(1300),
+    path: 'src/long.js',
+    line: 42,
+    failurePath: 'concrete failure path trigger',
+    riskClass: 'security',
+  }];
+  const resLongBody = validateStructuredReview({
+    summary: 'Review with long finding body',
+    findings: longBodyFinding,
+  }, INCREMENTAL_TEST_SCHEMA);
+  eq(resLongBody.ok, true);
+
+  // Boundary 5: Maximum allowed checkedText boundaries for finding fields
+  const maxFieldsFinding = [{
+    severity: 'P0',
+    title: 'T'.repeat(300),
+    body: 'B'.repeat(4000),
+    path: 'p/'.repeat(499) + 'f', // 1000 chars repository-relative
+    line: 1,
+    failurePath: 'F'.repeat(100),
+    riskClass: 'R'.repeat(120),
+  }];
+  const resMaxFields = validateStructuredReview({
+    summary: 'Review with maximum field lengths',
+    findings: maxFieldsFinding,
+  }, INCREMENTAL_TEST_SCHEMA);
+  eq(resMaxFields.ok, true);
+
+  // Boundary 6: Full adapter execution with boundary values succeeds
+  const f = createTestFixture();
+  try {
+    const gw = new ReadOnlyToolGateway({ safeRoot: f.safeRoot, cwd: f.tmpDir });
+    const mockFetch = async () => Response.json({
+      candidates: [{
+        content: {
+          role: 'model',
+          parts: [{
+            text: JSON.stringify({
+              summary: summary4000,
+              findings: findings6,
+            }),
+          }],
+        },
+      }],
+      usageMetadata: { promptTokenCount: 50, candidatesTokenCount: 50, totalTokenCount: 100 },
+    });
+    const adapter = getProviderAdapter(PROVIDER_KINDS.GEMINI);
+    const outcome = await adapter.execute({
+      prompt: 'Review boundary',
+      schema: INCREMENTAL_TEST_SCHEMA,
+      maxTurns: 2,
+      env: { GEMINI_API_KEY: 'test-key' },
+      fetchImpl: mockFetch,
+      toolGateway: gw,
+    });
+    eq(outcome.ok, true);
+    eq(outcome.structured.findings.length, 6);
+    eq(outcome.structured.summary.length, 4000);
+  } finally {
+    f.cleanup();
+  }
+});
