@@ -242,7 +242,7 @@ export function normalizeProviderOutcome({
   return {
     ok: Boolean(ok),
     provider,
-    status: status ?? meta?.status ?? null,
+    status: status ?? meta?.status ?? (ok ? 'success' : 'failed'),
     errorKind: errorKind || (ok ? 'none' : 'unknown'),
     error: error || (ok ? null : 'unknown error'),
     errors: errors || error || '',
@@ -311,6 +311,7 @@ export async function executeWorkUnit({
           costSource: rawOutcome.costSource ?? rawOutcome.meta?.cost_source ?? 'zero',
           duration: rawOutcome.duration || rawOutcome.meta?.duration_ms || 0,
           coverage: rawOutcome.structured?.coverage,
+          fallbackReason: notes.length ? notes.join('; ') : null,
         });
 
         if (typeof onPartialCoverage === 'function') {
@@ -442,6 +443,7 @@ export async function executeWorkUnit({
           duration: rawOutcome.duration || rawOutcome.meta?.duration_ms || 0,
           coverage: rawOutcome.structured?.coverage,
           facts: rawOutcome.facts || null,
+          fallbackReason: notes.length ? notes.join('; ') : null,
         });
 
         if (typeof onPartialCoverage === 'function') {
