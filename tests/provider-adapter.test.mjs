@@ -615,6 +615,10 @@ test('ProviderRegistry manages registrations, capabilities, and operational poli
   const descriptor = registry.getDescriptor('dummy');
   assert.equal(descriptor.name, 'dummy');
   assert.equal(descriptor.description, 'Dummy test adapter');
+  assert.ok(Object.isFrozen(descriptor.capabilities));
+  assert.ok(Object.isFrozen(descriptor.policy));
+  assert.ok(Object.isFrozen(descriptor.policy.credentialsRequired));
+  assert.ok(Object.isFrozen(descriptor.policy.circuitBreaker));
   assert.equal(descriptor.capabilities.tools, true);
   assert.equal(descriptor.capabilities.structuredOutput, true);
   assert.equal(descriptor.capabilities.multiturnTools, false);

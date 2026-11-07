@@ -270,23 +270,26 @@ export class ProviderRegistry {
       throw new Error(`Provider adapter factory/class for "${name}" must be a function`);
     }
 
+    const rawCaps = descriptor.capabilities || {};
     const capabilities = Object.freeze({
-      tools: Boolean(descriptor.capabilities?.tools),
-      structuredOutput: Boolean(descriptor.capabilities?.structuredOutput),
-      multiturnTools: Boolean(descriptor.capabilities?.multiturnTools),
-      hostSecurity: descriptor.capabilities?.hostSecurity ?? 'host-enforced',
-      ...(descriptor.capabilities || {}),
+      ...rawCaps,
+      tools: Boolean(rawCaps.tools),
+      structuredOutput: Boolean(rawCaps.structuredOutput),
+      multiturnTools: Boolean(rawCaps.multiturnTools),
+      hostSecurity: typeof rawCaps.hostSecurity === 'string' ? rawCaps.hostSecurity : 'host-enforced',
     });
 
+    const rawPolicy = descriptor.policy || {};
+    const rawCircuitBreaker = rawPolicy.circuitBreaker || {};
     const policy = Object.freeze({
-      budgetType: descriptor.policy?.budgetType ?? 'none',
-      defaultTimeoutMs: descriptor.policy?.defaultTimeoutMs ?? 480_000,
-      credentialsRequired: Object.freeze([...(descriptor.policy?.credentialsRequired ?? [])]),
+      ...rawPolicy,
+      budgetType: typeof rawPolicy.budgetType === 'string' ? rawPolicy.budgetType : 'none',
+      defaultTimeoutMs: Number.isFinite(rawPolicy.defaultTimeoutMs) && rawPolicy.defaultTimeoutMs > 0 ? rawPolicy.defaultTimeoutMs : 480_000,
+      credentialsRequired: Object.freeze([...(Array.isArray(rawPolicy.credentialsRequired) ? rawPolicy.credentialsRequired : [])]),
       circuitBreaker: Object.freeze({
-        maxFailures: descriptor.policy?.circuitBreaker?.maxFailures ?? 3,
-        ...(descriptor.policy?.circuitBreaker || {}),
+        ...rawCircuitBreaker,
+        maxFailures: Number.isInteger(rawCircuitBreaker.maxFailures) && rawCircuitBreaker.maxFailures > 0 ? rawCircuitBreaker.maxFailures : 3,
       }),
-      ...(descriptor.policy || {}),
     });
 
     this._providers.set(normalizedName, {
