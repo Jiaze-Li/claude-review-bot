@@ -38,9 +38,10 @@ export class DeadlineTracker {
 }
 
 export class CircuitBreaker {
-  constructor({ maxConsecutiveFailures = 2, initialReason = null } = {}) {
+  constructor({ maxConsecutiveFailures = 2, initialReason = null, initialStatus = 0 } = {}) {
     this.maxConsecutiveFailures = maxConsecutiveFailures;
     this.offReason = initialReason;
+    this.offStatus = initialStatus;
     this.failureCount = 0;
   }
 
@@ -52,16 +53,21 @@ export class CircuitBreaker {
     return this.offReason;
   }
 
-  trip(reason) {
+  get status() {
+    return this.offStatus;
+  }
+
+  trip(reason, status = 0) {
     if (!this.offReason) {
       this.offReason = reason || 'circuit breaker tripped';
+      this.offStatus = status || 0;
     }
   }
 
-  recordFailure(reason) {
+  recordFailure(reason, status = 0) {
     this.failureCount += 1;
     if (this.failureCount >= this.maxConsecutiveFailures && !this.offReason) {
-      this.trip(reason || `exceeded failure threshold of ${this.maxConsecutiveFailures}`);
+      this.trip(reason || `exceeded failure threshold of ${this.maxConsecutiveFailures}`, status);
     }
   }
 
@@ -92,9 +98,14 @@ export class BudgetManager {
     this.totalSpentUsd = 0;
   }
 
+  get totalPendingUsd() {
+    return this.charges.reduce((sum, c) => sum + (c.settled ? c.amount : c.cap), 0);
+  }
+
   async acquireReservation({ deadlineTracker, minTimeLeftMs = 60_000 } = {}) {
     for (;;) {
-      const available = this.getAvailableBudget(this.inflightUsd);
+      const pendingUsd = this.totalPendingUsd;
+      const available = this.getAvailableBudget(pendingUsd);
       if (available >= this.minStartingAllowanceUsd) {
         let cap = available;
         if (typeof this.perCallCap === 'function') {
@@ -120,6 +131,17 @@ export class BudgetManager {
         return null;
       }
       await this.sleepFn(this.pollIntervalMs);
+    }
+  }
+
+  cancelReservation(reservation) {
+    if (!reservation || reservation.settled) return;
+    reservation.settled = true;
+    this.inflightUsd = Math.max(0, this.inflightUsd - reservation.cap);
+    this.inflightCount = Math.max(0, this.inflightCount - 1);
+    const idx = this.charges.indexOf(reservation);
+    if (idx !== -1) {
+      this.charges.splice(idx, 1);
     }
   }
 
@@ -237,9 +259,14 @@ export async function executeWorkUnit({
   deadlineTracker = null,
   executors = {},
   onPartialCoverage = null,
+  onClaudeBudgetBlocked = null,
+  throwClaudeErrors = false,
   logImpl = () => {},
 } = {}) {
   const notes = [];
+  let lastGeminiFailure = geminiCircuitBreaker?.isOff
+    ? { status: geminiCircuitBreaker.status, message: geminiCircuitBreaker.reason }
+    : null;
   for (let position = 0; position < providers.length; position += 1) {
     const provider = providers[position];
 
@@ -288,11 +315,13 @@ export async function executeWorkUnit({
         return notes.length ? { ...normalized, fellBackFrom: notes.join('; ') } : normalized;
       }
 
+      const status = rawOutcome.status || 0;
       if (rawOutcome.kind === 'unavailable' || rawOutcome.kind === 'config') {
-        geminiCircuitBreaker?.trip(rawOutcome.error);
+        geminiCircuitBreaker?.trip(rawOutcome.error, status);
       } else {
-        geminiCircuitBreaker?.recordFailure(rawOutcome.error);
+        geminiCircuitBreaker?.recordFailure(rawOutcome.error, status);
       }
+      lastGeminiFailure = { status, message: rawOutcome.error };
       notes.push(`gemini: ${rawOutcome.error}`);
       continue;
     }
@@ -307,6 +336,12 @@ export async function executeWorkUnit({
       if (budgetManager) {
         reservation = await budgetManager.acquireReservation({ deadlineTracker });
         if (!reservation) {
+          if (typeof onClaudeBudgetBlocked === 'function') {
+            await onClaudeBudgetBlocked({
+              notes,
+              lastFailed: lastGeminiFailure,
+            });
+          }
           notes.push('claude: Claude budget for this review is exhausted');
           continue;
         }
@@ -316,16 +351,27 @@ export async function executeWorkUnit({
       const budgetUsd = reservation?.cap ?? null;
       let rawOutcome;
       try {
-        rawOutcome = await executors.claude({ unit, timeoutMs, maxBudgetUsd: budgetUsd, reservation });
+        rawOutcome = await executors.claude({
+          unit,
+          timeoutMs,
+          maxBudgetUsd: budgetUsd,
+          reservation,
+          notes,
+          lastFailed: lastGeminiFailure,
+        });
       } catch (err) {
+        if (budgetManager && reservation && !reservation.settled) {
+          budgetManager.settleReservation(reservation, { actualCostUsd: reservation.cap, costSource: 'reserve' });
+        }
+        if (throwClaudeErrors) throw err;
         rawOutcome = { ok: false, error: err?.message ?? String(err), subtype: 'error' };
       }
 
-      if (budgetManager && reservation) {
+      if (budgetManager && reservation && !reservation.settled) {
         budgetManager.settleReservation(reservation, {
           actualCostUsd: rawOutcome?.meta?.total_cost_usd ?? rawOutcome?.totalCostUsd,
           costSource: rawOutcome?.meta?.cost_source ?? rawOutcome?.costSource,
-          fallbackCostUsd: rawOutcome?.fallbackCostUsd,
+          fallbackCostUsd: rawOutcome?.fallbackCostUsd ?? reservation.cap,
         });
       }
 
