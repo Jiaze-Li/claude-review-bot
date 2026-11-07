@@ -69,6 +69,8 @@ export async function continueReview({ env = process.env, fetchImpl = fetch, log
         target_repo: target, pr_number: need('PR_NUMBER'), base_sha: need('BASE_SHA'), head_sha: headSha,
         trigger_user: need('TRIGGER_USER'), source_comment_id: next,
         source_kind: continuationSourceKind(env.REQUESTED_MODE, env.SOURCE_KIND), requested_mode: continuationMode(env.REQUESTED_MODE),
+        ...(env.REVIEW_PROVIDERS ? { review_providers: env.REVIEW_PROVIDERS } : {}),
+        ...(env.PROVIDER_BUDGETS ? { provider_budgets: env.PROVIDER_BUDGETS } : {}),
       },
     }),
     signal: AbortSignal.timeout(15000),

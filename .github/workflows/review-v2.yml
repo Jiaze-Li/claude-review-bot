@@ -571,6 +571,8 @@ jobs:
           SOURCE_COMMENT_ID: ${{ inputs.source_comment_id }}
           SOURCE_KIND: ${{ inputs.source_kind }}
           REQUESTED_MODE: ${{ inputs.requested_mode }}
+          REVIEW_PROVIDERS: ${{ inputs.review_providers || '' }}
+          PROVIDER_BUDGETS: ${{ inputs.provider_budgets || '' }}
           REVIEW_MODE: ${{ steps.plan.outputs.mode }}
           EXPECTED_REVIEW_AUTHOR: ${{ steps.app-token.outputs.app-slug }}[bot]
           REVIEW_CONTEXT_DIR: .review-context

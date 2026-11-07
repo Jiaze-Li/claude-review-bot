@@ -61,6 +61,31 @@ test('the next run is dispatched with the same inputs and a new trigger id; noth
   assert.equal(dispatched.length, 1);
 });
 
+test('continuation run propagates review_providers and provider_budgets dispatch inputs', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'continue-providers-'));
+  const dispatched = [];
+  const runWithProviders = (session) => continueReview({
+    env: {
+      TARGET_REPO: 'acme/project', PR_NUMBER: '7', BASE_SHA: BASE, HEAD_SHA: HEAD, SOURCE_COMMENT_ID: '6492010062', SOURCE_KIND: 'comment', REQUESTED_MODE: 'auto', TRIGGER_USER: 'jiaze', REVIEW_MODE: 'verification', GH_TOKEN: 't', DISPATCH_TOKEN: 'd', GITHUB_REPOSITORY: 'ctl/repo', GITHUB_RUN_ID: '40844152995', CONTROL_REF: 'main', EXPECTED_REVIEW_AUTHOR: 'bot[bot]', REVIEW_CONTEXT_DIR: dir,
+      REVIEW_PROVIDERS: 'mock-runner-provider',
+      PROVIDER_BUDGETS: 'mock-runner-provider=5.00',
+    },
+    log: { log() {} },
+    fetchImpl: async (url, init = {}) => {
+      if (url.includes('/issues/7/comments')) return Response.json(session ? [{ id: 5, user: { login: 'bot[bot]' }, body: renderSessionComment(session) }] : []);
+      if (url.endsWith('/actions/workflows/review-v2.yml/dispatches')) { dispatched.push(JSON.parse(init.body)); return new Response(null, { status: 204 }); }
+      assert.fail('unexpected URL ' + url);
+    },
+  });
+  assert.equal((await runWithProviders({ ...awaiting })).continue, true);
+  assert.equal(dispatched.length, 1);
+  assert.deepEqual(dispatched[0].inputs, {
+    target_repo: 'acme/project', pr_number: '7', base_sha: BASE, head_sha: HEAD, trigger_user: 'jiaze', source_comment_id: '8140844152995', source_kind: 'comment', requested_mode: 'auto',
+    review_providers: 'mock-runner-provider',
+    provider_budgets: 'mock-runner-provider=5.00',
+  });
+});
+
 test('the workflow starts the next run only after a successful job, never fails the review, and may only dispatch itself', async () => {
   const yml = fs.readFileSync(new URL('../.github/workflows/review-v2.yml', import.meta.url), 'utf8');
   const start = yml.indexOf('- name: Continue a big review in the next run');
