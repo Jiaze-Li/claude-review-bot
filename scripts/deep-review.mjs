@@ -48,7 +48,9 @@ export async function runDeepReviewCommand(command, { env = process.env, fetchIm
       claudeOnly: explicitClaude,
       defaultProviders: ['gemini', 'claude'],
     });
-    if (!manual && runBudget < CLAUDE_AUTO_MIN_BUDGET_USD && configuredProviders.includes('claude')) {
+    if (!configuredProviders.includes('claude')) {
+      runBudget = 0;
+    } else if (!manual && runBudget < CLAUDE_AUTO_MIN_BUDGET_USD) {
       configuredProviders = configuredProviders.filter((p) => p !== 'claude');
       if (!configuredProviders.length) configuredProviders = ['gemini'];
       runBudget = 0;

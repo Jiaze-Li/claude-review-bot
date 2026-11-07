@@ -38,6 +38,10 @@ on:
         required: true
         default: auto
         type: string
+      review_providers:
+        description: Comma-separated provider chain (e.g. gemini,claude)
+        required: false
+        type: string
 
   workflow_call:
     inputs:
@@ -67,6 +71,9 @@ on:
         required: false
         default: auto
         type: string
+      review_providers:
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -83,6 +90,8 @@ concurrency:
 jobs:
   review:
     runs-on: ubuntu-latest
+    env:
+      REVIEW_PROVIDERS: ${{ inputs.review_providers || vars.REVIEW_PROVIDERS || '' }}
     # Room for the sharded review (16 minutes) plus validation and publication.
     timeout-minutes: 30
 
@@ -321,6 +330,7 @@ jobs:
           HEAD_SHA: ${{ inputs.head_sha }}
           SOURCE_COMMENT_ID: ${{ inputs.source_comment_id }}
           SOURCE_KIND: ${{ inputs.source_kind }}
+          REVIEW_PROVIDERS: ${{ inputs.review_providers || vars.REVIEW_PROVIDERS || '' }}
           REVIEW_CONTEXT_DIR: .review-context
         run: node scripts/deep-review.mjs begin
 
@@ -398,6 +408,7 @@ jobs:
           HEAD_SHA: ${{ inputs.head_sha }}
           SAFE_REPO_DIR: safe-target
           SOURCE_KIND: ${{ inputs.source_kind }}
+          REVIEW_PROVIDERS: ${{ inputs.review_providers || vars.REVIEW_PROVIDERS || '' }}
           REVIEW_CONTEXT_DIR: .review-context
           REVIEW_OUTPUT_PATH: .review-context/review.json
         run: node scripts/run-gemini-review.mjs

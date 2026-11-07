@@ -12,6 +12,7 @@ import {
   ERROR_KINDS,
 } from '../scripts/provider-adapter.mjs';
 import { runGeminiReview } from '../scripts/run-gemini-review.mjs';
+import { runReview } from '../scripts/run-review.mjs';
 import { executeWorkUnit, BudgetManager } from '../scripts/review-orchestrator.mjs';
 import { ReadOnlyToolGateway } from '../scripts/tool-gateway.mjs';
 import './fixtures/register-mock-provider.mjs';
@@ -39,6 +40,7 @@ test('Production Runner Integration: runGeminiReview routes through registered m
   try {
     const env = {
       REVIEW_PROVIDERS: 'mock-runner-provider',
+      PROVIDER_MOCK_RUNNER_PROVIDER_BUDGET_USD: '5.00',
       TARGET_REPO: 'test/repo',
       PR_NUMBER: '10',
       HEAD_SHA: 'a'.repeat(40),
@@ -180,13 +182,14 @@ test('Production Runner Integration: run-review.mjs entrypoint completes with re
   try {
     const child = spawnSync(
       process.execPath,
-      ['-e', `import(${JSON.stringify(fixturePath)}).then(() => import(${JSON.stringify(runReviewPath)}))`],
+      ['-e', `import(${JSON.stringify(fixturePath)}).then(() => import(${JSON.stringify(runReviewPath)})).then(m => m.runReview ? m.runReview() : null)`],
       {
         cwd: tmpDir,
         encoding: 'utf8',
         env: {
           ...process.env,
           REVIEW_PROVIDERS: 'mock-runner-provider',
+          PROVIDER_MOCK_RUNNER_PROVIDER_BUDGET_USD: '5.00',
           TARGET_REPO: 'test/repo',
           PR_NUMBER: '12',
           HEAD_SHA: 'c'.repeat(40),
@@ -283,6 +286,253 @@ test('Host security boundary enforcement: createHostToolAuthorizer strictly deni
     const denied = await noGatewayAuthorizer('Read', {});
     assert.equal(denied.behavior, 'deny');
     assert.match(denied.message, /no Host Gateway available/);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('Runner REVIEW_PROVIDERS validation: unknown provider fails explicitly in runGeminiReview', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gemini-unknown-'));
+  const ctxDir = path.join(tmpDir, '.review-context');
+  fs.mkdirSync(ctxDir, { recursive: true });
+  fs.writeFileSync(path.join(ctxDir, 'session-plan.json'), JSON.stringify({ decision: { mode: 'incremental' }, requestedMode: 'auto' }));
+  fs.writeFileSync(path.join(ctxDir, 'pr.json'), JSON.stringify({ number: 10, title: 'Test PR', base: { ref: 'main' } }));
+  fs.writeFileSync(path.join(ctxDir, 'repair.diff'), 'diff --git a/a.swift b/a.swift\n');
+  fs.writeFileSync(path.join(ctxDir, 'risk-profile.json'), JSON.stringify({ version: 1, signals: {} }));
+  try {
+    await assert.rejects(
+      runGeminiReview({
+        env: {
+          REVIEW_PROVIDERS: 'unknown-provider',
+          TARGET_REPO: 'test/repo',
+          PR_NUMBER: '10',
+          HEAD_SHA: 'a'.repeat(40),
+          REVIEW_CONTEXT_DIR: ctxDir,
+        },
+      }),
+      /Unknown review provider "unknown-provider"/
+    );
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('Runner REVIEW_PROVIDERS validation: unknown provider fails explicitly in runReview', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'full-unknown-'));
+  const ctxDir = path.join(tmpDir, '.review-context');
+  fs.mkdirSync(ctxDir, { recursive: true });
+  fs.writeFileSync(path.join(ctxDir, 'changed-files.txt'), 'a.swift\n');
+  fs.writeFileSync(path.join(ctxDir, 'diff-stat.txt'), '1 file changed\n');
+  fs.writeFileSync(path.join(ctxDir, 'pr.diff'), 'diff --git a/a.swift b/a.swift\n');
+  fs.writeFileSync(path.join(ctxDir, 'pr.json'), JSON.stringify({ number: 12, title: 'Full review PR', base: { ref: 'main' } }));
+  fs.writeFileSync(path.join(ctxDir, 'risk-profile.json'), JSON.stringify({ version: 1, signals: {} }));
+  try {
+    await assert.rejects(
+      runReview({
+        env: {
+          REVIEW_PROVIDERS: 'unknown-provider',
+          TARGET_REPO: 'test/repo',
+          PR_NUMBER: '12',
+          HEAD_SHA: 'c'.repeat(40),
+          REVIEW_CONTEXT_DIR: ctxDir,
+        },
+        cwd: tmpDir,
+      }),
+      /Unknown review provider "unknown-provider"/
+    );
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('Runner REVIEW_PROVIDERS validation: duplicated providers deduplicated in runGeminiReview', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gemini-dedupe-'));
+  const ctxDir = path.join(tmpDir, '.review-context');
+  fs.mkdirSync(ctxDir, { recursive: true });
+  fs.writeFileSync(path.join(ctxDir, 'session-plan.json'), JSON.stringify({ decision: { mode: 'incremental' }, requestedMode: 'auto' }));
+  fs.writeFileSync(path.join(ctxDir, 'pr.json'), JSON.stringify({ number: 10, title: 'Test PR', base: { ref: 'main' } }));
+  fs.writeFileSync(path.join(ctxDir, 'repair.diff'), 'diff --git a/a.swift b/a.swift\n--- a/a.swift\n+++ b/a.swift\n@@ -1 +1 @@\n+test change\n');
+  fs.writeFileSync(path.join(ctxDir, 'risk-profile.json'), JSON.stringify({ version: 1, signals: {} }));
+  try {
+    const result = await runGeminiReview({
+      env: {
+        REVIEW_PROVIDERS: 'mock-runner-provider,mock-runner-provider',
+        PROVIDER_MOCK_RUNNER_PROVIDER_BUDGET_USD: '5.00',
+        TARGET_REPO: 'test/repo',
+        PR_NUMBER: '10',
+        HEAD_SHA: 'a'.repeat(40),
+        REVIEW_CONTEXT_DIR: ctxDir,
+      },
+      logImpl: () => {},
+    });
+    assert.ok(result);
+    assert.equal(result._meta.provider, 'mock-runner-provider');
+    assert.equal(result._meta.provider_costs['mock-runner-provider'], 0.04);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('Runner REVIEW_PROVIDERS validation: duplicated providers deduplicated in runReview', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'full-dedupe-'));
+  const ctxDir = path.join(tmpDir, '.review-context');
+  fs.mkdirSync(path.join(ctxDir, 'shards'), { recursive: true });
+  fs.writeFileSync(path.join(ctxDir, 'changed-files.txt'), 'a.swift\n');
+  fs.writeFileSync(path.join(ctxDir, 'diff-stat.txt'), '1 file changed, 1 insertion(+)\n');
+  fs.writeFileSync(path.join(ctxDir, 'pr.diff'), 'diff --git a/a.swift b/a.swift\n--- a/a.swift\n+++ b/a.swift\n@@ -1 +1 @@\n+line one\n');
+  fs.writeFileSync(path.join(ctxDir, 'pr.json'), JSON.stringify({ number: 12, title: 'Full review PR', base: { ref: 'main' } }));
+  fs.writeFileSync(path.join(ctxDir, 'risk-profile.json'), JSON.stringify({ version: 1, signals: {} }));
+  try {
+    const doc = await runReview({
+      env: {
+        REVIEW_PROVIDERS: 'mock-runner-provider,mock-runner-provider',
+        PROVIDER_MOCK_RUNNER_PROVIDER_BUDGET_USD: '5.00',
+        TARGET_REPO: 'test/repo',
+        PR_NUMBER: '12',
+        HEAD_SHA: 'c'.repeat(40),
+        REVIEW_CONTEXT_DIR: ctxDir,
+        REVIEW_OUTPUT_PATH: path.join(ctxDir, 'review.json'),
+      },
+      cwd: tmpDir,
+    });
+    assert.ok(doc);
+    assert.equal(doc._meta.providers['mock-runner-provider'], 1);
+    assert.equal(doc._meta.provider_costs['mock-runner-provider'], 0.04);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('Explicit @claude review remains Claude-only even when REVIEW_PROVIDERS includes third providers', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gemini-claude-only-'));
+  const ctxDir = path.join(tmpDir, '.review-context');
+  fs.mkdirSync(ctxDir, { recursive: true });
+  fs.writeFileSync(path.join(ctxDir, 'session-plan.json'), JSON.stringify({
+    decision: { mode: 'incremental' },
+    requestedMode: 'claude',
+    session: { version: 1, threadId: 'test-thread', status: 'OPEN', findings: [] },
+  }));
+  fs.writeFileSync(path.join(ctxDir, 'pr.json'), JSON.stringify({ number: 10, title: 'Test PR', base: { ref: 'main' } }));
+  fs.writeFileSync(path.join(ctxDir, 'repair.diff'), 'diff --git a/a.swift b/a.swift\n--- a/a.swift\n+++ b/a.swift\n@@ -1 +1 @@\n+test change\n');
+  fs.writeFileSync(path.join(ctxDir, 'risk-profile.json'), JSON.stringify({ version: 1, signals: {} }));
+
+  try {
+    // In runGeminiReview:
+    await assert.rejects(
+      runGeminiReview({
+        env: {
+          REVIEW_PROVIDERS: 'mock-runner-provider',
+          PROVIDER_MOCK_RUNNER_PROVIDER_BUDGET_USD: '5.00',
+          TARGET_REPO: 'test/repo',
+          PR_NUMBER: '10',
+          HEAD_SHA: 'a'.repeat(40),
+          REVIEW_CONTEXT_DIR: ctxDir,
+        },
+      }),
+      /CLAUDE_CODE_OAUTH_TOKEN|Claude budget|safe-target/
+    );
+
+    // In runReview:
+    fs.mkdirSync(path.join(ctxDir, 'shards'), { recursive: true });
+    fs.writeFileSync(path.join(ctxDir, 'changed-files.txt'), 'a.swift\n');
+    fs.writeFileSync(path.join(ctxDir, 'diff-stat.txt'), '1 file changed\n');
+    fs.writeFileSync(path.join(ctxDir, 'pr.diff'), 'diff --git a/a.swift b/a.swift\n--- a/a.swift\n+++ b/a.swift\n@@ -1 +1 @@\n+line one\n');
+    await assert.rejects(
+      runReview({
+        env: {
+          REVIEW_PROVIDERS: 'mock-runner-provider',
+          PROVIDER_MOCK_RUNNER_PROVIDER_BUDGET_USD: '5.00',
+          TARGET_REPO: 'test/repo',
+          PR_NUMBER: '10',
+          HEAD_SHA: 'a'.repeat(40),
+          REVIEW_CONTEXT_DIR: ctxDir,
+        },
+        cwd: tmpDir,
+      }),
+      /CLAUDE_CODE_OAUTH_TOKEN|Claude budget|safe-target/
+    );
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('Explicit budget enforcement: usd-ledger provider without budget configuration fails closed in runners', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'missing-budget-runners-'));
+  const ctxDir = path.join(tmpDir, '.review-context');
+  fs.mkdirSync(ctxDir, { recursive: true });
+  fs.writeFileSync(path.join(ctxDir, 'session-plan.json'), JSON.stringify({ decision: { mode: 'incremental' }, requestedMode: 'auto' }));
+  fs.writeFileSync(path.join(ctxDir, 'pr.json'), JSON.stringify({ number: 10, title: 'Test PR', base: { ref: 'main' } }));
+  fs.writeFileSync(path.join(ctxDir, 'repair.diff'), 'diff --git a/a.swift b/a.swift\n--- a/a.swift\n+++ b/a.swift\n@@ -1 +1 @@\n+test change\n');
+  fs.writeFileSync(path.join(ctxDir, 'risk-profile.json'), JSON.stringify({ version: 1, signals: {} }));
+
+  try {
+    // runGeminiReview fails closed
+    await assert.rejects(
+      runGeminiReview({
+        env: {
+          REVIEW_PROVIDERS: 'mock-runner-provider',
+          TARGET_REPO: 'test/repo',
+          PR_NUMBER: '10',
+          HEAD_SHA: 'a'.repeat(40),
+          REVIEW_CONTEXT_DIR: ctxDir,
+        },
+      }),
+      /budget configuration required for usd-ledger provider but none was provided/
+    );
+
+    // runReview fails closed
+    fs.mkdirSync(path.join(ctxDir, 'shards'), { recursive: true });
+    fs.writeFileSync(path.join(ctxDir, 'changed-files.txt'), 'a.swift\n');
+    fs.writeFileSync(path.join(ctxDir, 'diff-stat.txt'), '1 file changed\n');
+    fs.writeFileSync(path.join(ctxDir, 'pr.diff'), 'diff --git a/a.swift b/a.swift\n--- a/a.swift\n+++ b/a.swift\n@@ -1 +1 @@\n+line one\n');
+    await assert.rejects(
+      runReview({
+        env: {
+          REVIEW_PROVIDERS: 'mock-runner-provider',
+          TARGET_REPO: 'test/repo',
+          PR_NUMBER: '10',
+          HEAD_SHA: 'a'.repeat(40),
+          REVIEW_CONTEXT_DIR: ctxDir,
+        },
+        cwd: tmpDir,
+      }),
+      /budget configuration required for usd-ledger provider but none was provided/
+    );
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('Third-party failure accounting: failure settles reservation without corrupting Claude session', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fail-accounting-'));
+  const ctxDir = path.join(tmpDir, '.review-context');
+  fs.mkdirSync(ctxDir, { recursive: true });
+  fs.writeFileSync(path.join(ctxDir, 'session-plan.json'), JSON.stringify({ decision: { mode: 'incremental' }, requestedMode: 'auto' }));
+  fs.writeFileSync(path.join(ctxDir, 'pr.json'), JSON.stringify({ number: 10, title: 'Test PR', base: { ref: 'main' } }));
+  fs.writeFileSync(path.join(ctxDir, 'repair.diff'), 'diff --git a/a.swift b/a.swift\n--- a/a.swift\n+++ b/a.swift\n@@ -1 +1 @@\n+test change\n');
+  fs.writeFileSync(path.join(ctxDir, 'risk-profile.json'), JSON.stringify({ version: 1, signals: {} }));
+
+  try {
+    // When FAIL_MOCK is set, mock-runner-provider fails
+    await assert.rejects(
+      runGeminiReview({
+        env: {
+          REVIEW_PROVIDERS: 'mock-runner-provider',
+          PROVIDER_MOCK_RUNNER_PROVIDER_BUDGET_USD: '5.00',
+          FAIL_MOCK: 'true',
+          TARGET_REPO: 'test/repo',
+          PR_NUMBER: '10',
+          HEAD_SHA: 'a'.repeat(40),
+          REVIEW_CONTEXT_DIR: ctxDir,
+        },
+        logImpl: () => {},
+      }),
+      /mock-runner-provider simulated failure|mock-runner-provider failed/
+    );
+
+    // Verify Claude usage file was not created or modified with spurious charges
+    const claudeUsagePath = path.join(ctxDir, 'claude-usage.json');
+    assert.equal(fs.existsSync(claudeUsagePath), false);
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }

@@ -7,7 +7,7 @@
 // - Diagnostic logging and failure provenance tracking
 // - Normalized provider outcome contract
 
-import { defaultProviderRegistry } from './provider-adapter.mjs';
+import { defaultProviderRegistry, PROVIDER_KINDS } from './provider-adapter.mjs';
 
 export class DeadlineTracker {
   constructor({ totalMs, minBufferMs = 60_000, nowFn = Date.now } = {}) {
@@ -341,8 +341,9 @@ export async function executeWorkUnit({
 
     // 4. Budget manager & reservation check
     const usesLedger = policy.budgetType === 'usd-ledger';
+    const isClaude = provider === PROVIDER_KINDS.CLAUDE;
     const providerBudgetMgr = budgetManagers[provider]
-      ?? (usesLedger ? budgetManager : null);
+      ?? (isClaude ? budgetManager : null);
     let reservation = null;
     if (usesLedger) {
       if (!providerBudgetMgr) {

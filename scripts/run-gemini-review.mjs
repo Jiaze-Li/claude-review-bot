@@ -239,11 +239,32 @@ async function reviewPart(ctx,diff,shared){
         spentUsd:shared.budgetManager.charges.reduce((sum,c)=>sum+c.amount,0),costCharges:shared.budgetManager.charges})+'\n',{mode:0o600});
   };
 
+  const providerBudgetManagers = {};
+  for (const p of (providers || [])) {
+    if (p === 'claude') {
+      providerBudgetManagers.claude = shared.budgetManager;
+    } else {
+      const desc = defaultProviderRegistry.getDescriptor(p);
+      if (desc?.policy?.budgetType === 'usd-ledger') {
+        const envVar = `PROVIDER_${p.toUpperCase().replace(/[^A-Z0-9]/g, '_')}_BUDGET_USD`;
+        const val = env[envVar] ? Number(env[envVar]) : null;
+        if (val != null && Number.isFinite(val) && val > 0) {
+          providerBudgetManagers[p] = new BudgetManager({
+            minStartingAllowanceUsd: Math.min(0.1, val / 2),
+            getAvailableBudget: (pendingUsd) => val - pendingUsd,
+            perCallCap: val,
+          });
+        }
+      }
+    }
+  }
+
   const outcome = await executeWorkUnit({
     unit: { diff },
     providers: providers || (claudeOnly ? ['claude'] : ['gemini', 'claude']),
     geminiCircuitBreaker: shared.circuitBreaker,
     budgetManager: shared.budgetManager,
+    budgetManagers: providerBudgetManagers,
     defaultTimeoutMs: timeoutMs,
     throwClaudeErrors: true,
     executors: {
@@ -356,7 +377,7 @@ async function reviewPart(ctx,diff,shared){
           .filter((p) => p !== 'gemini' && p !== 'claude' && defaultProviderRegistry.has(p))
           .map((p) => [
             p,
-            async ({ unit, timeoutMs: callTimeout, maxBudgetUsd }) => {
+            async ({ unit, timeoutMs: callTimeout, maxBudgetUsd, reservation }) => {
               const adapter = getProviderAdapter(p);
               const desc = defaultProviderRegistry.getDescriptor(p);
               const safeRoot = resolveSafeRoot(env);
@@ -366,19 +387,31 @@ async function reviewPart(ctx,diff,shared){
                 cwd: process.cwd(),
                 allowedContextFiles: [diffName, 'changed-files.txt', 'diff-stat.txt', 'pr.json', 'skipped-files.txt', 'repair.diff', 'pr.diff'],
               }) : null;
-              const res = await adapter.execute({
-                prompt: built.prompt,
-                schema: built.schema,
-                timeoutMs: callTimeout,
-                maxBudgetUsd,
-                maxOutputTokens,
-                env,
-                fetchImpl,
-                maxAttempts: 2,
-                logImpl,
-                toolGateway,
-                allowZeroCost: true,
-              });
+              let res;
+              try {
+                res = await adapter.execute({
+                  prompt: built.prompt,
+                  schema: built.schema,
+                  timeoutMs: callTimeout,
+                  maxBudgetUsd,
+                  maxOutputTokens,
+                  env,
+                  fetchImpl,
+                  maxAttempts: 2,
+                  logImpl,
+                  toolGateway,
+                  allowZeroCost: true,
+                });
+              } finally {
+                const mgr = providerBudgetManagers[p];
+                if (mgr && reservation && !reservation.settled) {
+                  mgr.settleReservation(reservation, {
+                    actualCostUsd: res?.meta?.total_cost_usd,
+                    costSource: res?.meta?.cost_source ?? (res?.ok ? 'sdk' : 'reserve'),
+                    fallbackCostUsd: maxBudgetUsd,
+                  });
+                }
+              }
               if (res.ok) {
                 if (mode === 'verification') normalizeVerificationResult(res.structured);
                 else normalizeReviewResult(res.structured);
@@ -427,9 +460,19 @@ async function reviewPart(ctx,diff,shared){
     throw new Error(outcome.error || 'Review failed');
   }
 
+  const providerCosts = {};
+  for (const [p, mgr] of Object.entries(providerBudgetManagers)) {
+    if (p !== 'claude' && mgr) {
+      providerCosts[p] = Number(mgr.totalSpentUsd.toFixed(4));
+    }
+  }
+
   return {
     ...outcome.structured,
-    _meta: outcome.meta,
+    _meta: {
+      ...outcome.meta,
+      ...(Object.keys(providerCosts).length ? { provider_costs: providerCosts } : {}),
+    },
   };
 }
 
@@ -443,6 +486,14 @@ function mergeParts({ctx,parts,results}){
   const lead=claudeMetas[0]??metas[0];
   const sumUsage=(key)=>metas.reduce((total,meta)=>total+(nonnegative(meta?.usage?.[key])??0),0);
   const claudeCost=claudeMetas.reduce((total,meta)=>total+(nonnegative(meta.total_cost_usd)??0),0);
+  const partProviderCosts = {};
+  for (const meta of metas) {
+    if (meta?.provider_costs) {
+      for (const [p, c] of Object.entries(meta.provider_costs)) {
+        partProviderCosts[p] = Number(((partProviderCosts[p] ?? 0) + c).toFixed(4));
+      }
+    }
+  }
   const _meta={
     ...lead,
     mode,
@@ -455,6 +506,7 @@ function mergeParts({ctx,parts,results}){
       thoughts_tokens:sumUsage('thoughts_tokens'),
       total_tokens:sumUsage('total_tokens'),
     },
+    ...(Object.keys(partProviderCosts).length ? { provider_costs: partProviderCosts } : {}),
     ...(claudeMetas.length?{
       provider:'claude',
       ...(claudeMetas.some((meta)=>meta.fallback_from)?{
