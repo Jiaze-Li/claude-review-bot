@@ -38,6 +38,14 @@ on:
         required: true
         default: auto
         type: string
+      review_providers:
+        description: Comma-separated provider chain (e.g. gemini,claude)
+        required: false
+        type: string
+      provider_budgets:
+        description: Generic JSON or key=val budgets for third-party providers
+        required: false
+        type: string
 
   workflow_call:
     inputs:
@@ -67,6 +75,12 @@ on:
         required: false
         default: auto
         type: string
+      review_providers:
+        required: false
+        type: string
+      provider_budgets:
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -83,6 +97,9 @@ concurrency:
 jobs:
   review:
     runs-on: ubuntu-latest
+    env:
+      REVIEW_PROVIDERS: ${{ inputs.review_providers || vars.REVIEW_PROVIDERS || '' }}
+      PROVIDER_BUDGETS: ${{ inputs.provider_budgets || vars.PROVIDER_BUDGETS || '' }}
     # Room for the sharded review (16 minutes) plus validation and publication.
     timeout-minutes: 30
 
@@ -321,6 +338,8 @@ jobs:
           HEAD_SHA: ${{ inputs.head_sha }}
           SOURCE_COMMENT_ID: ${{ inputs.source_comment_id }}
           SOURCE_KIND: ${{ inputs.source_kind }}
+          REVIEW_PROVIDERS: ${{ inputs.review_providers || vars.REVIEW_PROVIDERS || '' }}
+          PROVIDER_BUDGETS: ${{ inputs.provider_budgets || vars.PROVIDER_BUDGETS || '' }}
           REVIEW_CONTEXT_DIR: .review-context
         run: node scripts/deep-review.mjs begin
 
@@ -398,6 +417,8 @@ jobs:
           HEAD_SHA: ${{ inputs.head_sha }}
           SAFE_REPO_DIR: safe-target
           SOURCE_KIND: ${{ inputs.source_kind }}
+          REVIEW_PROVIDERS: ${{ inputs.review_providers || vars.REVIEW_PROVIDERS || '' }}
+          PROVIDER_BUDGETS: ${{ inputs.provider_budgets || vars.PROVIDER_BUDGETS || '' }}
           REVIEW_CONTEXT_DIR: .review-context
           REVIEW_OUTPUT_PATH: .review-context/review.json
         run: node scripts/run-gemini-review.mjs
@@ -470,6 +491,7 @@ jobs:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           REVIEW_PROVIDERS: ${{ steps.begin-deep.outputs.providers }}
+          PROVIDER_BUDGETS: ${{ inputs.provider_budgets || vars.PROVIDER_BUDGETS || '' }}
           DEEP_REVIEW_MAX_BUDGET_USD: ${{ steps.begin-deep.outputs.run_budget_usd }}
           TARGET_REPO: ${{ inputs.target_repo }}
           PR_NUMBER: ${{ inputs.pr_number }}
@@ -549,6 +571,8 @@ jobs:
           SOURCE_COMMENT_ID: ${{ inputs.source_comment_id }}
           SOURCE_KIND: ${{ inputs.source_kind }}
           REQUESTED_MODE: ${{ inputs.requested_mode }}
+          REVIEW_PROVIDERS: ${{ inputs.review_providers || '' }}
+          PROVIDER_BUDGETS: ${{ inputs.provider_budgets || '' }}
           REVIEW_MODE: ${{ steps.plan.outputs.mode }}
           EXPECTED_REVIEW_AUTHOR: ${{ steps.app-token.outputs.app-slug }}[bot]
           REVIEW_CONTEXT_DIR: .review-context

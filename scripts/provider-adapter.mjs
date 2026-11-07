@@ -11,6 +11,41 @@ import { ReadOnlyToolGateway } from './tool-gateway.mjs';
 
 export const AUTHORIZED_GEMINI_TOOLS = Object.freeze(['Read', 'Glob', 'Grep']);
 
+/**
+ * Factory for Host tool authorizers enforcing that Agent providers may ONLY
+ * execute authorized Host Gateway tools and never invoke native host/sandbox tools.
+ * Capability descriptor alone is not a sandbox; this boundary guarantees host security.
+ */
+export function createHostToolAuthorizer({
+  toolGateway = null,
+  allowedTools = null,
+  serverName = 'gateway',
+  fallbackAuthorizer = null,
+} = {}) {
+  const allowed = allowedTools || (toolGateway?.getMcpToolNames
+    ? toolGateway.getMcpToolNames(serverName)
+    : AUTHORIZED_GEMINI_TOOLS.map((t) => `mcp__${serverName}__${t}`));
+
+  return async (toolName, input) => {
+    if (toolGateway) {
+      if (!allowed.includes(toolName)) {
+        return {
+          behavior: 'deny',
+          message: `Direct use of native tool ${toolName} is forbidden; use Host Gateway tools (${allowed.join(', ')}) instead.`,
+        };
+      }
+      return { behavior: 'allow', updatedInput: input };
+    }
+    if (typeof fallbackAuthorizer === 'function') {
+      return fallbackAuthorizer(toolName, input);
+    }
+    return {
+      behavior: 'deny',
+      message: `Tool execution denied: no Host Gateway available to authorize ${toolName}.`,
+    };
+  };
+}
+
 function checkCheckedText(value, max, name) {
   if (typeof value !== 'string') {
     return `${name} must be a string`;
@@ -242,15 +277,146 @@ export function firstModelName(value) {
   return Object.keys(value).find(Boolean) ?? null;
 }
 
+function isClassOrConstructor(fn) {
+  if (typeof fn !== 'function') return false;
+  if (!fn.prototype) return false;
+  const descriptor = Object.getOwnPropertyDescriptor(fn, 'prototype');
+  if (descriptor && descriptor.writable === false) return true;
+  if (/^class\s/.test(Function.prototype.toString.call(fn))) return true;
+  return Object.getOwnPropertyNames(fn.prototype).length > 1;
+}
+
+/**
+ * Provider Registry for registering and resolving review provider adapters,
+ * their capabilities (tools, structured output, security boundaries),
+ * and operational policies (budget type, timeout, credential requirements).
+ */
+export class ProviderRegistry {
+  constructor() {
+    this._providers = new Map();
+  }
+
+  register(name, adapterClassOrFactory, descriptor = {}) {
+    if (typeof name !== 'string' || !name.trim()) {
+      throw new Error('Provider name must be a non-empty string');
+    }
+    const normalizedName = name.trim().toLowerCase();
+    if (typeof adapterClassOrFactory !== 'function') {
+      throw new Error(`Provider adapter factory/class for "${name}" must be a function`);
+    }
+
+    const rawCaps = descriptor.capabilities || {};
+    const capabilities = Object.freeze({
+      ...rawCaps,
+      tools: Boolean(rawCaps.tools),
+      structuredOutput: Boolean(rawCaps.structuredOutput),
+      multiturnTools: Boolean(rawCaps.multiturnTools),
+      hostSecurity: typeof rawCaps.hostSecurity === 'string' ? rawCaps.hostSecurity : 'host-enforced',
+    });
+
+    const rawPolicy = descriptor.policy || {};
+    const rawCircuitBreaker = rawPolicy.circuitBreaker || {};
+    const policy = Object.freeze({
+      ...rawPolicy,
+      budgetType: typeof rawPolicy.budgetType === 'string' ? rawPolicy.budgetType : 'none',
+      defaultTimeoutMs: Number.isFinite(rawPolicy.defaultTimeoutMs) && rawPolicy.defaultTimeoutMs > 0 ? rawPolicy.defaultTimeoutMs : 480_000,
+      credentialsRequired: Object.freeze([...(Array.isArray(rawPolicy.credentialsRequired) ? rawPolicy.credentialsRequired : [])]),
+      circuitBreaker: Object.freeze({
+        ...rawCircuitBreaker,
+        maxFailures: Number.isInteger(rawCircuitBreaker.maxFailures) && rawCircuitBreaker.maxFailures > 0 ? rawCircuitBreaker.maxFailures : 3,
+      }),
+    });
+
+    this._providers.set(normalizedName, {
+      name: normalizedName,
+      adapterClassOrFactory,
+      capabilities,
+      policy,
+      description: descriptor.description ?? '',
+    });
+    return this;
+  }
+
+  get(name) {
+    if (typeof name !== 'string') return null;
+    return this._providers.get(name.trim().toLowerCase()) ?? null;
+  }
+
+  has(name) {
+    if (typeof name !== 'string') return false;
+    return this._providers.has(name.trim().toLowerCase());
+  }
+
+  createAdapter(name, options = {}) {
+    const entry = this.get(name);
+    if (!entry) {
+      throw new Error(`Unknown provider: ${name}`);
+    }
+    const Target = entry.adapterClassOrFactory;
+    const resolvedOptions = { descriptor: entry, ...options };
+    if (isClassOrConstructor(Target)) {
+      return new Target(resolvedOptions);
+    }
+    return Target(resolvedOptions);
+  }
+
+  list() {
+    return Array.from(this._providers.keys());
+  }
+
+  getDescriptor(name) {
+    const entry = this.get(name);
+    if (!entry) return null;
+    return {
+      name: entry.name,
+      capabilities: entry.capabilities,
+      policy: entry.policy,
+      description: entry.description,
+    };
+  }
+
+  unregister(name) {
+    if (typeof name !== 'string') return false;
+    return this._providers.delete(name.trim().toLowerCase());
+  }
+
+  clear() {
+    this._providers.clear();
+  }
+}
+
+export const defaultProviderRegistry = new ProviderRegistry();
+
+export function registerProvider(name, adapterClassOrFactory, descriptor) {
+  return defaultProviderRegistry.register(name, adapterClassOrFactory, descriptor);
+}
+
+export function getProviderDescriptor(name) {
+  return defaultProviderRegistry.getDescriptor(name);
+}
+
+export function listProviders() {
+  return defaultProviderRegistry.list();
+}
+
 /**
  * Base Provider Adapter defining the common review request contract.
  */
 export class ProviderAdapter {
-  constructor({ provider }) {
-    if (![PROVIDER_KINDS.GEMINI, PROVIDER_KINDS.CLAUDE].includes(provider)) {
-      throw new Error(`Unsupported provider: ${provider}`);
+  constructor({ provider, descriptor = null } = {}) {
+    if (typeof provider !== 'string' || !provider.trim()) {
+      throw new Error(`Provider name must be a non-empty string: ${provider}`);
     }
-    this.provider = provider;
+    this.provider = provider.trim().toLowerCase();
+    this.descriptor = descriptor || defaultProviderRegistry?.getDescriptor(this.provider) || null;
+  }
+
+  get capabilities() {
+    return this.descriptor?.capabilities || Object.freeze({});
+  }
+
+  get policy() {
+    return this.descriptor?.policy || Object.freeze({});
   }
 
   async execute(_request) {
@@ -263,7 +429,7 @@ export class ProviderAdapter {
  */
 export class GeminiProviderAdapter extends ProviderAdapter {
   constructor(options = {}) {
-    super({ provider: PROVIDER_KINDS.GEMINI });
+    super({ provider: PROVIDER_KINDS.GEMINI, descriptor: options.descriptor });
     this.defaultModel = options.defaultModel || GEMINI_MODEL;
     this.defaultEffort = options.defaultEffort || 'medium';
   }
@@ -994,7 +1160,7 @@ export class GeminiProviderAdapter extends ProviderAdapter {
  */
 export class ClaudeProviderAdapter extends ProviderAdapter {
   constructor(options = {}) {
-    super({ provider: PROVIDER_KINDS.CLAUDE });
+    super({ provider: PROVIDER_KINDS.CLAUDE, descriptor: options.descriptor });
     this.defaultModel = options.defaultModel || 'sonnet';
     this.defaultEffort = options.defaultEffort || 'medium';
   }
@@ -1084,11 +1250,12 @@ export class ClaudeProviderAdapter extends ProviderAdapter {
 
     // MCP handlers enforce path and quota policy. The permission callback only
     // allows the registered MCP tools; do not double-authorize or double-charge them.
-    const toolAuthorizer = toolGateway
-      ? async (name) => resolvedAllowedTools.includes(name)
-        ? { behavior: 'allow' }
-        : { behavior: 'deny', message: 'Only Host Gateway MCP tools are available.' }
-      : (canUseTool ?? (async () => ({ behavior: 'deny', message: 'No tools available in this review.' })));
+    const toolAuthorizer = createHostToolAuthorizer({
+      toolGateway,
+      allowedTools: resolvedAllowedTools,
+      serverName: 'gateway',
+      fallbackAuthorizer: canUseTool,
+    });
     // MCP handlers return their own already-bounded output. No PostToolUse rewrite.
     const resolvedHooks = toolGateway ? undefined : (hooks ?? undefined);
 
@@ -1282,15 +1449,149 @@ export class ClaudeProviderAdapter extends ProviderAdapter {
   }
 }
 
+// Register built-in default providers
+defaultProviderRegistry.register(PROVIDER_KINDS.GEMINI, GeminiProviderAdapter, {
+  description: 'Google Gemini REST API adapter with multi-turn tool calling and schema validation',
+  capabilities: {
+    tools: true,
+    structuredOutput: true,
+    multiturnTools: true,
+    hostSecurity: 'host-enforced',
+  },
+  policy: {
+    budgetType: 'prepaid-credits',
+    defaultTimeoutMs: 480_000,
+    credentialsRequired: ['GEMINI_API_KEY'],
+    circuitBreaker: { maxFailures: 3 },
+    requiresStructuredOutput: false,
+  },
+});
+
+defaultProviderRegistry.register(PROVIDER_KINDS.CLAUDE, ClaudeProviderAdapter, {
+  description: 'Anthropic Claude Agent SDK adapter with host-enforced tool execution and budget reservation',
+  capabilities: {
+    tools: true,
+    structuredOutput: true,
+    multiturnTools: true,
+    hostSecurity: 'host-enforced',
+  },
+  policy: {
+    budgetType: 'usd-ledger',
+    defaultTimeoutMs: 180_000,
+    credentialsRequired: ['CLAUDE_CODE_OAUTH_TOKEN'],
+    circuitBreaker: { maxFailures: 3 },
+    requiresStructuredOutput: true,
+  },
+});
+
 /**
  * Factory for creating or getting provider adapters.
+ * Delegates to the defaultProviderRegistry.
  */
 export function getProviderAdapter(provider, options = {}) {
-  if (provider === PROVIDER_KINDS.GEMINI) {
-    return new GeminiProviderAdapter(options);
-  }
-  if (provider === PROVIDER_KINDS.CLAUDE) {
-    return new ClaudeProviderAdapter(options);
-  }
-  throw new Error(`Unknown provider: ${provider}`);
+  return defaultProviderRegistry.createAdapter(provider, options);
 }
+
+/**
+ * Parse, validate, and normalize a REVIEW_PROVIDERS configuration string.
+ *
+ * Rules:
+ * 1. If claudeOnly is true, returns ['claude'] unconditionally.
+ * 2. If raw is omitted or whitespace-only, returns defaultProviders.
+ * 3. Rejects unknown provider names with an explicit Error.
+ * 4. Deduplicates repeated names preserving order.
+ */
+export function parseReviewProviders(raw, {
+  registry = defaultProviderRegistry,
+  claudeOnly = false,
+  defaultProviders = ['claude'],
+} = {}) {
+  if (claudeOnly) {
+    return ['claude'];
+  }
+  if (!raw || typeof raw !== 'string' || !raw.trim()) {
+    return [...defaultProviders];
+  }
+  const parts = raw.split(',').map((p) => p.trim().toLowerCase()).filter(Boolean);
+  if (!parts.length) {
+    return [...defaultProviders];
+  }
+
+  const seen = new Set();
+  const out = [];
+  for (const name of parts) {
+    if (!registry.has(name)) {
+      throw new Error(`Unknown review provider "${name}"; registered providers are: ${registry.list().join(', ')}`);
+    }
+    if (!seen.has(name)) {
+      seen.add(name);
+      out.push(name);
+    }
+  }
+  return out;
+}
+
+/**
+ * Generic configuration parser for third-party Provider budgets.
+ * Supports JSON string (e.g. '{"mock-runner-provider": 5.00}') or key=val pairs
+ * (e.g. 'mock-runner-provider=5.00, other=2.50').
+ *
+ * Enforces:
+ * - Budget numbers must be positive finite values (> 0); invalid entries fail closed.
+ * - Claude is ignored to strictly preserve Claude's existing $6 per-PR ledger.
+ */
+export function parseProviderBudgets(raw, { env = process.env } = {}) {
+  const source = raw != null ? String(raw) : (env?.PROVIDER_BUDGETS ? String(env.PROVIDER_BUDGETS) : '');
+  const trimmed = source.trim();
+  if (!trimmed) {
+    return {};
+  }
+
+  let parsed = null;
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch (err) {
+      throw new Error(`Invalid PROVIDER_BUDGETS JSON: ${err.message}`);
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('Invalid PROVIDER_BUDGETS: must be a JSON object mapping provider names to numeric budgets');
+    }
+  } else {
+    parsed = {};
+    const entries = trimmed.split(/[\n,;]+/).map((s) => s.trim()).filter(Boolean);
+    for (const entry of entries) {
+      const match = entry.match(/^([a-zA-Z0-9_-]+)\s*[:=]\s*(.+)$/);
+      if (!match) {
+        throw new Error(`Invalid PROVIDER_BUDGETS entry: "${entry}". Expected "provider=budget" or "provider: budget"`);
+      }
+      const [, k, v] = match;
+      parsed[k.trim()] = v.trim();
+    }
+  }
+
+  const result = {};
+  for (const [key, value] of Object.entries(parsed)) {
+    const provider = key.trim().toLowerCase();
+    if (provider === 'claude') {
+      // Claude retains its existing $6 per-PR ledger; third-party provider budgets channel cannot override Claude.
+      continue;
+    }
+    let num = null;
+    if (typeof value === 'number') {
+      num = value;
+    } else if (typeof value === 'string') {
+      const trimmedVal = value.trim();
+      if (/^[0-9]+(?:\.[0-9]+)?$/.test(trimmedVal)) {
+        num = Number(trimmedVal);
+      }
+    }
+    if (num == null || !Number.isFinite(num) || num <= 0) {
+      throw new Error(`Invalid budget for provider "${provider}": budget must be a positive finite number, got "${value}"`);
+    }
+    result[provider] = num;
+  }
+
+  return result;
+}
+

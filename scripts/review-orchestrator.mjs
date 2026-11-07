@@ -7,6 +7,10 @@
 // - Diagnostic logging and failure provenance tracking
 // - Normalized provider outcome contract
 
+import { defaultProviderRegistry, PROVIDER_KINDS, parseProviderBudgets } from './provider-adapter.mjs';
+
+export { parseProviderBudgets };
+
 export class DeadlineTracker {
   constructor({ totalMs, minBufferMs = 60_000, nowFn = Date.now } = {}) {
     this.nowFn = nowFn;
@@ -264,220 +268,305 @@ export async function executeWorkUnit({
   unit,
   providers = ['gemini', 'claude'],
   geminiCircuitBreaker = null,
+  circuitBreakers = {},
   budgetManager = null,
+  budgetManagers = {},
   deadlineTracker = null,
   defaultTimeoutMs = null,
   executors = {},
   canExecute = {},
   onPartialCoverage = null,
   onClaudeBudgetBlocked = null,
+  onBudgetBlocked = {},
   onClaudeError = null,
+  onError = {},
   throwClaudeErrors = false,
+  throwErrors = {},
   logImpl = () => {},
+  providerRegistry = defaultProviderRegistry,
 } = {}) {
   const notes = [];
-  let lastGeminiFailure = geminiCircuitBreaker?.isOff
-    ? { status: geminiCircuitBreaker.status, message: geminiCircuitBreaker.reason }
-    : null;
-  let lastGeminiOutcome = null;
+  const resolvedCircuitBreakers = {
+    ...circuitBreakers,
+    ...(geminiCircuitBreaker ? { gemini: geminiCircuitBreaker } : {}),
+  };
+  const resolvedOnBudgetBlocked = {
+    ...onBudgetBlocked,
+    ...(typeof onClaudeBudgetBlocked === 'function' ? { claude: onClaudeBudgetBlocked } : {}),
+  };
+  const resolvedOnError = {
+    ...onError,
+    ...(typeof onClaudeError === 'function' ? { claude: onClaudeError } : {}),
+  };
+  const resolvedThrowErrors = typeof throwErrors === 'object' && throwErrors !== null
+    ? { ...throwErrors, ...(throwClaudeErrors ? { claude: true } : {}) }
+    : Boolean(throwErrors || throwClaudeErrors);
+
+  let lastFailure = null;
+  for (const p of providers) {
+    const b = resolvedCircuitBreakers[p];
+    if (b?.isOff) {
+      lastFailure = { status: b.status, message: b.reason };
+      break;
+    }
+  }
+  let lastOutcome = null;
+
   for (let position = 0; position < providers.length; position += 1) {
     const provider = providers[position];
+    const descriptor = providerRegistry?.getDescriptor?.(provider);
+    const policy = descriptor?.policy || {};
+    const capabilities = descriptor?.capabilities || {};
 
-    if (provider === 'gemini') {
-      if (geminiCircuitBreaker?.isOff) {
-        notes.push(`gemini: ${geminiCircuitBreaker.reason}`);
-        continue;
-      }
-      if (typeof executors.gemini !== 'function') {
-        notes.push('gemini: executor not configured');
-        continue;
-      }
-      const timeoutMs = deadlineTracker
-        ? deadlineTracker.timeoutForCall(30_000, defaultTimeoutMs)
-        : (defaultTimeoutMs ?? 180_000);
-      let rawOutcome;
-      try {
-        rawOutcome = await executors.gemini({ unit, timeoutMs });
-      } catch (err) {
-        rawOutcome = { ok: false, error: err?.message ?? String(err), kind: 'failed' };
-      }
-      lastGeminiOutcome = rawOutcome;
-
-      if (rawOutcome.ok) {
-        geminiCircuitBreaker?.recordSuccess();
-        const normalized = normalizeProviderOutcome({
-          ok: true,
-          provider: 'gemini',
-          structured: rawOutcome.structured,
-          meta: rawOutcome.meta,
-          usage: rawOutcome.usage || rawOutcome.meta?.usage,
-          totalCostUsd: rawOutcome.totalCostUsd ?? rawOutcome.meta?.total_cost_usd ?? 0,
-          costSource: rawOutcome.costSource ?? rawOutcome.meta?.cost_source ?? 'zero',
-          duration: rawOutcome.duration || rawOutcome.meta?.duration_ms || 0,
-          coverage: rawOutcome.structured?.coverage,
-          fallbackReason: notes.length ? notes.join('; ') : null,
-        });
-
-        if (typeof onPartialCoverage === 'function') {
-          const handled = await onPartialCoverage({
-            result: normalized,
-            unit,
-            currentProvider: 'gemini',
-            remainingProviders: providers.slice(position + 1),
-            notes,
-          });
-          if (handled) return handled;
-        }
-
-        return notes.length ? { ...normalized, fellBackFrom: notes.join('; ') } : normalized;
-      }
-
-      if (rawOutcome.kind === 'skipped') {
-        notes.push(`gemini: ${rawOutcome.error}`);
-        continue;
-      }
-
-      const status = rawOutcome.status || 0;
-      if (rawOutcome.kind === 'unavailable' || rawOutcome.kind === 'config') {
-        geminiCircuitBreaker?.trip(rawOutcome.error, status);
-      } else {
-        geminiCircuitBreaker?.recordFailure(rawOutcome.error, status);
-      }
-      lastGeminiFailure = { status, message: rawOutcome.error };
-      notes.push(`gemini: ${rawOutcome.error}`);
+    // 1. Circuit breaker check
+    const breaker = resolvedCircuitBreakers[provider] ?? null;
+    if (breaker?.isOff) {
+      notes.push(`${provider}: ${breaker.reason}`);
       continue;
     }
 
-    if (provider === 'claude') {
-      if (typeof canExecute?.claude === 'function') {
-        const canRun = canExecute.claude();
-        if (canRun !== true) {
-          notes.push(`claude: ${typeof canRun === 'string' ? canRun : 'not available'}`);
-          continue;
-        }
-      }
-      if (typeof executors.claude !== 'function') {
-        notes.push('claude: executor not configured');
+    // 2. Pre-execution guard
+    if (typeof canExecute?.[provider] === 'function') {
+      const canRun = canExecute[provider]();
+      if (canRun !== true) {
+        notes.push(`${provider}: ${typeof canRun === 'string' ? canRun : 'not available'}`);
         continue;
       }
+    }
 
-      let reservation = null;
-      if (budgetManager) {
-        reservation = await budgetManager.acquireReservation({ deadlineTracker });
-        if (!reservation) {
-          if (typeof onClaudeBudgetBlocked === 'function') {
-            await onClaudeBudgetBlocked({
-              notes,
-              lastFailed: lastGeminiFailure,
-            });
-          }
-          notes.push('claude: Claude budget for this review is exhausted');
-          continue;
-        }
+    // 3. Executor check
+    const executor = executors[provider];
+    if (typeof executor !== 'function') {
+      notes.push(`${provider}: executor not configured`);
+      continue;
+    }
+
+    // 4. Budget manager & reservation check
+    const usesLedger = policy.budgetType === 'usd-ledger';
+    const isClaude = provider === PROVIDER_KINDS.CLAUDE;
+    const providerBudgetMgr = budgetManagers[provider]
+      ?? (isClaude ? budgetManager : null);
+    let reservation = null;
+    if (usesLedger) {
+      if (!providerBudgetMgr) {
+        notes.push(`${provider}: budget configuration required for usd-ledger provider but none was provided`);
+        continue;
       }
+      reservation = await providerBudgetMgr.acquireReservation({ deadlineTracker });
+      if (!reservation) {
+        if (typeof resolvedOnBudgetBlocked[provider] === 'function') {
+          await resolvedOnBudgetBlocked[provider]({
+            notes,
+            lastFailed: lastFailure,
+          });
+        }
+        notes.push(`${provider}: budget for this review is exhausted`);
+        continue;
+      }
+    } else if (providerBudgetMgr) {
+      reservation = await providerBudgetMgr.acquireReservation({ deadlineTracker });
+      if (!reservation) {
+        if (typeof resolvedOnBudgetBlocked[provider] === 'function') {
+          await resolvedOnBudgetBlocked[provider]({
+            notes,
+            lastFailed: lastFailure,
+          });
+        }
+        notes.push(`${provider}: budget for this review is exhausted`);
+        continue;
+      }
+    }
 
-      const timeoutMs = deadlineTracker
-        ? deadlineTracker.timeoutForCall(30_000, defaultTimeoutMs)
-        : (defaultTimeoutMs ?? 180_000);
-      const budgetUsd = reservation?.cap ?? null;
-      let rawOutcome;
-      try {
-        rawOutcome = await executors.claude({
+    // 5. Timeout calculation
+    const fallbackTimeout = policy.defaultTimeoutMs ?? 180_000;
+    const timeoutMs = deadlineTracker
+      ? deadlineTracker.timeoutForCall(30_000, defaultTimeoutMs)
+      : (defaultTimeoutMs ?? fallbackTimeout);
+    const budgetUsd = reservation?.cap ?? null;
+
+    // 6. Invoke executor
+    let rawOutcome;
+    try {
+      rawOutcome = await executor({
+        unit,
+        timeoutMs,
+        maxBudgetUsd: budgetUsd,
+        reservation,
+        notes,
+        lastFailed: lastFailure,
+        priorGeminiOutcome: lastOutcome,
+        priorOutcome: lastOutcome,
+      });
+    } catch (err) {
+      if (providerBudgetMgr && reservation && !reservation.settled) {
+        providerBudgetMgr.settleReservation(reservation, { actualCostUsd: reservation.cap, costSource: 'reserve' });
+      }
+      if (typeof resolvedOnError[provider] === 'function') {
+        await resolvedOnError[provider]({ error: err, reservation, notes, lastFailed: lastFailure });
+      }
+      const shouldThrow = resolvedThrowErrors === true || Boolean(resolvedThrowErrors?.[provider]);
+      if (shouldThrow) throw err;
+      rawOutcome = {
+        ok: false,
+        error: err?.message ?? String(err),
+        errors: err?.message ?? String(err),
+        kind: 'failed',
+        errorKind: 'execution',
+        subtype: 'error',
+      };
+    }
+    lastOutcome = rawOutcome;
+
+    // 7. Handle skipped outcome
+    if (rawOutcome.kind === 'skipped') {
+      if (providerBudgetMgr && reservation && !reservation.settled) {
+        providerBudgetMgr.cancelReservation(reservation);
+      }
+      notes.push(`${provider}: ${rawOutcome.error}`);
+      continue;
+    }
+
+    // 8. Settle reservation on normal completion or failure
+    if (providerBudgetMgr && reservation && !reservation.settled) {
+      providerBudgetMgr.settleReservation(reservation, {
+        actualCostUsd: rawOutcome?.meta?.total_cost_usd ?? rawOutcome?.totalCostUsd,
+        costSource: rawOutcome?.meta?.cost_source ?? rawOutcome?.costSource,
+        fallbackCostUsd: rawOutcome?.fallbackCostUsd ?? reservation.cap,
+      });
+    }
+
+    // 9. Cost resolution driven by budgetType policy
+    const defaultZeroCost = policy.budgetType === 'prepaid-credits' || (!providerBudgetMgr && !reservation && !usesLedger);
+    const resolvedTotalCost = Number.isFinite(rawOutcome?.totalCostUsd)
+      ? rawOutcome.totalCostUsd
+      : (Number.isFinite(rawOutcome?.meta?.total_cost_usd)
+        ? rawOutcome.meta.total_cost_usd
+        : (reservation ? reservation.amount : (defaultZeroCost ? 0 : null)));
+
+    const resolvedCostSource = rawOutcome?.costSource
+      || rawOutcome?.meta?.cost_source
+      || (reservation ? reservation.source : (defaultZeroCost ? 'zero' : (Number.isFinite(resolvedTotalCost) ? 'sdk' : null)));
+
+    if (rawOutcome?.meta) {
+      if (!Number.isFinite(rawOutcome.meta.total_cost_usd) && Number.isFinite(resolvedTotalCost)) {
+        rawOutcome.meta.total_cost_usd = resolvedTotalCost;
+      }
+      if (!rawOutcome.meta.cost_source && resolvedCostSource) {
+        rawOutcome.meta.cost_source = resolvedCostSource;
+      }
+    }
+
+    // 10. Success check driven by policy.requiresStructuredOutput
+    const requiresStructured = Boolean(policy.requiresStructuredOutput);
+    const isSuccess = Boolean(rawOutcome.ok) && (!requiresStructured || rawOutcome.structured != null);
+    if (isSuccess) {
+      breaker?.recordSuccess();
+
+      const normalized = normalizeProviderOutcome({
+        ok: true,
+        provider,
+        structured: rawOutcome.structured,
+        meta: rawOutcome.meta,
+        usage: rawOutcome.usage || rawOutcome.meta?.usage,
+        totalCostUsd: resolvedTotalCost,
+        costSource: resolvedCostSource,
+        duration: rawOutcome.duration || rawOutcome.meta?.duration_ms || 0,
+        coverage: rawOutcome.structured?.coverage || rawOutcome.coverage,
+        facts: rawOutcome.facts || null,
+        fallbackReason: notes.length ? notes.join('; ') : null,
+      });
+
+      if (typeof onPartialCoverage === 'function') {
+        const handled = await onPartialCoverage({
+          result: normalized,
           unit,
-          timeoutMs,
-          maxBudgetUsd: budgetUsd,
-          reservation,
+          currentProvider: provider,
+          remainingProviders: providers.slice(position + 1),
           notes,
-          lastFailed: lastGeminiFailure,
-          priorGeminiOutcome: lastGeminiOutcome,
         });
-      } catch (err) {
-        if (budgetManager && reservation && !reservation.settled) {
-          budgetManager.settleReservation(reservation, { actualCostUsd: reservation.cap, costSource: 'reserve' });
-        }
-        if (typeof onClaudeError === 'function') {
-          await onClaudeError({ error: err, reservation, notes, lastFailed: lastGeminiFailure });
-        }
-        if (throwClaudeErrors) throw err;
-        rawOutcome = { ok: false, error: err?.message ?? String(err), subtype: 'error' };
+        if (handled) return handled;
       }
 
-      if (rawOutcome.kind === 'skipped') {
-        if (budgetManager && reservation && !reservation.settled) {
-          budgetManager.cancelReservation(reservation);
-        }
-        notes.push(`claude: ${rawOutcome.error}`);
-        continue;
-      }
-
-      if (budgetManager && reservation && !reservation.settled) {
-        budgetManager.settleReservation(reservation, {
-          actualCostUsd: rawOutcome?.meta?.total_cost_usd ?? rawOutcome?.totalCostUsd,
-          costSource: rawOutcome?.meta?.cost_source ?? rawOutcome?.costSource,
-          fallbackCostUsd: rawOutcome?.fallbackCostUsd ?? reservation.cap,
-        });
-      }
-
-      const resolvedTotalCost = Number.isFinite(rawOutcome?.totalCostUsd)
-        ? rawOutcome.totalCostUsd
-        : (Number.isFinite(rawOutcome?.meta?.total_cost_usd)
-          ? rawOutcome.meta.total_cost_usd
-          : (reservation ? reservation.amount : null));
-
-      const resolvedCostSource = rawOutcome?.costSource
-        || rawOutcome?.meta?.cost_source
-        || (reservation ? reservation.source : (Number.isFinite(resolvedTotalCost) ? 'sdk' : null));
-
-      if (rawOutcome?.meta) {
-        if (!Number.isFinite(rawOutcome.meta.total_cost_usd) && Number.isFinite(resolvedTotalCost)) {
-          rawOutcome.meta.total_cost_usd = resolvedTotalCost;
-        }
-        if (!rawOutcome.meta.cost_source && resolvedCostSource) {
-          rawOutcome.meta.cost_source = resolvedCostSource;
-        }
-      }
-
-      if (rawOutcome.ok && rawOutcome.structured) {
-        const normalized = normalizeProviderOutcome({
-          ok: true,
-          provider: 'claude',
-          structured: rawOutcome.structured,
-          meta: rawOutcome.meta,
-          usage: rawOutcome.usage || rawOutcome.meta?.usage,
-          totalCostUsd: resolvedTotalCost,
-          costSource: resolvedCostSource,
-          duration: rawOutcome.duration || rawOutcome.meta?.duration_ms || 0,
-          coverage: rawOutcome.structured?.coverage,
-          facts: rawOutcome.facts || null,
-          fallbackReason: notes.length ? notes.join('; ') : null,
-        });
-
-        if (typeof onPartialCoverage === 'function') {
-          const handled = await onPartialCoverage({
-            result: normalized,
-            unit,
-            currentProvider: 'claude',
-            remainingProviders: providers.slice(position + 1),
-            notes,
-          });
-          if (handled) return handled;
-        }
-
-        return notes.length ? { ...normalized, fellBackFrom: notes.join('; ') } : normalized;
-      }
-
-      notes.push(`claude: ${rawOutcome.error || rawOutcome.errors || 'no structured output'}`);
-      continue;
+      return notes.length ? { ...normalized, fellBackFrom: notes.join('; ') } : normalized;
     }
 
-    notes.push(`unknown provider: ${provider}`);
+    // 11. Failure classification & breaker recording
+    const status = rawOutcome.status || 0;
+    if (breaker) {
+      if (rawOutcome.kind === 'unavailable' || rawOutcome.kind === 'config') {
+        breaker.trip(rawOutcome.error, status);
+      } else {
+        breaker.recordFailure(rawOutcome.error, status);
+      }
+    }
+
+    lastFailure = { status, message: rawOutcome.error || rawOutcome.errors };
+    notes.push(`${provider}: ${rawOutcome.error || rawOutcome.errors || 'no structured output'}`);
   }
 
   return normalizeProviderOutcome({
     ok: false,
     provider: null,
+    errorKind: 'unavailable',
     error: notes.join('; ') || 'no provider available',
     errors: notes.join('; ') || 'no provider available',
     fallbackReason: notes.join('; ') || null,
   });
+}
+
+/**
+ * Resolves independent BudgetManager instances for registered providers.
+ * Reads budgets from generic PROVIDER_BUDGETS channel (or legacy PROVIDER_<NAME>_BUDGET_USD).
+ * Claude always uses the provided claudeBudgetManager ($6 per-PR ledger).
+ * Missing budget for usd-ledger provider results in no manager, causing executeWorkUnit
+ * to fail closed.
+ */
+export function resolveProviderBudgetManagers({
+  providers = [],
+  env = process.env,
+  claudeBudgetManager = null,
+  registry = defaultProviderRegistry,
+} = {}) {
+  const parsedBudgets = parseProviderBudgets(env?.PROVIDER_BUDGETS, { env });
+  const managers = {};
+
+  if (claudeBudgetManager) {
+    managers.claude = claudeBudgetManager;
+  }
+
+  for (const p of providers) {
+    if (p === 'claude') {
+      if (!managers.claude && claudeBudgetManager) {
+        managers.claude = claudeBudgetManager;
+      }
+      continue;
+    }
+
+    const desc = registry?.getDescriptor?.(p);
+    if (desc?.policy?.budgetType === 'usd-ledger') {
+      const envVar = `PROVIDER_${p.toUpperCase().replace(/[^A-Z0-9]/g, '_')}_BUDGET_USD`;
+      let val = parsedBudgets[p];
+      if (val == null && env?.[envVar] != null && env[envVar] !== '') {
+        const rawLegacy = String(env[envVar]).trim();
+        if (!/^[0-9]+(?:\.[0-9]+)?$/.test(rawLegacy)) {
+          throw new Error(`Invalid budget in ${envVar}: budget must be a positive finite number, got "${env[envVar]}"`);
+        }
+        const legacyVal = Number(rawLegacy);
+        if (!Number.isFinite(legacyVal) || legacyVal <= 0) {
+          throw new Error(`Invalid budget in ${envVar}: budget must be a positive finite number, got "${env[envVar]}"`);
+        }
+        val = legacyVal;
+      }
+
+      if (val != null && Number.isFinite(val) && val > 0) {
+        managers[p] = new BudgetManager({
+          minStartingAllowanceUsd: Math.min(0.1, val / 2),
+          getAvailableBudget: (pendingUsd) => val - pendingUsd,
+          perCallCap: val,
+        });
+      }
+    }
+  }
+
+  return managers;
 }

@@ -5,9 +5,9 @@ import { CLAUDE_AUTO_MIN_BUDGET_USD, DEEP_REVIEW_MANUAL_RUN_BUDGET_USD, GEMINI_M
 import {isGeminiUnavailableStatus,runClaudeStructured} from './claude-fallback.mjs';
 import {geminiBaseUrl} from './gemini-config.mjs';
 import {MAX_SHARDS,dropIgnoredFiles,planShards,splitDiffByFile} from './review-shards.mjs';
-import {getProviderAdapter, PROVIDER_KINDS, OUTCOME_KINDS} from './provider-adapter.mjs';
+import {defaultProviderRegistry, getProviderAdapter, parseReviewProviders, PROVIDER_KINDS, OUTCOME_KINDS} from './provider-adapter.mjs';
 import {ReadOnlyToolGateway} from './tool-gateway.mjs';
-import {BudgetManager, CircuitBreaker, DeadlineTracker, runBoundedPool, executeWorkUnit} from './review-orchestrator.mjs';
+import {BudgetManager, CircuitBreaker, DeadlineTracker, runBoundedPool, executeWorkUnit, resolveProviderBudgetManagers} from './review-orchestrator.mjs';
 
 // Moving alias: always resolves to Google's current Flash model. Override with GEMINI_MODEL to pin.
 export const GEMINI_MODEL='gemini-flash-latest';
@@ -131,14 +131,22 @@ const MAX_REPAIR_FINDINGS=3;
 const VERDICT_RANK={FIXED:1,UNCERTAIN:2,STILL_OPEN:3};
 
 export async function runGeminiReview({env=process.env,fetchImpl=fetch,logImpl=console.log,queryImpl=null}={}){
-  // `@claude review` asks for Claude alone: Gemini is neither needed nor called.
-  const claudeOnly=JSON.parse(fs.readFileSync(path.join(path.resolve(env.REVIEW_CONTEXT_DIR||'.review-context'),'session-plan.json'),'utf8')).requestedMode==='claude';
-  const apiKey=claudeOnly?(env.GEMINI_API_KEY||''):required(env,'GEMINI_API_KEY');
   const repo=required(env,'TARGET_REPO');
   const prNumber=required(env,'PR_NUMBER');
   const headSha=required(env,'HEAD_SHA');
   const contextRoot=path.resolve(env.REVIEW_CONTEXT_DIR||'.review-context');
-  const plan=JSON.parse(fs.readFileSync(path.join(contextRoot,'session-plan.json'),'utf8'));
+  const planPath=path.join(contextRoot,'session-plan.json');
+  const plan=JSON.parse(fs.readFileSync(planPath,'utf8'));
+  // `@claude review` asks for Claude alone: Gemini is neither needed nor called.
+  const claudeOnly=plan.requestedMode==='claude';
+
+  const providers = parseReviewProviders(env.REVIEW_PROVIDERS, {
+    registry: defaultProviderRegistry,
+    claudeOnly,
+    defaultProviders: claudeOnly ? ['claude'] : ['gemini', 'claude'],
+  });
+
+  const apiKey = env.GEMINI_API_KEY || '';
   const mode=plan.decision?.mode;
   const diffName=['verification','incremental'].includes(mode)?'repair.diff':'pr.diff';
   // Same files skipped as in the sharded engine (binary/asset files and the repository's .reviewbotignore, read
@@ -153,7 +161,9 @@ export async function runGeminiReview({env=process.env,fetchImpl=fetch,logImpl=c
     ? JSON.parse(fs.readFileSync(riskPath,'utf8'))
     : {version:1,stateIntegrity:false,signals:{synchronization:[],durableState:[],multiActor:[]}};
   const manual=isManualBudgetExemptReview({sourceKind:env.SOURCE_KIND,requestedMode:plan.requestedMode});
-  const circuitBreaker = new CircuitBreaker();
+  const circuitBreaker = new CircuitBreaker({
+    initialReason: !providers.includes('gemini') ? 'not requested' : (apiKey ? null : 'GEMINI_API_KEY is not configured'),
+  });
   const budgetManager = new BudgetManager({
     minStartingAllowanceUsd: CLAUDE_AUTO_MIN_BUDGET_USD,
     getAvailableBudget: (pendingUsd) => {
@@ -162,8 +172,14 @@ export async function runGeminiReview({env=process.env,fetchImpl=fetch,logImpl=c
     },
     perCallCap: null,
   });
-  const ctx={claudeOnly,env,fetchImpl,logImpl,queryImpl,apiKey,repo,prNumber,headSha,contextRoot,plan,mode,prJson,session,riskProfile,diffName,manual};
-  const shared={circuitBreaker,budgetManager};
+  const providerBudgetManagers = resolveProviderBudgetManagers({
+    providers,
+    env,
+    claudeBudgetManager: budgetManager,
+    registry: defaultProviderRegistry,
+  });
+  const ctx={claudeOnly,env,fetchImpl,logImpl,queryImpl,apiKey,repo,prNumber,headSha,contextRoot,plan,mode,prJson,session,riskProfile,diffName,manual,providers};
+  const shared={circuitBreaker,budgetManager,providerBudgetManagers};
 
   const fixedBytes=Buffer.byteLength(prJson,'utf8')+Buffer.byteLength(JSON.stringify(session??{}),'utf8')+Buffer.byteLength(JSON.stringify(riskProfile),'utf8');
   if(Buffer.byteLength(diff,'utf8')+fixedBytes<=SINGLE_REQUEST_MAX_BYTES){
@@ -195,7 +211,7 @@ export async function runGeminiReview({env=process.env,fetchImpl=fetch,logImpl=c
     recordParts(ctx,shared,`${missing} of ${parts.length} part(s) were not reviewed before the time limit`);
     throw new Error(`The ${mode} review ran out of time with ${missing} of ${parts.length} part(s) unreviewed; use @claude review to continue`);
   }
-  return mergeParts({ctx,parts,results});
+  return mergeParts({ctx,parts,results,shared});
 }
 
 // Persist what Claude already cost, so a failure part-way never makes spent allowance disappear.
@@ -214,7 +230,7 @@ function recordParts(ctx,shared,reason){
 // One model request for one diff: Gemini, then Claude when Gemini cannot do it. `shared` carries what an
 // earlier part learned (Gemini unavailable) and what Claude has already cost.
 async function reviewPart(ctx,diff,shared){
-  const {claudeOnly,env,fetchImpl,logImpl,queryImpl,apiKey,repo,prNumber,headSha,contextRoot,plan,mode,prJson,session,riskProfile,diffName}=ctx;
+  const {claudeOnly,env,fetchImpl,logImpl,queryImpl,apiKey,repo,prNumber,headSha,contextRoot,plan,mode,prJson,session,riskProfile,diffName,providers}=ctx;
   const contextBytes=Buffer.byteLength(diff,'utf8')+Buffer.byteLength(prJson,'utf8')+Buffer.byteLength(JSON.stringify(session??{}),'utf8')+Buffer.byteLength(JSON.stringify(riskProfile),'utf8');
   if(contextBytes>MAX_CONTEXT_BYTES) throw new Error(`Gemini review context exceeds ${MAX_CONTEXT_BYTES} bytes; use targeted human/Codex review rather than silently truncating`);
 
@@ -230,11 +246,14 @@ async function reviewPart(ctx,diff,shared){
         spentUsd:shared.budgetManager.charges.reduce((sum,c)=>sum+c.amount,0),costCharges:shared.budgetManager.charges})+'\n',{mode:0o600});
   };
 
+  const providerBudgetManagers = shared.providerBudgetManagers || {};
+
   const outcome = await executeWorkUnit({
     unit: { diff },
-    providers: claudeOnly ? ['claude'] : ['gemini', 'claude'],
+    providers: providers || (claudeOnly ? ['claude'] : ['gemini', 'claude']),
     geminiCircuitBreaker: shared.circuitBreaker,
     budgetManager: shared.budgetManager,
+    budgetManagers: providerBudgetManagers,
     defaultTimeoutMs: timeoutMs,
     throwClaudeErrors: true,
     executors: {
@@ -243,9 +262,7 @@ async function reviewPart(ctx,diff,shared){
           defaultModel: model,
           defaultEffort: thinking,
         });
-        const safeDir = env.SAFE_REPO_DIR || 'safe-target';
-        const safePath = path.resolve(safeDir);
-        const safeRoot = fs.existsSync(safePath) ? safePath : null;
+        const safeRoot = resolveSafeRoot(env);
         const toolGateway = safeRoot ? new ReadOnlyToolGateway({
           safeRoot,
           contextRoot,
@@ -344,6 +361,77 @@ async function reviewPart(ctx,diff,shared){
           },
         };
       },
+      ...Object.fromEntries(
+        (providers || [])
+          .filter((p) => p !== 'gemini' && p !== 'claude' && defaultProviderRegistry.has(p))
+          .map((p) => [
+            p,
+            async ({ unit, timeoutMs: callTimeout, maxBudgetUsd, reservation }) => {
+              const adapter = getProviderAdapter(p);
+              const desc = defaultProviderRegistry.getDescriptor(p);
+              const safeRoot = resolveSafeRoot(env);
+              const toolGateway = (safeRoot && desc?.capabilities?.tools) ? new ReadOnlyToolGateway({
+                safeRoot,
+                contextRoot,
+                cwd: process.cwd(),
+                allowedContextFiles: [diffName, 'changed-files.txt', 'diff-stat.txt', 'pr.json', 'skipped-files.txt', 'repair.diff', 'pr.diff'],
+              }) : null;
+              let res;
+              try {
+                res = await adapter.execute({
+                  prompt: built.prompt,
+                  schema: built.schema,
+                  timeoutMs: callTimeout,
+                  maxBudgetUsd,
+                  maxOutputTokens,
+                  env,
+                  fetchImpl,
+                  maxAttempts: 2,
+                  logImpl,
+                  toolGateway,
+                  allowZeroCost: true,
+                });
+              } finally {
+                const mgr = providerBudgetManagers[p];
+                if (mgr && reservation && !reservation.settled) {
+                  mgr.settleReservation(reservation, {
+                    actualCostUsd: res?.meta?.total_cost_usd,
+                    costSource: res?.meta?.cost_source ?? (res?.ok ? 'sdk' : 'reserve'),
+                    fallbackCostUsd: maxBudgetUsd,
+                  });
+                }
+              }
+              if (res.ok) {
+                if (mode === 'verification') normalizeVerificationResult(res.structured);
+                else normalizeReviewResult(res.structured);
+                return {
+                  ok: true,
+                  structured: res.structured,
+                  meta: {
+                    provider: p,
+                    requested_model: res.meta?.requested_model || 'default',
+                    resolved_model: res.meta?.resolved_model || 'default',
+                    mode,
+                    attempts: res.meta?.num_turns ?? 1,
+                    max_output_tokens: maxOutputTokens,
+                    timeout_ms: callTimeout,
+                    risk_profile: riskProfile,
+                    usage: res.meta?.usage,
+                    total_cost_usd: res.meta?.total_cost_usd,
+                    cost_source: res.meta?.cost_source,
+                  },
+                };
+              }
+              return {
+                ok: false,
+                error: res.error || res.errors || `${p} failed`,
+                kind: res.kind,
+                status: res.status,
+                meta: res.meta,
+              };
+            },
+          ])
+      ),
     },
     onClaudeBudgetBlocked: async ({ notes, lastFailed }) => {
       const reasonText = lastFailed?.status ? `HTTP ${lastFailed.status}` : (lastFailed?.message?.slice(0, 120) || (claudeOnly ? 'requested' : 'unknown'));
@@ -361,24 +449,77 @@ async function reviewPart(ctx,diff,shared){
     throw new Error(outcome.error || 'Review failed');
   }
 
+  const providerCosts = {};
+  const providerUsage = {};
+  for (const [p, mgr] of Object.entries(providerBudgetManagers)) {
+    if (p !== 'claude' && mgr) {
+      providerCosts[p] = Number(mgr.totalSpentUsd.toFixed(4));
+    }
+  }
+
+  const isClaude = outcome.meta?.provider === 'claude';
+  const isGemini = outcome.meta?.provider === 'gemini';
+  const outMeta = { ...outcome.meta };
+  if (!isClaude) {
+    delete outMeta.total_cost_usd;
+    delete outMeta.cost_source;
+  }
+  if (!isClaude && !isGemini && outcome.meta?.provider) {
+    const p = outcome.meta.provider;
+    if (outcome.meta.usage) {
+      providerUsage[p] = outcome.meta.usage;
+    }
+  }
+
   return {
     ...outcome.structured,
-    _meta: outcome.meta,
+    _meta: {
+      ...outMeta,
+      ...(Object.keys(providerCosts).length ? { provider_costs: providerCosts } : {}),
+      ...(Object.keys(providerUsage).length ? { provider_usage: providerUsage } : {}),
+    },
   };
 }
 
 // ---- Merging the parts of a large diff back into one result of the usual shape ----
 
-function mergeParts({ctx,parts,results}){
+function mergeParts({ctx,parts,results,shared}){
   const {mode,session}=ctx;
   const summary=results.map((result,index)=>`Part ${index+1}/${results.length}: ${String(result.summary??'').trim()}`).join('\n').slice(0,3900);
   const metas=results.map((result)=>result._meta);
   const claudeMetas=metas.filter((meta)=>meta?.provider==='claude');
-  const lead=claudeMetas[0]??metas[0];
-  const sumUsage=(key)=>metas.reduce((total,meta)=>total+(nonnegative(meta?.usage?.[key])??0),0);
+  const geminiMetas=metas.filter((meta)=>meta?.provider==='gemini');
+  const thirdPartyMetas=metas.filter((meta)=>meta?.provider && meta.provider !== 'claude' && meta.provider !== 'gemini');
+  const coreMetas=[...claudeMetas, ...geminiMetas];
+  const lead=claudeMetas[0] ?? geminiMetas[0] ?? metas[0];
+
+  const sumUsage=(key)=>coreMetas.reduce((total,meta)=>total+(nonnegative(meta?.usage?.[key])??0),0);
   const claudeCost=claudeMetas.reduce((total,meta)=>total+(nonnegative(meta.total_cost_usd)??0),0);
+  const partProviderCosts = {};
+  for (const [p, mgr] of Object.entries(shared?.providerBudgetManagers || {})) {
+    if (p !== 'claude' && mgr) {
+      partProviderCosts[p] = Number(mgr.totalSpentUsd.toFixed(4));
+    }
+  }
+
+  const partProviderUsage = {};
+  for (const meta of thirdPartyMetas) {
+    if (meta?.provider && meta.usage) {
+      const p = meta.provider;
+      partProviderUsage[p] = {
+        input_tokens: (partProviderUsage[p]?.input_tokens ?? 0) + (meta.usage.input_tokens ?? 0),
+        output_tokens: (partProviderUsage[p]?.output_tokens ?? 0) + (meta.usage.output_tokens ?? 0),
+        total_tokens: (partProviderUsage[p]?.total_tokens ?? 0) + (meta.usage.total_tokens ?? 0),
+      };
+    }
+  }
+
+  const baseLead = { ...lead };
+  delete baseLead.total_cost_usd;
+  delete baseLead.cost_source;
+
   const _meta={
-    ...lead,
+    ...baseLead,
     mode,
     attempts:Math.max(...metas.map((meta)=>meta?.attempts??1)),
     parts:parts.length,
@@ -389,15 +530,17 @@ function mergeParts({ctx,parts,results}){
       thoughts_tokens:sumUsage('thoughts_tokens'),
       total_tokens:sumUsage('total_tokens'),
     },
-    ...(claudeMetas.length?{
-      provider:'claude',
+    ...(claudeMetas.length ? {
+      provider: 'claude',
+      total_cost_usd: Number(claudeCost.toFixed(4)),
+      cost_source: claudeMetas.some((meta)=>meta.cost_source==='reserve')?'reserve':'sdk',
       ...(claudeMetas.some((meta)=>meta.fallback_from)?{
         fallback_from:'gemini',
         fallback_reason:`${claudeMetas.filter((meta)=>meta.fallback_from).length} of ${parts.length} part(s): ${claudeMetas.find((meta)=>meta.fallback_from).fallback_reason??'Gemini unavailable'}`,
       }:{fallback_from:undefined,fallback_reason:undefined}),
-      total_cost_usd:Number(claudeCost.toFixed(4)),
-      cost_source:claudeMetas.some((meta)=>meta.cost_source==='reserve')?'reserve':'sdk',
-    }:{}),
+    } : {}),
+    ...(Object.keys(partProviderCosts).length ? { provider_costs: partProviderCosts } : {}),
+    ...(Object.keys(partProviderUsage).length ? { provider_usage: partProviderUsage } : {}),
   };
   if(mode==='verification'){
     const merged=mergeVerifications({session,parts,results});
@@ -463,6 +606,18 @@ export function toGeminiJsonSchema(value,key=null){
     out[childKey]=toGeminiJsonSchema(childValue,childKey);
   }
   return out;
+}
+
+function resolveSafeRoot(env) {
+  const candidate = env.SAFE_REPO_DIR || 'safe-target';
+  const target = path.resolve(candidate);
+  if (!fs.existsSync(target)) return null;
+  try {
+    const resolved = fs.realpathSync.native ? fs.realpathSync.native(target) : fs.realpathSync(target);
+    return fs.statSync(resolved).isDirectory() ? resolved : null;
+  } catch {
+    return null;
+  }
 }
 
 function nonnegative(v){return typeof v==='number'&&Number.isFinite(v)&&v>=0?v:null;}

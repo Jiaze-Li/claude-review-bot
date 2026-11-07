@@ -1,3 +1,4 @@
+import { defaultProviderRegistry, parseReviewProviders } from './provider-adapter.mjs';
 import { saveSessionComment } from './session-comment.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -42,11 +43,21 @@ export async function runDeepReviewCommand(command, { env = process.env, fetchIm
     // Gemini first (it is cheaper and billed to its own key); Claude takes over what Gemini cannot
     // finish. An explicit @claude review asks for Claude only. When this PR's automatic Claude
     // allowance is spent, Gemini alone can still review; it is not charged to that ledger.
-    let providers = explicitClaude ? 'claude' : 'gemini,claude';
-    if (!manual && runBudget < CLAUDE_AUTO_MIN_BUDGET_USD) {
-      providers = 'gemini';
+    let configuredProviders = parseReviewProviders(env.REVIEW_PROVIDERS, {
+      registry: defaultProviderRegistry,
+      claudeOnly: explicitClaude,
+      defaultProviders: ['gemini', 'claude'],
+    });
+    if (!configuredProviders.includes('claude')) {
+      runBudget = 0;
+    } else if (!manual && runBudget < CLAUDE_AUTO_MIN_BUDGET_USD) {
+      configuredProviders = configuredProviders.filter((p) => p !== 'claude');
+      if (!configuredProviders.length) {
+        throw new Error('Claude automatic budget is exhausted and no eligible provider remains; human judgment required');
+      }
       runBudget = 0;
     }
+    const providers = configuredProviders.join(',');
     const session = beginDeepReview({
       session: ctx.plan.session, baseSha: ctx.baseSha, headSha: ctx.headSha, runId: env.GITHUB_RUN_ID,
       reserveUsd: runBudget, now,

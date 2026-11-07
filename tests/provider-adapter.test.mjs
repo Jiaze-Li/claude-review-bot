@@ -4,6 +4,13 @@ import {
   getProviderAdapter,
   GeminiProviderAdapter,
   ClaudeProviderAdapter,
+  ProviderAdapter,
+  ProviderRegistry,
+  defaultProviderRegistry,
+  registerProvider,
+  getProviderDescriptor,
+  listProviders,
+  parseReviewProviders,
   PROVIDER_KINDS,
   OUTCOME_KINDS,
   ERROR_KINDS,
@@ -574,4 +581,145 @@ test('Claude adapter allows only Host Gateway MCP tools, never built-in tool ali
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
+
+test('ProviderRegistry manages registrations, capabilities, and operational policies', () => {
+  const registry = new ProviderRegistry();
+  assert.deepEqual(registry.list(), []);
+
+  class DummyAdapter extends ProviderAdapter {
+    constructor(opts) {
+      super({ provider: 'dummy', descriptor: opts.descriptor });
+    }
+    async execute() {
+      return { ok: true };
+    }
+  }
+
+  registry.register('dummy', DummyAdapter, {
+    description: 'Dummy test adapter',
+    capabilities: {
+      tools: true,
+      structuredOutput: true,
+      multiturnTools: false,
+    },
+    policy: {
+      budgetType: 'usd-ledger',
+      defaultTimeoutMs: 60000,
+      credentialsRequired: ['DUMMY_API_KEY'],
+    },
+  });
+
+  assert.equal(registry.has('dummy'), true);
+  assert.equal(registry.has('nonexistent'), false);
+  assert.deepEqual(registry.list(), ['dummy']);
+
+  const descriptor = registry.getDescriptor('dummy');
+  assert.equal(descriptor.name, 'dummy');
+  assert.equal(descriptor.description, 'Dummy test adapter');
+  assert.ok(Object.isFrozen(descriptor.capabilities));
+  assert.ok(Object.isFrozen(descriptor.policy));
+  assert.ok(Object.isFrozen(descriptor.policy.credentialsRequired));
+  assert.ok(Object.isFrozen(descriptor.policy.circuitBreaker));
+  assert.equal(descriptor.capabilities.tools, true);
+  assert.equal(descriptor.capabilities.structuredOutput, true);
+  assert.equal(descriptor.capabilities.multiturnTools, false);
+  assert.equal(descriptor.capabilities.hostSecurity, 'host-enforced');
+  assert.equal(descriptor.policy.budgetType, 'usd-ledger');
+  assert.equal(descriptor.policy.defaultTimeoutMs, 60000);
+  assert.deepEqual(descriptor.policy.credentialsRequired, ['DUMMY_API_KEY']);
+  assert.equal(descriptor.policy.circuitBreaker.maxFailures, 3);
+
+  const adapter = registry.createAdapter('dummy');
+  assert.ok(adapter instanceof DummyAdapter);
+  assert.equal(adapter.provider, 'dummy');
+  assert.equal(adapter.capabilities.tools, true);
+  assert.equal(adapter.policy.budgetType, 'usd-ledger');
+
+  // Factory function registration
+  registry.register('factory-dummy', (opts) => ({ provider: 'factory-dummy', opts }));
+  const factoryAdapter = registry.createAdapter('factory-dummy', { custom: 123 });
+  assert.equal(factoryAdapter.provider, 'factory-dummy');
+  assert.equal(factoryAdapter.opts.custom, 123);
+
+  // Class constructor exceptions propagate directly and are not swallowed
+  class FailingAdapter extends ProviderAdapter {
+    constructor() {
+      super({ provider: 'failing' });
+      throw new Error('Explicit constructor failure');
+    }
+  }
+  registry.register('failing', FailingAdapter);
+  assert.throws(() => registry.createAdapter('failing'), /^Error: Explicit constructor failure$/);
+
+  // Unknown provider throws
+  assert.throws(() => registry.createAdapter('unknown'), /Unknown provider: unknown/);
+
+  // Unregister
+  assert.equal(registry.unregister('dummy'), true);
+  assert.equal(registry.has('dummy'), false);
+  assert.equal(registry.unregister('dummy'), false);
+});
+
+test('defaultProviderRegistry includes Gemini and Claude with capability and policy declarations', () => {
+  assert.equal(defaultProviderRegistry.has('gemini'), true);
+  assert.equal(defaultProviderRegistry.has('claude'), true);
+  assert.deepEqual(listProviders(), ['gemini', 'claude']);
+
+  const geminiDesc = getProviderDescriptor('gemini');
+  assert.equal(geminiDesc.name, 'gemini');
+  assert.equal(geminiDesc.capabilities.tools, true);
+  assert.equal(geminiDesc.capabilities.structuredOutput, true);
+  assert.equal(geminiDesc.capabilities.multiturnTools, true);
+  assert.equal(geminiDesc.capabilities.hostSecurity, 'host-enforced');
+  assert.equal(geminiDesc.policy.budgetType, 'prepaid-credits');
+  assert.deepEqual(geminiDesc.policy.credentialsRequired, ['GEMINI_API_KEY']);
+
+  const claudeDesc = getProviderDescriptor('claude');
+  assert.equal(claudeDesc.name, 'claude');
+  assert.equal(claudeDesc.capabilities.tools, true);
+  assert.equal(claudeDesc.capabilities.structuredOutput, true);
+  assert.equal(claudeDesc.capabilities.multiturnTools, true);
+  assert.equal(claudeDesc.capabilities.hostSecurity, 'host-enforced');
+  assert.equal(claudeDesc.policy.budgetType, 'usd-ledger');
+  assert.deepEqual(claudeDesc.policy.credentialsRequired, ['CLAUDE_CODE_OAUTH_TOKEN']);
+
+  const geminiAdapter = getProviderAdapter('gemini');
+  assert.ok(geminiAdapter instanceof GeminiProviderAdapter);
+  assert.equal(geminiAdapter.capabilities.hostSecurity, 'host-enforced');
+  assert.equal(geminiAdapter.policy.budgetType, 'prepaid-credits');
+
+  const claudeAdapter = getProviderAdapter('claude');
+  assert.ok(claudeAdapter instanceof ClaudeProviderAdapter);
+  assert.equal(claudeAdapter.capabilities.hostSecurity, 'host-enforced');
+  assert.equal(claudeAdapter.policy.budgetType, 'usd-ledger');
+});
+
+test('parseReviewProviders: validates unknown providers, deduplicates repeated names, and enforces claudeOnly', () => {
+  // 1. Unknown provider throws explicit error
+  assert.throws(
+    () => parseReviewProviders('gemini,unknown-provider'),
+    /Unknown review provider "unknown-provider"/
+  );
+  assert.throws(
+    () => parseReviewProviders('invalid'),
+    /Unknown review provider "invalid"/
+  );
+
+  // 2. Repeated providers are deduplicated preserving order
+  assert.deepEqual(parseReviewProviders('gemini,gemini'), ['gemini']);
+  assert.deepEqual(parseReviewProviders('claude,gemini,claude'), ['claude', 'gemini']);
+  assert.deepEqual(parseReviewProviders('gemini,claude,gemini'), ['gemini', 'claude']);
+
+  // 3. Explicit @claude review (claudeOnly: true) strictly returns ['claude']
+  assert.deepEqual(parseReviewProviders('gemini,claude', { claudeOnly: true }), ['claude']);
+  assert.deepEqual(parseReviewProviders('', { claudeOnly: true }), ['claude']);
+  assert.deepEqual(parseReviewProviders('unknown', { claudeOnly: true }), ['claude']);
+
+  // 4. Default fallbacks when empty/omitted
+  assert.deepEqual(parseReviewProviders('', { defaultProviders: ['gemini', 'claude'] }), ['gemini', 'claude']);
+  assert.deepEqual(parseReviewProviders(null, { defaultProviders: ['claude'] }), ['claude']);
+  assert.deepEqual(parseReviewProviders('   ', { defaultProviders: ['claude'] }), ['claude']);
+});
+
+
 
