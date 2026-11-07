@@ -344,7 +344,23 @@ export async function executeWorkUnit({
     const providerBudgetMgr = budgetManagers[provider]
       ?? (usesLedger ? budgetManager : null);
     let reservation = null;
-    if (providerBudgetMgr) {
+    if (usesLedger) {
+      if (!providerBudgetMgr) {
+        notes.push(`${provider}: budget configuration required for usd-ledger provider but none was provided`);
+        continue;
+      }
+      reservation = await providerBudgetMgr.acquireReservation({ deadlineTracker });
+      if (!reservation) {
+        if (typeof resolvedOnBudgetBlocked[provider] === 'function') {
+          await resolvedOnBudgetBlocked[provider]({
+            notes,
+            lastFailed: lastFailure,
+          });
+        }
+        notes.push(`${provider}: budget for this review is exhausted`);
+        continue;
+      }
+    } else if (providerBudgetMgr) {
       reservation = await providerBudgetMgr.acquireReservation({ deadlineTracker });
       if (!reservation) {
         if (typeof resolvedOnBudgetBlocked[provider] === 'function') {

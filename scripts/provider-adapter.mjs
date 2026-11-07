@@ -1442,7 +1442,7 @@ defaultProviderRegistry.register(PROVIDER_KINDS.CLAUDE, ClaudeProviderAdapter, {
   policy: {
     budgetType: 'usd-ledger',
     defaultTimeoutMs: 180_000,
-    credentialsRequired: ['ANTHROPIC_API_KEY'],
+    credentialsRequired: ['CLAUDE_CODE_OAUTH_TOKEN'],
     circuitBreaker: { maxFailures: 3 },
     requiresStructuredOutput: true,
   },

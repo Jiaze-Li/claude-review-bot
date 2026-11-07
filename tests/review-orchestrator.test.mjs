@@ -264,6 +264,7 @@ test('Golden Test D: Two Gemini failures trigger existing cutoff', async () => {
     unit: { diff: 'diff' },
     providers: ['gemini', 'claude'],
     geminiCircuitBreaker: circuitBreaker,
+    budgetManager: new BudgetManager({ minStartingAllowanceUsd: 1.0, getAvailableBudget: () => 5.0, perCallCap: 1.0 }),
     executors: {
       gemini: async () => {
         geminiCalls += 1;
@@ -448,6 +449,7 @@ test('Golden Test K: Budget or deadline exhaustion fails closed via runGeminiRev
   await executeWorkUnit({
     unit: { diff: 'diff' },
     providers: ['claude'],
+    budgetManager: new BudgetManager({ minStartingAllowanceUsd: 1.0, getAvailableBudget: () => 5.0, perCallCap: 1.0 }),
     deadlineTracker: longTracker,
     executors: {
       claude: async ({ timeoutMs }) => {
@@ -643,4 +645,24 @@ test('Generic provider cascade: executeWorkUnit executes arbitrary providers and
   assert.equal(executed[1].hasReservation, true);
   assert.equal(executed[1].maxBudgetUsd, 2.0);
 });
+
+test('Explicit budget enforcement: usd-ledger provider without budget configuration fails closed', async () => {
+  let invoked = false;
+  const outcome = await executeWorkUnit({
+    unit: { diff: 'diff' },
+    providers: ['claude'],
+    // Note: no budgetManager or budgetManagers provided!
+    executors: {
+      claude: async () => {
+        invoked = true;
+        return { ok: true, structured: { summary: 'Should not run', findings: [] } };
+      },
+    },
+  });
+
+  assert.equal(invoked, false, 'usd-ledger provider must not be invoked without budget configuration');
+  assert.equal(outcome.ok, false);
+  assert.match(outcome.error, /budget configuration required for usd-ledger provider/);
+});
+
 

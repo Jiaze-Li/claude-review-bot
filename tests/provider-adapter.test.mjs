@@ -680,7 +680,7 @@ test('defaultProviderRegistry includes Gemini and Claude with capability and pol
   assert.equal(claudeDesc.capabilities.multiturnTools, true);
   assert.equal(claudeDesc.capabilities.hostSecurity, 'host-enforced');
   assert.equal(claudeDesc.policy.budgetType, 'usd-ledger');
-  assert.deepEqual(claudeDesc.policy.credentialsRequired, ['ANTHROPIC_API_KEY']);
+  assert.deepEqual(claudeDesc.policy.credentialsRequired, ['CLAUDE_CODE_OAUTH_TOKEN']);
 
   const geminiAdapter = getProviderAdapter('gemini');
   assert.ok(geminiAdapter instanceof GeminiProviderAdapter);
