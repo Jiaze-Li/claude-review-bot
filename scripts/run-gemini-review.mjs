@@ -360,8 +360,9 @@ async function reviewPart(ctx,diff,shared){
             p,
             async ({ unit, timeoutMs: callTimeout, maxBudgetUsd }) => {
               const adapter = getProviderAdapter(p);
+              const desc = defaultProviderRegistry.getDescriptor(p);
               const safeRoot = resolveSafeRoot(env);
-              const toolGateway = safeRoot ? new ReadOnlyToolGateway({
+              const toolGateway = (safeRoot && desc?.capabilities?.tools) ? new ReadOnlyToolGateway({
                 safeRoot,
                 contextRoot,
                 cwd: process.cwd(),
@@ -534,22 +535,8 @@ export function toGeminiJsonSchema(value,key=null){
 
 function resolveSafeRoot(env) {
   const candidate = env.SAFE_REPO_DIR || 'safe-target';
-  const basePath = env.GITHUB_WORKSPACE || process.cwd();
-  const target = path.isAbsolute(candidate) ? candidate : path.resolve(basePath, candidate);
-  if (!fs.existsSync(target)) {
-    if (candidate !== 'safe-target') {
-      const fallback = path.resolve(basePath, 'safe-target');
-      if (fs.existsSync(fallback)) {
-        try {
-          const resolved = fs.realpathSync.native ? fs.realpathSync.native(fallback) : fs.realpathSync(fallback);
-          return fs.statSync(resolved).isDirectory() ? resolved : null;
-        } catch {
-          return null;
-        }
-      }
-    }
-    return null;
-  }
+  const target = path.resolve(candidate);
+  if (!fs.existsSync(target)) return null;
   try {
     const resolved = fs.realpathSync.native ? fs.realpathSync.native(target) : fs.realpathSync(target);
     return fs.statSync(resolved).isDirectory() ? resolved : null;

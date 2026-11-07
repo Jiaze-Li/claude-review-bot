@@ -299,7 +299,7 @@ async function reviewUnit(index, unit, providers, suffix = '', retries = 2) {
       }
       executors[p] = async ({ unit: curUnit, timeoutMs: callTimeout, maxBudgetUsd }) => {
         const shardContextPath = path.relative(contextRoot, path.resolve(cwd, diffPath)).replace(/\\/g, '/');
-        const toolGateway = safeRoot ? new ReadOnlyToolGateway({
+        const toolGateway = (safeRoot && desc?.capabilities?.tools) ? new ReadOnlyToolGateway({
           safeRoot,
           contextRoot,
           cwd,
@@ -307,15 +307,17 @@ async function reviewUnit(index, unit, providers, suffix = '', retries = 2) {
           maxCalls: SHARD_MAX_TURNS * 4,
           allowedContextFiles: [shardContextPath, 'changed-files.txt', 'diff-stat.txt', 'pr.json', 'skipped-files.txt'],
         }) : null;
-        const inlineDiff = toolGateway
-          ? (curUnit.bytes <= GEMINI_SHARD_MAX_BYTES ? curUnit.diff : null)
-          : curUnit.diff;
+        const providerHasTools = Boolean(toolGateway);
+        if (!providerHasTools && curUnit.bytes > GEMINI_SHARD_MAX_BYTES) {
+          return { ok: false, kind: 'skipped', error: `shard too large for ${p} without tools` };
+        }
+        const inlineDiff = curUnit.bytes <= GEMINI_SHARD_MAX_BYTES ? curUnit.diff : null;
         const prompt = buildPrompt({
           ...common,
           maxTurns: SHARD_MAX_TURNS,
           budgetUsd: maxBudgetUsd,
           inlineDiff,
-          hasTools: Boolean(toolGateway),
+          hasTools: providerHasTools,
         });
         const adapter = getProviderAdapter(p);
         const outcome = await adapter.execute({
@@ -638,22 +640,8 @@ function realDir(value) {
 
 function optionalRealDir(value) {
   if (!value) return null;
-  const basePath = process.env.GITHUB_WORKSPACE || process.cwd();
-  const target = path.isAbsolute(value) ? value : path.resolve(basePath, value);
-  if (!fs.existsSync(target)) {
-    if (value !== 'safe-target') {
-      const fallback = path.resolve(basePath, 'safe-target');
-      if (fs.existsSync(fallback)) {
-        try {
-          const resolved = fs.realpathSync.native(fallback);
-          return fs.statSync(resolved).isDirectory() ? resolved : null;
-        } catch {
-          return null;
-        }
-      }
-    }
-    return null;
-  }
+  const target = path.resolve(value);
+  if (!fs.existsSync(target)) return null;
   try {
     const resolved = fs.realpathSync.native(target);
     return fs.statSync(resolved).isDirectory() ? resolved : null;
