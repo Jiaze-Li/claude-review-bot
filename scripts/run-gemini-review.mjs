@@ -235,6 +235,7 @@ async function reviewPart(ctx,diff,shared){
     providers: claudeOnly ? ['claude'] : ['gemini', 'claude'],
     geminiCircuitBreaker: shared.circuitBreaker,
     budgetManager: shared.budgetManager,
+    defaultTimeoutMs: timeoutMs,
     throwClaudeErrors: true,
     executors: {
       gemini: async ({ unit, timeoutMs: callTimeout }) => {
@@ -256,7 +257,7 @@ async function reviewPart(ctx,diff,shared){
           schema: built.schema,
           model,
           effort: thinking,
-          timeoutMs: callTimeout || timeoutMs,
+          timeoutMs: callTimeout,
           maxOutputTokens,
           env,
           fetchImpl,
@@ -312,7 +313,7 @@ async function reviewPart(ctx,diff,shared){
           fallback = await runClaudeStructured({
             prompt: built.prompt,
             schema: built.schema,
-            timeoutMs: callTimeout || timeoutMs,
+            timeoutMs: callTimeout,
             maxBudgetUsd,
             env,
             logImpl,

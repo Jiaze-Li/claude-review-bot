@@ -264,6 +264,7 @@ export async function executeWorkUnit({
   geminiCircuitBreaker = null,
   budgetManager = null,
   deadlineTracker = null,
+  defaultTimeoutMs = 180_000,
   executors = {},
   canExecute = {},
   onPartialCoverage = null,
@@ -289,7 +290,7 @@ export async function executeWorkUnit({
         notes.push('gemini: executor not configured');
         continue;
       }
-      const timeoutMs = deadlineTracker ? deadlineTracker.timeoutForCall(30_000) : 180_000;
+      const timeoutMs = deadlineTracker ? deadlineTracker.timeoutForCall(30_000, defaultTimeoutMs) : defaultTimeoutMs;
       let rawOutcome;
       try {
         rawOutcome = await executors.gemini({ unit, timeoutMs });
@@ -370,7 +371,7 @@ export async function executeWorkUnit({
         }
       }
 
-      const timeoutMs = deadlineTracker ? deadlineTracker.timeoutForCall(30_000) : 180_000;
+      const timeoutMs = deadlineTracker ? deadlineTracker.timeoutForCall(30_000, defaultTimeoutMs) : defaultTimeoutMs;
       const budgetUsd = reservation?.cap ?? null;
       let rawOutcome;
       try {
