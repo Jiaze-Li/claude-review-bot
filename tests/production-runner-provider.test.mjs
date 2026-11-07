@@ -597,3 +597,25 @@ test('Production Runner Integration: runGeminiReview shares third-party BudgetMa
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+test('GitHub Actions workflow propagation: review-v2.yml propagates REVIEW_PROVIDERS to production runners', () => {
+  const ymlPath = path.resolve('.github/workflows/review-v2.yml');
+  const yml = fs.readFileSync(ymlPath, 'utf8');
+
+  // Verify inputs defined
+  assert.match(yml, /workflow_dispatch:[\s\S]*?review_providers:\s*\n\s*description:/);
+  assert.match(yml, /workflow_call:[\s\S]*?review_providers:\s*\n\s*required: false/);
+
+  // Verify job level environment propagation
+  assert.match(yml, /jobs:\s*\n\s*review:\s*\n\s*runs-on: ubuntu-latest\s*\n\s*env:\s*\n\s*REVIEW_PROVIDERS:/);
+
+  // Verify step level propagation to begin-deep and gemini-run
+  const beginDeepBlock = yml.slice(yml.indexOf('- name: Begin Claude deep review'), yml.indexOf('- name: Recover published session'));
+  assert.match(beginDeepBlock, /REVIEW_PROVIDERS: \$\{\{ inputs\.review_providers \|\| vars\.REVIEW_PROVIDERS \|\| '' \}\}/);
+
+  const geminiRunBlock = yml.slice(yml.indexOf('- name: Run Gemini bounded review'), yml.indexOf('- name: Record provider-unavailable delta review'));
+  assert.match(geminiRunBlock, /REVIEW_PROVIDERS: \$\{\{ inputs\.review_providers \|\| vars\.REVIEW_PROVIDERS \|\| '' \}\}/);
+
+  const claudeRunBlock = yml.slice(yml.indexOf('- name: Run Claude explicit deep review'), yml.indexOf('- name: Publish Claude explicit deep review'));
+  assert.match(claudeRunBlock, /REVIEW_PROVIDERS: \$\{\{ steps\.begin-deep\.outputs\.providers \}\}/);
+});
