@@ -441,7 +441,23 @@ test('Golden Test K: Budget or deadline exhaustion fails closed via runGeminiRev
   fakeNow = 1600; // Past deadline
   assert.equal(tracker.isNearExpiry(0), true);
 
-  // 2. Budget exhaustion fails closed
+  // 2. executeWorkUnit without defaultTimeoutMs preserves available deadline tracker time (not capped to 180s)
+  let receivedTimeout = null;
+  const longTracker = new DeadlineTracker({ totalMs: 1_000_000, nowFn: () => 0 });
+  await executeWorkUnit({
+    unit: { diff: 'diff' },
+    providers: ['claude'],
+    deadlineTracker: longTracker,
+    executors: {
+      claude: async ({ timeoutMs }) => {
+        receivedTimeout = timeoutMs;
+        return { ok: true, structured: { summary: 'ok', findings: [] } };
+      },
+    },
+  });
+  assert.equal(receivedTimeout, 970_000); // 1_000_000 - 30_000, not clamped to 180_000
+
+  // 3. Budget exhaustion fails closed
   const exhaustedSession = {
     version: 1,
     baseSha: BASE_SHA,

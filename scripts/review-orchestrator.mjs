@@ -38,8 +38,8 @@ export class DeadlineTracker {
 }
 
 export class CircuitBreaker {
-  constructor({ maxConsecutiveFailures = 2, maxFailures = 2, initialReason = null, initialStatus = 0 } = {}) {
-    this.maxFailures = maxFailures ?? maxConsecutiveFailures;
+  constructor({ maxConsecutiveFailures, maxFailures = 2, initialReason = null, initialStatus = 0 } = {}) {
+    this.maxFailures = maxConsecutiveFailures ?? maxFailures;
     this.maxConsecutiveFailures = this.maxFailures;
     this.offReason = initialReason;
     this.offStatus = initialStatus;
@@ -266,7 +266,7 @@ export async function executeWorkUnit({
   geminiCircuitBreaker = null,
   budgetManager = null,
   deadlineTracker = null,
-  defaultTimeoutMs = 180_000,
+  defaultTimeoutMs = null,
   executors = {},
   canExecute = {},
   onPartialCoverage = null,
@@ -292,7 +292,9 @@ export async function executeWorkUnit({
         notes.push('gemini: executor not configured');
         continue;
       }
-      const timeoutMs = deadlineTracker ? deadlineTracker.timeoutForCall(30_000, defaultTimeoutMs) : defaultTimeoutMs;
+      const timeoutMs = deadlineTracker
+        ? deadlineTracker.timeoutForCall(30_000, defaultTimeoutMs)
+        : (defaultTimeoutMs ?? 180_000);
       let rawOutcome;
       try {
         rawOutcome = await executors.gemini({ unit, timeoutMs });
@@ -374,7 +376,9 @@ export async function executeWorkUnit({
         }
       }
 
-      const timeoutMs = deadlineTracker ? deadlineTracker.timeoutForCall(30_000, defaultTimeoutMs) : defaultTimeoutMs;
+      const timeoutMs = deadlineTracker
+        ? deadlineTracker.timeoutForCall(30_000, defaultTimeoutMs)
+        : (defaultTimeoutMs ?? 180_000);
       const budgetUsd = reservation?.cap ?? null;
       let rawOutcome;
       try {
