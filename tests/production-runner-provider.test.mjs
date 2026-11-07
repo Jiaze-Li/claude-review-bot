@@ -208,7 +208,7 @@ test('Production Runner Integration: run-review.mjs entrypoint completes with re
     const doc = JSON.parse(fs.readFileSync(outJsonPath, 'utf8'));
 
     assert.equal(doc._meta.providers['mock-runner-provider'], 1);
-    assert.equal(doc._meta.total_cost_usd, undefined);
+    assert.equal(doc._meta.total_cost_usd, 0);
     assert.equal(doc._meta.provider_costs['mock-runner-provider'], 0.04);
     assert.ok(doc._meta.provider_usage['mock-runner-provider']);
     assert.equal(doc.coverage.complete, true);

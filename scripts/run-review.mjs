@@ -548,7 +548,7 @@ function aggregateMeta(list) {
   const usage = { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 };
   for (const meta of list) for (const key of Object.keys(usage)) usage[key] += meta?.usage?.[key] ?? 0;
   const lead = claudeList[0] ?? list[0];
-  const out = {
+  return {
     requested_model: lead?.requested_model ?? REVIEW_MODEL,
     resolved_model: lead?.resolved_model ?? null,
     effort: lead?.effort ?? REVIEW_EFFORT,
@@ -556,13 +556,10 @@ function aggregateMeta(list) {
     num_turns: sum('num_turns'),
     duration_ms: sum('duration_ms'),
     duration_api_ms: sum('duration_api_ms'),
+    total_cost_usd: Number(sumClaude('total_cost_usd').toFixed(4)),
     usage,
     model_usage: {},
   };
-  if (claudeList.length > 0) {
-    out.total_cost_usd = Number(sumClaude('total_cost_usd').toFixed(4));
-  }
-  return out;
 }
 
 function readSession(contextRoot) {
