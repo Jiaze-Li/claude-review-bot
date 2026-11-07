@@ -146,8 +146,7 @@ export async function runGeminiReview({env=process.env,fetchImpl=fetch,logImpl=c
     defaultProviders: claudeOnly ? ['claude'] : ['gemini', 'claude'],
   });
 
-  const needsGemini=providers.includes('gemini');
-  const apiKey=needsGemini?(env.GEMINI_API_KEY?required(env,'GEMINI_API_KEY'):required(env,'GEMINI_API_KEY')):(env.GEMINI_API_KEY||'');
+  const apiKey = env.GEMINI_API_KEY || '';
   const mode=plan.decision?.mode;
   const diffName=['verification','incremental'].includes(mode)?'repair.diff':'pr.diff';
   // Same files skipped as in the sharded engine (binary/asset files and the repository's .reviewbotignore, read
@@ -162,7 +161,9 @@ export async function runGeminiReview({env=process.env,fetchImpl=fetch,logImpl=c
     ? JSON.parse(fs.readFileSync(riskPath,'utf8'))
     : {version:1,stateIntegrity:false,signals:{synchronization:[],durableState:[],multiActor:[]}};
   const manual=isManualBudgetExemptReview({sourceKind:env.SOURCE_KIND,requestedMode:plan.requestedMode});
-  const circuitBreaker = new CircuitBreaker();
+  const circuitBreaker = new CircuitBreaker({
+    initialReason: !providers.includes('gemini') ? 'not requested' : (apiKey ? null : 'GEMINI_API_KEY is not configured'),
+  });
   const budgetManager = new BudgetManager({
     minStartingAllowanceUsd: CLAUDE_AUTO_MIN_BUDGET_USD,
     getAvailableBudget: (pendingUsd) => {

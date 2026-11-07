@@ -598,6 +598,90 @@ test('Production Runner Integration: runGeminiReview shares third-party BudgetMa
   }
 });
 
+test('Missing Gemini key handling: runGeminiReview falls back to Claude when GEMINI_API_KEY is missing', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gemini-missing-key-'));
+  const ctxDir = path.join(tmpDir, '.review-context');
+  fs.mkdirSync(ctxDir, { recursive: true });
+
+  const sessionPlan = {
+    decision: { mode: 'incremental' },
+    requestedMode: 'auto',
+    session: {
+      version: 1,
+      threadId: 'test-thread',
+      status: 'OPEN',
+      findings: [],
+    },
+  };
+  fs.writeFileSync(path.join(ctxDir, 'session-plan.json'), JSON.stringify(sessionPlan));
+  fs.writeFileSync(path.join(ctxDir, 'pr.json'), JSON.stringify({ number: 10, title: 'Test PR', base: { ref: 'main' } }));
+  fs.writeFileSync(path.join(ctxDir, 'repair.diff'), 'diff --git a/a.swift b/a.swift\n--- a/a.swift\n+++ b/a.swift\n@@ -1 +1 @@\n+test change\n');
+  fs.writeFileSync(path.join(ctxDir, 'risk-profile.json'), JSON.stringify({ version: 1, stateIntegrity: false, signals: { synchronization: [], durableState: [], multiActor: [] } }));
+
+  try {
+    let geminiCalled = false;
+    const fetchImpl = async () => {
+      geminiCalled = true;
+      throw new Error('Gemini fetch should not be called when GEMINI_API_KEY is missing');
+    };
+
+    const claudeCalls = [];
+    const queryImpl = async function* (args) {
+      claudeCalls.push(args);
+      yield { type: 'system', subtype: 'init', model: 'claude-sonnet-x' };
+      yield {
+        type: 'result',
+        subtype: 'success',
+        structured_output: { summary: 'fallback to claude on missing key', findings: [] },
+        usage: { input_tokens: 10, output_tokens: 20 },
+        total_cost_usd: 0.05,
+      };
+    };
+
+    const env = {
+      TARGET_REPO: 'test/repo',
+      PR_NUMBER: '10',
+      HEAD_SHA: 'a'.repeat(40),
+      REVIEW_CONTEXT_DIR: ctxDir,
+      CLAUDE_CODE_OAUTH_TOKEN: 'test-oauth-token',
+      GH_TOKEN: 'test-gh-token',
+      // GEMINI_API_KEY is omitted
+    };
+
+    const logs = [];
+    const result = await runGeminiReview({
+      env,
+      fetchImpl,
+      queryImpl,
+      logImpl: (msg) => logs.push(msg),
+    });
+
+    assert.equal(geminiCalled, false, 'Gemini fetch must not be invoked');
+    assert.equal(claudeCalls.length, 1, 'Claude must be invoked as fallback');
+    assert.ok(result);
+    assert.equal(result._meta.provider, 'claude');
+    assert.equal(result._meta.fallback_from, 'gemini');
+    assert.equal(result._meta.fallback_reason, 'GEMINI_API_KEY is not configured');
+    assert.equal(result.summary, 'fallback to claude on missing key');
+
+    // Also test: when only Gemini is configured and GEMINI_API_KEY is missing, fails closed with CONFIG/UNAVAILABLE
+    await assert.rejects(
+      runGeminiReview({
+        env: {
+          ...env,
+          REVIEW_PROVIDERS: 'gemini',
+        },
+        fetchImpl,
+        queryImpl,
+        logImpl: () => {},
+      }),
+      /GEMINI_API_KEY is not configured/
+    );
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
 test('GitHub Actions workflow propagation: review-v2.yml propagates REVIEW_PROVIDERS to production runners', () => {
   const ymlPath = path.resolve('.github/workflows/review-v2.yml');
   const yml = fs.readFileSync(ymlPath, 'utf8');
