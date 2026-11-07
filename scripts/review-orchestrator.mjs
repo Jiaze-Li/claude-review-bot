@@ -324,6 +324,25 @@ export async function executeWorkUnit({
         });
       }
 
+      const resolvedTotalCost = Number.isFinite(rawOutcome?.totalCostUsd)
+        ? rawOutcome.totalCostUsd
+        : (Number.isFinite(rawOutcome?.meta?.total_cost_usd)
+          ? rawOutcome.meta.total_cost_usd
+          : (reservation ? reservation.amount : null));
+
+      const resolvedCostSource = rawOutcome?.costSource
+        || rawOutcome?.meta?.cost_source
+        || (reservation ? reservation.source : (Number.isFinite(resolvedTotalCost) ? 'sdk' : null));
+
+      if (rawOutcome?.meta) {
+        if (!Number.isFinite(rawOutcome.meta.total_cost_usd) && Number.isFinite(resolvedTotalCost)) {
+          rawOutcome.meta.total_cost_usd = resolvedTotalCost;
+        }
+        if (!rawOutcome.meta.cost_source && resolvedCostSource) {
+          rawOutcome.meta.cost_source = resolvedCostSource;
+        }
+      }
+
       if (rawOutcome.ok && rawOutcome.structured) {
         const normalized = normalizeProviderOutcome({
           ok: true,
@@ -331,8 +350,8 @@ export async function executeWorkUnit({
           structured: rawOutcome.structured,
           meta: rawOutcome.meta,
           usage: rawOutcome.usage || rawOutcome.meta?.usage,
-          totalCostUsd: rawOutcome.totalCostUsd ?? rawOutcome.meta?.total_cost_usd ?? null,
-          costSource: rawOutcome.costSource ?? rawOutcome.meta?.cost_source ?? null,
+          totalCostUsd: resolvedTotalCost,
+          costSource: resolvedCostSource,
           duration: rawOutcome.duration || rawOutcome.meta?.duration_ms || 0,
           coverage: rawOutcome.structured?.coverage,
           facts: rawOutcome.facts || null,
