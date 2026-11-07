@@ -284,9 +284,30 @@ export async function executeWorkUnit({
   providerRegistry = defaultProviderRegistry,
 } = {}) {
   const notes = [];
-  let lastFailure = geminiCircuitBreaker?.isOff
-    ? { status: geminiCircuitBreaker.status, message: geminiCircuitBreaker.reason }
-    : null;
+  const resolvedCircuitBreakers = {
+    ...circuitBreakers,
+    ...(geminiCircuitBreaker ? { gemini: geminiCircuitBreaker } : {}),
+  };
+  const resolvedOnBudgetBlocked = {
+    ...onBudgetBlocked,
+    ...(typeof onClaudeBudgetBlocked === 'function' ? { claude: onClaudeBudgetBlocked } : {}),
+  };
+  const resolvedOnError = {
+    ...onError,
+    ...(typeof onClaudeError === 'function' ? { claude: onClaudeError } : {}),
+  };
+  const resolvedThrowErrors = typeof throwErrors === 'object' && throwErrors !== null
+    ? { ...throwErrors, ...(throwClaudeErrors ? { claude: true } : {}) }
+    : Boolean(throwErrors || throwClaudeErrors);
+
+  let lastFailure = null;
+  for (const p of providers) {
+    const b = resolvedCircuitBreakers[p];
+    if (b?.isOff) {
+      lastFailure = { status: b.status, message: b.reason };
+      break;
+    }
+  }
   let lastOutcome = null;
 
   for (let position = 0; position < providers.length; position += 1) {
@@ -296,8 +317,7 @@ export async function executeWorkUnit({
     const capabilities = descriptor?.capabilities || {};
 
     // 1. Circuit breaker check
-    const breaker = circuitBreakers[provider]
-      || (provider === 'gemini' ? geminiCircuitBreaker : null);
+    const breaker = resolvedCircuitBreakers[provider] ?? null;
     if (breaker?.isOff) {
       notes.push(`${provider}: ${breaker.reason}`);
       continue;
@@ -320,24 +340,20 @@ export async function executeWorkUnit({
     }
 
     // 4. Budget manager & reservation check
+    const usesLedger = policy.budgetType === 'usd-ledger';
     const providerBudgetMgr = budgetManagers[provider]
-      || (policy.budgetType === 'usd-ledger' ? budgetManager : (provider === 'claude' ? budgetManager : null));
+      ?? (usesLedger ? budgetManager : null);
     let reservation = null;
     if (providerBudgetMgr) {
       reservation = await providerBudgetMgr.acquireReservation({ deadlineTracker });
       if (!reservation) {
-        if (provider === 'claude' && typeof onClaudeBudgetBlocked === 'function') {
-          await onClaudeBudgetBlocked({
-            notes,
-            lastFailed: lastFailure,
-          });
-        } else if (typeof onBudgetBlocked?.[provider] === 'function') {
-          await onBudgetBlocked[provider]({
+        if (typeof resolvedOnBudgetBlocked[provider] === 'function') {
+          await resolvedOnBudgetBlocked[provider]({
             notes,
             lastFailed: lastFailure,
           });
         }
-        notes.push(`${provider}: ${provider === 'claude' ? 'Claude' : provider} budget for this review is exhausted`);
+        notes.push(`${provider}: budget for this review is exhausted`);
         continue;
       }
     }
@@ -366,14 +382,10 @@ export async function executeWorkUnit({
       if (providerBudgetMgr && reservation && !reservation.settled) {
         providerBudgetMgr.settleReservation(reservation, { actualCostUsd: reservation.cap, costSource: 'reserve' });
       }
-      if (provider === 'claude' && typeof onClaudeError === 'function') {
-        await onClaudeError({ error: err, reservation, notes, lastFailed: lastFailure });
-      } else if (typeof onError?.[provider] === 'function') {
-        await onError[provider]({ error: err, reservation, notes, lastFailed: lastFailure });
+      if (typeof resolvedOnError[provider] === 'function') {
+        await resolvedOnError[provider]({ error: err, reservation, notes, lastFailed: lastFailure });
       }
-      const shouldThrow = (provider === 'claude' && throwClaudeErrors)
-        || (throwErrors === true)
-        || (throwErrors?.[provider] === true);
+      const shouldThrow = resolvedThrowErrors === true || Boolean(resolvedThrowErrors?.[provider]);
       if (shouldThrow) throw err;
       rawOutcome = {
         ok: false,
@@ -404,8 +416,8 @@ export async function executeWorkUnit({
       });
     }
 
-    // 9. Cost resolution
-    const defaultZeroCost = (policy.budgetType === 'prepaid-credits' || (!providerBudgetMgr && !reservation && provider !== 'claude'));
+    // 9. Cost resolution driven by budgetType policy
+    const defaultZeroCost = policy.budgetType === 'prepaid-credits' || (!providerBudgetMgr && !reservation && !usesLedger);
     const resolvedTotalCost = Number.isFinite(rawOutcome?.totalCostUsd)
       ? rawOutcome.totalCostUsd
       : (Number.isFinite(rawOutcome?.meta?.total_cost_usd)
@@ -425,10 +437,10 @@ export async function executeWorkUnit({
       }
     }
 
-    // 10. Success check
-    const requiresStructured = capabilities.structuredOutput ?? (provider === 'claude');
-    const hasRequiredStructure = !requiresStructured || (rawOutcome.structured != null);
-    if (rawOutcome.ok && hasRequiredStructure) {
+    // 10. Success check driven by policy.requiresStructuredOutput
+    const requiresStructured = Boolean(policy.requiresStructuredOutput);
+    const isSuccess = Boolean(rawOutcome.ok) && (!requiresStructured || rawOutcome.structured != null);
+    if (isSuccess) {
       breaker?.recordSuccess();
 
       const normalized = normalizeProviderOutcome({

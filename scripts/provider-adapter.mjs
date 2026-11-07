@@ -1427,6 +1427,7 @@ defaultProviderRegistry.register(PROVIDER_KINDS.GEMINI, GeminiProviderAdapter, {
     defaultTimeoutMs: 480_000,
     credentialsRequired: ['GEMINI_API_KEY'],
     circuitBreaker: { maxFailures: 3 },
+    requiresStructuredOutput: false,
   },
 });
 
@@ -1443,6 +1444,7 @@ defaultProviderRegistry.register(PROVIDER_KINDS.CLAUDE, ClaudeProviderAdapter, {
     defaultTimeoutMs: 180_000,
     credentialsRequired: ['ANTHROPIC_API_KEY'],
     circuitBreaker: { maxFailures: 3 },
+    requiresStructuredOutput: true,
   },
 });
 
