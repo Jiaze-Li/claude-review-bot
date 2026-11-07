@@ -251,6 +251,9 @@ test('Golden Test D: Two Gemini failures trigger existing cutoff', async () => {
   circuitBreaker.recordFailure('HTTP 500 server error', 500);
   assert.equal(circuitBreaker.isOff, false);
 
+  // Success in between does not reset cumulative failure count
+  circuitBreaker.recordSuccess();
+
   // Failure 2: trips circuit breaker
   circuitBreaker.recordFailure('HTTP 500 server error', 500);
   assert.equal(circuitBreaker.isOff, true);
@@ -429,6 +432,16 @@ test('Golden Test J: Verification preserves FIXED/STILL_OPEN/UNCERTAIN via runGe
 });
 
 test('Golden Test K: Budget or deadline exhaustion fails closed via runGeminiReview', async () => {
+  // 1. DeadlineTracker with bufferMs=0 trips when expired
+  let fakeNow = 1000;
+  const tracker = new DeadlineTracker({ totalMs: 500, minBufferMs: 0, nowFn: () => fakeNow });
+  assert.equal(tracker.isNearExpiry(0), false);
+  fakeNow = 1500; // Exact deadline
+  assert.equal(tracker.isNearExpiry(0), true);
+  fakeNow = 1600; // Past deadline
+  assert.equal(tracker.isNearExpiry(0), true);
+
+  // 2. Budget exhaustion fails closed
   const exhaustedSession = {
     version: 1,
     baseSha: BASE_SHA,
@@ -464,15 +477,15 @@ test('Golden Test K: Budget or deadline exhaustion fails closed via runGeminiRev
 test('Golden Test L: Failed requests never fabricate READY via sessionCommitStatus', async () => {
   const dir = setupGeminiContext({ mode: 'incremental' });
 
-  try {
-    await runGeminiReview({
+  // Failed runner request must reject rather than fabricate a successful/READY review
+  await assert.rejects(
+    runGeminiReview({
       env: makeEnv(dir, { CLAUDE_CODE_OAUTH_TOKEN: '' }), // Missing Claude credential
       logImpl: () => {},
       fetchImpl: mockGeminiReply({ status: 503 }),
-    });
-  } catch {
-    // Expected failure
-  }
+    }),
+    /CLAUDE_CODE_OAUTH_TOKEN/
+  );
 
   // Failed state evaluated against commit status
   const session = {

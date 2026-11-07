@@ -28,7 +28,7 @@ export class DeadlineTracker {
   }
 
   isNearExpiry(bufferMs = this.minBufferMs) {
-    return this.timeLeftMs() < bufferMs;
+    return this.timeLeftMs() <= bufferMs;
   }
 
   timeoutForCall(safetyBufferMs = 30_000, maxCapMs = null) {
@@ -38,8 +38,9 @@ export class DeadlineTracker {
 }
 
 export class CircuitBreaker {
-  constructor({ maxConsecutiveFailures = 2, initialReason = null, initialStatus = 0 } = {}) {
-    this.maxConsecutiveFailures = maxConsecutiveFailures;
+  constructor({ maxConsecutiveFailures = 2, maxFailures = 2, initialReason = null, initialStatus = 0 } = {}) {
+    this.maxFailures = maxFailures ?? maxConsecutiveFailures;
+    this.maxConsecutiveFailures = this.maxFailures;
     this.offReason = initialReason;
     this.offStatus = initialStatus;
     this.failureCount = 0;
@@ -66,13 +67,14 @@ export class CircuitBreaker {
 
   recordFailure(reason, status = 0) {
     this.failureCount += 1;
-    if (this.failureCount >= this.maxConsecutiveFailures && !this.offReason) {
-      this.trip(reason || `exceeded failure threshold of ${this.maxConsecutiveFailures}`, status);
+    if (this.failureCount >= this.maxFailures && !this.offReason) {
+      this.trip(reason || `exceeded failure threshold of ${this.maxFailures}`, status);
     }
   }
 
   recordSuccess() {
-    this.failureCount = 0;
+    // Cumulative failure accounting across review run matches original runner semantics;
+    // does not reset failureCount.
   }
 }
 
