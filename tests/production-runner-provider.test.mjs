@@ -57,8 +57,9 @@ test('Production Runner Integration: runGeminiReview routes through registered m
     assert.ok(result);
     assert.equal(result._meta.provider, 'mock-runner-provider');
     assert.equal(result._meta.requested_model, 'mock-runner-v1');
-    assert.equal(result._meta.total_cost_usd, 0);
+    assert.equal(result._meta.total_cost_usd, undefined);
     assert.equal(result._meta.provider_costs['mock-runner-provider'], 0.04);
+    assert.ok(result._meta.provider_usage['mock-runner-provider']);
     assert.match(result.summary, /Mock third provider/);
     assert.equal(result.findings.length, 1);
     assert.equal(result.findings[0].severity, 'P2');
@@ -207,8 +208,9 @@ test('Production Runner Integration: run-review.mjs entrypoint completes with re
     const doc = JSON.parse(fs.readFileSync(outJsonPath, 'utf8'));
 
     assert.equal(doc._meta.providers['mock-runner-provider'], 1);
-    assert.equal(doc._meta.total_cost_usd, 0);
+    assert.equal(doc._meta.total_cost_usd, undefined);
     assert.equal(doc._meta.provider_costs['mock-runner-provider'], 0.04);
+    assert.ok(doc._meta.provider_usage['mock-runner-provider']);
     assert.equal(doc.coverage.complete, true);
     assert.deepEqual(doc.coverage.reviewedPaths, ['a.swift']);
     assert.equal(doc.findings.length, 1);
@@ -588,8 +590,9 @@ test('Production Runner Integration: runGeminiReview shares third-party BudgetMa
     assert.ok(result);
     assert.equal(result._meta.provider, 'mock-runner-provider');
     assert.equal(result._meta.parts, 2);
-    assert.equal(result._meta.total_cost_usd, 0);
+    assert.equal(result._meta.total_cost_usd, undefined);
     assert.equal(result._meta.provider_costs['mock-runner-provider'], 0.08);
+    assert.ok(result._meta.provider_usage['mock-runner-provider']);
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }

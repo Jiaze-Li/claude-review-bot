@@ -462,6 +462,7 @@ async function reviewPart(ctx,diff,shared){
   }
 
   const providerCosts = {};
+  const providerUsage = {};
   for (const [p, mgr] of Object.entries(providerBudgetManagers)) {
     if (p !== 'claude' && mgr) {
       providerCosts[p] = Number(mgr.totalSpentUsd.toFixed(4));
@@ -469,13 +470,25 @@ async function reviewPart(ctx,diff,shared){
   }
 
   const isClaude = outcome.meta?.provider === 'claude';
+  const isGemini = outcome.meta?.provider === 'gemini';
+  const outMeta = { ...outcome.meta };
+  if (!isClaude) {
+    delete outMeta.total_cost_usd;
+    delete outMeta.cost_source;
+  }
+  if (!isClaude && !isGemini && outcome.meta?.provider) {
+    const p = outcome.meta.provider;
+    if (outcome.meta.usage) {
+      providerUsage[p] = outcome.meta.usage;
+    }
+  }
+
   return {
     ...outcome.structured,
     _meta: {
-      ...outcome.meta,
-      total_cost_usd: isClaude ? (outcome.meta?.total_cost_usd ?? 0) : 0,
-      ...(isClaude ? {} : { cost_source: undefined }),
+      ...outMeta,
       ...(Object.keys(providerCosts).length ? { provider_costs: providerCosts } : {}),
+      ...(Object.keys(providerUsage).length ? { provider_usage: providerUsage } : {}),
     },
   };
 }
@@ -487,8 +500,12 @@ function mergeParts({ctx,parts,results,shared}){
   const summary=results.map((result,index)=>`Part ${index+1}/${results.length}: ${String(result.summary??'').trim()}`).join('\n').slice(0,3900);
   const metas=results.map((result)=>result._meta);
   const claudeMetas=metas.filter((meta)=>meta?.provider==='claude');
-  const lead=claudeMetas[0]??metas[0];
-  const sumUsage=(key)=>metas.reduce((total,meta)=>total+(nonnegative(meta?.usage?.[key])??0),0);
+  const geminiMetas=metas.filter((meta)=>meta?.provider==='gemini');
+  const thirdPartyMetas=metas.filter((meta)=>meta?.provider && meta.provider !== 'claude' && meta.provider !== 'gemini');
+  const coreMetas=[...claudeMetas, ...geminiMetas];
+  const lead=claudeMetas[0] ?? geminiMetas[0] ?? metas[0];
+
+  const sumUsage=(key)=>coreMetas.reduce((total,meta)=>total+(nonnegative(meta?.usage?.[key])??0),0);
   const claudeCost=claudeMetas.reduce((total,meta)=>total+(nonnegative(meta.total_cost_usd)??0),0);
   const partProviderCosts = {};
   for (const [p, mgr] of Object.entries(shared?.providerBudgetManagers || {})) {
@@ -496,28 +513,46 @@ function mergeParts({ctx,parts,results,shared}){
       partProviderCosts[p] = Number(mgr.totalSpentUsd.toFixed(4));
     }
   }
+
+  const partProviderUsage = {};
+  for (const meta of thirdPartyMetas) {
+    if (meta?.provider && meta.usage) {
+      const p = meta.provider;
+      partProviderUsage[p] = {
+        input_tokens: (partProviderUsage[p]?.input_tokens ?? 0) + (meta.usage.input_tokens ?? 0),
+        output_tokens: (partProviderUsage[p]?.output_tokens ?? 0) + (meta.usage.output_tokens ?? 0),
+        total_tokens: (partProviderUsage[p]?.total_tokens ?? 0) + (meta.usage.total_tokens ?? 0),
+      };
+    }
+  }
+
+  const baseLead = { ...lead };
+  delete baseLead.total_cost_usd;
+  delete baseLead.cost_source;
+
   const _meta={
-    ...lead,
+    ...baseLead,
     mode,
     attempts:Math.max(...metas.map((meta)=>meta?.attempts??1)),
     parts:parts.length,
     parts_by_claude:claudeMetas.length,
-    total_cost_usd:Number(claudeCost.toFixed(4)),
-    cost_source:claudeMetas.length ? (claudeMetas.some((meta)=>meta.cost_source==='reserve')?'reserve':'sdk') : undefined,
     usage:{
       input_tokens:sumUsage('input_tokens'),
       output_tokens:sumUsage('output_tokens'),
       thoughts_tokens:sumUsage('thoughts_tokens'),
       total_tokens:sumUsage('total_tokens'),
     },
-    ...(Object.keys(partProviderCosts).length ? { provider_costs: partProviderCosts } : {}),
-    ...(claudeMetas.length?{
-      provider:'claude',
+    ...(claudeMetas.length ? {
+      provider: 'claude',
+      total_cost_usd: Number(claudeCost.toFixed(4)),
+      cost_source: claudeMetas.some((meta)=>meta.cost_source==='reserve')?'reserve':'sdk',
       ...(claudeMetas.some((meta)=>meta.fallback_from)?{
         fallback_from:'gemini',
         fallback_reason:`${claudeMetas.filter((meta)=>meta.fallback_from).length} of ${parts.length} part(s): ${claudeMetas.find((meta)=>meta.fallback_from).fallback_reason??'Gemini unavailable'}`,
       }:{fallback_from:undefined,fallback_reason:undefined}),
-    }:{}),
+    } : {}),
+    ...(Object.keys(partProviderCosts).length ? { provider_costs: partProviderCosts } : {}),
+    ...(Object.keys(partProviderUsage).length ? { provider_usage: partProviderUsage } : {}),
   };
   if(mode==='verification'){
     const merged=mergeVerifications({session,parts,results});
