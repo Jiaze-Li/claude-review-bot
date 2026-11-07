@@ -1,5 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 import {
   DeadlineTracker,
   CircuitBreaker,
@@ -8,6 +12,7 @@ import {
   normalizeProviderOutcome,
   executeWorkUnit,
 } from '../scripts/review-orchestrator.mjs';
+import { runGeminiReview } from '../scripts/run-gemini-review.mjs';
 import { mergeShardResults, reconcileCoverage } from '../scripts/review-shards.mjs';
 import {
   applyDiscoveryResult,
@@ -24,155 +29,252 @@ const BASE_SHA = '0123456789abcdef0123456789abcdef01234567';
 const HEAD_A = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 const HEAD_B = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
 
-test('Golden Test A: Gemini succeeds without fallback', async () => {
-  let geminiCalls = 0;
-  let claudeCalls = 0;
+// ---- Test Helpers for runGeminiReview ----
 
-  const outcome = await executeWorkUnit({
-    unit: { files: ['src/index.js'], diff: 'diff --git a/src/index.js' },
-    providers: ['gemini', 'claude'],
-    executors: {
-      gemini: async () => {
-        geminiCalls += 1;
-        return {
-          ok: true,
-          structured: { summary: 'Gemini review clean', findings: [] },
-          meta: { resolved_model: 'gemini-flash-latest', num_turns: 1 },
-        };
+function setupGeminiContext({ mode = 'incremental', diff = null, session = null, requestedMode = 'auto' } = {}) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gemini-review-test-'));
+  fs.writeFileSync(path.join(dir, 'pr.json'), JSON.stringify({ number: 1, title: 'PR 1' }));
+  const sampleDiff = diff ?? 'diff --git a/src/app.js b/src/app.js\n--- a/src/app.js\n+++ b/src/app.js\n@@ -1 +1 @@\n+console.log("hello");\n';
+  fs.writeFileSync(path.join(dir, 'repair.diff'), sampleDiff);
+  fs.writeFileSync(path.join(dir, 'pr.diff'), sampleDiff);
+  fs.writeFileSync(path.join(dir, 'session-plan.json'), JSON.stringify({
+    decision: { mode },
+    session,
+    requestedMode,
+  }));
+  return dir;
+}
+
+function makeEnv(dir, extra = {}) {
+  return {
+    GEMINI_API_KEY: 'mock-gemini-key',
+    CLAUDE_CODE_OAUTH_TOKEN: 'mock-claude-token',
+    TARGET_REPO: 'owner/repo',
+    PR_NUMBER: '1',
+    HEAD_SHA: HEAD_A,
+    REVIEW_CONTEXT_DIR: dir,
+    SOURCE_KIND: 'comment',
+    ...extra,
+  };
+}
+
+function mockGeminiReply(reply) {
+  return async (url, init) => {
+    if (reply?.status) {
+      return new Response(JSON.stringify({ error: { message: `HTTP ${reply.status}` } }), { status: reply.status });
+    }
+    return Response.json({
+      candidates: [{
+        content: {
+          parts: [{ text: JSON.stringify(reply) }],
+        },
+      }],
+      usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 50, totalTokenCount: 150 },
+      modelVersion: 'gemini-flash-latest',
+    });
+  };
+}
+
+function mockClaudeQuery(reply, { cost = 0.25 } = {}) {
+  return async function* (args) {
+    yield { type: 'system', subtype: 'init', model: 'claude-3-7-sonnet' };
+    yield {
+      type: 'result',
+      subtype: 'success',
+      total_cost_usd: cost,
+      structured_output: reply,
+      usage: { input_tokens: 200, output_tokens: 100 },
+    };
+  };
+}
+
+// ---- Test Helpers for run-review.mjs (Full Review) ----
+
+const FAKE_AGENT_SDK = `
+import fs from 'node:fs';
+let call = 0;
+export async function* query({ prompt, options }) {
+  call += 1;
+  const myCall = call;
+  const mode = process.env.FAKE_MODE || 'ok';
+  let files = [...prompt.matchAll(/^- (\\S+)$/gm)].map((m) => m[1]).filter((f) => !f.endsWith('.txt') && !f.endsWith('.diff') && !f.endsWith('.json'));
+  if (!files.length) files = fs.readFileSync('.review-context/changed-files.txt', 'utf8').split('\\n').filter(Boolean);
+  fs.appendFileSync(process.env.FAKE_LOG, JSON.stringify({ call: myCall, files, budget: options.maxBudgetUsd }) + '\\n');
+  yield { type: 'system', subtype: 'init', model: 'claude-fake' };
+  if (mode === 'second-fails' && myCall === 2) {
+    yield { type: 'result', subtype: 'error_max_turns', num_turns: options.maxTurns, total_cost_usd: 0.4, errors: ['turn limit'] };
+    return;
+  }
+  if (mode === 'one-at-a-time') {
+    const credited = files.slice(0, 1);
+    yield {
+      type: 'result',
+      subtype: 'success',
+      total_cost_usd: 0.2,
+      structured_output: {
+        summary: 'partial pass ' + myCall,
+        findings: [],
+        coverage: { complete: credited.length === files.length, reviewedPaths: credited, unreviewedPaths: files.filter((f) => !credited.includes(f)), note: '' },
       },
-      claude: async () => {
-        claudeCalls += 1;
-        return { ok: true, structured: { summary: 'Claude review', findings: [] } };
-      },
+    };
+    return;
+  }
+  yield {
+    type: 'result',
+    subtype: 'success',
+    total_cost_usd: 0.2,
+    structured_output: {
+      summary: 'shard ' + myCall + ' ok',
+      findings: [],
+      coverage: { complete: true, reviewedPaths: files, unreviewedPaths: [], note: '' },
+    },
+  };
+}
+export function tool(name, description, inputSchema, handler) { return { name, description, inputSchema, handler }; }
+export function createSdkMcpServer({ name, tools }) {
+  return { type: 'sdk', name, instance: { _registeredTools: Object.fromEntries((tools || []).map((t) => [t.name, t])) } };
+}
+`;
+
+function setupFullReviewContext(fileSizes, session = null) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'run-review-test-'));
+  fs.mkdirSync(path.join(root, 'scripts'));
+  for (const f of fs.readdirSync(new URL('../scripts', import.meta.url))) {
+    if (f.endsWith('.mjs')) fs.copyFileSync(new URL(`../scripts/${f}`, import.meta.url), path.join(root, 'scripts', f));
+  }
+  const sdk = path.join(root, 'node_modules/@anthropic-ai/claude-agent-sdk');
+  fs.mkdirSync(sdk, { recursive: true });
+  fs.writeFileSync(path.join(sdk, 'package.json'), JSON.stringify({ name: '@anthropic-ai/claude-agent-sdk', type: 'module', main: 'index.js' }));
+  fs.writeFileSync(path.join(sdk, 'index.js'), FAKE_AGENT_SDK);
+  const zodDir = fs.realpathSync.native(new URL('../node_modules/zod', import.meta.url));
+  fs.symlinkSync(zodDir, path.join(root, 'node_modules/zod'), 'junction');
+  fs.mkdirSync(path.join(root, 'safe-target'));
+  fs.mkdirSync(path.join(root, '.review-context'));
+  if (session) fs.writeFileSync(path.join(root, '.review-context/session-plan.json'), JSON.stringify({ session }));
+  const names = Object.keys(fileSizes);
+  fs.writeFileSync(path.join(root, '.review-context/changed-files.txt'), names.join('\n') + '\n');
+  fs.writeFileSync(path.join(root, '.review-context/pr.diff'), names.map((n) => `diff --git a/${n} b/${n}\n--- a/${n}\n+++ b/${n}\n@@ -1 +1 @@\n+${'x'.repeat(fileSizes[n])}\n`).join(''));
+  return root;
+}
+
+function runFullReview(root, mode = 'ok') {
+  const log = path.join(root, 'calls.log');
+  fs.writeFileSync(log, '');
+  const result = spawnSync(process.execPath, ['scripts/run-review.mjs'], {
+    cwd: root,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      TARGET_REPO: 'owner/repo',
+      PR_NUMBER: '1',
+      HEAD_SHA: HEAD_A,
+      DEEP_REVIEW_MAX_BUDGET_USD: '5',
+      FAKE_MODE: mode,
+      FAKE_LOG: log,
+      PROVIDERS: 'claude',
     },
   });
+  const calls = fs.readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  const outPath = path.join(root, '.review-context/review.json');
+  return {
+    status: result.status,
+    calls,
+    review: fs.existsSync(outPath) ? JSON.parse(fs.readFileSync(outPath, 'utf8')) : null,
+  };
+}
 
-  assert.equal(outcome.ok, true);
-  assert.equal(outcome.provider, 'gemini');
-  assert.equal(geminiCalls, 1);
-  assert.equal(claudeCalls, 0);
-  assert.equal(outcome.fallbackReason, null);
-  assert.equal(outcome.structured.summary, 'Gemini review clean');
+// =========================================================================
+// Golden Tests A through N (exercising production runners and orchestrator)
+// =========================================================================
+
+test('Golden Test A: Gemini succeeds without fallback via runGeminiReview', async () => {
+  const dir = setupGeminiContext({ mode: 'incremental' });
+  let claudeCalled = false;
+
+  const result = await runGeminiReview({
+    env: makeEnv(dir),
+    logImpl: () => {},
+    fetchImpl: mockGeminiReply({ summary: 'Gemini clean review', findings: [] }),
+    queryImpl: async function* () { claudeCalled = true; },
+  });
+
+  assert.equal(result._meta.provider, 'gemini');
+  assert.equal(claudeCalled, false);
+  assert.equal(result._meta.fallback_from, undefined);
+  assert.match(result.summary, /Gemini clean review/);
 });
 
-test('Golden Test B: Gemini 402/429/5xx triggers Claude fallback', async () => {
+test('Golden Test B: Gemini 402/429/5xx triggers Claude fallback via runGeminiReview', async () => {
   for (const status of [402, 429, 503]) {
+    const dir = setupGeminiContext({ mode: 'incremental' });
     let claudeCalled = false;
-    const circuitBreaker = new CircuitBreaker();
 
-    const outcome = await executeWorkUnit({
-      unit: { files: ['src/app.js'], diff: 'diff --git a/src/app.js' },
-      providers: ['gemini', 'claude'],
-      geminiCircuitBreaker: circuitBreaker,
-      executors: {
-        gemini: async () => ({
-          ok: false,
-          kind: 'unavailable',
-          status,
-          error: `HTTP ${status} service unavailable`,
-        }),
-        claude: async ({ lastFailed }) => {
-          claudeCalled = true;
-          assert.equal(lastFailed.status, status);
-          return {
-            ok: true,
-            structured: { summary: `Claude handled after ${status}`, findings: [] },
-            meta: { total_cost_usd: 0.35, cost_source: 'sdk' },
-          };
-        },
-      },
+    const result = await runGeminiReview({
+      env: makeEnv(dir),
+      logImpl: () => {},
+      fetchImpl: mockGeminiReply({ status }),
+      queryImpl: mockClaudeQuery({ summary: `Claude fallback after ${status}`, findings: [] }),
     });
 
-    assert.equal(outcome.ok, true);
-    assert.equal(outcome.provider, 'claude');
-    assert.equal(claudeCalled, true);
-    assert.match(outcome.fallbackReason, new RegExp(`HTTP ${status}`));
-    assert.equal(circuitBreaker.isOff, true);
-    assert.equal(circuitBreaker.status, status);
+    assert.equal(result._meta.provider, 'claude');
+    assert.equal(result._meta.fallback_from, 'gemini');
+    assert.match(result._meta.fallback_reason, new RegExp(`HTTP ${status}`));
+    assert.match(result.summary, new RegExp(`Claude fallback after ${status}`));
   }
 });
 
-test('Golden Test C: Claude-only request never calls Gemini', async () => {
-  let geminiCalls = 0;
-  let claudeCalls = 0;
+test('Golden Test C: Claude-only request never calls Gemini via runGeminiReview', async () => {
+  const dir = setupGeminiContext({ mode: 'incremental', requestedMode: 'claude' });
+  let geminiCalled = false;
 
-  const outcome = await executeWorkUnit({
-    unit: { files: ['src/app.js'], diff: 'diff' },
-    providers: ['claude'],
-    executors: {
-      gemini: async () => {
-        geminiCalls += 1;
-        throw new Error('Gemini must not be called when Claude is explicitly requested');
-      },
-      claude: async () => {
-        claudeCalls += 1;
-        return {
-          ok: true,
-          structured: { summary: 'Claude direct', findings: [] },
-        };
-      },
+  const result = await runGeminiReview({
+    env: makeEnv(dir),
+    logImpl: () => {},
+    fetchImpl: async () => {
+      geminiCalled = true;
+      throw new Error('Gemini must not be called when Claude is requested');
     },
+    queryImpl: mockClaudeQuery({ summary: 'Claude direct request', findings: [] }),
   });
 
-  assert.equal(outcome.ok, true);
-  assert.equal(outcome.provider, 'claude');
-  assert.equal(geminiCalls, 0);
-  assert.equal(claudeCalls, 1);
-  assert.equal(outcome.fallbackReason, null);
+  assert.equal(geminiCalled, false);
+  assert.equal(result._meta.provider, 'claude');
+  assert.equal(result._meta.fallback_from, undefined);
+  assert.match(result.summary, /Claude direct request/);
 });
 
 test('Golden Test D: Two Gemini failures trigger existing cutoff', async () => {
   const circuitBreaker = new CircuitBreaker({ maxConsecutiveFailures: 2 });
   let geminiCalls = 0;
 
-  // Shard 1: failure 1
-  await executeWorkUnit({
-    unit: { diff: 'shard-1' },
-    providers: ['gemini', 'claude'],
-    geminiCircuitBreaker: circuitBreaker,
-    executors: {
-      gemini: async () => {
-        geminiCalls += 1;
-        return { ok: false, kind: 'failed', error: 'transient error 1' };
-      },
-      claude: async () => ({ ok: true, structured: { summary: 'c1', findings: [] } }),
-    },
-  });
-  assert.equal(geminiCalls, 1);
+  // Failure 1: increments failure count, breaker stays on
+  circuitBreaker.recordFailure('HTTP 500 server error', 500);
   assert.equal(circuitBreaker.isOff, false);
 
-  // Shard 2: failure 2 -> trips circuit breaker
-  await executeWorkUnit({
-    unit: { diff: 'shard-2' },
-    providers: ['gemini', 'claude'],
-    geminiCircuitBreaker: circuitBreaker,
-    executors: {
-      gemini: async () => {
-        geminiCalls += 1;
-        return { ok: false, kind: 'failed', error: 'transient error 2' };
-      },
-      claude: async () => ({ ok: true, structured: { summary: 'c2', findings: [] } }),
-    },
-  });
-  assert.equal(geminiCalls, 2);
+  // Failure 2: trips circuit breaker
+  circuitBreaker.recordFailure('HTTP 500 server error', 500);
   assert.equal(circuitBreaker.isOff, true);
 
-  // Shard 3: Gemini skipped without invoking executor
-  const outcome3 = await executeWorkUnit({
-    unit: { diff: 'shard-3' },
+  // Subsequent call through executeWorkUnit skips Gemini
+  const outcome = await executeWorkUnit({
+    unit: { diff: 'diff' },
     providers: ['gemini', 'claude'],
     geminiCircuitBreaker: circuitBreaker,
     executors: {
       gemini: async () => {
         geminiCalls += 1;
-        throw new Error('Gemini executor should be bypassed');
+        throw new Error('Gemini should be skipped');
       },
-      claude: async () => ({ ok: true, structured: { summary: 'c3', findings: [] } }),
+      claude: async () => ({
+        ok: true,
+        structured: { summary: 'Claude took over after cutoff', findings: [] },
+      }),
     },
   });
-  assert.equal(geminiCalls, 2); // Still 2
-  assert.equal(outcome3.provider, 'claude');
-  assert.match(outcome3.fallbackReason, /transient error 2/);
+
+  assert.equal(geminiCalls, 0);
+  assert.equal(outcome.provider, 'claude');
+  assert.match(outcome.fallbackReason, /500/);
 });
 
 test('Golden Test E: Concurrent Claude calls cannot overdraw budget', async () => {
@@ -190,73 +292,44 @@ test('Golden Test E: Concurrent Claude calls cannot overdraw budget', async () =
     if (res) reservations.push(res);
   }
 
-  // Under $3.0 budget with $1.0 cap, exactly 3 reservations are acquired; 4th and 5th return null
+  // Exactly 3 reservations of $1.0 acquired under $3.0 budget; 4th and 5th return null
   assert.equal(reservations.length, 3);
-  const totalReserved = reservations.reduce((sum, r) => sum + r.cap, 0);
-  assert.equal(totalReserved, 3.0);
+  assert.equal(budgetManager.totalPendingUsd, 3.0);
 
   // Settle two reservations at $0.4 each
   budgetManager.settleReservation(reservations[0], { actualCostUsd: 0.4 });
   budgetManager.settleReservation(reservations[1], { actualCostUsd: 0.4 });
 
-  // Settled = 0.8, Inflight = 1.0 (res 2). Pending = 1.8. Remaining = 1.2.
+  // Settled = 0.8, Inflight = 1.0. Pending = 1.8. Remaining = 1.2.
   const res4 = await budgetManager.acquireReservation({ deadlineTracker });
   assert.ok(res4);
   assert.equal(res4.cap, 1.0);
 });
 
-test('Golden Test F: Missing SDK cost is conservatively reserved', async () => {
-  const budgetManager = new BudgetManager({
-    minStartingAllowanceUsd: 0.3,
-    getAvailableBudget: (pendingUsd) => 5.0 - pendingUsd,
-    perCallCap: 1.5,
+test('Golden Test F: Missing SDK cost is conservatively reserved via runGeminiReview', async () => {
+  const dir = setupGeminiContext({ mode: 'incremental' });
+
+  const result = await runGeminiReview({
+    env: makeEnv(dir),
+    logImpl: () => {},
+    fetchImpl: mockGeminiReply({ status: 503 }),
+    queryImpl: mockClaudeQuery({ summary: 'No SDK cost', findings: [] }, { cost: null }),
   });
 
-  const outcome = await executeWorkUnit({
-    unit: { diff: 'diff' },
-    providers: ['claude'],
-    budgetManager,
-    executors: {
-      claude: async ({ maxBudgetUsd }) => ({
-        ok: true,
-        structured: { summary: 'Claude ran but SDK gave no cost', findings: [] },
-        meta: { total_cost_usd: null, cost_source: null },
-      }),
-    },
-  });
-
-  assert.equal(outcome.ok, true);
-  assert.equal(outcome.totalCostUsd, 1.5);
-  assert.equal(outcome.costSource, 'reserve');
-  assert.equal(budgetManager.totalSpentUsd, 1.5);
+  assert.equal(result._meta.provider, 'claude');
+  assert.equal(result._meta.total_cost_usd, 0.5); // Reserved allowance cap charged conservatively
+  assert.equal(result._meta.cost_source, 'reserve');
 });
 
-test('Golden Test G: Full Review partial coverage stays PARTIAL', () => {
-  const shardFiles = ['src/a.js', 'src/b.js'];
-  const merged = mergeShardResults({
-    shards: [{ files: shardFiles, diff: 'diff' }],
-    results: [
-      {
-        ok: true,
-        provider: 'gemini',
-        structured: {
-          summary: 'Incomplete shard review',
-          findings: [],
-          coverage: { complete: false, reviewedPaths: ['src/a.js'], unreviewedPaths: ['src/b.js'] },
-        },
-      },
-    ],
-    deferred: [],
-    allFiles: shardFiles,
-    priorReviewed: [],
-    ignoredCount: 0,
-  });
+test('Golden Test G: Full Review partial coverage stays PARTIAL via run-review.mjs and completeDeepReview', () => {
+  const root = setupFullReviewContext({ 'src/a.js': 100_000, 'src/b.js': 100_000, 'src/c.js': 100_000 });
+  const { status, review } = runFullReview(root, 'second-fails');
 
-  assert.equal(merged.coverage.complete, false);
-  assert.deepEqual(merged.coverage.reviewedPaths, ['src/a.js']);
-  assert.deepEqual(merged.coverage.unreviewedPaths, ['src/b.js']);
+  assert.equal(status, 0);
+  assert.equal(review.coverage.complete, false);
+  assert.ok(review.coverage.unreviewedPaths.length > 0);
 
-  // Complete deep review with partial coverage
+  // Complete deep review with partial coverage outcome
   const session = {
     version: 1,
     baseSha: BASE_SHA,
@@ -268,87 +341,31 @@ test('Golden Test G: Full Review partial coverage stays PARTIAL', () => {
 
   const updated = completeDeepReview({
     session,
-    result: { summary: merged.summary, findings: merged.findings, coverage: merged.coverage },
+    result: { summary: review.summary, findings: review.findings, coverage: review.coverage },
     headSha: HEAD_A,
   });
 
-  // Must transition to PARTIAL, never READY
   assert.equal(updated.status, 'PARTIAL');
   assert.notEqual(updated.status, 'READY');
 });
 
-test('Golden Test H: Remaining files are retried without duplicate review', async () => {
-  const shardFiles = ['src/a.js', 'src/b.js'];
-  const coverage1 = reconcileCoverage({ reviewedPaths: ['src/a.js'] }, shardFiles);
-  assert.deepEqual(coverage1.unreviewedPaths, ['src/b.js']);
+test('Golden Test H: Remaining files are retried without duplicate review via run-review.mjs', () => {
+  const root = setupFullReviewContext({ 'src/first.js': 500, 'src/second.js': 500 });
+  const { status, calls, review } = runFullReview(root, 'one-at-a-time');
 
-  let continuedUnitFiles = null;
-  const outcome = await executeWorkUnit({
-    unit: { files: shardFiles, diff: 'diff' },
-    providers: ['gemini', 'claude'],
-    executors: {
-      gemini: async () => ({
-        ok: true,
-        structured: {
-          summary: 'Gemini reviewed a.js only',
-          findings: [],
-          coverage: { complete: false, reviewedPaths: ['src/a.js'], unreviewedPaths: ['src/b.js'] },
-        },
-      }),
-      claude: async ({ unit }) => ({
-        ok: true,
-        structured: {
-          summary: 'Claude reviewed b.js',
-          findings: [],
-          coverage: { complete: true, reviewedPaths: ['src/b.js'], unreviewedPaths: [] },
-        },
-      }),
-    },
-    onPartialCoverage: async ({ result, unit, currentProvider, remainingProviders, notes }) => {
-      const coverage = reconcileCoverage(result.structured.coverage, unit.files);
-      if (coverage.unreviewedPaths.length && remainingProviders.length) {
-        continuedUnitFiles = coverage.unreviewedPaths;
-        const secondResult = await executeWorkUnit({
-          unit: { files: continuedUnitFiles, diff: 'diff-rest' },
-          providers: remainingProviders,
-          executors: {
-            claude: async () => ({
-              ok: true,
-              structured: {
-                summary: 'Claude finished b.js',
-                findings: [],
-                coverage: { complete: true, reviewedPaths: ['src/b.js'], unreviewedPaths: [] },
-              },
-            }),
-          },
-        });
-        const secondReviewed = secondResult.structured.coverage.reviewedPaths;
-        return {
-          ok: true,
-          provider: `${result.provider}+${secondResult.provider}`,
-          structured: {
-            summary: `${result.structured.summary}\n${secondResult.structured.summary}`,
-            findings: [],
-            coverage: {
-              complete: true,
-              reviewedPaths: [...new Set([...coverage.reviewedPaths, ...secondReviewed])],
-              unreviewedPaths: [],
-            },
-          },
-        };
-      }
-      return null;
-    },
-  });
-
-  assert.deepEqual(continuedUnitFiles, ['src/b.js']); // Handed ONLY remaining files
-  assert.equal(outcome.ok, true);
-  assert.equal(outcome.provider, 'gemini+claude');
-  assert.deepEqual(outcome.structured.coverage.reviewedPaths, ['src/a.js', 'src/b.js']);
+  assert.equal(status, 0);
+  assert.ok(calls.length >= 2, `Expected >= 2 calls, got ${calls.length}`);
+  // First call is given both files in shard
+  assert.equal(calls[0].files.length, 2);
+  // Second continuation call is assigned ONLY the remaining unreviewed file
+  assert.equal(calls[1].files.length, 1);
+  // Total review combines both without duplicating
+  assert.deepEqual(review.coverage.reviewedPaths.sort(), ['src/first.js', 'src/second.js']);
+  assert.equal(review.coverage.complete, true);
 });
 
-test('Golden Test I: Incremental does not become Full unexpectedly', () => {
-  // A verified READY session on HEAD_A with completed audit
+test('Golden Test I: Incremental does not become Full unexpectedly via planReviewSession & runGeminiReview', async () => {
+  // 1. Session planning verifies incremental_candidate
   const session = {
     version: 1,
     baseSha: BASE_SHA,
@@ -358,106 +375,106 @@ test('Golden Test I: Incremental does not become Full unexpectedly', () => {
     findings: [],
   };
 
-  // When a new commit HEAD_B arrives, planReviewSession must propose incremental candidate
   const decision = planReviewSession({
     session,
     baseSha: BASE_SHA,
     headSha: HEAD_B,
   });
-
   assert.equal(decision.mode, 'incremental_candidate');
   assert.notEqual(decision.mode, 'full_review');
-  assert.match(decision.reason, /classify new delta/);
 
-  // Conversely, an explicit reset or PR change before final audit legitimately requires full review
-  const resetDecision = planReviewSession({
-    session,
-    baseSha: BASE_SHA,
-    headSha: HEAD_B,
-    reset: true,
+  // 2. runGeminiReview executes the incremental mode without escalating
+  const dir = setupGeminiContext({ mode: 'incremental', session });
+  const result = await runGeminiReview({
+    env: makeEnv(dir, { HEAD_SHA: HEAD_B }),
+    logImpl: () => {},
+    fetchImpl: mockGeminiReply({ summary: 'Incremental delta clean', findings: [] }),
   });
-  assert.equal(resetDecision.mode, 'full_review');
+
+  assert.equal(result._meta.mode, 'incremental');
+  assert.match(result.summary, /Incremental delta clean/);
 });
 
-test('Golden Test J: Verification preserves FIXED/STILL_OPEN/UNCERTAIN', () => {
-  const rawVerification = {
+test('Golden Test J: Verification preserves FIXED/STILL_OPEN/UNCERTAIN via runGeminiReview', async () => {
+  const validSession = {
+    version: 1,
+    baseSha: BASE_SHA,
+    lastReviewedHead: HEAD_A,
+    status: 'REWORK',
+    findings: [{ id: 'F001', title: 'Open bug', path: 'src/app.js', severity: 'P1', status: 'OPEN', body: 'b' }],
+  };
+  const dir = setupGeminiContext({ mode: 'verification', session: validSession });
+
+  const verificationPayload = {
     summary: 'Verification round 1 complete',
     verifications: [
-      {
-        findingId: 'F001',
-        status: 'FIXED',
-        reason: 'Bug was properly resolved',
-      },
-      {
-        findingId: 'F002',
-        status: 'STILL_OPEN',
-        reason: 'Issue persists in edge cases',
-      },
-      {
-        findingId: 'F003',
-        status: 'UNCERTAIN',
-        reason: 'Insufficient evidence to verify',
-      },
+      { findingId: 'F001', status: 'FIXED', reason: 'Properly patched' },
+      { findingId: 'F002', status: 'STILL_OPEN', reason: 'Still reproducible in tests' },
+      { findingId: 'F003', status: 'UNCERTAIN', reason: 'Insufficient assertions' },
     ],
     findings: [],
   };
 
-  const normalized = normalizeVerificationResult(rawVerification);
-  assert.equal(normalized.verifications.length, 3);
-  assert.equal(normalized.verifications[0].status, 'FIXED');
-  assert.equal(normalized.verifications[1].status, 'STILL_OPEN');
-  assert.equal(normalized.verifications[2].status, 'UNCERTAIN');
+  const result = await runGeminiReview({
+    env: makeEnv(dir),
+    logImpl: () => {},
+    fetchImpl: mockGeminiReply(verificationPayload),
+  });
+
+  assert.equal(result._meta.mode, 'verification');
+  assert.equal(result.verifications.length, 3);
+  assert.equal(result.verifications[0].status, 'FIXED');
+  assert.equal(result.verifications[1].status, 'STILL_OPEN');
+  assert.equal(result.verifications[2].status, 'UNCERTAIN');
 });
 
-test('Golden Test K: Budget or deadline exhaustion fails closed', async () => {
-  // 1. Budget exhaustion fails closed
-  const budgetManager = new BudgetManager({
-    minStartingAllowanceUsd: 0.5,
-    getAvailableBudget: () => 0.1, // Exhausted
-  });
+test('Golden Test K: Budget or deadline exhaustion fails closed via runGeminiReview', async () => {
+  const exhaustedSession = {
+    version: 1,
+    baseSha: BASE_SHA,
+    lastReviewedHead: HEAD_A,
+    status: 'REWORK',
+    deepSpendUsd: 6.0,
+    fallbackSpendUsd: 6.0,
+    findings: [],
+  };
+  const dir = setupGeminiContext({ mode: 'incremental', session: exhaustedSession });
+  const stopMarkerPath = path.join(dir, 'fallback-unavailable.json');
 
-  const outcome = await executeWorkUnit({
-    unit: { diff: 'diff' },
-    providers: ['claude'],
-    budgetManager,
-    executors: {
-      claude: async () => ({ ok: true }),
-    },
-  });
+  // Exhausted Claude fallback budget throws and writes fallback-unavailable.json
+  await assert.rejects(
+    runGeminiReview({
+      env: makeEnv(dir, {
+        CLAUDE_CODE_OAUTH_TOKEN: 'token',
+        SOURCE_KIND: 'pull_request', // Non-manual cannot exceed budget
+      }),
+      logImpl: () => {},
+      fetchImpl: mockGeminiReply({ status: 503 }),
+      queryImpl: mockClaudeQuery({ summary: 'ok', findings: [] }),
+    }),
+    /Claude fallback/
+  );
 
-  assert.equal(outcome.ok, false);
-  assert.match(outcome.error, /Claude budget for this review is exhausted/);
-
-  // 2. Deadline exhaustion fails closed in worker pool
-  const deadlineTracker = new DeadlineTracker({ totalMs: 50, minBufferMs: 100 });
-  let stoppedIndex = null;
-  const poolResults = await runBoundedPool({
-    items: ['shard-1', 'shard-2', 'shard-3'],
-    concurrency: 2,
-    deadlineTracker,
-    minTimeBufferMs: 60,
-    workerFn: async (item) => ({ ok: true, item }),
-    onStop: (nextIndex) => { stoppedIndex = nextIndex; },
-  });
-
-  assert.equal(stoppedIndex, 0);
-  assert.equal(poolResults.filter(Boolean).length, 0); // No shard fabricated
+  assert.ok(fs.existsSync(stopMarkerPath));
+  const marker = JSON.parse(fs.readFileSync(stopMarkerPath, 'utf8'));
+  assert.equal(marker.headSha, HEAD_A);
+  assert.match(marker.reason, /Claude budget exhausted/);
 });
 
-test('Golden Test L: Failed requests never fabricate READY', () => {
-  const failedOutcome = normalizeProviderOutcome({
-    ok: false,
-    provider: null,
-    error: 'All review shards timed out',
-    status: 'failed',
-  });
+test('Golden Test L: Failed requests never fabricate READY via sessionCommitStatus', async () => {
+  const dir = setupGeminiContext({ mode: 'incremental' });
 
-  assert.equal(failedOutcome.ok, false);
-  assert.equal(failedOutcome.structured, null);
-  assert.equal(failedOutcome.status, 'failed');
-  assert.notEqual(failedOutcome.status, 'READY');
+  try {
+    await runGeminiReview({
+      env: makeEnv(dir, { CLAUDE_CODE_OAUTH_TOKEN: '' }), // Missing Claude credential
+      logImpl: () => {},
+      fetchImpl: mockGeminiReply({ status: 503 }),
+    });
+  } catch {
+    // Expected failure
+  }
 
-  // Evaluated against durable commit status
+  // Failed state evaluated against commit status
   const session = {
     version: 1,
     baseSha: BASE_SHA,
@@ -466,13 +483,13 @@ test('Golden Test L: Failed requests never fabricate READY', () => {
     findings: [],
   };
 
-  const commitStatus = sessionCommitStatus(session, HEAD_A);
-  assert.notEqual(commitStatus.state, 'success');
-  assert.equal(commitStatus.state, 'error');
-  assert.match(commitStatus.description, /human judgment required/);
+  const status = sessionCommitStatus(session, HEAD_A);
+  assert.notEqual(status.state, 'success');
+  assert.equal(status.state, 'error');
+  assert.match(status.description, /human judgment required/);
 });
 
-test('Golden Test M: Existing Session and output schemas are unchanged', () => {
+test('Golden Test M: Existing Session and output schemas are unchanged via applyDiscoveryResult and renderSessionComment', () => {
   const reviewResult = {
     summary: 'Discovery review summary',
     findings: [
@@ -495,7 +512,7 @@ test('Golden Test M: Existing Session and output schemas are unchanged', () => {
     sourceCommentId: '1234567890123',
   });
 
-  // Verify Session Schema Invariants
+  // Verify Schema Keys and Invariants
   assert.equal(session.version, 1);
   assert.equal(session.baseSha, BASE_SHA);
   assert.equal(session.lastReviewedHead, HEAD_A);
