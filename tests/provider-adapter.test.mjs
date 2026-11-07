@@ -4,6 +4,12 @@ import {
   getProviderAdapter,
   GeminiProviderAdapter,
   ClaudeProviderAdapter,
+  ProviderAdapter,
+  ProviderRegistry,
+  defaultProviderRegistry,
+  registerProvider,
+  getProviderDescriptor,
+  listProviders,
   PROVIDER_KINDS,
   OUTCOME_KINDS,
   ERROR_KINDS,
@@ -574,4 +580,97 @@ test('Claude adapter allows only Host Gateway MCP tools, never built-in tool ali
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
+
+test('ProviderRegistry manages registrations, capabilities, and operational policies', () => {
+  const registry = new ProviderRegistry();
+  assert.deepEqual(registry.list(), []);
+
+  class DummyAdapter extends ProviderAdapter {
+    constructor(opts) {
+      super({ provider: 'dummy', descriptor: opts.descriptor });
+    }
+    async execute() {
+      return { ok: true };
+    }
+  }
+
+  registry.register('dummy', DummyAdapter, {
+    description: 'Dummy test adapter',
+    capabilities: {
+      tools: true,
+      structuredOutput: true,
+      multiturnTools: false,
+    },
+    policy: {
+      budgetType: 'usd-ledger',
+      defaultTimeoutMs: 60000,
+      credentialsRequired: ['DUMMY_API_KEY'],
+    },
+  });
+
+  assert.equal(registry.has('dummy'), true);
+  assert.equal(registry.has('nonexistent'), false);
+  assert.deepEqual(registry.list(), ['dummy']);
+
+  const descriptor = registry.getDescriptor('dummy');
+  assert.equal(descriptor.name, 'dummy');
+  assert.equal(descriptor.description, 'Dummy test adapter');
+  assert.equal(descriptor.capabilities.tools, true);
+  assert.equal(descriptor.capabilities.structuredOutput, true);
+  assert.equal(descriptor.capabilities.multiturnTools, false);
+  assert.equal(descriptor.capabilities.hostSecurity, 'host-enforced');
+  assert.equal(descriptor.policy.budgetType, 'usd-ledger');
+  assert.equal(descriptor.policy.defaultTimeoutMs, 60000);
+  assert.deepEqual(descriptor.policy.credentialsRequired, ['DUMMY_API_KEY']);
+  assert.equal(descriptor.policy.circuitBreaker.maxFailures, 3);
+
+  const adapter = registry.createAdapter('dummy');
+  assert.ok(adapter instanceof DummyAdapter);
+  assert.equal(adapter.provider, 'dummy');
+  assert.equal(adapter.capabilities.tools, true);
+  assert.equal(adapter.policy.budgetType, 'usd-ledger');
+
+  // Unknown provider throws
+  assert.throws(() => registry.createAdapter('unknown'), /Unknown provider: unknown/);
+
+  // Unregister
+  assert.equal(registry.unregister('dummy'), true);
+  assert.equal(registry.has('dummy'), false);
+  assert.equal(registry.unregister('dummy'), false);
+});
+
+test('defaultProviderRegistry includes Gemini and Claude with capability and policy declarations', () => {
+  assert.equal(defaultProviderRegistry.has('gemini'), true);
+  assert.equal(defaultProviderRegistry.has('claude'), true);
+  assert.deepEqual(listProviders(), ['gemini', 'claude']);
+
+  const geminiDesc = getProviderDescriptor('gemini');
+  assert.equal(geminiDesc.name, 'gemini');
+  assert.equal(geminiDesc.capabilities.tools, true);
+  assert.equal(geminiDesc.capabilities.structuredOutput, true);
+  assert.equal(geminiDesc.capabilities.multiturnTools, true);
+  assert.equal(geminiDesc.capabilities.hostSecurity, 'host-enforced');
+  assert.equal(geminiDesc.policy.budgetType, 'prepaid-credits');
+  assert.deepEqual(geminiDesc.policy.credentialsRequired, ['GEMINI_API_KEY']);
+
+  const claudeDesc = getProviderDescriptor('claude');
+  assert.equal(claudeDesc.name, 'claude');
+  assert.equal(claudeDesc.capabilities.tools, true);
+  assert.equal(claudeDesc.capabilities.structuredOutput, true);
+  assert.equal(claudeDesc.capabilities.multiturnTools, true);
+  assert.equal(claudeDesc.capabilities.hostSecurity, 'host-enforced');
+  assert.equal(claudeDesc.policy.budgetType, 'usd-ledger');
+  assert.deepEqual(claudeDesc.policy.credentialsRequired, ['ANTHROPIC_API_KEY']);
+
+  const geminiAdapter = getProviderAdapter('gemini');
+  assert.ok(geminiAdapter instanceof GeminiProviderAdapter);
+  assert.equal(geminiAdapter.capabilities.hostSecurity, 'host-enforced');
+  assert.equal(geminiAdapter.policy.budgetType, 'prepaid-credits');
+
+  const claudeAdapter = getProviderAdapter('claude');
+  assert.ok(claudeAdapter instanceof ClaudeProviderAdapter);
+  assert.equal(claudeAdapter.capabilities.hostSecurity, 'host-enforced');
+  assert.equal(claudeAdapter.policy.budgetType, 'usd-ledger');
+});
+
 

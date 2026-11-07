@@ -243,14 +243,137 @@ export function firstModelName(value) {
 }
 
 /**
+ * Provider Registry for registering and resolving review provider adapters,
+ * their capabilities (tools, structured output, security boundaries),
+ * and operational policies (budget type, timeout, credential requirements).
+ */
+export class ProviderRegistry {
+  constructor() {
+    this._providers = new Map();
+  }
+
+  register(name, adapterClassOrFactory, descriptor = {}) {
+    if (typeof name !== 'string' || !name.trim()) {
+      throw new Error('Provider name must be a non-empty string');
+    }
+    const normalizedName = name.trim().toLowerCase();
+    if (typeof adapterClassOrFactory !== 'function') {
+      throw new Error(`Provider adapter factory/class for "${name}" must be a function`);
+    }
+
+    const capabilities = Object.freeze({
+      tools: Boolean(descriptor.capabilities?.tools),
+      structuredOutput: Boolean(descriptor.capabilities?.structuredOutput),
+      multiturnTools: Boolean(descriptor.capabilities?.multiturnTools),
+      hostSecurity: descriptor.capabilities?.hostSecurity ?? 'host-enforced',
+      ...(descriptor.capabilities || {}),
+    });
+
+    const policy = Object.freeze({
+      budgetType: descriptor.policy?.budgetType ?? 'none',
+      defaultTimeoutMs: descriptor.policy?.defaultTimeoutMs ?? 480_000,
+      credentialsRequired: Object.freeze([...(descriptor.policy?.credentialsRequired ?? [])]),
+      circuitBreaker: Object.freeze({
+        maxFailures: descriptor.policy?.circuitBreaker?.maxFailures ?? 3,
+        ...(descriptor.policy?.circuitBreaker || {}),
+      }),
+      ...(descriptor.policy || {}),
+    });
+
+    this._providers.set(normalizedName, {
+      name: normalizedName,
+      adapterClassOrFactory,
+      capabilities,
+      policy,
+      description: descriptor.description ?? '',
+    });
+    return this;
+  }
+
+  get(name) {
+    if (typeof name !== 'string') return null;
+    return this._providers.get(name.trim().toLowerCase()) ?? null;
+  }
+
+  has(name) {
+    if (typeof name !== 'string') return false;
+    return this._providers.has(name.trim().toLowerCase());
+  }
+
+  createAdapter(name, options = {}) {
+    const entry = this.get(name);
+    if (!entry) {
+      throw new Error(`Unknown provider: ${name}`);
+    }
+    const Target = entry.adapterClassOrFactory;
+    const resolvedOptions = { descriptor: entry, ...options };
+    try {
+      return new Target(resolvedOptions);
+    } catch (err) {
+      if (err instanceof TypeError && /cannot be invoked without 'new'/.test(err.message)) {
+        throw err;
+      }
+      return Target(resolvedOptions);
+    }
+  }
+
+  list() {
+    return Array.from(this._providers.keys());
+  }
+
+  getDescriptor(name) {
+    const entry = this.get(name);
+    if (!entry) return null;
+    return {
+      name: entry.name,
+      capabilities: entry.capabilities,
+      policy: entry.policy,
+      description: entry.description,
+    };
+  }
+
+  unregister(name) {
+    if (typeof name !== 'string') return false;
+    return this._providers.delete(name.trim().toLowerCase());
+  }
+
+  clear() {
+    this._providers.clear();
+  }
+}
+
+export const defaultProviderRegistry = new ProviderRegistry();
+
+export function registerProvider(name, adapterClassOrFactory, descriptor) {
+  return defaultProviderRegistry.register(name, adapterClassOrFactory, descriptor);
+}
+
+export function getProviderDescriptor(name) {
+  return defaultProviderRegistry.getDescriptor(name);
+}
+
+export function listProviders() {
+  return defaultProviderRegistry.list();
+}
+
+/**
  * Base Provider Adapter defining the common review request contract.
  */
 export class ProviderAdapter {
-  constructor({ provider }) {
-    if (![PROVIDER_KINDS.GEMINI, PROVIDER_KINDS.CLAUDE].includes(provider)) {
-      throw new Error(`Unsupported provider: ${provider}`);
+  constructor({ provider, descriptor = null } = {}) {
+    if (typeof provider !== 'string' || !provider.trim()) {
+      throw new Error(`Provider name must be a non-empty string: ${provider}`);
     }
-    this.provider = provider;
+    this.provider = provider.trim().toLowerCase();
+    this.descriptor = descriptor || defaultProviderRegistry?.getDescriptor(this.provider) || null;
+  }
+
+  get capabilities() {
+    return this.descriptor?.capabilities || Object.freeze({});
+  }
+
+  get policy() {
+    return this.descriptor?.policy || Object.freeze({});
   }
 
   async execute(_request) {
@@ -263,7 +386,7 @@ export class ProviderAdapter {
  */
 export class GeminiProviderAdapter extends ProviderAdapter {
   constructor(options = {}) {
-    super({ provider: PROVIDER_KINDS.GEMINI });
+    super({ provider: PROVIDER_KINDS.GEMINI, descriptor: options.descriptor });
     this.defaultModel = options.defaultModel || GEMINI_MODEL;
     this.defaultEffort = options.defaultEffort || 'medium';
   }
@@ -994,7 +1117,7 @@ export class GeminiProviderAdapter extends ProviderAdapter {
  */
 export class ClaudeProviderAdapter extends ProviderAdapter {
   constructor(options = {}) {
-    super({ provider: PROVIDER_KINDS.CLAUDE });
+    super({ provider: PROVIDER_KINDS.CLAUDE, descriptor: options.descriptor });
     this.defaultModel = options.defaultModel || 'sonnet';
     this.defaultEffort = options.defaultEffort || 'medium';
   }
@@ -1282,15 +1405,43 @@ export class ClaudeProviderAdapter extends ProviderAdapter {
   }
 }
 
+// Register built-in default providers
+defaultProviderRegistry.register(PROVIDER_KINDS.GEMINI, GeminiProviderAdapter, {
+  description: 'Google Gemini REST API adapter with multi-turn tool calling and schema validation',
+  capabilities: {
+    tools: true,
+    structuredOutput: true,
+    multiturnTools: true,
+    hostSecurity: 'host-enforced',
+  },
+  policy: {
+    budgetType: 'prepaid-credits',
+    defaultTimeoutMs: 480_000,
+    credentialsRequired: ['GEMINI_API_KEY'],
+    circuitBreaker: { maxFailures: 3 },
+  },
+});
+
+defaultProviderRegistry.register(PROVIDER_KINDS.CLAUDE, ClaudeProviderAdapter, {
+  description: 'Anthropic Claude Agent SDK adapter with host-enforced tool execution and budget reservation',
+  capabilities: {
+    tools: true,
+    structuredOutput: true,
+    multiturnTools: true,
+    hostSecurity: 'host-enforced',
+  },
+  policy: {
+    budgetType: 'usd-ledger',
+    defaultTimeoutMs: 180_000,
+    credentialsRequired: ['ANTHROPIC_API_KEY'],
+    circuitBreaker: { maxFailures: 3 },
+  },
+});
+
 /**
  * Factory for creating or getting provider adapters.
+ * Delegates to the defaultProviderRegistry.
  */
 export function getProviderAdapter(provider, options = {}) {
-  if (provider === PROVIDER_KINDS.GEMINI) {
-    return new GeminiProviderAdapter(options);
-  }
-  if (provider === PROVIDER_KINDS.CLAUDE) {
-    return new ClaudeProviderAdapter(options);
-  }
-  throw new Error(`Unknown provider: ${provider}`);
+  return defaultProviderRegistry.createAdapter(provider, options);
 }
