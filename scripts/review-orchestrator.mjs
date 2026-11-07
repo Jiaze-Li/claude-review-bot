@@ -147,6 +147,7 @@ export async function runBoundedPool({
   minTimeBufferMs = 60_000,
   workerFn,
   onStop = () => {},
+  catchErrors = false,
 }) {
   const results = new Array(items.length);
   let nextIndex = 0;
@@ -160,10 +161,14 @@ export async function runBoundedPool({
       }
       const index = nextIndex;
       nextIndex += 1;
-      try {
+      if (catchErrors) {
+        try {
+          results[index] = await workerFn(items[index], index);
+        } catch (err) {
+          results[index] = { ok: false, error: err?.message ?? String(err), provider: null };
+        }
+      } else {
         results[index] = await workerFn(items[index], index);
-      } catch (err) {
-        results[index] = { ok: false, error: err?.message ?? String(err), provider: null };
       }
     }
   }
