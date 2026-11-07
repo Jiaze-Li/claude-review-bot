@@ -468,10 +468,13 @@ async function reviewPart(ctx,diff,shared){
     }
   }
 
+  const isClaude = outcome.meta?.provider === 'claude';
   return {
     ...outcome.structured,
     _meta: {
       ...outcome.meta,
+      total_cost_usd: isClaude ? (outcome.meta?.total_cost_usd ?? 0) : 0,
+      ...(isClaude ? {} : { cost_source: undefined }),
       ...(Object.keys(providerCosts).length ? { provider_costs: providerCosts } : {}),
     },
   };
@@ -499,6 +502,8 @@ function mergeParts({ctx,parts,results,shared}){
     attempts:Math.max(...metas.map((meta)=>meta?.attempts??1)),
     parts:parts.length,
     parts_by_claude:claudeMetas.length,
+    total_cost_usd:Number(claudeCost.toFixed(4)),
+    cost_source:claudeMetas.length ? (claudeMetas.some((meta)=>meta.cost_source==='reserve')?'reserve':'sdk') : undefined,
     usage:{
       input_tokens:sumUsage('input_tokens'),
       output_tokens:sumUsage('output_tokens'),
@@ -512,8 +517,6 @@ function mergeParts({ctx,parts,results,shared}){
         fallback_from:'gemini',
         fallback_reason:`${claudeMetas.filter((meta)=>meta.fallback_from).length} of ${parts.length} part(s): ${claudeMetas.find((meta)=>meta.fallback_from).fallback_reason??'Gemini unavailable'}`,
       }:{fallback_from:undefined,fallback_reason:undefined}),
-      total_cost_usd:Number(claudeCost.toFixed(4)),
-      cost_source:claudeMetas.some((meta)=>meta.cost_source==='reserve')?'reserve':'sdk',
     }:{}),
   };
   if(mode==='verification'){

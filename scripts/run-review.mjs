@@ -315,12 +315,12 @@ export async function runReview({ env = process.env, cwd = process.cwd() } = {})
           maxTurns: SHARD_MAX_TURNS,
           env,
         });
+        if (outcome.meta) metas.push(outcome.meta);
         if (outcome.kind === 'ok') {
-          metas.push(outcome.meta);
           return { ok: true, structured: outcome.structured, meta: outcome.meta };
         }
         console.warn(`Gemini could not review shard ${index + 1}/${shards.length}: ${outcome.error}`);
-        return { ok: false, error: outcome.error, kind: outcome.kind, status: outcome.status };
+        return { ok: false, error: outcome.error, kind: outcome.kind, status: outcome.status, meta: outcome.meta };
       },
       claude: async ({ unit, timeoutMs, maxBudgetUsd }) => {
         const prompt = buildPrompt({
@@ -405,8 +405,8 @@ export async function runReview({ env = process.env, cwd = process.cwd() } = {})
               });
             }
           }
+          if (outcome?.meta) metas.push(outcome.meta);
           if (outcome.ok) {
-            if (outcome.meta) metas.push(outcome.meta);
             return {
               ok: true,
               structured: outcome.structured,
@@ -529,10 +529,12 @@ export async function runReview({ env = process.env, cwd = process.cwd() } = {})
 }
 
 function aggregateMeta(list) {
-  const sum = (key) => list.reduce((total, meta) => total + (meta[key] ?? 0), 0);
+  const claudeList = list.filter((m) => m?.provider === 'claude');
+  const sum = (key) => list.reduce((total, meta) => total + (meta?.[key] ?? 0), 0);
+  const sumClaude = (key) => claudeList.reduce((total, meta) => total + (meta?.[key] ?? 0), 0);
   const usage = { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 };
-  for (const meta of list) for (const key of Object.keys(usage)) usage[key] += meta.usage?.[key] ?? 0;
-  const lead = list.find((meta) => meta.provider === 'claude') ?? list[0];
+  for (const meta of claudeList) for (const key of Object.keys(usage)) usage[key] += meta?.usage?.[key] ?? 0;
+  const lead = claudeList[0] ?? list[0];
   return {
     requested_model: lead?.requested_model ?? REVIEW_MODEL,
     resolved_model: lead?.resolved_model ?? null,
@@ -541,7 +543,7 @@ function aggregateMeta(list) {
     num_turns: sum('num_turns'),
     duration_ms: sum('duration_ms'),
     duration_api_ms: sum('duration_api_ms'),
-    total_cost_usd: Number(sum('total_cost_usd').toFixed(4)),
+    total_cost_usd: Number(sumClaude('total_cost_usd').toFixed(4)),
     usage,
     model_usage: {},
   };
