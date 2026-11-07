@@ -1577,8 +1577,16 @@ export function parseProviderBudgets(raw, { env = process.env } = {}) {
       // Claude retains its existing $6 per-PR ledger; third-party provider budgets channel cannot override Claude.
       continue;
     }
-    const num = typeof value === 'number' ? value : Number(value);
-    if (!Number.isFinite(num) || num <= 0) {
+    let num = null;
+    if (typeof value === 'number') {
+      num = value;
+    } else if (typeof value === 'string') {
+      const trimmedVal = value.trim();
+      if (/^[0-9]+(?:\.[0-9]+)?$/.test(trimmedVal)) {
+        num = Number(trimmedVal);
+      }
+    }
+    if (num == null || !Number.isFinite(num) || num <= 0) {
       throw new Error(`Invalid budget for provider "${provider}": budget must be a positive finite number, got "${value}"`);
     }
     result[provider] = num;

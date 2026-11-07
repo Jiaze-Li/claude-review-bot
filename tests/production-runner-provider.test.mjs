@@ -727,9 +727,16 @@ test('Generic PROVIDER_BUDGETS parser: valid formats, Claude protection, and fai
   assert.throws(() => parseProviderBudgets('{"mock-runner-provider": -5}'), /must be a positive finite number/);
   assert.throws(() => parseProviderBudgets('{"mock-runner-provider": 0}'), /must be a positive finite number/);
   assert.throws(() => parseProviderBudgets('{"mock-runner-provider": "not-a-number"}'), /must be a positive finite number/);
+  assert.throws(() => parseProviderBudgets('{"mock-runner-provider": true}'), /must be a positive finite number/);
+  assert.throws(() => parseProviderBudgets('{"mock-runner-provider": false}'), /must be a positive finite number/);
+  assert.throws(() => parseProviderBudgets('{"mock-runner-provider": [5]}'), /must be a positive finite number/);
+  assert.throws(() => parseProviderBudgets('{"mock-runner-provider": {}}'), /must be a positive finite number/);
+  assert.throws(() => parseProviderBudgets('{"mock-runner-provider": "   "}'), /must be a positive finite number/);
   assert.throws(() => parseProviderBudgets('mock-runner-provider=-5'), /must be a positive finite number/);
   assert.throws(() => parseProviderBudgets('mock-runner-provider=0'), /must be a positive finite number/);
   assert.throws(() => parseProviderBudgets('mock-runner-provider=invalid'), /must be a positive finite number/);
+  assert.throws(() => parseProviderBudgets('mock-runner-provider=true'), /must be a positive finite number/);
+  assert.throws(() => parseProviderBudgets('mock-runner-provider=   '), /Invalid PROVIDER_BUDGETS entry/);
 
   // Fail closed on malformed key-value syntax
   assert.throws(() => parseProviderBudgets('mock-runner-provider without separator'), /Invalid PROVIDER_BUDGETS entry/);

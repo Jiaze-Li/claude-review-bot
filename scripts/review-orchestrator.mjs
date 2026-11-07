@@ -547,7 +547,11 @@ export function resolveProviderBudgetManagers({
       const envVar = `PROVIDER_${p.toUpperCase().replace(/[^A-Z0-9]/g, '_')}_BUDGET_USD`;
       let val = parsedBudgets[p];
       if (val == null && env?.[envVar] != null && env[envVar] !== '') {
-        const legacyVal = Number(env[envVar]);
+        const rawLegacy = String(env[envVar]).trim();
+        if (!/^[0-9]+(?:\.[0-9]+)?$/.test(rawLegacy)) {
+          throw new Error(`Invalid budget in ${envVar}: budget must be a positive finite number, got "${env[envVar]}"`);
+        }
+        const legacyVal = Number(rawLegacy);
         if (!Number.isFinite(legacyVal) || legacyVal <= 0) {
           throw new Error(`Invalid budget in ${envVar}: budget must be a positive finite number, got "${env[envVar]}"`);
         }
