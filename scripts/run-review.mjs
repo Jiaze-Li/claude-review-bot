@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { getProviderAdapter, PROVIDER_KINDS } from './provider-adapter.mjs';
+import { defaultProviderRegistry, getProviderAdapter, PROVIDER_KINDS } from './provider-adapter.mjs';
 import { ReadOnlyToolGateway } from './tool-gateway.mjs';
 import { stateIntegrityProcedure } from './review-prompts.mjs';
 import { knownIssuesPromptBlock, matchesKnownDismissal, pathKey } from './review-session-core.mjs';
@@ -33,10 +33,15 @@ const SHARD_CONCURRENCY = Math.max(1, Math.floor(positiveNumberEnv('DEEP_REVIEW_
 // The workflow step has a 20 minute timeout; stop starting shards well before it.
 const DEADLINE_MS = positiveNumberEnv('DEEP_REVIEW_DEADLINE_MS', 16 * 60 * 1000);
 const usagePath = path.join(contextRoot, 'claude-usage.json');
-// Who reviews each shard, in order. Gemini is cheaper, so automatic reviews list it first and Claude
+// Who reviews each shard, in order. By default Gemini is listed first and Claude
 // continues whatever Gemini cannot finish; an explicit `@claude review` lists only Claude.
-const PROVIDERS = (process.env.REVIEW_PROVIDERS || 'claude').split(',').map((name) => name.trim()).filter((name) => ['gemini', 'claude'].includes(name));
-if (!PROVIDERS.length) PROVIDERS.push('claude');
+// Any registered third-party provider can be selected via REVIEW_PROVIDERS.
+const rawProviders = (process.env.REVIEW_PROVIDERS || 'claude')
+  .split(',')
+  .map((name) => name.trim().toLowerCase())
+  .filter(Boolean);
+const validProviders = rawProviders.filter((name) => defaultProviderRegistry.has(name));
+const PROVIDERS = validProviders.length > 0 ? validProviders : ['claude'];
 
 const schema = {
   type: 'object',
@@ -221,76 +226,133 @@ async function reviewUnit(index, unit, providers, suffix = '', retries = 2) {
   fs.writeFileSync(path.resolve(cwd, diffPath), unit.diff, { mode: 0o600 });
   const common = { shard: unit, index, count: shards.length, diffPath, knownIssues, riskNotes };
 
+  const canExecute = {
+    claude: () => safeRoot ? true : 'safe-target repository snapshot is not available for Claude review',
+  };
+  const executors = {
+    gemini: async ({ unit, timeoutMs }) => {
+      const shardContextPath = path.relative(contextRoot, path.resolve(cwd, diffPath)).replace(/\\/g, '/');
+      const toolGateway = safeRoot ? new ReadOnlyToolGateway({
+        safeRoot, contextRoot, cwd, ignorePatterns, maxCalls: SHARD_MAX_TURNS * 4,
+        allowedContextFiles: [shardContextPath, 'changed-files.txt', 'diff-stat.txt', 'pr.json', 'skipped-files.txt'],
+      }) : null;
+      if (!toolGateway && unit.bytes > GEMINI_SHARD_MAX_BYTES) {
+        return { ok: false, kind: 'skipped', error: 'shard too large for Gemini without tools' };
+      }
+      const inlineDiff = unit.bytes <= GEMINI_SHARD_MAX_BYTES ? unit.diff : null;
+      const prompt = buildPrompt({
+        ...common,
+        maxTurns: SHARD_MAX_TURNS,
+        inlineDiff,
+        hasTools: Boolean(toolGateway),
+      });
+      const outcome = await runGeminiShard({
+        prompt,
+        schema,
+        timeoutMs: Math.min(GEMINI_SHARD_TIMEOUT_MS, timeoutMs),
+        toolGateway,
+        maxTurns: SHARD_MAX_TURNS,
+      });
+      if (outcome.kind === 'ok') {
+        metas.push(outcome.meta);
+        return { ok: true, structured: outcome.structured, meta: outcome.meta };
+      }
+      console.warn(`Gemini could not review shard ${index + 1}/${shards.length}: ${outcome.error}`);
+      return { ok: false, error: outcome.error, kind: outcome.kind, status: outcome.status };
+    },
+    claude: async ({ unit, timeoutMs, maxBudgetUsd }) => {
+      const prompt = buildPrompt({
+        ...common,
+        maxTurns: SHARD_MAX_TURNS,
+        budgetUsd: maxBudgetUsd,
+        hasTools: Boolean(safeRoot),
+      });
+      const run = await runClaudeShard({
+        prompt,
+        maxTurns: SHARD_MAX_TURNS,
+        maxBudgetUsd,
+        timeoutMs,
+        diffPath,
+      });
+      if (run.meta) metas.push(run.meta);
+      if (run.subtype === 'success' && run.structured) {
+        return {
+          ok: true,
+          structured: run.structured,
+          meta: run.meta,
+          facts: claudeFacts(run.meta, SHARD_MAX_TURNS, maxBudgetUsd),
+        };
+      }
+      return {
+        ok: false,
+        error: run.subtype ? `${run.subtype}${run.errors ? `: ${run.errors}` : ''}` : (run.errors || 'no structured output'),
+        meta: run.meta,
+      };
+    },
+  };
+
+  for (const p of providers) {
+    if (!executors[p] && defaultProviderRegistry.has(p)) {
+      const desc = defaultProviderRegistry.getDescriptor(p);
+      if (desc?.capabilities?.tools) {
+        canExecute[p] = () => safeRoot ? true : `safe-target repository snapshot is not available for ${p} review`;
+      }
+      executors[p] = async ({ unit: curUnit, timeoutMs: callTimeout, maxBudgetUsd }) => {
+        const shardContextPath = path.relative(contextRoot, path.resolve(cwd, diffPath)).replace(/\\/g, '/');
+        const toolGateway = safeRoot ? new ReadOnlyToolGateway({
+          safeRoot,
+          contextRoot,
+          cwd,
+          ignorePatterns,
+          maxCalls: SHARD_MAX_TURNS * 4,
+          allowedContextFiles: [shardContextPath, 'changed-files.txt', 'diff-stat.txt', 'pr.json', 'skipped-files.txt'],
+        }) : null;
+        const prompt = buildPrompt({
+          ...common,
+          maxTurns: SHARD_MAX_TURNS,
+          budgetUsd: maxBudgetUsd,
+          hasTools: Boolean(toolGateway),
+        });
+        const adapter = getProviderAdapter(p);
+        const outcome = await adapter.execute({
+          prompt,
+          schema,
+          timeoutMs: callTimeout,
+          maxBudgetUsd,
+          maxTurns: SHARD_MAX_TURNS,
+          toolGateway,
+          cwd,
+          env: process.env,
+          allowZeroCost: true,
+        });
+        if (outcome.ok) {
+          if (outcome.meta) metas.push(outcome.meta);
+          return {
+            ok: true,
+            structured: outcome.structured,
+            meta: outcome.meta,
+            facts: `${p} review complete`,
+          };
+        }
+        return {
+          ok: false,
+          error: outcome.error || outcome.errors || `${p} review failed`,
+          kind: outcome.kind,
+          status: outcome.status,
+          meta: outcome.meta,
+        };
+      };
+    }
+  }
+
   return executeWorkUnit({
     unit,
     providers,
     geminiCircuitBreaker: circuitBreaker,
     budgetManager,
     deadlineTracker,
-    canExecute: {
-      claude: () => safeRoot ? true : 'safe-target repository snapshot is not available for Claude review',
-    },
-    executors: {
-      gemini: async ({ unit, timeoutMs }) => {
-        const shardContextPath = path.relative(contextRoot, path.resolve(cwd, diffPath)).replace(/\\/g, '/');
-        const toolGateway = safeRoot ? new ReadOnlyToolGateway({
-          safeRoot, contextRoot, cwd, ignorePatterns, maxCalls: SHARD_MAX_TURNS * 4,
-          allowedContextFiles: [shardContextPath, 'changed-files.txt', 'diff-stat.txt', 'pr.json', 'skipped-files.txt'],
-        }) : null;
-        if (!toolGateway && unit.bytes > GEMINI_SHARD_MAX_BYTES) {
-          return { ok: false, kind: 'skipped', error: 'shard too large for Gemini without tools' };
-        }
-        const inlineDiff = unit.bytes <= GEMINI_SHARD_MAX_BYTES ? unit.diff : null;
-        const prompt = buildPrompt({
-          ...common,
-          maxTurns: SHARD_MAX_TURNS,
-          inlineDiff,
-          hasTools: Boolean(toolGateway),
-        });
-        const outcome = await runGeminiShard({
-          prompt,
-          schema,
-          timeoutMs: Math.min(GEMINI_SHARD_TIMEOUT_MS, timeoutMs),
-          toolGateway,
-          maxTurns: SHARD_MAX_TURNS,
-        });
-        if (outcome.kind === 'ok') {
-          metas.push(outcome.meta);
-          return { ok: true, structured: outcome.structured, meta: outcome.meta };
-        }
-        console.warn(`Gemini could not review shard ${index + 1}/${shards.length}: ${outcome.error}`);
-        return { ok: false, error: outcome.error, kind: outcome.kind, status: outcome.status };
-      },
-      claude: async ({ unit, timeoutMs, maxBudgetUsd }) => {
-        const prompt = buildPrompt({
-          ...common,
-          maxTurns: SHARD_MAX_TURNS,
-          budgetUsd: maxBudgetUsd,
-          hasTools: Boolean(safeRoot),
-        });
-        const run = await runClaudeShard({
-          prompt,
-          maxTurns: SHARD_MAX_TURNS,
-          maxBudgetUsd,
-          timeoutMs,
-          diffPath,
-        });
-        if (run.meta) metas.push(run.meta);
-        if (run.subtype === 'success' && run.structured) {
-          return {
-            ok: true,
-            structured: run.structured,
-            meta: run.meta,
-            facts: claudeFacts(run.meta, SHARD_MAX_TURNS, maxBudgetUsd),
-          };
-        }
-        return {
-          ok: false,
-          error: run.subtype ? `${run.subtype}${run.errors ? `: ${run.errors}` : ''}` : (run.errors || 'no structured output'),
-          meta: run.meta,
-        };
-      },
-    },
+    canExecute,
+    executors,
     onPartialCoverage: async ({ result, unit, currentProvider, remainingProviders, notes }) => {
       const coverage = reconcileCoverage(result.structured.coverage, unit.files);
       if (coverage.unreviewedPaths.length && remainingProviders.length) {

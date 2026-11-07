@@ -5,7 +5,7 @@ import { CLAUDE_AUTO_MIN_BUDGET_USD, DEEP_REVIEW_MANUAL_RUN_BUDGET_USD, GEMINI_M
 import {isGeminiUnavailableStatus,runClaudeStructured} from './claude-fallback.mjs';
 import {geminiBaseUrl} from './gemini-config.mjs';
 import {MAX_SHARDS,dropIgnoredFiles,planShards,splitDiffByFile} from './review-shards.mjs';
-import {getProviderAdapter, PROVIDER_KINDS, OUTCOME_KINDS} from './provider-adapter.mjs';
+import {defaultProviderRegistry, getProviderAdapter, PROVIDER_KINDS, OUTCOME_KINDS} from './provider-adapter.mjs';
 import {ReadOnlyToolGateway} from './tool-gateway.mjs';
 import {BudgetManager, CircuitBreaker, DeadlineTracker, runBoundedPool, executeWorkUnit} from './review-orchestrator.mjs';
 
@@ -131,14 +131,25 @@ const MAX_REPAIR_FINDINGS=3;
 const VERDICT_RANK={FIXED:1,UNCERTAIN:2,STILL_OPEN:3};
 
 export async function runGeminiReview({env=process.env,fetchImpl=fetch,logImpl=console.log,queryImpl=null}={}){
-  // `@claude review` asks for Claude alone: Gemini is neither needed nor called.
-  const claudeOnly=JSON.parse(fs.readFileSync(path.join(path.resolve(env.REVIEW_CONTEXT_DIR||'.review-context'),'session-plan.json'),'utf8')).requestedMode==='claude';
-  const apiKey=claudeOnly?(env.GEMINI_API_KEY||''):required(env,'GEMINI_API_KEY');
   const repo=required(env,'TARGET_REPO');
   const prNumber=required(env,'PR_NUMBER');
   const headSha=required(env,'HEAD_SHA');
   const contextRoot=path.resolve(env.REVIEW_CONTEXT_DIR||'.review-context');
-  const plan=JSON.parse(fs.readFileSync(path.join(contextRoot,'session-plan.json'),'utf8'));
+  const planPath=path.join(contextRoot,'session-plan.json');
+  const plan=fs.existsSync(planPath)?JSON.parse(fs.readFileSync(planPath,'utf8')):{};
+  // `@claude review` asks for Claude alone: Gemini is neither needed nor called.
+  const claudeOnly=plan.requestedMode==='claude';
+
+  const configuredProviders=(env.REVIEW_PROVIDERS||'')
+    .split(',')
+    .map((p)=>p.trim().toLowerCase())
+    .filter((p)=>defaultProviderRegistry.has(p));
+  const providers=configuredProviders.length>0
+    ? configuredProviders
+    : (claudeOnly ? ['claude'] : ['gemini', 'claude']);
+
+  const needsGemini=providers.includes('gemini');
+  const apiKey=needsGemini?(env.GEMINI_API_KEY?required(env,'GEMINI_API_KEY'):required(env,'GEMINI_API_KEY')):(env.GEMINI_API_KEY||'');
   const mode=plan.decision?.mode;
   const diffName=['verification','incremental'].includes(mode)?'repair.diff':'pr.diff';
   // Same files skipped as in the sharded engine (binary/asset files and the repository's .reviewbotignore, read
@@ -162,7 +173,7 @@ export async function runGeminiReview({env=process.env,fetchImpl=fetch,logImpl=c
     },
     perCallCap: null,
   });
-  const ctx={claudeOnly,env,fetchImpl,logImpl,queryImpl,apiKey,repo,prNumber,headSha,contextRoot,plan,mode,prJson,session,riskProfile,diffName,manual};
+  const ctx={claudeOnly,env,fetchImpl,logImpl,queryImpl,apiKey,repo,prNumber,headSha,contextRoot,plan,mode,prJson,session,riskProfile,diffName,manual,providers};
   const shared={circuitBreaker,budgetManager};
 
   const fixedBytes=Buffer.byteLength(prJson,'utf8')+Buffer.byteLength(JSON.stringify(session??{}),'utf8')+Buffer.byteLength(JSON.stringify(riskProfile),'utf8');
@@ -214,7 +225,7 @@ function recordParts(ctx,shared,reason){
 // One model request for one diff: Gemini, then Claude when Gemini cannot do it. `shared` carries what an
 // earlier part learned (Gemini unavailable) and what Claude has already cost.
 async function reviewPart(ctx,diff,shared){
-  const {claudeOnly,env,fetchImpl,logImpl,queryImpl,apiKey,repo,prNumber,headSha,contextRoot,plan,mode,prJson,session,riskProfile,diffName}=ctx;
+  const {claudeOnly,env,fetchImpl,logImpl,queryImpl,apiKey,repo,prNumber,headSha,contextRoot,plan,mode,prJson,session,riskProfile,diffName,providers}=ctx;
   const contextBytes=Buffer.byteLength(diff,'utf8')+Buffer.byteLength(prJson,'utf8')+Buffer.byteLength(JSON.stringify(session??{}),'utf8')+Buffer.byteLength(JSON.stringify(riskProfile),'utf8');
   if(contextBytes>MAX_CONTEXT_BYTES) throw new Error(`Gemini review context exceeds ${MAX_CONTEXT_BYTES} bytes; use targeted human/Codex review rather than silently truncating`);
 
@@ -232,7 +243,7 @@ async function reviewPart(ctx,diff,shared){
 
   const outcome = await executeWorkUnit({
     unit: { diff },
-    providers: claudeOnly ? ['claude'] : ['gemini', 'claude'],
+    providers: providers || (claudeOnly ? ['claude'] : ['gemini', 'claude']),
     geminiCircuitBreaker: shared.circuitBreaker,
     budgetManager: shared.budgetManager,
     defaultTimeoutMs: timeoutMs,
@@ -344,6 +355,66 @@ async function reviewPart(ctx,diff,shared){
           },
         };
       },
+      ...Object.fromEntries(
+        (providers || [])
+          .filter((p) => p !== 'gemini' && p !== 'claude' && defaultProviderRegistry.has(p))
+          .map((p) => [
+            p,
+            async ({ unit, timeoutMs: callTimeout, maxBudgetUsd }) => {
+              const adapter = getProviderAdapter(p);
+              const safeDir = env.SAFE_REPO_DIR || 'safe-target';
+              const safePath = path.resolve(safeDir);
+              const safeRoot = fs.existsSync(safePath) ? safePath : null;
+              const toolGateway = safeRoot ? new ReadOnlyToolGateway({
+                safeRoot,
+                contextRoot,
+                cwd: process.cwd(),
+                allowedContextFiles: [diffName, 'changed-files.txt', 'diff-stat.txt', 'pr.json', 'skipped-files.txt', 'repair.diff', 'pr.diff'],
+              }) : null;
+              const res = await adapter.execute({
+                prompt: built.prompt,
+                schema: built.schema,
+                timeoutMs: callTimeout,
+                maxBudgetUsd,
+                maxOutputTokens,
+                env,
+                fetchImpl,
+                maxAttempts: 2,
+                logImpl,
+                toolGateway,
+                allowZeroCost: true,
+              });
+              if (res.ok) {
+                if (mode === 'verification') normalizeVerificationResult(res.structured);
+                else normalizeReviewResult(res.structured);
+                return {
+                  ok: true,
+                  structured: res.structured,
+                  meta: {
+                    provider: p,
+                    requested_model: res.meta?.requested_model || 'default',
+                    resolved_model: res.meta?.resolved_model || 'default',
+                    mode,
+                    attempts: res.meta?.num_turns ?? 1,
+                    max_output_tokens: maxOutputTokens,
+                    timeout_ms: callTimeout,
+                    risk_profile: riskProfile,
+                    usage: res.meta?.usage,
+                    total_cost_usd: res.meta?.total_cost_usd,
+                    cost_source: res.meta?.cost_source,
+                  },
+                };
+              }
+              return {
+                ok: false,
+                error: res.error || res.errors || `${p} failed`,
+                kind: res.kind,
+                status: res.status,
+                meta: res.meta,
+              };
+            },
+          ])
+      ),
     },
     onClaudeBudgetBlocked: async ({ notes, lastFailed }) => {
       const reasonText = lastFailed?.status ? `HTTP ${lastFailed.status}` : (lastFailed?.message?.slice(0, 120) || (claudeOnly ? 'requested' : 'unknown'));

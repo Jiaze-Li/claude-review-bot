@@ -11,6 +11,41 @@ import { ReadOnlyToolGateway } from './tool-gateway.mjs';
 
 export const AUTHORIZED_GEMINI_TOOLS = Object.freeze(['Read', 'Glob', 'Grep']);
 
+/**
+ * Factory for Host tool authorizers enforcing that Agent providers may ONLY
+ * execute authorized Host Gateway tools and never invoke native host/sandbox tools.
+ * Capability descriptor alone is not a sandbox; this boundary guarantees host security.
+ */
+export function createHostToolAuthorizer({
+  toolGateway = null,
+  allowedTools = null,
+  serverName = 'gateway',
+  fallbackAuthorizer = null,
+} = {}) {
+  const allowed = allowedTools || (toolGateway?.getMcpToolNames
+    ? toolGateway.getMcpToolNames(serverName)
+    : AUTHORIZED_GEMINI_TOOLS.map((t) => `mcp__${serverName}__${t}`));
+
+  return async (toolName, input) => {
+    if (toolGateway) {
+      if (!allowed.includes(toolName)) {
+        return {
+          behavior: 'deny',
+          message: `Direct use of native tool ${toolName} is forbidden; use Host Gateway tools (${allowed.join(', ')}) instead.`,
+        };
+      }
+      return { behavior: 'allow', updatedInput: input };
+    }
+    if (typeof fallbackAuthorizer === 'function') {
+      return fallbackAuthorizer(toolName, input);
+    }
+    return {
+      behavior: 'deny',
+      message: `Tool execution denied: no Host Gateway available to authorize ${toolName}.`,
+    };
+  };
+}
+
 function checkCheckedText(value, max, name) {
   if (typeof value !== 'string') {
     return `${name} must be a string`;
@@ -1215,11 +1250,12 @@ export class ClaudeProviderAdapter extends ProviderAdapter {
 
     // MCP handlers enforce path and quota policy. The permission callback only
     // allows the registered MCP tools; do not double-authorize or double-charge them.
-    const toolAuthorizer = toolGateway
-      ? async (name) => resolvedAllowedTools.includes(name)
-        ? { behavior: 'allow' }
-        : { behavior: 'deny', message: 'Only Host Gateway MCP tools are available.' }
-      : (canUseTool ?? (async () => ({ behavior: 'deny', message: 'No tools available in this review.' })));
+    const toolAuthorizer = createHostToolAuthorizer({
+      toolGateway,
+      allowedTools: resolvedAllowedTools,
+      serverName: 'gateway',
+      fallbackAuthorizer: canUseTool,
+    });
     // MCP handlers return their own already-bounded output. No PostToolUse rewrite.
     const resolvedHooks = toolGateway ? undefined : (hooks ?? undefined);
 
