@@ -10,10 +10,11 @@ import {
   createHostToolAuthorizer,
   OUTCOME_KINDS,
   ERROR_KINDS,
+  parseProviderBudgets,
 } from '../scripts/provider-adapter.mjs';
 import { runGeminiReview } from '../scripts/run-gemini-review.mjs';
 import { runReview } from '../scripts/run-review.mjs';
-import { executeWorkUnit, BudgetManager } from '../scripts/review-orchestrator.mjs';
+import { executeWorkUnit, BudgetManager, resolveProviderBudgetManagers } from '../scripts/review-orchestrator.mjs';
 import { ReadOnlyToolGateway } from '../scripts/tool-gateway.mjs';
 import './fixtures/register-mock-provider.mjs';
 
@@ -682,24 +683,186 @@ test('Missing Gemini key handling: runGeminiReview falls back to Claude when GEM
   }
 });
 
-test('GitHub Actions workflow propagation: review-v2.yml propagates REVIEW_PROVIDERS to production runners', () => {
+test('Generic PROVIDER_BUDGETS parser: valid formats, Claude protection, and fail closed', () => {
+  // Empty or undefined
+  assert.deepEqual(parseProviderBudgets(undefined), {});
+  assert.deepEqual(parseProviderBudgets(''), {});
+  assert.deepEqual(parseProviderBudgets('   '), {});
+
+  // JSON format
+  assert.deepEqual(
+    parseProviderBudgets('{"mock-runner-provider": 5.00, "other": 2.5}'),
+    { 'mock-runner-provider': 5, other: 2.5 }
+  );
+
+  // Key=value comma-separated
+  assert.deepEqual(
+    parseProviderBudgets('mock-runner-provider=5.00, other=2.50'),
+    { 'mock-runner-provider': 5, other: 2.5 }
+  );
+
+  // Key:value newline-separated
+  assert.deepEqual(
+    parseProviderBudgets('mock-runner-provider: 5.00\nother: 2.50'),
+    { 'mock-runner-provider': 5, other: 2.5 }
+  );
+
+  // Claude is ignored to strictly protect Claude's $6 per-PR ledger
+  assert.deepEqual(
+    parseProviderBudgets('{"claude": 100.00, "mock-runner-provider": 3.00}'),
+    { 'mock-runner-provider': 3 }
+  );
+  assert.deepEqual(
+    parseProviderBudgets('claude=100.00, mock-runner-provider=3.00'),
+    { 'mock-runner-provider': 3 }
+  );
+
+  // Fail closed on invalid JSON
+  assert.throws(() => parseProviderBudgets('{invalid json}'), /Invalid PROVIDER_BUDGETS JSON/);
+
+  // Fail closed on non-object JSON
+  assert.throws(() => parseProviderBudgets('[1, 2, 3]'), /must be a JSON object/);
+
+  // Fail closed on non-positive or invalid number
+  assert.throws(() => parseProviderBudgets('{"mock-runner-provider": -5}'), /must be a positive finite number/);
+  assert.throws(() => parseProviderBudgets('{"mock-runner-provider": 0}'), /must be a positive finite number/);
+  assert.throws(() => parseProviderBudgets('{"mock-runner-provider": "not-a-number"}'), /must be a positive finite number/);
+  assert.throws(() => parseProviderBudgets('mock-runner-provider=-5'), /must be a positive finite number/);
+  assert.throws(() => parseProviderBudgets('mock-runner-provider=0'), /must be a positive finite number/);
+  assert.throws(() => parseProviderBudgets('mock-runner-provider=invalid'), /must be a positive finite number/);
+
+  // Fail closed on malformed key-value syntax
+  assert.throws(() => parseProviderBudgets('mock-runner-provider without separator'), /Invalid PROVIDER_BUDGETS entry/);
+});
+
+test('Generic PROVIDER_BUDGETS channel in production runners: JSON and key=val formats succeed and invalid budgets fail closed', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'provider-budgets-runner-'));
+  const ctxDir = path.join(tmpDir, '.review-context');
+  fs.mkdirSync(ctxDir, { recursive: true });
+
+  const sessionPlan = {
+    decision: { mode: 'incremental' },
+    requestedMode: 'auto',
+    session: {
+      version: 1,
+      threadId: 'test-thread',
+      status: 'OPEN',
+      findings: [],
+    },
+  };
+  fs.writeFileSync(path.join(ctxDir, 'session-plan.json'), JSON.stringify(sessionPlan));
+  fs.writeFileSync(path.join(ctxDir, 'pr.json'), JSON.stringify({ number: 10, title: 'Test PR', base: { ref: 'main' } }));
+  fs.writeFileSync(path.join(ctxDir, 'repair.diff'), 'diff --git a/a.swift b/a.swift\n--- a/a.swift\n+++ b/a.swift\n@@ -1 +1 @@\n+test change\n');
+  fs.writeFileSync(path.join(ctxDir, 'risk-profile.json'), JSON.stringify({ version: 1, stateIntegrity: false, signals: { synchronization: [], durableState: [], multiActor: [] } }));
+
+  try {
+    const baseEnv = {
+      REVIEW_PROVIDERS: 'mock-runner-provider',
+      TARGET_REPO: 'test/repo',
+      PR_NUMBER: '10',
+      HEAD_SHA: 'a'.repeat(40),
+      REVIEW_CONTEXT_DIR: ctxDir,
+    };
+
+    // 1. runGeminiReview succeeds with JSON PROVIDER_BUDGETS
+    const resJson = await runGeminiReview({
+      env: {
+        ...baseEnv,
+        PROVIDER_BUDGETS: '{"mock-runner-provider": 5.00}',
+      },
+      logImpl: () => {},
+    });
+    assert.ok(resJson);
+    assert.equal(resJson._meta.provider, 'mock-runner-provider');
+    assert.equal(resJson._meta.provider_costs['mock-runner-provider'], 0.04);
+
+    // 2. runGeminiReview succeeds with key=val PROVIDER_BUDGETS
+    const resKeyVal = await runGeminiReview({
+      env: {
+        ...baseEnv,
+        PROVIDER_BUDGETS: 'mock-runner-provider=5.00',
+      },
+      logImpl: () => {},
+    });
+    assert.ok(resKeyVal);
+    assert.equal(resKeyVal._meta.provider, 'mock-runner-provider');
+
+    // 3. runGeminiReview fails closed on invalid PROVIDER_BUDGETS
+    await assert.rejects(
+      runGeminiReview({
+        env: {
+          ...baseEnv,
+          PROVIDER_BUDGETS: 'mock-runner-provider=-10.00',
+        },
+        logImpl: () => {},
+      }),
+      /must be a positive finite number/
+    );
+
+    // 4. runReview succeeds with PROVIDER_BUDGETS
+    const safeTarget = path.join(tmpDir, 'safe-target');
+    fs.mkdirSync(safeTarget, { recursive: true });
+    fs.writeFileSync(path.join(safeTarget, 'a.swift'), 'test content');
+    fs.writeFileSync(path.join(ctxDir, 'changed-files.txt'), 'a.swift\n');
+    fs.writeFileSync(path.join(ctxDir, 'diff-stat.txt'), '1 file changed, 1 insertion(+)\n');
+    fs.writeFileSync(path.join(ctxDir, 'pr.diff'), 'diff --git a/a.swift b/a.swift\n--- a/a.swift\n+++ b/a.swift\n@@ -1 +1 @@\n+test change\n');
+    fs.writeFileSync(path.join(ctxDir, 'skipped-files.txt'), '');
+
+    const resFull = await runReview({
+      env: {
+        ...baseEnv,
+        PROVIDER_BUDGETS: '{"mock-runner-provider": 5.00}',
+        SAFE_REPO_DIR: safeTarget,
+        REVIEW_MODEL: 'mock-runner-v1',
+      },
+      cwd: tmpDir,
+      log: () => {},
+    });
+    assert.ok(resFull);
+    assert.equal(resFull._meta.providers['mock-runner-provider'], 1);
+    assert.equal(resFull._meta.provider_costs['mock-runner-provider'], 0.04);
+
+    // 5. runReview fails closed on invalid PROVIDER_BUDGETS
+    await assert.rejects(
+      runReview({
+        env: {
+          ...baseEnv,
+          PROVIDER_BUDGETS: '{"mock-runner-provider": "invalid"}',
+          SAFE_REPO_DIR: safeTarget,
+        },
+        cwd: tmpDir,
+        log: () => {},
+      }),
+      /must be a positive finite number/
+    );
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('GitHub Actions workflow propagation: review-v2.yml propagates REVIEW_PROVIDERS and PROVIDER_BUDGETS to production runners', () => {
   const ymlPath = path.resolve('.github/workflows/review-v2.yml');
   const yml = fs.readFileSync(ymlPath, 'utf8');
 
   // Verify inputs defined
   assert.match(yml, /workflow_dispatch:[\s\S]*?review_providers:\s*\n\s*description:/);
+  assert.match(yml, /workflow_dispatch:[\s\S]*?provider_budgets:\s*\n\s*description:/);
   assert.match(yml, /workflow_call:[\s\S]*?review_providers:\s*\n\s*required: false/);
+  assert.match(yml, /workflow_call:[\s\S]*?provider_budgets:\s*\n\s*required: false/);
 
   // Verify job level environment propagation
-  assert.match(yml, /jobs:\s*\n\s*review:\s*\n\s*runs-on: ubuntu-latest\s*\n\s*env:\s*\n\s*REVIEW_PROVIDERS:/);
+  assert.match(yml, /jobs:\s*\n\s*review:\s*\n\s*runs-on: ubuntu-latest\s*\n\s*env:\s*\n\s*REVIEW_PROVIDERS:[\s\S]*?PROVIDER_BUDGETS:/);
 
-  // Verify step level propagation to begin-deep and gemini-run
+  // Verify step level propagation to begin-deep, gemini-run, and claude-run
   const beginDeepBlock = yml.slice(yml.indexOf('- name: Begin Claude deep review'), yml.indexOf('- name: Recover published session'));
   assert.match(beginDeepBlock, /REVIEW_PROVIDERS: \$\{\{ inputs\.review_providers \|\| vars\.REVIEW_PROVIDERS \|\| '' \}\}/);
+  assert.match(beginDeepBlock, /PROVIDER_BUDGETS: \$\{\{ inputs\.provider_budgets \|\| vars\.PROVIDER_BUDGETS \|\| '' \}\}/);
 
   const geminiRunBlock = yml.slice(yml.indexOf('- name: Run Gemini bounded review'), yml.indexOf('- name: Record provider-unavailable delta review'));
   assert.match(geminiRunBlock, /REVIEW_PROVIDERS: \$\{\{ inputs\.review_providers \|\| vars\.REVIEW_PROVIDERS \|\| '' \}\}/);
+  assert.match(geminiRunBlock, /PROVIDER_BUDGETS: \$\{\{ inputs\.provider_budgets \|\| vars\.PROVIDER_BUDGETS \|\| '' \}\}/);
 
   const claudeRunBlock = yml.slice(yml.indexOf('- name: Run Claude explicit deep review'), yml.indexOf('- name: Publish Claude explicit deep review'));
   assert.match(claudeRunBlock, /REVIEW_PROVIDERS: \$\{\{ steps\.begin-deep\.outputs\.providers \}\}/);
+  assert.match(claudeRunBlock, /PROVIDER_BUDGETS: \$\{\{ inputs\.provider_budgets \|\| vars\.PROVIDER_BUDGETS \|\| '' \}\}/);
 });

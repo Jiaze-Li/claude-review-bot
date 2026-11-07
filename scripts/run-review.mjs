@@ -8,7 +8,7 @@ import { stateIntegrityProcedure } from './review-prompts.mjs';
 import { knownIssuesPromptBlock, matchesKnownDismissal, pathKey } from './review-session-core.mjs';
 import { GEMINI_SHARD_MAX_BYTES, GEMINI_SHARD_TIMEOUT_MS, runGeminiShard } from './gemini-shard.mjs';
 import { DEFAULT_IGNORE, matchesIgnore, mergeShardResults, parseIgnorePatterns, planShards, reconcileCoverage, splitDiffByFile } from './review-shards.mjs';
-import { BudgetManager, CircuitBreaker, DeadlineTracker, runBoundedPool, executeWorkUnit } from './review-orchestrator.mjs';
+import { BudgetManager, CircuitBreaker, DeadlineTracker, runBoundedPool, executeWorkUnit, resolveProviderBudgetManagers } from './review-orchestrator.mjs';
 
 // Use Claude Code's moving Sonnet alias so reviews follow the current Sonnet
 // generation without pinning this repository to a specific release.
@@ -223,25 +223,12 @@ export async function runReview({ env = process.env, cwd = process.cwd() } = {})
     perCallCap: (available) => sharded ? Math.min(available, Math.max(1, REVIEW_MAX_BUDGET_USD / 3)) : available,
   });
 
-  const providerBudgetManagers = {};
-  for (const p of PROVIDERS) {
-    if (p === 'claude') {
-      providerBudgetManagers.claude = budgetManager;
-    } else {
-      const desc = defaultProviderRegistry.getDescriptor(p);
-      if (desc?.policy?.budgetType === 'usd-ledger') {
-        const envVar = `PROVIDER_${p.toUpperCase().replace(/[^A-Z0-9]/g, '_')}_BUDGET_USD`;
-        const val = positiveNumberEnv(envVar, null, env);
-        if (val != null) {
-          providerBudgetManagers[p] = new BudgetManager({
-            minStartingAllowanceUsd: Math.min(0.1, val / 2),
-            getAvailableBudget: (pendingUsd) => val - pendingUsd,
-            perCallCap: val,
-          });
-        }
-      }
-    }
-  }
+  const providerBudgetManagers = resolveProviderBudgetManagers({
+    providers: PROVIDERS,
+    env,
+    claudeBudgetManager: budgetManager,
+    registry: defaultProviderRegistry,
+  });
 
   function timeLeftMs() {
     return deadlineTracker.timeLeftMs();

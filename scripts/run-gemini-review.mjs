@@ -7,7 +7,7 @@ import {geminiBaseUrl} from './gemini-config.mjs';
 import {MAX_SHARDS,dropIgnoredFiles,planShards,splitDiffByFile} from './review-shards.mjs';
 import {defaultProviderRegistry, getProviderAdapter, parseReviewProviders, PROVIDER_KINDS, OUTCOME_KINDS} from './provider-adapter.mjs';
 import {ReadOnlyToolGateway} from './tool-gateway.mjs';
-import {BudgetManager, CircuitBreaker, DeadlineTracker, runBoundedPool, executeWorkUnit} from './review-orchestrator.mjs';
+import {BudgetManager, CircuitBreaker, DeadlineTracker, runBoundedPool, executeWorkUnit, resolveProviderBudgetManagers} from './review-orchestrator.mjs';
 
 // Moving alias: always resolves to Google's current Flash model. Override with GEMINI_MODEL to pin.
 export const GEMINI_MODEL='gemini-flash-latest';
@@ -172,25 +172,12 @@ export async function runGeminiReview({env=process.env,fetchImpl=fetch,logImpl=c
     },
     perCallCap: null,
   });
-  const providerBudgetManagers = {
-    claude: budgetManager,
-  };
-  for (const p of (providers || [])) {
-    if (p !== 'claude') {
-      const desc = defaultProviderRegistry.getDescriptor(p);
-      if (desc?.policy?.budgetType === 'usd-ledger') {
-        const envVar = `PROVIDER_${p.toUpperCase().replace(/[^A-Z0-9]/g, '_')}_BUDGET_USD`;
-        const val = env[envVar] ? Number(env[envVar]) : null;
-        if (val != null && Number.isFinite(val) && val > 0) {
-          providerBudgetManagers[p] = new BudgetManager({
-            minStartingAllowanceUsd: Math.min(0.1, val / 2),
-            getAvailableBudget: (pendingUsd) => val - pendingUsd,
-            perCallCap: val,
-          });
-        }
-      }
-    }
-  }
+  const providerBudgetManagers = resolveProviderBudgetManagers({
+    providers,
+    env,
+    claudeBudgetManager: budgetManager,
+    registry: defaultProviderRegistry,
+  });
   const ctx={claudeOnly,env,fetchImpl,logImpl,queryImpl,apiKey,repo,prNumber,headSha,contextRoot,plan,mode,prJson,session,riskProfile,diffName,manual,providers};
   const shared={circuitBreaker,budgetManager,providerBudgetManagers};
 

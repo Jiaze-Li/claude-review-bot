@@ -1531,3 +1531,59 @@ export function parseReviewProviders(raw, {
   return out;
 }
 
+/**
+ * Generic configuration parser for third-party Provider budgets.
+ * Supports JSON string (e.g. '{"mock-runner-provider": 5.00}') or key=val pairs
+ * (e.g. 'mock-runner-provider=5.00, other=2.50').
+ *
+ * Enforces:
+ * - Budget numbers must be positive finite values (> 0); invalid entries fail closed.
+ * - Claude is ignored to strictly preserve Claude's existing $6 per-PR ledger.
+ */
+export function parseProviderBudgets(raw, { env = process.env } = {}) {
+  const source = raw != null ? String(raw) : (env?.PROVIDER_BUDGETS ? String(env.PROVIDER_BUDGETS) : '');
+  const trimmed = source.trim();
+  if (!trimmed) {
+    return {};
+  }
+
+  let parsed = null;
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch (err) {
+      throw new Error(`Invalid PROVIDER_BUDGETS JSON: ${err.message}`);
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('Invalid PROVIDER_BUDGETS: must be a JSON object mapping provider names to numeric budgets');
+    }
+  } else {
+    parsed = {};
+    const entries = trimmed.split(/[\n,;]+/).map((s) => s.trim()).filter(Boolean);
+    for (const entry of entries) {
+      const match = entry.match(/^([a-zA-Z0-9_-]+)\s*[:=]\s*(.+)$/);
+      if (!match) {
+        throw new Error(`Invalid PROVIDER_BUDGETS entry: "${entry}". Expected "provider=budget" or "provider: budget"`);
+      }
+      const [, k, v] = match;
+      parsed[k.trim()] = v.trim();
+    }
+  }
+
+  const result = {};
+  for (const [key, value] of Object.entries(parsed)) {
+    const provider = key.trim().toLowerCase();
+    if (provider === 'claude') {
+      // Claude retains its existing $6 per-PR ledger; third-party provider budgets channel cannot override Claude.
+      continue;
+    }
+    const num = typeof value === 'number' ? value : Number(value);
+    if (!Number.isFinite(num) || num <= 0) {
+      throw new Error(`Invalid budget for provider "${provider}": budget must be a positive finite number, got "${value}"`);
+    }
+    result[provider] = num;
+  }
+
+  return result;
+}
+

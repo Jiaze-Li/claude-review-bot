@@ -7,7 +7,9 @@
 // - Diagnostic logging and failure provenance tracking
 // - Normalized provider outcome contract
 
-import { defaultProviderRegistry, PROVIDER_KINDS } from './provider-adapter.mjs';
+import { defaultProviderRegistry, PROVIDER_KINDS, parseProviderBudgets } from './provider-adapter.mjs';
+
+export { parseProviderBudgets };
 
 export class DeadlineTracker {
   constructor({ totalMs, minBufferMs = 60_000, nowFn = Date.now } = {}) {
@@ -510,4 +512,57 @@ export async function executeWorkUnit({
     errors: notes.join('; ') || 'no provider available',
     fallbackReason: notes.join('; ') || null,
   });
+}
+
+/**
+ * Resolves independent BudgetManager instances for registered providers.
+ * Reads budgets from generic PROVIDER_BUDGETS channel (or legacy PROVIDER_<NAME>_BUDGET_USD).
+ * Claude always uses the provided claudeBudgetManager ($6 per-PR ledger).
+ * Missing budget for usd-ledger provider results in no manager, causing executeWorkUnit
+ * to fail closed.
+ */
+export function resolveProviderBudgetManagers({
+  providers = [],
+  env = process.env,
+  claudeBudgetManager = null,
+  registry = defaultProviderRegistry,
+} = {}) {
+  const parsedBudgets = parseProviderBudgets(env?.PROVIDER_BUDGETS, { env });
+  const managers = {};
+
+  if (claudeBudgetManager) {
+    managers.claude = claudeBudgetManager;
+  }
+
+  for (const p of providers) {
+    if (p === 'claude') {
+      if (!managers.claude && claudeBudgetManager) {
+        managers.claude = claudeBudgetManager;
+      }
+      continue;
+    }
+
+    const desc = registry?.getDescriptor?.(p);
+    if (desc?.policy?.budgetType === 'usd-ledger') {
+      const envVar = `PROVIDER_${p.toUpperCase().replace(/[^A-Z0-9]/g, '_')}_BUDGET_USD`;
+      let val = parsedBudgets[p];
+      if (val == null && env?.[envVar] != null && env[envVar] !== '') {
+        const legacyVal = Number(env[envVar]);
+        if (!Number.isFinite(legacyVal) || legacyVal <= 0) {
+          throw new Error(`Invalid budget in ${envVar}: budget must be a positive finite number, got "${env[envVar]}"`);
+        }
+        val = legacyVal;
+      }
+
+      if (val != null && Number.isFinite(val) && val > 0) {
+        managers[p] = new BudgetManager({
+          minStartingAllowanceUsd: Math.min(0.1, val / 2),
+          getAvailableBudget: (pendingUsd) => val - pendingUsd,
+          perCallCap: val,
+        });
+      }
+    }
+  }
+
+  return managers;
 }
