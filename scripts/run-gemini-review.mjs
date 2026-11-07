@@ -136,7 +136,7 @@ export async function runGeminiReview({env=process.env,fetchImpl=fetch,logImpl=c
   const headSha=required(env,'HEAD_SHA');
   const contextRoot=path.resolve(env.REVIEW_CONTEXT_DIR||'.review-context');
   const planPath=path.join(contextRoot,'session-plan.json');
-  const plan=fs.existsSync(planPath)?JSON.parse(fs.readFileSync(planPath,'utf8')):{};
+  const plan=JSON.parse(fs.readFileSync(planPath,'utf8'));
   // `@claude review` asks for Claude alone: Gemini is neither needed nor called.
   const claudeOnly=plan.requestedMode==='claude';
 
@@ -254,9 +254,7 @@ async function reviewPart(ctx,diff,shared){
           defaultModel: model,
           defaultEffort: thinking,
         });
-        const safeDir = env.SAFE_REPO_DIR || 'safe-target';
-        const safePath = path.resolve(safeDir);
-        const safeRoot = fs.existsSync(safePath) ? safePath : null;
+        const safeRoot = resolveSafeRoot(env);
         const toolGateway = safeRoot ? new ReadOnlyToolGateway({
           safeRoot,
           contextRoot,
@@ -362,9 +360,7 @@ async function reviewPart(ctx,diff,shared){
             p,
             async ({ unit, timeoutMs: callTimeout, maxBudgetUsd }) => {
               const adapter = getProviderAdapter(p);
-              const safeDir = env.SAFE_REPO_DIR || 'safe-target';
-              const safePath = path.resolve(safeDir);
-              const safeRoot = fs.existsSync(safePath) ? safePath : null;
+              const safeRoot = resolveSafeRoot(env);
               const toolGateway = safeRoot ? new ReadOnlyToolGateway({
                 safeRoot,
                 contextRoot,
@@ -534,6 +530,32 @@ export function toGeminiJsonSchema(value,key=null){
     out[childKey]=toGeminiJsonSchema(childValue,childKey);
   }
   return out;
+}
+
+function resolveSafeRoot(env) {
+  const candidate = env.SAFE_REPO_DIR || 'safe-target';
+  const basePath = env.GITHUB_WORKSPACE || process.cwd();
+  const target = path.isAbsolute(candidate) ? candidate : path.resolve(basePath, candidate);
+  if (!fs.existsSync(target)) {
+    if (candidate !== 'safe-target') {
+      const fallback = path.resolve(basePath, 'safe-target');
+      if (fs.existsSync(fallback)) {
+        try {
+          const resolved = fs.realpathSync.native ? fs.realpathSync.native(fallback) : fs.realpathSync(fallback);
+          return fs.statSync(resolved).isDirectory() ? resolved : null;
+        } catch {
+          return null;
+        }
+      }
+    }
+    return null;
+  }
+  try {
+    const resolved = fs.realpathSync.native ? fs.realpathSync.native(target) : fs.realpathSync(target);
+    return fs.statSync(resolved).isDirectory() ? resolved : null;
+  } catch {
+    return null;
+  }
 }
 
 function nonnegative(v){return typeof v==='number'&&Number.isFinite(v)&&v>=0?v:null;}

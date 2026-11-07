@@ -307,10 +307,14 @@ async function reviewUnit(index, unit, providers, suffix = '', retries = 2) {
           maxCalls: SHARD_MAX_TURNS * 4,
           allowedContextFiles: [shardContextPath, 'changed-files.txt', 'diff-stat.txt', 'pr.json', 'skipped-files.txt'],
         }) : null;
+        const inlineDiff = toolGateway
+          ? (curUnit.bytes <= GEMINI_SHARD_MAX_BYTES ? curUnit.diff : null)
+          : curUnit.diff;
         const prompt = buildPrompt({
           ...common,
           maxTurns: SHARD_MAX_TURNS,
           budgetUsd: maxBudgetUsd,
+          inlineDiff,
           hasTools: Boolean(toolGateway),
         });
         const adapter = getProviderAdapter(p);
@@ -634,8 +638,22 @@ function realDir(value) {
 
 function optionalRealDir(value) {
   if (!value) return null;
-  const target = path.resolve(value);
-  if (!fs.existsSync(target)) return null;
+  const basePath = process.env.GITHUB_WORKSPACE || process.cwd();
+  const target = path.isAbsolute(value) ? value : path.resolve(basePath, value);
+  if (!fs.existsSync(target)) {
+    if (value !== 'safe-target') {
+      const fallback = path.resolve(basePath, 'safe-target');
+      if (fs.existsSync(fallback)) {
+        try {
+          const resolved = fs.realpathSync.native(fallback);
+          return fs.statSync(resolved).isDirectory() ? resolved : null;
+        } catch {
+          return null;
+        }
+      }
+    }
+    return null;
+  }
   try {
     const resolved = fs.realpathSync.native(target);
     return fs.statSync(resolved).isDirectory() ? resolved : null;
