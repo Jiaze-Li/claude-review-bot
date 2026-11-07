@@ -583,6 +583,50 @@ test('an automatic review tries Gemini first and its Claude part obeys the autom
   assert.match(fs.readFileSync(path.join(explicit, 'out'), 'utf8'), /providers=claude\n/);
 });
 
+test('REVIEW_PROVIDERS=claude with automatic Claude budget exhausted fails closed: no Gemini invocation, no READY', async () => {
+  const dir = ctxDir({
+    requestedMode: 'auto',
+    decision: { mode: 'claude' },
+    session: { ...readySession(), deepSpendUsd: 6 },
+    sessionCommentId: '300',
+  });
+  const outPath = path.join(dir, 'out');
+  const env = cenv(dir, {
+    GITHUB_OUTPUT: outPath,
+    SOURCE_KIND: 'pull_request',
+    REVIEW_PROVIDERS: 'claude',
+  });
+
+  let geminiInvoked = false;
+  const gh = fakeGitHub();
+  const origFetch = gh.fetchImpl;
+  const trackingFetch = async (url, opts) => {
+    if (typeof url === 'string' && (url.includes('generativelanguage.googleapis.com') || url.includes('gemini'))) {
+      geminiInvoked = true;
+    }
+    return origFetch(url, opts);
+  };
+
+  await assert.rejects(
+    () => runDeepReviewCommand('begin', { env, fetchImpl: trackingFetch, now: T0 }),
+    /budget is exhausted and no eligible provider remains/
+  );
+
+  // Assert no Gemini invocation
+  assert.equal(geminiInvoked, false, 'Gemini must never be invoked');
+
+  // Assert GITHUB_OUTPUT was not populated with run=true or providers=gemini
+  if (fs.existsSync(outPath)) {
+    const outContent = fs.readFileSync(outPath, 'utf8');
+    assert.doesNotMatch(outContent, /providers=.*gemini/);
+    assert.doesNotMatch(outContent, /run=true/);
+  }
+
+  // Assert no state file was created that could advance the session to READY
+  const stateFile = path.join(dir, 'deep-review-state.json');
+  assert.equal(fs.existsSync(stateFile), false, 'deep-review-state.json must not be written');
+});
+
 test('a partial review remembers the files it covered in compact keys, and a complete re-run clears them', () => {
   const files = Array.from({ length: 300 }, (_, i) => `Sources/Module${i}/File${i}.swift`);
   const first = completeDeepReview({

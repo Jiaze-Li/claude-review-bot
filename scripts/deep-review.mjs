@@ -52,7 +52,9 @@ export async function runDeepReviewCommand(command, { env = process.env, fetchIm
       runBudget = 0;
     } else if (!manual && runBudget < CLAUDE_AUTO_MIN_BUDGET_USD) {
       configuredProviders = configuredProviders.filter((p) => p !== 'claude');
-      if (!configuredProviders.length) configuredProviders = ['gemini'];
+      if (!configuredProviders.length) {
+        throw new Error('Claude automatic budget is exhausted and no eligible provider remains; human judgment required');
+      }
       runBudget = 0;
     }
     const providers = configuredProviders.join(',');
