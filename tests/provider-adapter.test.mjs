@@ -630,6 +630,22 @@ test('ProviderRegistry manages registrations, capabilities, and operational poli
   assert.equal(adapter.capabilities.tools, true);
   assert.equal(adapter.policy.budgetType, 'usd-ledger');
 
+  // Factory function registration
+  registry.register('factory-dummy', (opts) => ({ provider: 'factory-dummy', opts }));
+  const factoryAdapter = registry.createAdapter('factory-dummy', { custom: 123 });
+  assert.equal(factoryAdapter.provider, 'factory-dummy');
+  assert.equal(factoryAdapter.opts.custom, 123);
+
+  // Class constructor exceptions propagate directly and are not swallowed
+  class FailingAdapter extends ProviderAdapter {
+    constructor() {
+      super({ provider: 'failing' });
+      throw new Error('Explicit constructor failure');
+    }
+  }
+  registry.register('failing', FailingAdapter);
+  assert.throws(() => registry.createAdapter('failing'), /^Error: Explicit constructor failure$/);
+
   // Unknown provider throws
   assert.throws(() => registry.createAdapter('unknown'), /Unknown provider: unknown/);
 

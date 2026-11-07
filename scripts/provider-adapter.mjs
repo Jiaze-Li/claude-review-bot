@@ -242,6 +242,15 @@ export function firstModelName(value) {
   return Object.keys(value).find(Boolean) ?? null;
 }
 
+function isClassOrConstructor(fn) {
+  if (typeof fn !== 'function') return false;
+  if (!fn.prototype) return false;
+  const descriptor = Object.getOwnPropertyDescriptor(fn, 'prototype');
+  if (descriptor && descriptor.writable === false) return true;
+  if (/^class\s/.test(Function.prototype.toString.call(fn))) return true;
+  return Object.getOwnPropertyNames(fn.prototype).length > 1;
+}
+
 /**
  * Provider Registry for registering and resolving review provider adapters,
  * their capabilities (tools, structured output, security boundaries),
@@ -307,14 +316,10 @@ export class ProviderRegistry {
     }
     const Target = entry.adapterClassOrFactory;
     const resolvedOptions = { descriptor: entry, ...options };
-    try {
+    if (isClassOrConstructor(Target)) {
       return new Target(resolvedOptions);
-    } catch (err) {
-      if (err instanceof TypeError && /cannot be invoked without 'new'/.test(err.message)) {
-        throw err;
-      }
-      return Target(resolvedOptions);
     }
+    return Target(resolvedOptions);
   }
 
   list() {
