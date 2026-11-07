@@ -30,21 +30,12 @@ export function validateStructuredReview(value, schema = null) {
     if (typeof value.summary !== 'string' || !value.summary.trim()) {
       return { ok: false, error: 'summary must be a non-empty string' };
     }
-    const maxSummaryLen = schema?.properties?.summary?.maxLength;
-    if (typeof maxSummaryLen === 'number' && value.summary.length > maxSummaryLen) {
-      return { ok: false, error: `summary exceeded maxLength: ${value.summary.length} > ${maxSummaryLen}` };
-    }
   }
 
-  // 3. Findings validation (strictly validate nested required fields, types, enums, maxItems, and maxLengths)
+  // 3. Findings validation (strictly validate nested required fields, types, and enums)
   if (value.findings !== undefined) {
     if (!Array.isArray(value.findings)) return { ok: false, error: 'findings must be an array' };
-    const maxFindings = schema?.properties?.findings?.maxItems;
-    if (typeof maxFindings === 'number' && value.findings.length > maxFindings) {
-      return { ok: false, error: `findings exceeded maxItems: ${value.findings.length} > ${maxFindings}` };
-    }
     const findingRequired = schema?.properties?.findings?.items?.required ?? ['severity', 'title', 'body', 'path', 'line', 'failurePath'];
-    const fProps = schema?.properties?.findings?.items?.properties;
     for (const f of value.findings) {
       if (!f || typeof f !== 'object' || Array.isArray(f)) return { ok: false, error: 'finding must be an object' };
 
@@ -60,20 +51,11 @@ export function validateStructuredReview(value, schema = null) {
       if (typeof f.title !== 'string' || !f.title.trim()) {
         return { ok: false, error: 'finding title must be a non-empty string' };
       }
-      if (typeof fProps?.title?.maxLength === 'number' && f.title.length > fProps.title.maxLength) {
-        return { ok: false, error: `finding title exceeded maxLength: ${f.title.length} > ${fProps.title.maxLength}` };
-      }
       if (typeof f.body !== 'string' || !f.body.trim()) {
         return { ok: false, error: 'finding body must be a non-empty string' };
       }
-      if (typeof fProps?.body?.maxLength === 'number' && f.body.length > fProps.body.maxLength) {
-        return { ok: false, error: `finding body exceeded maxLength: ${f.body.length} > ${fProps.body.maxLength}` };
-      }
       if (typeof f.path !== 'string' || !f.path.trim()) {
         return { ok: false, error: 'finding path must be a non-empty string' };
-      }
-      if (typeof fProps?.path?.maxLength === 'number' && f.path.length > fProps.path.maxLength) {
-        return { ok: false, error: `finding path exceeded maxLength: ${f.path.length} > ${fProps.path.maxLength}` };
       }
       if (f.line !== null && (!Number.isInteger(f.line) || f.line < 1)) {
         return { ok: false, error: `finding line must be a positive integer or null: ${f.line}` };
@@ -81,16 +63,8 @@ export function validateStructuredReview(value, schema = null) {
       if (typeof f.failurePath !== 'string') {
         return { ok: false, error: 'finding failurePath must be a string' };
       }
-      if (typeof fProps?.failurePath?.maxLength === 'number' && f.failurePath.length > fProps.failurePath.maxLength) {
-        return { ok: false, error: `finding failurePath exceeded maxLength: ${f.failurePath.length} > ${fProps.failurePath.maxLength}` };
-      }
-      if (f.riskClass !== undefined) {
-        if (typeof f.riskClass !== 'string') {
-          return { ok: false, error: 'finding riskClass must be a string' };
-        }
-        if (typeof fProps?.riskClass?.maxLength === 'number' && f.riskClass.length > fProps.riskClass.maxLength) {
-          return { ok: false, error: `finding riskClass exceeded maxLength: ${f.riskClass.length} > ${fProps.riskClass.maxLength}` };
-        }
+      if (f.riskClass !== undefined && typeof f.riskClass !== 'string') {
+        return { ok: false, error: 'finding riskClass must be a string' };
       }
     }
   }
@@ -129,10 +103,6 @@ export function validateStructuredReview(value, schema = null) {
   // 5. Verification results validation
   if (value.verifications !== undefined) {
     if (!Array.isArray(value.verifications)) return { ok: false, error: 'verifications must be an array' };
-    const maxVerifs = schema?.properties?.verifications?.maxItems;
-    if (typeof maxVerifs === 'number' && value.verifications.length > maxVerifs) {
-      return { ok: false, error: `verifications exceeded maxItems: ${value.verifications.length} > ${maxVerifs}` };
-    }
     const idPattern = schema?.properties?.verifications?.items?.properties?.findingId?.pattern;
     const idRegex = idPattern ? new RegExp(idPattern) : null;
     for (const v of value.verifications) {
