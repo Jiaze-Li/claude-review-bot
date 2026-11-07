@@ -282,7 +282,7 @@ async function reviewPart(ctx,diff,shared){
               usage: {
                 input_tokens: nonnegative(res.meta?.usage?.input_tokens ?? res.meta?.usage?.promptTokenCount),
                 output_tokens: nonnegative(res.meta?.usage?.output_tokens ?? res.meta?.usage?.candidatesTokenCount),
-                thoughts_tokens: nonnegative(res.meta?.usage?.thoughts_tokens ?? res.meta?.usage?.candidatesTokenCountDetails?.reasoningTokenCount),
+                thoughts_tokens: nonnegative(res.meta?.usage?.thoughts_tokens ?? res.meta?.usage?.thoughtsTokenCount),
                 total_tokens: nonnegative(res.meta?.usage?.total_tokens ?? res.meta?.usage?.totalTokenCount),
               },
             },

@@ -315,6 +315,11 @@ export async function executeWorkUnit({
         return notes.length ? { ...normalized, fellBackFrom: notes.join('; ') } : normalized;
       }
 
+      if (rawOutcome.kind === 'skipped') {
+        notes.push(`gemini: ${rawOutcome.error}`);
+        continue;
+      }
+
       const status = rawOutcome.status || 0;
       if (rawOutcome.kind === 'unavailable' || rawOutcome.kind === 'config') {
         geminiCircuitBreaker?.trip(rawOutcome.error, status);
@@ -365,6 +370,14 @@ export async function executeWorkUnit({
         }
         if (throwClaudeErrors) throw err;
         rawOutcome = { ok: false, error: err?.message ?? String(err), subtype: 'error' };
+      }
+
+      if (rawOutcome.kind === 'skipped') {
+        if (budgetManager && reservation && !reservation.settled) {
+          budgetManager.cancelReservation(reservation);
+        }
+        notes.push(`claude: ${rawOutcome.error}`);
+        continue;
       }
 
       if (budgetManager && reservation && !reservation.settled) {

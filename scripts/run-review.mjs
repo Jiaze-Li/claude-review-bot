@@ -235,7 +235,7 @@ async function reviewUnit(index, unit, providers, suffix = '', retries = 2) {
           allowedContextFiles: [shardContextPath, 'changed-files.txt', 'diff-stat.txt', 'pr.json', 'skipped-files.txt'],
         }) : null;
         if (!toolGateway && unit.bytes > GEMINI_SHARD_MAX_BYTES) {
-          return { ok: false, kind: 'unavailable', error: 'shard too large for Gemini without tools' };
+          return { ok: false, kind: 'skipped', error: 'shard too large for Gemini without tools' };
         }
         const inlineDiff = unit.bytes <= GEMINI_SHARD_MAX_BYTES ? unit.diff : null;
         const prompt = buildPrompt({
@@ -260,7 +260,7 @@ async function reviewUnit(index, unit, providers, suffix = '', retries = 2) {
       },
       claude: async ({ unit, timeoutMs, maxBudgetUsd }) => {
         if (!safeRoot) {
-          return { ok: false, error: 'safe-target repository snapshot is not available for Claude review' };
+          return { ok: false, kind: 'skipped', error: 'safe-target repository snapshot is not available for Claude review' };
         }
         const prompt = buildPrompt({
           ...common,
