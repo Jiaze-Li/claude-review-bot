@@ -6,6 +6,7 @@ import {isGeminiUnavailableStatus,runClaudeStructured} from './claude-fallback.m
 import {geminiBaseUrl} from './gemini-config.mjs';
 import {MAX_SHARDS,dropIgnoredFiles,planShards,splitDiffByFile} from './review-shards.mjs';
 import {getProviderAdapter, PROVIDER_KINDS, OUTCOME_KINDS} from './provider-adapter.mjs';
+import {ReadOnlyToolGateway} from './tool-gateway.mjs';
 
 // Moving alias: always resolves to Google's current Flash model. Override with GEMINI_MODEL to pin.
 export const GEMINI_MODEL='gemini-flash-latest';
@@ -150,7 +151,7 @@ export async function runGeminiReview({env=process.env,fetchImpl=fetch,logImpl=c
   const riskProfile=fs.existsSync(riskPath)
     ? JSON.parse(fs.readFileSync(riskPath,'utf8'))
     : {version:1,stateIntegrity:false,signals:{synchronization:[],durableState:[],multiActor:[]}};
-  const ctx={claudeOnly,env,fetchImpl,logImpl,queryImpl,apiKey,repo,prNumber,headSha,contextRoot,plan,mode,prJson,session,riskProfile};
+  const ctx={claudeOnly,env,fetchImpl,logImpl,queryImpl,apiKey,repo,prNumber,headSha,contextRoot,plan,mode,prJson,session,riskProfile,diffName};
   const shared={geminiOff:null,geminiFailures:0,charges:[],inflight:0,perCallCap:null};
 
   const fixedBytes=Buffer.byteLength(prJson,'utf8')+Buffer.byteLength(JSON.stringify(session??{}),'utf8')+Buffer.byteLength(JSON.stringify(riskProfile),'utf8');
@@ -204,7 +205,7 @@ function recordParts(ctx,shared,reason){
 // One model request for one diff: Gemini, then Claude when Gemini cannot do it. `shared` carries what an
 // earlier part learned (Gemini unavailable) and what Claude has already cost.
 async function reviewPart(ctx,diff,shared){
-  const {claudeOnly,env,fetchImpl,logImpl,queryImpl,apiKey,repo,prNumber,headSha,contextRoot,plan,mode,prJson,session,riskProfile}=ctx;
+  const {claudeOnly,env,fetchImpl,logImpl,queryImpl,apiKey,repo,prNumber,headSha,contextRoot,plan,mode,prJson,session,riskProfile,diffName}=ctx;
   const contextBytes=Buffer.byteLength(diff,'utf8')+Buffer.byteLength(prJson,'utf8')+Buffer.byteLength(JSON.stringify(session??{}),'utf8')+Buffer.byteLength(JSON.stringify(riskProfile),'utf8');
   if(contextBytes>MAX_CONTEXT_BYTES) throw new Error(`Gemini review context exceeds ${MAX_CONTEXT_BYTES} bytes; use targeted human/Codex review rather than silently truncating`);
 
@@ -232,6 +233,15 @@ async function reviewPart(ctx,diff,shared){
       defaultModel: model,
       defaultEffort: thinking,
     });
+    const safeDir = env.SAFE_REPO_DIR || 'safe-target';
+    const safePath = path.resolve(safeDir);
+    const safeRoot = fs.existsSync(safePath) ? safePath : null;
+    const toolGateway = safeRoot ? new ReadOnlyToolGateway({
+      safeRoot,
+      contextRoot,
+      cwd: process.cwd(),
+      allowedContextFiles: [diffName, 'changed-files.txt', 'diff-stat.txt', 'pr.json', 'skipped-files.txt', 'repair.diff', 'pr.diff'],
+    }) : null;
     const outcome = await adapter.execute({
       prompt: built.prompt,
       schema: built.schema,
@@ -244,6 +254,7 @@ async function reviewPart(ctx,diff,shared){
       maxAttempts: 2,
       logImpl,
       metadata: { mode, contextBytes },
+      toolGateway,
     });
     if(outcome.ok){
       result = outcome.structured;

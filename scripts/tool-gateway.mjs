@@ -395,7 +395,7 @@ export class ReadOnlyToolGateway {
 
   denyAndRecord(toolName, input, message) {
     this.recordRejection(toolName, input, message);
-    return { behavior: 'deny', message };
+    return { ok: false, behavior: 'deny', message, error: message };
   }
 
   async prepareExecution(toolName, input) {
@@ -712,9 +712,51 @@ export class ReadOnlyToolGateway {
 
   static getToolDeclarations() {
     return [
-      { name: 'Read', description: 'Read file contents.', parameters: { type: 'object', properties: { file_path: { type: 'string' }, offset: { type: 'integer' }, limit: { type: 'integer' } }, required: ['file_path'] } },
-      { name: 'Glob', description: 'Find files matching glob.', parameters: { type: 'object', properties: { pattern: { type: 'string' }, path: { type: 'string' } }, required: ['pattern'] } },
-      { name: 'Grep', description: 'Search pattern across files.', parameters: { type: 'object', properties: { pattern: { type: 'string' }, path: { type: 'string' }, glob: { type: 'string' } }, required: ['pattern'] } },
+      {
+        name: TOOL_NAMES.READ,
+        description: 'Read file contents from the repository or authorized review context.',
+        parameters: {
+          type: 'object',
+          properties: {
+            file_path: { type: 'string', description: 'Path to the file to read (must be within repository or authorized review context)' },
+            offset: { type: 'integer', description: '1-based line number to start reading from' },
+            limit: { type: 'integer', description: 'Number of lines to read' },
+            start_column: { type: 'integer', description: '1-based character position; pass the col from a Read [more offset=.. col=..] cursor' },
+          },
+          required: ['file_path'],
+        },
+      },
+      {
+        name: TOOL_NAMES.GLOB,
+        description: 'Find files matching a glob pattern within the repository.',
+        parameters: {
+          type: 'object',
+          properties: {
+            pattern: { type: 'string', description: 'Glob pattern to match files against' },
+            path: { type: 'string', description: 'Directory to search in (must be within repository)' },
+          },
+          required: ['pattern'],
+        },
+      },
+      {
+        name: TOOL_NAMES.GREP,
+        description: 'Search with JavaScript regex syntax (Unicode mode) or fixed_string=true for literal text; unsupported regex syntax returns an error, never an empty result.',
+        parameters: {
+          type: 'object',
+          properties: {
+            pattern: { type: 'string', description: 'Pattern or regular expression to search for' },
+            path: { type: 'string', description: 'Directory to search in (must be within repository)' },
+            glob: { type: 'string', description: 'Glob pattern to filter files' },
+            output_mode: { type: 'string', description: 'Output mode: files_with_matches or content' },
+            mode: { type: 'string', description: 'Output mode alias' },
+            '-i': { type: 'boolean', description: 'Case-insensitive matching, supported' },
+            fixed_string: { type: 'boolean', description: 'Use literal text instead of a JS regex; malformed regex patterns otherwise return an explicit error' },
+            '-n': { type: 'boolean', description: 'Line numbers are always included; false is rejected' },
+            head_limit: { type: 'integer', description: 'Bound number of Grep matches' },
+          },
+          required: ['pattern'],
+        },
+      },
     ];
   }
 }
@@ -734,7 +776,7 @@ export function createGatewayMcpServer(gateway, serverName = 'gateway') {
       if (!res.ok) {
         return {
           isError: true,
-          content: [{ type: 'text', text: res.error || res.reason || 'Read failed' }],
+          content: [{ type: 'text', text: res.error || res.message || res.reason || 'Read failed' }],
         };
       }
       return {
@@ -755,7 +797,7 @@ export function createGatewayMcpServer(gateway, serverName = 'gateway') {
       if (!res.ok) {
         return {
           isError: true,
-          content: [{ type: 'text', text: res.error || res.reason || 'Glob failed' }],
+          content: [{ type: 'text', text: res.error || res.message || res.reason || 'Glob failed' }],
         };
       }
       return { content: [{ type: 'text', text: res.content }] };
@@ -789,7 +831,7 @@ export function createGatewayMcpServer(gateway, serverName = 'gateway') {
       if (!res.ok) {
         return {
           isError: true,
-          content: [{ type: 'text', text: res.error || res.reason || 'Grep failed' }],
+          content: [{ type: 'text', text: res.error || res.message || res.reason || 'Grep failed' }],
         };
       }
       return { content: [{ type: 'text', text: res.content }] };

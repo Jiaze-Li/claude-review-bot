@@ -85,8 +85,9 @@ function run(root, mode = 'ok', extraEnv = {}) {
   });
   const calls = fs.readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
   const outPath = path.join(root, '.review-context/review.json');
+  const usagePath = path.join(root, '.review-context/claude-usage.json');
   return { result, calls, review: fs.existsSync(outPath) ? JSON.parse(fs.readFileSync(outPath, 'utf8')) : null,
-    usage: JSON.parse(fs.readFileSync(path.join(root, '.review-context/claude-usage.json'), 'utf8')) };
+    usage: fs.existsSync(usagePath) ? JSON.parse(fs.readFileSync(usagePath, 'utf8')) : null };
 }
 
 test('a small PR is one review pass over pr.diff with complete coverage', () => {
@@ -508,4 +509,12 @@ test('a provider that makes no progress is not asked again', () => {
   assert.equal(result.status, 0, result.stderr);
   assert.equal(calls.length, 1);
   assert.equal(review.coverage.complete, false);
+});
+
+test('when safe-target snapshot is absent, Claude fails closed and is skipped with clear note', () => {
+  const root = setup({ 'a.swift': 100 });
+  fs.rmdirSync(path.join(root, 'safe-target'));
+  const { result } = run(root);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /safe-target repository snapshot is not available for Claude review/);
 });

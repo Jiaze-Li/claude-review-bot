@@ -324,3 +324,135 @@ test('Integration E3: Full review with Tool Gateway preserves shard execution, c
   assert.equal(outcome.meta.total_cost_usd, 0.35);
   fs.rmSync(tmp, { recursive: true, force: true });
 });
+
+test('Integration E4: Gemini shard review with Tool Gateway explores files and reports structured coverage', async () => {
+  const { ReadOnlyToolGateway } = await import('../scripts/tool-gateway.mjs');
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'gemini-shard-gw-'));
+  const safe = path.join(tmp, 'safe-target');
+  const ctx = path.join(tmp, '.review-context');
+  fs.mkdirSync(safe, { recursive: true });
+  fs.mkdirSync(ctx, { recursive: true });
+  fs.writeFileSync(path.join(safe, 'service.js'), 'export function serve() { return 200; }\n');
+  fs.writeFileSync(path.join(ctx, 'diff.txt'), 'diff --git a/service.js b/service.js\n');
+
+  const gw = new ReadOnlyToolGateway({
+    safeRoot: safe,
+    contextRoot: ctx,
+    cwd: tmp,
+    allowedContextFiles: ['diff.txt'],
+  });
+
+  let turn = 0;
+  const mockFetch = async () => {
+    turn += 1;
+    if (turn === 1) {
+      return Response.json({
+        candidates: [
+          {
+            content: {
+              role: 'model',
+              parts: [{ functionCall: { name: 'Read', args: { file_path: path.join(safe, 'service.js') }, id: 'read_srv' } }],
+            },
+          },
+        ],
+        usageMetadata: { promptTokenCount: 120, candidatesTokenCount: 25 },
+        modelVersion: 'gemini-flash-latest',
+      });
+    }
+    return Response.json({
+      candidates: [
+        {
+          content: {
+            role: 'model',
+            parts: [
+              {
+                text: JSON.stringify({
+                  summary: 'Service verified',
+                  findings: [],
+                  coverage: { complete: true, reviewedPaths: ['service.js'], unreviewedPaths: [], note: '' },
+                }),
+              },
+            ],
+          },
+        },
+      ],
+      usageMetadata: { promptTokenCount: 180, candidatesTokenCount: 45 },
+      modelVersion: 'gemini-flash-latest',
+    });
+  };
+
+  const schema = {
+    type: 'object',
+    properties: {
+      summary: { type: 'string' },
+      findings: { type: 'array' },
+      coverage: { type: 'object', properties: { complete: { type: 'boolean' } }, required: ['complete'] },
+    },
+    required: ['summary', 'findings', 'coverage'],
+  };
+
+  const outcome = await runGeminiShard({
+    prompt: 'Review service.js with tools',
+    schema,
+    env: { GEMINI_API_KEY: 'test-key' },
+    fetchImpl: mockFetch,
+    toolGateway: gw,
+  });
+
+  assert.equal(outcome.kind, 'ok');
+  assert.equal(outcome.structured.summary, 'Service verified');
+  assert.equal(outcome.structured.coverage.complete, true);
+  assert.equal(outcome.meta.num_turns, 2);
+  assert.equal(outcome.meta.tool_calls, 1);
+  assert.equal(gw.getDiagnostics().callCount, 1);
+
+  fs.rmSync(tmp, { recursive: true, force: true });
+});
+
+test('Integration E5: Incremental review with SAFE_REPO_DIR configures toolGateway without ReferenceError on diffName', async () => {
+  const dir = createReviewContext('incremental');
+  const safeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'safe-test-'));
+  fs.writeFileSync(path.join(safeDir, 'app.js'), 'export function test() {}');
+  try {
+    let fetchCount = 0;
+    const mockFetch = async () => {
+      fetchCount += 1;
+      return Response.json({
+        candidates: [
+          {
+            content: {
+              parts: [
+                {
+                  text: JSON.stringify({
+                    summary: 'Safe target incremental clean',
+                    findings: [],
+                  }),
+                },
+              ],
+            },
+          },
+        ],
+        usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 20, totalTokenCount: 120 },
+      });
+    };
+
+    const result = await runGeminiReview({
+      env: {
+        GEMINI_API_KEY: 'test-key',
+        TARGET_REPO: 'owner/repo',
+        PR_NUMBER: '1',
+        HEAD_SHA: HEAD_A,
+        REVIEW_CONTEXT_DIR: dir,
+        SAFE_REPO_DIR: safeDir,
+      },
+      fetchImpl: mockFetch,
+      logImpl: () => {},
+    });
+
+    assert.equal(result.summary, 'Safe target incremental clean');
+    assert.deepEqual(result.findings, []);
+    assert.equal(fetchCount, 1);
+  } finally {
+    fs.rmSync(safeDir, { recursive: true, force: true });
+  }
+});
