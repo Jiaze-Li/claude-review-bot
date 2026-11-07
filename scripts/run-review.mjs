@@ -227,6 +227,9 @@ async function reviewUnit(index, unit, providers, suffix = '', retries = 2) {
     geminiCircuitBreaker: circuitBreaker,
     budgetManager,
     deadlineTracker,
+    canExecute: {
+      claude: () => safeRoot ? true : 'safe-target repository snapshot is not available for Claude review',
+    },
     executors: {
       gemini: async ({ unit, timeoutMs }) => {
         const shardContextPath = path.relative(contextRoot, path.resolve(cwd, diffPath)).replace(/\\/g, '/');
@@ -259,9 +262,6 @@ async function reviewUnit(index, unit, providers, suffix = '', retries = 2) {
         return { ok: false, error: outcome.error, kind: outcome.kind, status: outcome.status };
       },
       claude: async ({ unit, timeoutMs, maxBudgetUsd }) => {
-        if (!safeRoot) {
-          return { ok: false, kind: 'skipped', error: 'safe-target repository snapshot is not available for Claude review' };
-        }
         const prompt = buildPrompt({
           ...common,
           maxTurns: SHARD_MAX_TURNS,

@@ -94,12 +94,19 @@ export class BudgetManager {
 
     this.inflightUsd = 0;
     this.inflightCount = 0;
-    this.charges = [];
+    this._charges = [];
     this.totalSpentUsd = 0;
   }
 
+  get charges() {
+    return this._charges.filter((c) => c.settled).map((c) => ({
+      amount: c.amount,
+      source: c.source,
+    }));
+  }
+
   get totalPendingUsd() {
-    return this.charges.reduce((sum, c) => sum + (c.settled ? c.amount : c.cap), 0);
+    return this._charges.reduce((sum, c) => sum + (c.settled ? c.amount : c.cap), 0);
   }
 
   async acquireReservation({ deadlineTracker, minTimeLeftMs = 60_000 } = {}) {
@@ -121,7 +128,7 @@ export class BudgetManager {
           source: 'reserve',
           settled: false,
         };
-        this.charges.push(reservation);
+        this._charges.push(reservation);
         return reservation;
       }
 
@@ -139,9 +146,9 @@ export class BudgetManager {
     reservation.settled = true;
     this.inflightUsd = Math.max(0, this.inflightUsd - reservation.cap);
     this.inflightCount = Math.max(0, this.inflightCount - 1);
-    const idx = this.charges.indexOf(reservation);
+    const idx = this._charges.indexOf(reservation);
     if (idx !== -1) {
-      this.charges.splice(idx, 1);
+      this._charges.splice(idx, 1);
     }
   }
 
@@ -258,8 +265,10 @@ export async function executeWorkUnit({
   budgetManager = null,
   deadlineTracker = null,
   executors = {},
+  canExecute = {},
   onPartialCoverage = null,
   onClaudeBudgetBlocked = null,
+  onClaudeError = null,
   throwClaudeErrors = false,
   logImpl = () => {},
 } = {}) {
@@ -267,6 +276,7 @@ export async function executeWorkUnit({
   let lastGeminiFailure = geminiCircuitBreaker?.isOff
     ? { status: geminiCircuitBreaker.status, message: geminiCircuitBreaker.reason }
     : null;
+  let lastGeminiOutcome = null;
   for (let position = 0; position < providers.length; position += 1) {
     const provider = providers[position];
 
@@ -286,6 +296,7 @@ export async function executeWorkUnit({
       } catch (err) {
         rawOutcome = { ok: false, error: err?.message ?? String(err), kind: 'failed' };
       }
+      lastGeminiOutcome = rawOutcome;
 
       if (rawOutcome.ok) {
         geminiCircuitBreaker?.recordSuccess();
@@ -332,6 +343,13 @@ export async function executeWorkUnit({
     }
 
     if (provider === 'claude') {
+      if (typeof canExecute?.claude === 'function') {
+        const canRun = canExecute.claude();
+        if (canRun !== true) {
+          notes.push(`claude: ${typeof canRun === 'string' ? canRun : 'not available'}`);
+          continue;
+        }
+      }
       if (typeof executors.claude !== 'function') {
         notes.push('claude: executor not configured');
         continue;
@@ -363,10 +381,14 @@ export async function executeWorkUnit({
           reservation,
           notes,
           lastFailed: lastGeminiFailure,
+          priorGeminiOutcome: lastGeminiOutcome,
         });
       } catch (err) {
         if (budgetManager && reservation && !reservation.settled) {
           budgetManager.settleReservation(reservation, { actualCostUsd: reservation.cap, costSource: 'reserve' });
+        }
+        if (typeof onClaudeError === 'function') {
+          await onClaudeError({ error: err, reservation, notes, lastFailed: lastGeminiFailure });
         }
         if (throwClaudeErrors) throw err;
         rawOutcome = { ok: false, error: err?.message ?? String(err), subtype: 'error' };

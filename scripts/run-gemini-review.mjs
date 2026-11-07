@@ -295,37 +295,34 @@ async function reviewPart(ctx,diff,shared){
           status: res.status,
         };
       },
-      claude: async ({ unit, timeoutMs: callTimeout, maxBudgetUsd, reservation, lastFailed }) => {
+      claude: async ({ unit, timeoutMs: callTimeout, maxBudgetUsd, reservation, lastFailed, priorGeminiOutcome }) => {
         const reasonText = lastFailed?.status ? `HTTP ${lastFailed.status}` : (lastFailed?.message?.slice(0, 120) || (claudeOnly ? 'requested' : 'unknown'));
         if (!env.CLAUDE_CODE_OAUTH_TOKEN) {
           shared.budgetManager.cancelReservation(reservation);
           recordStop(`Gemini ${reasonText}; Claude fallback credential unavailable`);
-          throw new Error('Claude fallback unavailable: CLAUDE_CODE_OAUTH_TOKEN is not set');
+          const err = new Error('Claude fallback unavailable: CLAUDE_CODE_OAUTH_TOKEN is not set');
+          err.alreadyRecorded = true;
+          throw err;
         }
         logImpl(claudeOnly ? `Claude was requested for this ${mode} review` : `Gemini could not do this ${mode} review (${reasonText}); falling back to Claude`);
-        let fallback;
-        try {
-          fallback = await runClaudeStructured({
-            prompt: built.prompt,
-            schema: built.schema,
-            timeoutMs: callTimeout || timeoutMs,
-            maxBudgetUsd,
-            env,
-            logImpl,
-            queryImpl,
-          });
-          if (mode === 'verification') normalizeVerificationResult(fallback.structured); else normalizeReviewResult(fallback.structured);
-        } catch (error) {
-          recordStop(`Gemini ${reasonText}; Claude fallback failed: ` + String(error.message || error).slice(0, 160));
-          throw error;
-        }
+        const fallback = await runClaudeStructured({
+          prompt: built.prompt,
+          schema: built.schema,
+          timeoutMs: callTimeout || timeoutMs,
+          maxBudgetUsd,
+          env,
+          logImpl,
+          queryImpl,
+        });
+        if (mode === 'verification') normalizeVerificationResult(fallback.structured); else normalizeReviewResult(fallback.structured);
+        const geminiAttempts = priorGeminiOutcome?.meta?.attempts ?? priorGeminiOutcome?.meta?.num_turns ?? priorGeminiOutcome?.attempts ?? 0;
         return {
           ok: true,
           structured: fallback.structured,
           meta: {
             ...fallback.meta,
             mode,
-            attempts: 0,
+            attempts: geminiAttempts,
             ...(claudeOnly ? {} : { fallback_from: 'gemini', fallback_reason: reasonText }),
             max_output_tokens: null,
             timeout_ms: timeoutMs,
@@ -338,6 +335,11 @@ async function reviewPart(ctx,diff,shared){
       const reasonText = lastFailed?.status ? `HTTP ${lastFailed.status}` : (lastFailed?.message?.slice(0, 120) || (claudeOnly ? 'requested' : 'unknown'));
       recordStop(`Gemini ${reasonText}; Claude budget exhausted or below minimum starting allowance`);
       throw new Error('Claude fallback blocked: automatic budget is exhausted or insufficient for a full review; human judgment required');
+    },
+    onClaudeError: async ({ error, lastFailed }) => {
+      if (error?.alreadyRecorded) return;
+      const reasonText = lastFailed?.status ? `HTTP ${lastFailed.status}` : (lastFailed?.message?.slice(0, 120) || (claudeOnly ? 'requested' : 'unknown'));
+      recordStop(`Gemini ${reasonText}; Claude fallback failed: ` + String(error?.message || error).slice(0, 160));
     },
   });
 
