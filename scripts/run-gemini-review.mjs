@@ -293,6 +293,8 @@ async function reviewPart(ctx,diff,shared){
           error: res.error,
           kind: res.kind,
           status: res.status,
+          meta: res.meta,
+          attempts: res.meta?.num_turns ?? 0,
         };
       },
       claude: async ({ unit, timeoutMs: callTimeout, maxBudgetUsd, reservation, lastFailed, priorGeminiOutcome }) => {
@@ -305,15 +307,26 @@ async function reviewPart(ctx,diff,shared){
           throw err;
         }
         logImpl(claudeOnly ? `Claude was requested for this ${mode} review` : `Gemini could not do this ${mode} review (${reasonText}); falling back to Claude`);
-        const fallback = await runClaudeStructured({
-          prompt: built.prompt,
-          schema: built.schema,
-          timeoutMs: callTimeout || timeoutMs,
-          maxBudgetUsd,
-          env,
-          logImpl,
-          queryImpl,
-        });
+        let fallback;
+        try {
+          fallback = await runClaudeStructured({
+            prompt: built.prompt,
+            schema: built.schema,
+            timeoutMs: callTimeout || timeoutMs,
+            maxBudgetUsd,
+            env,
+            logImpl,
+            queryImpl,
+          });
+        } finally {
+          if (fallback?.meta && shared.budgetManager && reservation && !reservation.settled) {
+            shared.budgetManager.settleReservation(reservation, {
+              actualCostUsd: fallback.meta.total_cost_usd,
+              costSource: fallback.meta.cost_source ?? 'reserve',
+              fallbackCostUsd: maxBudgetUsd,
+            });
+          }
+        }
         if (mode === 'verification') normalizeVerificationResult(fallback.structured); else normalizeReviewResult(fallback.structured);
         const geminiAttempts = priorGeminiOutcome?.meta?.attempts ?? priorGeminiOutcome?.meta?.num_turns ?? priorGeminiOutcome?.attempts ?? 0;
         return {

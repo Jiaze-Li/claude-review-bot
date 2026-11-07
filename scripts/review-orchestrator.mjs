@@ -99,7 +99,7 @@ export class BudgetManager {
   }
 
   get charges() {
-    return this._charges.filter((c) => c.settled).map((c) => ({
+    return this._charges.map((c) => ({
       amount: c.amount,
       source: c.source,
     }));
