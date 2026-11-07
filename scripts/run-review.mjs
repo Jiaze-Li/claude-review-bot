@@ -533,7 +533,7 @@ function aggregateMeta(list) {
   const sum = (key) => list.reduce((total, meta) => total + (meta?.[key] ?? 0), 0);
   const sumClaude = (key) => claudeList.reduce((total, meta) => total + (meta?.[key] ?? 0), 0);
   const usage = { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 };
-  for (const meta of claudeList) for (const key of Object.keys(usage)) usage[key] += meta?.usage?.[key] ?? 0;
+  for (const meta of list) for (const key of Object.keys(usage)) usage[key] += meta?.usage?.[key] ?? 0;
   const lead = claudeList[0] ?? list[0];
   return {
     requested_model: lead?.requested_model ?? REVIEW_MODEL,
