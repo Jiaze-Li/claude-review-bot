@@ -537,3 +537,55 @@ test('Third-party failure accounting: failure settles reservation without corrup
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+test('Production Runner Integration: runGeminiReview shares third-party BudgetManager across multi-part diffs', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gemini-multipart-budget-'));
+  const ctxDir = path.join(tmpDir, '.review-context');
+  fs.mkdirSync(ctxDir, { recursive: true });
+  fs.writeFileSync(path.join(ctxDir, 'session-plan.json'), JSON.stringify({ decision: { mode: 'incremental' }, requestedMode: 'auto' }));
+  fs.writeFileSync(path.join(ctxDir, 'pr.json'), JSON.stringify({ number: 10, title: 'Multi-part PR', base: { ref: 'main' } }));
+  fs.writeFileSync(path.join(ctxDir, 'risk-profile.json'), JSON.stringify({ version: 1, signals: {} }));
+
+  // Two files each exceeding chunking thresholds to generate 2 parts (>300,000 bytes total)
+  const bigFile1 = `diff --git a/f1.swift b/f1.swift\n--- a/f1.swift\n+++ b/f1.swift\n@@ -1 +1 @@\n+${'x'.repeat(160000)}\n`;
+  const bigFile2 = `diff --git a/f2.swift b/f2.swift\n--- a/f2.swift\n+++ b/f2.swift\n@@ -1 +1 @@\n+${'y'.repeat(160000)}\n`;
+  fs.writeFileSync(path.join(ctxDir, 'repair.diff'), bigFile1 + bigFile2);
+
+  try {
+    // 1. With insufficient budget for 2 parts ($0.05 budget when each part costs $0.04), it must fail on budget exhaustion
+    await assert.rejects(
+      runGeminiReview({
+        env: {
+          REVIEW_PROVIDERS: 'mock-runner-provider',
+          PROVIDER_MOCK_RUNNER_PROVIDER_BUDGET_USD: '0.05',
+          TARGET_REPO: 'test/repo',
+          PR_NUMBER: '10',
+          HEAD_SHA: 'a'.repeat(40),
+          REVIEW_CONTEXT_DIR: ctxDir,
+        },
+        logImpl: () => {},
+      }),
+      /budget.*is exhausted/
+    );
+
+    // 2. With sufficient budget ($0.20), both parts complete and total cost $0.08 is recorded in _meta.provider_costs
+    const result = await runGeminiReview({
+      env: {
+        REVIEW_PROVIDERS: 'mock-runner-provider',
+        PROVIDER_MOCK_RUNNER_PROVIDER_BUDGET_USD: '0.20',
+        TARGET_REPO: 'test/repo',
+        PR_NUMBER: '10',
+        HEAD_SHA: 'a'.repeat(40),
+        REVIEW_CONTEXT_DIR: ctxDir,
+      },
+      logImpl: () => {},
+    });
+
+    assert.ok(result);
+    assert.equal(result._meta.provider, 'mock-runner-provider');
+    assert.equal(result._meta.parts, 2);
+    assert.equal(result._meta.provider_costs['mock-runner-provider'], 0.08);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});

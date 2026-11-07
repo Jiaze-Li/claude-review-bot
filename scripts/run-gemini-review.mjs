@@ -171,8 +171,27 @@ export async function runGeminiReview({env=process.env,fetchImpl=fetch,logImpl=c
     },
     perCallCap: null,
   });
+  const providerBudgetManagers = {
+    claude: budgetManager,
+  };
+  for (const p of (providers || [])) {
+    if (p !== 'claude') {
+      const desc = defaultProviderRegistry.getDescriptor(p);
+      if (desc?.policy?.budgetType === 'usd-ledger') {
+        const envVar = `PROVIDER_${p.toUpperCase().replace(/[^A-Z0-9]/g, '_')}_BUDGET_USD`;
+        const val = env[envVar] ? Number(env[envVar]) : null;
+        if (val != null && Number.isFinite(val) && val > 0) {
+          providerBudgetManagers[p] = new BudgetManager({
+            minStartingAllowanceUsd: Math.min(0.1, val / 2),
+            getAvailableBudget: (pendingUsd) => val - pendingUsd,
+            perCallCap: val,
+          });
+        }
+      }
+    }
+  }
   const ctx={claudeOnly,env,fetchImpl,logImpl,queryImpl,apiKey,repo,prNumber,headSha,contextRoot,plan,mode,prJson,session,riskProfile,diffName,manual,providers};
-  const shared={circuitBreaker,budgetManager};
+  const shared={circuitBreaker,budgetManager,providerBudgetManagers};
 
   const fixedBytes=Buffer.byteLength(prJson,'utf8')+Buffer.byteLength(JSON.stringify(session??{}),'utf8')+Buffer.byteLength(JSON.stringify(riskProfile),'utf8');
   if(Buffer.byteLength(diff,'utf8')+fixedBytes<=SINGLE_REQUEST_MAX_BYTES){
@@ -204,7 +223,7 @@ export async function runGeminiReview({env=process.env,fetchImpl=fetch,logImpl=c
     recordParts(ctx,shared,`${missing} of ${parts.length} part(s) were not reviewed before the time limit`);
     throw new Error(`The ${mode} review ran out of time with ${missing} of ${parts.length} part(s) unreviewed; use @claude review to continue`);
   }
-  return mergeParts({ctx,parts,results});
+  return mergeParts({ctx,parts,results,shared});
 }
 
 // Persist what Claude already cost, so a failure part-way never makes spent allowance disappear.
@@ -239,25 +258,7 @@ async function reviewPart(ctx,diff,shared){
         spentUsd:shared.budgetManager.charges.reduce((sum,c)=>sum+c.amount,0),costCharges:shared.budgetManager.charges})+'\n',{mode:0o600});
   };
 
-  const providerBudgetManagers = {};
-  for (const p of (providers || [])) {
-    if (p === 'claude') {
-      providerBudgetManagers.claude = shared.budgetManager;
-    } else {
-      const desc = defaultProviderRegistry.getDescriptor(p);
-      if (desc?.policy?.budgetType === 'usd-ledger') {
-        const envVar = `PROVIDER_${p.toUpperCase().replace(/[^A-Z0-9]/g, '_')}_BUDGET_USD`;
-        const val = env[envVar] ? Number(env[envVar]) : null;
-        if (val != null && Number.isFinite(val) && val > 0) {
-          providerBudgetManagers[p] = new BudgetManager({
-            minStartingAllowanceUsd: Math.min(0.1, val / 2),
-            getAvailableBudget: (pendingUsd) => val - pendingUsd,
-            perCallCap: val,
-          });
-        }
-      }
-    }
-  }
+  const providerBudgetManagers = shared.providerBudgetManagers || {};
 
   const outcome = await executeWorkUnit({
     unit: { diff },
@@ -478,7 +479,7 @@ async function reviewPart(ctx,diff,shared){
 
 // ---- Merging the parts of a large diff back into one result of the usual shape ----
 
-function mergeParts({ctx,parts,results}){
+function mergeParts({ctx,parts,results,shared}){
   const {mode,session}=ctx;
   const summary=results.map((result,index)=>`Part ${index+1}/${results.length}: ${String(result.summary??'').trim()}`).join('\n').slice(0,3900);
   const metas=results.map((result)=>result._meta);
@@ -487,11 +488,9 @@ function mergeParts({ctx,parts,results}){
   const sumUsage=(key)=>metas.reduce((total,meta)=>total+(nonnegative(meta?.usage?.[key])??0),0);
   const claudeCost=claudeMetas.reduce((total,meta)=>total+(nonnegative(meta.total_cost_usd)??0),0);
   const partProviderCosts = {};
-  for (const meta of metas) {
-    if (meta?.provider_costs) {
-      for (const [p, c] of Object.entries(meta.provider_costs)) {
-        partProviderCosts[p] = Number(((partProviderCosts[p] ?? 0) + c).toFixed(4));
-      }
+  for (const [p, mgr] of Object.entries(shared?.providerBudgetManagers || {})) {
+    if (p !== 'claude' && mgr) {
+      partProviderCosts[p] = Number(mgr.totalSpentUsd.toFixed(4));
     }
   }
   const _meta={
