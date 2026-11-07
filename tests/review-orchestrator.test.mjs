@@ -12,6 +12,7 @@ import {
   normalizeProviderOutcome,
   executeWorkUnit,
 } from '../scripts/review-orchestrator.mjs';
+import { ProviderRegistry, ProviderAdapter } from '../scripts/provider-adapter.mjs';
 import { runGeminiReview } from '../scripts/run-gemini-review.mjs';
 import { mergeShardResults, reconcileCoverage } from '../scripts/review-shards.mjs';
 import {
@@ -584,3 +585,62 @@ test('Golden Test N: Re-running an already-reviewed HEAD does not duplicate mode
   assert.equal(status.state, 'success');
   assert.match(status.description, /READY/);
 });
+
+test('Generic provider cascade: executeWorkUnit executes arbitrary providers and routes fallbacks by normalized error types', async () => {
+  const customRegistry = new ProviderRegistry();
+  customRegistry.register('provider-alpha', class Alpha extends ProviderAdapter {
+    constructor(o) { super({ provider: 'provider-alpha', descriptor: o.descriptor }); }
+  }, {
+    policy: { budgetType: 'none', defaultTimeoutMs: 5000 },
+    capabilities: { tools: true, structuredOutput: true },
+  });
+  customRegistry.register('provider-beta', class Beta extends ProviderAdapter {
+    constructor(o) { super({ provider: 'provider-beta', descriptor: o.descriptor }); }
+  }, {
+    policy: { budgetType: 'usd-ledger', defaultTimeoutMs: 10000 },
+    capabilities: { tools: false, structuredOutput: true },
+  });
+
+  const executed = [];
+  const betaBudgetMgr = new BudgetManager({
+    minStartingAllowanceUsd: 1.0,
+    getAvailableBudget: () => 5.0,
+    perCallCap: 2.0,
+  });
+
+  // Alpha fails with unavailable -> cascades to Beta
+  const outcome = await executeWorkUnit({
+    unit: { diff: 'alpha-to-beta' },
+    providers: ['provider-alpha', 'provider-beta'],
+    providerRegistry: customRegistry,
+    budgetManagers: {
+      'provider-beta': betaBudgetMgr,
+    },
+    executors: {
+      'provider-alpha': async ({ unit, timeoutMs }) => {
+        executed.push({ provider: 'provider-alpha', timeoutMs });
+        return { ok: false, kind: 'unavailable', error: 'HTTP 429 rate limit', status: 429 };
+      },
+      'provider-beta': async ({ unit, timeoutMs, maxBudgetUsd, reservation }) => {
+        executed.push({ provider: 'provider-beta', timeoutMs, maxBudgetUsd, hasReservation: Boolean(reservation) });
+        return {
+          ok: true,
+          structured: { summary: 'Beta review succeeded after Alpha rate limit', findings: [] },
+          totalCostUsd: 0.75,
+        };
+      },
+    },
+  });
+
+  assert.equal(outcome.ok, true);
+  assert.equal(outcome.provider, 'provider-beta');
+  assert.equal(outcome.structured.summary, 'Beta review succeeded after Alpha rate limit');
+  assert.equal(outcome.totalCostUsd, 0.75);
+  assert.match(outcome.fellBackFrom, /provider-alpha: HTTP 429 rate limit/);
+  assert.equal(executed.length, 2);
+  assert.equal(executed[0].provider, 'provider-alpha');
+  assert.equal(executed[1].provider, 'provider-beta');
+  assert.equal(executed[1].hasReservation, true);
+  assert.equal(executed[1].maxBudgetUsd, 2.0);
+});
+
