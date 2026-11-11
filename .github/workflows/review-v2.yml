@@ -231,7 +231,11 @@ jobs:
           [[ "$merge_base" =~ ^[0-9a-f]{40}$ ]] || { echo "GitHub did not return a valid merge-base SHA" >&2; exit 1; }
           printf '%s\n' "$merge_base" > .review-context/merge-base.txt
           if ! git -C target cat-file -e "${merge_base}^{commit}" 2>/dev/null; then
-            git -C target fetch --no-tags --depth=1 origin "$merge_base"
+            # checkout uses persist-credentials:false; scope the App token to this fetch only.
+            auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+            GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
+              GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" \
+              git -C target fetch --no-tags --depth=1 origin "$merge_base"
           fi
           git -C target diff --no-ext-diff --no-textconv --unified=80 "$merge_base" "$HEAD_SHA" > .review-context/pr.diff
           git -C target diff --no-ext-diff --no-textconv --name-only "$merge_base" "$HEAD_SHA" > .review-context/changed-files.txt
