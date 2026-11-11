@@ -1,13 +1,13 @@
-# CRB-DESIGN-01 — Design Task Architecture Contract v0.8
+# CRB-DESIGN-01 — Design Task Architecture Contract v0.9
 
-**Status:** v0.6 received an independent **DESIGN PASS** on 2026-11-11, bound to blob `40b9823aa2d00282cf78d43b69fb45a55560dc0c`. v0.7 addressed bot review finding F001 (P2) and CRB-v06-F01 (P3). v0.8 incorporates independent design review finding CRB-v07-F06 (P3): defining the non-LLM deterministic orchestrator interface and separating deterministic polling/waiting/retrying (0 LLM inference tokens) from cognitive editing agent invocation (§6.3, §9, §12, §14). Not approved for implementation by this document.
+**Status:** v0.6 received an independent **DESIGN PASS** on 2026-11-11, bound to blob `40b9823aa2d00282cf78d43b69fb45a55560dc0c`. v0.7 addressed bot review finding F001 (P2) and CRB-v06-F01 (P3). v0.8 incorporated CRB-v07-F06 (P3). v0.9 resolves independent review findings F01 through F06: distinguishing queued vs in-progress vs terminated runs in GitHub Actions to eliminate duplicate requests on queue latency (P1), establishing stable request identity and persisting retry counts in session state (P2), ensuring recoverable session identity on initial manifest failures (P2), clarifying ISO-3 multi-write revision tracking (P2), defining the exact session state after `reset design` (P2), and removing boundary ambiguity on the daily 20-run limit (P3). §14 lists all findings. Not approved for implementation by this document.
 **Target repository:** `Jiaze-Li/claude-review-bot`
 **Engineering policy snapshot (`policy_sha`):** `ae4c3f538f9e8998fe534aaa01ff12daae1725aa`
 **Code baseline for the facts in §3 (read-only):** `b2ab0631ac0ef4192c2b6956ea100a8e3ca17047`, the merge of PR #71 on `main`.
 **Risk / gate:** Tier 3 / REQUIRED / PENDING, as classified by the Engineering Lead for v0.1. v0.5 narrowed the scope (§2); re-classification is the Lead's decision, not this document's.
-**Immutable `design_ref`:** `git:Jiaze-Li/claude-review-bot@<commit-of-this-file>:docs/design-task-architecture-contract-v0.8.md`, assigned in the PR description after commit.
-**Previous versions:** v0.7 at `7b211fc52240ee75d3baca54ad352960e4ce50a1`, v0.6 at `62a15fab1c23c6b3f49bf2cda90bc529c2550300`, v0.5 at `5402aeca88697a94cf9ded791f1ba00ef61b4722`, v0.4 at `7c6b8c80e752f1f8e34e710cbf68b442baeda587`, v0.3 at `99682892968a76e0b47a9b44afcd97af377cabb7`, v0.2 at `b8034c3d3b6de60334c6f567a206723ef7559d0a`, v0.1 at `d424d833de44fddcf1fd804baf5630ff0027ac56`, all under `docs/`.
-**Authorship:** v0.1 and v0.2 were drafted in the user's GPT conversation. v0.3 to v0.8 were revised by a coding-agent session at the user's request. Whoever reviews v0.8 must be a separate context from both.
+**Immutable `design_ref`:** `git:Jiaze-Li/claude-review-bot@<commit-of-this-file>:docs/design-task-architecture-contract-v0.9.md`, assigned in the PR description after commit.
+**Previous versions:** v0.8 at `1755afad28b3b497d83c7d71ab5b731da1057ee2`, v0.7 at `7b211fc52240ee75d3baca54ad352960e4ce50a1`, v0.6 at `62a15fab1c23c6b3f49bf2cda90bc529c2550300`, v0.5 at `5402aeca88697a94cf9ded791f1ba00ef61b4722`, v0.4 at `7c6b8c80e752f1f8e34e710cbf68b442baeda587`, v0.3 at `99682892968a76e0b47a9b44afcd97af377cabb7`, v0.2 at `b8034c3d3b6de60334c6f567a206723ef7559d0a`, v0.1 at `d424d833de44fddcf1fd804baf5630ff0027ac56`, all under `docs/`.
+**Authorship:** v0.1 and v0.2 were drafted in the user's GPT conversation. v0.3 to v0.9 were revised by a coding-agent session at the user's request. Whoever reviews v0.9 must be a separate context from both.
 
 This document proposes a change. It does not approve itself, and it grants no implementation, merge, deployment, credential or spending authority.
 
@@ -81,13 +81,13 @@ Not verified: the deployed Worker revision; how strictly the SDK enforces `maxBu
 | --- | --- |
 | `@gemini design` | Design review, Gemini first, Claude where Gemini cannot |
 | `@claude design` | Design review, Claude only |
-| `@jiaze-claude-review-bot reset design` | Clear the brief anchor, round count and findings. Spend and processed-command history are kept. No model call. |
+| `@jiaze-claude-review-bot reset design` | Clear the brief anchor, round count, retry count and findings. Writes session status as `DESIGN_REWORK` with reason `RESET` and `bundle: null` (§6.2, CRB-v07-F04). Spend and processed-command history are kept. No model call. |
 
 All existing commands keep their current meaning and act on Review only.
 
-The Worker routes the three commands to a **separate workflow file**, `design.yml`, with the same kind of inputs Review receives (§3 row 4) and a `workflow_dispatch` trigger only. `design.yml` sets `run-name: Design PR #${{ inputs.pr_number }} @ ${{ inputs.head_sha }}`. `review-v2.yml` is not modified.
+The Worker routes the three commands to a **separate workflow file**, `design.yml`, with the same kind of inputs Review receives (§3 row 4) and a `workflow_dispatch` trigger only. `design.yml` sets `run-name: design/${{ inputs.target_repo }}#${{ inputs.pr_number }}@${{ inputs.head_sha }}:${{ inputs.source_comment_id }}`. `review-v2.yml` is not modified.
 
-When the deterministic orchestrator posts a command comment (`@claude design` or `@gemini design`), it includes a head marker `<!-- design-head:<40-hex-sha> -->` in the comment body to explicitly bind the command to head `H`. A manual comment from a person may omit the marker; in that case, the Worker binds the PR's head at dispatch time and `design.yml`'s `run-name` carries it.
+When the deterministic orchestrator posts a command comment (`@claude design` or `@gemini design`), it includes a head marker `<!-- design-head:<40-hex-sha> -->` in the comment body to explicitly bind the command to head `H`. A manual comment from a person may omit the marker; in that case, the Worker binds the PR's head at dispatch time and `design.yml`'s `run-name` carries it. Combined with the source comment ID, this establishes the unique request identity: `<repo>#<pr>@<head>:<commentId>`.
 
 **All Design runs share one concurrency group.** `design.yml` uses a single group for every target repository and PR, does not cancel a running Design, and keeps pending runs with `queue: max`, as Review does per PR (§3 row 5). GitHub keeps at most 100 pending runs in a group; a run cancelled while pending has written nothing and is not an evaluation. At most one Design run executes at a time, anywhere. Its job has a 20-minute timeout (proposed). With one owner, Design runs are rare and waiting behind another PR's run is acceptable; in exchange, per-PR ordering and the daily lock (§9) need no further coordination.
 
@@ -99,7 +99,9 @@ The token `design.yml` uses on the target repository has contents-read and pull-
 
 The manifest is `.reviewbot/tasks/<task_id>.json` at the dispatched head. `task_id` matches `[A-Za-z0-9][A-Za-z0-9._-]{0,63}` and equals the file name.
 
-On the first Design run for a PR, the host takes the files added or modified between the merge base and the head that match `.reviewbot/tasks/*.json`. Exactly one must exist. Later runs use the path recorded in the session.
+On the first Design run for a PR (or when an existing session has `manifestPath: null`), the host takes the files added or modified between the merge base and the head that match `.reviewbot/tasks/*.json`. Exactly one must exist. Later runs with a non-null `manifestPath` use the path recorded in the session.
+
+**First-run manifest failure (CRB-v07-F02).** If zero or multiple files match `.reviewbot/tasks/*.json`, or if the candidate file fails schema or syntax validation before establishing a valid `task_id`, the run writes `DESIGN_BLOCKED / MANIFEST_INVALID` with `taskId: "UNASSIGNED"` and `manifestPath: null`. The session comment is created and bound to the PR. Having `manifestPath: null` explicitly identifies the session as unassigned, ensuring that subsequent runs re-execute manifest discovery across changed files instead of looking for a stale or non-existent recorded path. When the author subsequently commits a valid manifest, the next run sees `manifestPath: null`, discovers the valid manifest, updates `taskId` and `manifestPath` to the valid manifest in step 4, updates its local expected `taskId` under ISO-3, and continues to evaluation and publish.
 
 ### 5.2 Schema
 
@@ -145,7 +147,7 @@ Review selects its session by author plus a marker substring anywhere in the bod
 
 **ISO-2, discovery.** A comment is the Design session only if its author is the App identity, its body starts with the Design marker, it contains no Review marker, its state decodes, and the decoded repository and PR match. The newest such comment is used. If the newest comment by author and Design marker fails the remaining checks, the run stops without a model call and without mutating it.
 
-**ISO-3, mutation.** Design has its own comment writer. Immediately before every PATCH or DELETE it re-fetches the comment by ID and verifies the ISO-2 conditions plus the `taskId` and `revision` loaded at the start of the run. On a mismatch it does not mutate and stops. `design.yml` invokes no Review session writer, thread reconciler, PR-review publisher or status writer.
+**ISO-3, mutation (CRB-v07-F03).** Design has its own comment writer. Immediately before every PATCH or DELETE it re-fetches the comment by ID and verifies the ISO-2 conditions plus the expected `taskId` and `revision`. At the start of the run, the expected `taskId` is the one in the loaded session (or `"UNASSIGNED"` if recovering from an initial manifest failure). When a run replaces an unassigned manifest identity (`taskId: "UNASSIGNED"`, `manifestPath: null`) with a newly validated manifest's `taskId` (§5.1), the step 4 write verifies the existing `"UNASSIGNED"` `taskId`, writes the new `taskId`, `manifestPath` and revision `N+1`, and updates the run's expected `taskId` to the new `taskId` and expected revision to `N+1`. Subsequent intra-run writes (such as publishing in step 6 at revision `N+2`) verify against the updated `taskId` and updated revision `N+1`. This allows intra-run sequential writes and manifest recovery to proceed while strictly rejecting any external or concurrent mutation. `design.yml` invokes no Review session writer, thread reconciler, PR-review publisher or status writer.
 
 **The Design session comment is the only Design decision.**
 
@@ -154,13 +156,16 @@ Review selects its session by author plus a marker substring anywhere in the bod
 | Field | Meaning |
 | --- | --- |
 | `status`, `reason` | A status below and a machine reason code |
-| `repo`, `pr`, `taskId`, `manifestPath`, `revision` | Identity; `revision` increments on every write |
+| `repo`, `pr`, `taskId`, `manifestPath`, `revision` | Identity; `revision` increments on every write. On initial manifest failure, `taskId: "UNASSIGNED"` and `manifestPath: null` (CRB-v07-F02) |
 | `bundle`, `reviewedHead` | Bundle identity of the verdict, and the PR head the run that wrote this state was looking at. `reviewedHead` is set on every write, including `DESIGN_BLOCKED` |
 | `briefAnchor` | Set at the first validated run; cleared by `reset design` |
 | `round`, `maxRounds` | Completed evaluations and the limit |
+| `retryCount` | Retries executed for the current `reviewedHead`. Incremented when evaluating a retry command for `DESIGN_BLOCKED` or when recovering from an abandoned `DESIGN_IN_PROGRESS` on head `H`; reset to 0 when `reviewedHead` moves or on `reset design` |
+| `lastHandledCommentId` | ID of the source command comment processed by the latest write; updated on every write |
 | `findings` | `{id, severity, status, file, location, title, detail}` |
 | `spend` | Design-only Claude ledger: recorded USD, cap, last call's cost |
 | `runStartedAt` | Set when a run writes `DESIGN_IN_PROGRESS` |
+| `updatedAt` | Timestamp of the latest session comment write |
 | `inFlight` | `{sourceCommentId, chargedUsd}` while the run's one Claude call is outstanding, else null |
 | `processedSourceComments` | Comment IDs already handled; kept across `reset design` |
 
@@ -168,7 +173,7 @@ Review selects its session by author plus a marker substring anywhere in the bod
 | --- | --- | --- |
 | `DESIGN_IN_PROGRESS` | A run is active | — |
 | `DESIGN_PASS` | No open blocking finding for the recorded bundle | — |
-| `DESIGN_REWORK` | Open blocking findings for the recorded bundle | — |
+| `DESIGN_REWORK` | Open blocking findings for the recorded bundle, or state reset | `RESET` (on `reset design`), otherwise findings |
 | `DESIGN_BLOCKED` | No evaluation happened or none could be published | `MANIFEST_INVALID`, `INPUT_INVALID`, `POLICY_UNREADABLE`, `PROVIDER_UNAVAILABLE`, `INPUT_CHANGED`, `OUTPUT_REJECTED` |
 | `HUMAN_REQUIRED` | A person must decide | `BRIEF_CHANGED`, `ROUNDS_EXHAUSTED`, `BUDGET_EXHAUSTED`, `DAILY_LIMIT` |
 
@@ -184,9 +189,14 @@ The consumer of the decision function is an external **deterministic orchestrato
 The only sanctioned way to act on a Design result is the decision function, shipped as `scripts/design-status.mjs`:
 
 1. Read the PR head, `H`.
-2. Select the session by ISO-2. Where the table below needs it, compute the bundle identity at `H` from the session's `manifestPath`. Check for an outstanding request: a Design command (`@claude design` or `@gemini design`) posted by a writer (§3 row 2) whose comment body contains `<!-- design-head:<H> -->` (or, if omitted, matching a queued or in-progress `design.yml` run for `H`), posted after `session.runStartedAt` when `reviewedHead == H` (or anytime if `reviewedHead != H` or no session exists), whose comment ID is not in `processedSourceComments`. If found, record it as `outstandingRequest: { commentId, postedAt }`, else null.
+2. Select the session by ISO-2. Where the table below needs it, compute the bundle identity at `H` from the session's `manifestPath`. Check for an active in-flight request for head `H` (`outstandingRequest`):
+   - Check GitHub Actions workflow runs for `design.yml` targeting this repository:
+     a) **In-flight Actions run:** A `design.yml` run targeting this PR with dispatched head `H` (matching `run-name: design/<repo>#<pr>@<head>:<commentId>`) is currently non-terminal in Actions (its status is not `completed` and its conclusion is null, covering `queued`, `in_progress`, `pending`, `waiting`, or `requested`).
+     b) **Pending dispatch:** A Design command comment on this PR authored by a writer (§3 row 2) whose body contains `<!-- design-head:<H> -->`, whose comment ID is not in `processedSourceComments` and is greater than `session.lastHandledCommentId`, posted within 5 minutes (grace window for webhook/dispatch), without a completed or cancelled workflow run.
+   If (a) or (b) holds, record `outstandingRequest: { commentId, runId, status: "<non-terminal-status>" }`, else null. A request is confirmed terminated only when its Actions run has concluded (completed, cancelled, timed out, or action failure), or when a command receives no Actions run after the 5-minute dispatch window.
+   Count the unfulfilled commands posted on this PR carrying `<!-- design-head:<H> -->` posted after the latest completed evaluation (`DESIGN_PASS`, `DESIGN_REWORK`, or `DESIGN_BLOCKED`), or after the latest `reset design` command, or since head `H` became current (whichever is most recent). A **completed evaluation** is a workflow run that published a terminal session verdict (`DESIGN_PASS` or `DESIGN_REWORK`) or recorded a blocked state (`DESIGN_BLOCKED`). If `(session.reviewedHead == H && session.retryCount >= 2)` (2 retries executed after the initial review request for head `H`), or if 3 or more total commands (1 initial request + 2 retries) were posted for head `H` without producing a completed evaluation, flag `attemptsExhausted: true`.
 3. Read the PR head again. If it is no longer `H`, start over, at most three times, then return `stop`.
-4. Output a structured machine-readable JSON object on stdout and return `{action, head: H, bundle, reason, round, findings, outstandingRequest}`:
+4. Output a structured machine-readable JSON object on stdout and return `{action, head: H, bundle, reason, round, retryCount, findings, outstandingRequest}`:
    ```json
    {
      "action": "wait" | "request_review" | "fix_input" | "retry" | "revise" | "stop" | "continue",
@@ -194,10 +204,12 @@ The only sanctioned way to act on a Design result is the decision function, ship
      "bundle": "<bundle-identity-sha>",
      "reason": "<reason-code>" | null,
      "round": 1,
+     "retryCount": 0,
      "findings": [],
      "outstandingRequest": {
        "commentId": 123456,
-       "postedAt": "2026-11-11T10:00:00Z"
+       "runId": 789012,
+       "status": "queued" | "in_progress" | "pending" | "waiting" | "requested"
      } | null
    }
    ```
@@ -208,31 +220,33 @@ The only sanctioned way to act on a Design result is the decision function, ship
 | Reading the PR or its comments fails, or the newest Design comment fails ISO-2 | `stop` |
 | Status is `HUMAN_REQUIRED` | `stop` |
 | Status is `DESIGN_PASS`, identity equal | `continue` |
-| Status is `DESIGN_REWORK`, identity equal | `revise` |
+| Status is `DESIGN_REWORK`, identity equal, reason is not `RESET` | `revise` |
 | Status is `DESIGN_BLOCKED` at `H`, reason `MANIFEST_INVALID` or `INPUT_INVALID` | `fix_input` |
-| An `outstandingRequest` for head `H` was posted less than 30 minutes ago | `wait` |
-| Status is `DESIGN_IN_PROGRESS` and `runStartedAt` is less than 30 minutes ago | `wait` |
+| An `outstandingRequest` for head `H` is active (status is non-terminal in Actions or pending dispatch) | `wait` |
+| Status is `DESIGN_IN_PROGRESS` and (the workflow run is active in Actions or `runStartedAt` is less than 30 minutes ago) | `wait` |
+| Evaluation attempts for head `H` are exhausted (`attemptsExhausted == true`) | `stop` |
+| Status is `DESIGN_REWORK` and session reason is `RESET` | `request_review` |
+| Status is `DESIGN_IN_PROGRESS` and `runStartedAt` is 30 minutes ago or more (and no active workflow run in Actions) | `request_review` |
 | Status is `DESIGN_BLOCKED` at `H`, any other reason | `retry` |
-| Status is `DESIGN_IN_PROGRESS` and `runStartedAt` is 30 minutes ago or more | `request_review` |
 | No Design session exists | `request_review` |
 | Status is `DESIGN_BLOCKED` and `H` differs from the session's `reviewedHead` | `request_review` |
 | Status is `DESIGN_REWORK` or `DESIGN_PASS`, and the bundle identity at `H` differs from the session's or cannot be computed | `request_review` |
 
 The rows are evaluated in order. What each action asks of the consumer:
 
-- `wait`: non-LLM orchestrator pauses (sleep) and calls again later; consumes zero LLM tokens. If `outstandingRequest` is set, a command has been dispatched or is queued in GitHub Actions and has not yet written `DESIGN_IN_PROGRESS`.
-- `request_review`: non-LLM orchestrator posts the Design command.
+- `wait`: non-LLM orchestrator pauses (sleep) and calls again later; consumes zero LLM tokens. While a run is non-terminal in GitHub Actions (`queued`, `in_progress`, `pending`, `waiting`, or `requested`, even past 30 minutes in a congested queue), `wait` is returned continuously without duplicate requests.
+- `request_review`: non-LLM orchestrator posts the Design command with `<!-- design-head:<H> -->`.
 - `fix_input`: non-LLM orchestrator passes the error reason to the editing agent, which corrects the manifest or listed files and pushes; the orchestrator then posts the Design command.
-- `retry`: nothing in the repository needs to change. Non-LLM orchestrator posts the Design command again, at most twice for the same head and with a pause between attempts; if the result is still `retry`, stop and report.
+- `retry`: nothing in the repository needs to change. Non-LLM orchestrator posts the Design command with `<!-- design-head:<H> -->`. The session state and comment history track attempts, persisting across orchestrator restarts. At most 2 retries (3 total attempts for the same head H) are permitted; subsequent attempts are rejected with `stop`.
 - `revise`: non-LLM orchestrator transfers open findings to the editing agent, which modifies the contract documents to address them and pushes; the orchestrator then posts the Design command.
 - `stop`: non-LLM orchestrator reports to the person and terminates.
 - `continue`: see below.
 
 **What `continue` authorizes.** Exactly this: the listed documents as they are at commit `H` passed. The result is a statement about `H`, not about the branch. A consumer bases its work on `H`, and calls the function again before relying on the pass at any later commit, in particular before it hands the task on.
 
-**Outstanding requests and interruption recovery.** When the orchestrator posts a Design command comment (either for a new review or for a retry), GitHub Actions dispatches the workflow asynchronously. Until the workflow starts and writes `DESIGN_IN_PROGRESS`, the command comment is an unprocessed source comment. The orchestrator includes `<!-- design-head:<H> -->` in the comment body, explicitly binding the request to head `H`. By checking for unprocessed Design commands on the PR carrying `<!-- design-head:<H> -->` (or matching a queued `design.yml` run for `H`) and posted after `runStartedAt` when `reviewedHead == H`, `design-status.mjs` identifies active in-flight requests for `H` and returns `wait` with `outstandingRequest` populated, rather than prematurely emitting repeated `request_review` or `retry` actions during queue latency. Binding the target head SHA directly into the comment and run name eliminates reliance on committer timestamps, removes client clock drift, and guarantees commands dispatched for an earlier head are never attributed to `H`. An orchestrator process that restarts or recovers after interruption calls `design-status.mjs`, observes the outstanding request, and seamlessly resumes waiting with zero duplicate command dispatches. If an unprocessed command remains unhandled after 30 minutes, it is treated as abandoned and the table proceeds to `retry` or `request_review`. Commands carrying an earlier head marker are ignored and do not delay actions at `H`.
+**Outstanding requests, queue separation, and interruption recovery.** When the orchestrator posts a Design command comment (either for a new review or for a retry), GitHub Actions dispatches the workflow asynchronously. Because `design.yml` runs in a single global concurrency group across the repository, runs may wait in non-terminal status (`pending`, `queued`, `waiting`) during high activity. `design-status.mjs` checks Actions run state: as long as a run for this PR and head `H` is non-terminal in Actions (covering `queued`, `in_progress`, `pending`, `waiting`, `requested`), it returns `wait` with `outstandingRequest` populated, completely eliminating duplicate review commands caused by arbitrary time limits. Only when a run is confirmed terminated (completed, cancelled, timed out) without publishing a session, or when a command receives no workflow dispatch after 5 minutes, is the request treated as terminated, allowing `request_review` or `retry` up to the 2-retry bound. Persistent `retryCount` and PR comment history guarantee that restart or multiple invocations of the orchestrator enforce the at-most-2-retries limit deterministically.
 
-**Abandoned runs.** A run that is killed after writing `DESIGN_IN_PROGRESS` leaves that status behind, and nothing dispatches a successor by itself. The job timeout is 20 minutes, so a status still in progress after 30 minutes belongs to a dead run. The decision function then returns `request_review`. The consumer, which is the deterministic orchestrator in the automated loop, posts the Design command again. That run settles the abandoned charge first and evaluates (§8, CRB-DEC-01). No person relays anything. Two evaluations cannot overlap, because Design runs execute one at a time (§4).
+**Abandoned runs.** A run that is killed after writing `DESIGN_IN_PROGRESS` leaves that status behind, and nothing dispatches a successor by itself. The job timeout is 20 minutes, so a status still in progress after 30 minutes belongs to a dead run. If evaluation attempts for head `H` are exhausted (`attemptsExhausted == true`, through `retryCount >= 2` or 3 unfulfilled attempts), the decision function returns `stop`. Otherwise, it returns `request_review`. The consumer, which is the deterministic orchestrator in the automated loop, posts the Design command again. That run settles the abandoned charge first, increments `session.retryCount` (§8 step 3), and evaluates (§8, CRB-DEC-01). No person relays anything. Two evaluations cannot overlap, because Design runs execute one at a time (§4).
 
 A PR head can change at any time, so no check can promise the branch will not move afterwards. Binding the answer to `H` makes that harmless: an answer about `H` stays true, and it does not cover a later commit.
 
@@ -252,17 +266,18 @@ This is a tripwire for the case the workflow must catch: an agent editing the br
 
 ## 8. Run protocol
 
-1. **Load.** Check that the live PR is open and that its base and head equal the dispatched SHAs. If they do not, the run ends here and **writes nothing**: a run that was queued for an earlier head must not replace the session, which may hold a valid verdict. The consumer learns what to do from the decision function at the present head (§6.3). Otherwise select the session (ISO-2), or start an empty one.
+1. **Load.** Check that the live PR is open and that its base and head equal the dispatched SHAs. If they do not, the run ends here and **writes nothing**: a run that was queued for an earlier head must not replace the session, which may hold a valid verdict. The consumer learns what to do from the decision function at the present head (§6.3). Otherwise select the session (ISO-2), or start an empty one. If `H` differs from `session.reviewedHead`, reset `session.retryCount` to 0.
 2. **Settle first.** If `inFlight` is set, add `chargedUsd` to `spend` and clear it. This happens before anything else in every run that loads a session, including `reset` and runs that then stop for any reason (CRB-DEC-01).
 3. **Validate, no model call.**
    - If the source comment is in `processedSourceComments`, write the settlement if step 2 made one, and stop.
-   - For `reset`: apply §4, write the session, stop.
-   - Validate the manifest and files (§5), compute the bundle identity, read the policy, check the brief anchor. If any check fails, or if `round` is exhausted, write the resulting `DESIGN_BLOCKED` or `HUMAN_REQUIRED` status with the source comment recorded in `processedSourceComments`, and stop.
+   - For `reset`: write `DESIGN_REWORK` with reason `RESET`, `bundle: null`, `round: 0`, `retryCount: 0`, `findings: []`, clear `briefAnchor`, record the source comment in `processedSourceComments`, update `lastHandledCommentId` and `updatedAt`, and stop (§4, §6.2, CRB-v07-F04).
+   - If the session at `H` is already `DESIGN_BLOCKED` or `DESIGN_IN_PROGRESS` (recovering from a prior blocked result or an abandoned in-progress run on head `H`), increment `session.retryCount` for this evaluation attempt.
+   - Validate the manifest and files (§5), compute the bundle identity, read the policy, check the brief anchor. If any check fails, or if `round` is exhausted, write the resulting `DESIGN_BLOCKED` or `HUMAN_REQUIRED` status with `reviewedHead: H`, `session.retryCount`, `updatedAt`, `lastHandledCommentId`, and the source comment recorded in `processedSourceComments`, and stop. On an initial manifest failure (§5.1), write `taskId: "UNASSIGNED"` and `manifestPath: null` (CRB-v07-F02).
    - If the session holds a pass or rework for this exact bundle identity, record the command as processed, re-surface the result and stop.
    - Check `round`.
-4. **Admit and charge.** Decide now whether this run may use Claude, by applying the three locks in §9. Write the session as `DESIGN_IN_PROGRESS` with `runStartedAt`, the brief anchor and, if Claude was admitted, `inFlight` set. If this write fails, stop before any model call.
-5. **Evaluate.** **A Design run makes at most one Claude SDK invocation.** There are no shards, no retries and no second fallback. `@gemini design` tries Gemini and, only if Gemini cannot complete and Claude was admitted in step 4, makes the one Claude invocation. `@claude design` makes the one Claude invocation. If that invocation fails, the run publishes `DESIGN_BLOCKED / PROVIDER_UNAVAILABLE` with the source comment recorded in `processedSourceComments`. Shared read-only provider execution. The model receives the listed files, the reviewer policy, prior findings, and the existing sanitized read-only tools over the snapshot at the head. It receives no GitHub token.
-6. **Publish.** Recompute the bundle identity at the PR's present head. If unchanged, write the verdict, findings, incremented `round`, the call's cost in place of the charge, `inFlight: null`, and the processed command. If changed, write `DESIGN_BLOCKED / INPUT_CHANGED` with the same spend settlement and the processed command.
+4. **Admit and charge.** Decide now whether this run may use Claude, by applying the three locks in §9. Write the session as `DESIGN_IN_PROGRESS` with `runStartedAt`, `updatedAt`, `lastHandledCommentId`, `session.retryCount`, the brief anchor and, if Claude was admitted, `inFlight` set. Update local expected revision to `N+1` and, if transitioning from an unassigned manifest session (`manifestPath: null`), update local expected `taskId` to the validated manifest's `taskId` (ISO-3, CRB-v07-F03). If this write fails, stop before any model call.
+5. **Evaluate.** **A Design run makes at most one Claude SDK invocation.** There are no shards, no retries and no second fallback. `@gemini design` tries Gemini and, only if Gemini cannot complete and Claude was admitted in step 4, makes the one Claude invocation. `@claude design` makes the one Claude invocation. If that invocation fails, the run publishes `DESIGN_BLOCKED / PROVIDER_UNAVAILABLE` with `reviewedHead: H`, `session.retryCount`, `updatedAt`, `lastHandledCommentId`, and the source comment recorded in `processedSourceComments`. Shared read-only provider execution. The model receives the listed files, the reviewer policy, prior findings, and the existing sanitized read-only tools over the snapshot at the head. It receives no GitHub token.
+6. **Publish.** Recompute the bundle identity at the PR's present head. If unchanged, write the verdict, findings, incremented `round`, `retryCount: 0`, `updatedAt`, `lastHandledCommentId`, the call's cost in place of the charge, `inFlight: null`, and the processed command. If changed, write `DESIGN_BLOCKED / INPUT_CHANGED` with the same spend settlement, `retryCount: 0`, `updatedAt`, `lastHandledCommentId`, and the processed command.
 
 `design.yml` does not print file contents, policy text or model output to logs or the job summary. Target repositories can be private while this repository's logs are public.
 
@@ -274,11 +289,11 @@ The requirement is the user's: a Claude call that misbehaves must not be able to
 | --- | --- | --- |
 | Per call | `maxBudgetUsd` and the adapter's turn limit are passed to the SDK; the job timeout ends a run that does not return. A run makes at most one Claude call | USD 2, 20 minutes |
 | Per PR | Claude is admitted for a run only if `cap − spend ≥ per-call amount`. The full per-call amount is recorded as `inFlight` **before** the call (§8 step 4) | USD 6 cap |
-| Daily, all PRs | Before admitting Claude, the host counts the `design.yml` runs created in this repository in the last 24 hours, in any state and including the present run. Above the limit, or if the count cannot be read, the status is `HUMAN_REQUIRED / DAILY_LIMIT` | 20 runs |
+| Daily, all PRs | Before admitting Claude, the host counts the `design.yml` runs created in this repository in the last 24 hours, in any state and including the present run. If `count > 20`, or if the count cannot be read, the status is `HUMAN_REQUIRED / DAILY_LIMIT` (CRB-v07-F05) | 20 runs |
 
 **One run, one call, one charge.** Admission happens once per run and covers exactly the one Claude invocation the run may make (§8 step 5). `inFlight` therefore never stands for more than one paid call, and no call starts without its own recorded charge.
 
-**Why the daily count needs no reservation.** The count is of runs created, not of calls admitted, so it also counts resets and blocked runs; that errs toward refusing. Design runs execute one at a time (§4). When a run reads the count, every Design run that executed before it has ended and is in the listing, and runs still pending can only raise the count. Two commands arriving together on different PRs therefore cannot both be admitted past the limit: whichever executes second sees the first. This rests on one assumption, to be confirmed in S3: a completed run appears in the Actions run listing by the time the next run in the group starts.
+**Why the daily count needs no reservation.** The count is of runs created, not of calls admitted, so it also counts resets and blocked runs; that errs toward refusing. Design runs execute one at a time (§4). When a run reads the count, every Design run that executed before it has ended and is in the listing, and runs still pending can only raise the count. Two commands arriving together on different PRs therefore cannot both be admitted past the limit: whichever executes second sees the first. Exactly 20 runs in any rolling 24-hour window are admitted (`count <= 20`); the 21st run is refused with `HUMAN_REQUIRED / DAILY_LIMIT` (CRB-v07-F05). If the listing cannot be retrieved, the run fails closed. This rests on one assumption, to be confirmed in S3: a completed run appears in the Actions run listing by the time the next run in the group starts.
 
 **Settlement.** On publish, the call's provider-reported cost replaces the charge, including any amount above the per-call value. With no reported cost, the full charge stands. If the run completed without invoking Claude, because Gemini finished the evaluation, the charge is released and nothing is recorded. Design supplies no smaller fallback cost to the shared budget manager (§3 row 11).
 
@@ -346,7 +361,7 @@ The reviewer does not rewrite the contract and does not decide product questions
 | AC2 | Isolation (§6.1) | Both task types on one PR in both orders. Model output and file content carrying Review markers, Design markers, HTML comments and encoded state. Wrong comment ID, changed `revision`, failed PATCH and DELETE. Review's planner and status sync select the same session as without Design, and Review sessions, findings, threads, PR reviews and statuses are unchanged |
 | AC3 | Validation | Base or head moved: the run writes nothing, an existing session is byte-identical afterwards, and no model is called. Zero or several manifests; malformed schema; unknown role; missing file; symlink; submodule; oversize input; unreadable policy; repeated source comment. Each gives the stated status with no model call |
 | AC4 | Brief tripwire | Changed, added or removed brief gives `BRIEF_CHANGED` with no model call. `reset design` re-anchors, zeroes `round`, keeps `spend` and processed commands |
-| AC5 | Freshness, abandonment, and token-efficient orchestration (§6.3, §9) | Every row of the decision table. `DESIGN_IN_PROGRESS` gives `wait` before 30 minutes and `request_review` from 30 minutes. No session gives `request_review`. `DESIGN_BLOCKED` gives `request_review` when the head has moved since, `fix_input` for the two input reasons and `retry` for every other reason. **Stale queued run:** with a pass recorded for the present head, a queued run dispatched for an earlier head changes nothing, and the decision function still returns `continue`; with a rework recorded, it still returns `revise`. A listed file changed after a pass gives `request_review`. A code-only commit after a pass gives `continue` with the new head. A push between the two head reads is detected. An unreadable session gives `stop`. No case returns `continue` with a head whose bundle was not evaluated. **Zero-token orchestration:** repeated status checks during a pending review consume zero LLM tokens; repeated polling does not emit duplicate review requests; target head binding (`<!-- design-head:<H> -->` / `run-name`) prevents earlier commands from stalling a new head; PASS and terminal states end orchestration without LLM invocation; REWORK transfers structured findings to the editing agent; an interrupted orchestrator resumes from `design-status.mjs` state without duplicate evaluations |
+| AC5 | Freshness, abandonment, and token-efficient orchestration (§6.3, §9) | Every row of the decision table. No session gives `request_review`. `DESIGN_BLOCKED` gives `request_review` when the head has moved since, `fix_input` for the two input reasons and `retry` for other reasons (`session.retryCount < 2`), or `stop` (`session.retryCount >= 2`). **Stale queued run:** with a pass recorded for the present head, a queued run dispatched for an earlier head changes nothing, and the decision function still returns `continue`; with a rework recorded, it still returns `revise`. A listed file changed after a pass gives `request_review`. A code-only commit after a pass gives `continue` with the new head. A push between the two head reads is detected. An unreadable session gives `stop`. No case returns `continue` with a head whose bundle was not evaluated. **Zero-token orchestration & queue separation (CRB-v07-F01, F06):** repeated status checks during a pending review consume zero LLM tokens; queue latency in the single concurrency group maintains `wait` without duplicate requests while the run is `queued` or `in_progress` in Actions; target head binding (`<!-- design-head:<H> -->` / `run-name`) prevents earlier commands from stalling a new head; `retryCount` persisted in session state bounds retries across orchestrator restarts; PASS and terminal states end orchestration without LLM invocation; REWORK transfers structured findings to the editing agent; an interrupted orchestrator resumes from `design-status.mjs` state without duplicate evaluations |
 | AC6 | Loop | A seeded contradiction gives rework; a fix gives a full re-review that rules the old finding fixed and passes; three reworks give `ROUNDS_EXHAUSTED` |
 | AC7 | Spend locks (§9) | Charge is written before the call. **One call per run:** with Gemini failing and Claude failing, the run makes exactly one Claude invocation and ends blocked; with USD 4 recorded, a run cannot make a second Claude invocation under one charge. **Abandoned run:** kill a run after the charge is written and post no human comment; after 30 minutes the decision function returns `request_review`, the orchestrator's repeated command settles the charge first and re-evaluates, and no pass is visible before that evaluation completes (CRB-DEC-01). **Daily lock under concurrency:** with 19 runs counted, start Design on two different PRs at once, holding each just before admission; the runs execute one after the other and at most the limit is admitted; repeat after deleting a session comment and after repeated resets. With USD 4 recorded and USD 2 in flight, a `reset` followed by a command admits no Claude call. Reported cost above the per-call amount is recorded in full (CRB-DEC-02). The daily limit refuses at the threshold and when the count cannot be read. Review's ledger is unchanged throughout |
 | AC8 | Logs | With a sentinel string in a listed file and in model output, the sentinel appears in no log or job summary |
@@ -356,19 +371,24 @@ Evidence must separate tests run, CI logs, model claims and observations on a re
 ## 13. Stages
 
 - **S1 Gate.** Independent review of this document at its `design_ref`.
-- **S2 Routing and validation, no model call.** Commands, `design.yml`, manifest validation, brief anchor, session writer with ISO-1 to ISO-3, the decision function. AC1 to AC5.
+- **S2 Routing and validation, no model call.** Commands, `design.yml`, manifest validation, brief anchor, session writer with ISO-1 to ISO-3, the decision function. AC1 to AC5. Verified using deterministic non-LLM test drivers without requiring an external production agent platform.
 - **S3 Evaluation.** Provider call, findings, rounds, spend locks. AC6 to AC8 with providers stubbed.
 - **S4 Live.** Only with separate authorization to deploy and to spend. One rework-to-pass loop and one Review lifecycle on real PRs.
 
-## 14. Changes from v0.7, and the response to earlier reviews
+## 14. Changes from v0.8, and the response to earlier reviews
 
-### Changes from v0.7
+### Changes from v0.8 (Resolution of v0.7 independent review findings F01–F06)
 
-v0.7 addressed bot review finding F001 (P2). The independent design review of v0.7 raised one P3 architecture finding (CRB-v07-F06), which is addressed here:
+v0.8 addressed the initial architecture clarification for token-efficient agent orchestration. The full independent engineering review of v0.7 returned six prioritized findings (F01–F06), all resolved here:
 
 | Source | Problem | Correction |
 | --- | --- | --- |
-| Independent review CRB-v07-F06, P3 | v0.7 defined a deterministic decision interface (`design-status.mjs`) but did not specify how the consumer loop runs without unnecessary LLM inference. An implementation keeping an LLM agent active for polling and waiting would consume inference tokens on deterministic operations, and lacked outstanding request tracking to prevent duplicate commands during dispatch latency | Separated the non-LLM Deterministic Orchestrator from the cognitive Editing Agent in §1 and §6.3. Defined the machine-readable JSON output schema for `design-status.mjs` including `outstandingRequest` tracking to prevent duplicate review requests, enable external non-LLM orchestration, and guarantee interruption recovery. Established the three-bucket cost model in §9 and extended AC5 with zero-token orchestration acceptance criteria |
+| Independent review F01 (P1) | Queued requests exceeding 30 minutes in the global concurrency group returned `request_review`, triggering duplicate commands and exhausting the 20-run daily limit | Separated `queued` vs `in_progress` vs `terminated` states via GitHub Actions run queries in §6.3. As long as a run is `queued` or `in_progress`, `design-status.mjs` returns `wait`, regardless of queue latency. A run is only re-requested when confirmed terminated without writing or if dispatch failed after a 5-minute grace window (§6.3, AC5) |
+| Independent review F02 (P2) | When the first manifest is invalid, the session had no established `taskId` or `manifestPath` to allow subsequent recovery | Defined fallback identity for initial manifest failures in §5.1 and §6.2: `taskId: "UNASSIGNED"` and `manifestPath: null`. Subsequent runs re-trigger manifest discovery while `manifestPath` is null, updating `taskId` and `manifestPath` once valid and updating expected `taskId` under ISO-3 in step 4 |
+| Independent review F03 (P2) | ISO-3 checked comment revision against the initial revision loaded at the start of the run, conflicting with sequential writes in a single run (e.g. step 4 writing in-progress, step 6 publishing) | Clarified ISO-3 in §6.1: a run tracks its own incremented expected revision and updated expected `taskId` across sequential writes, allowing internal multi-write execution and unassigned manifest recovery while rejecting external/concurrent mutations |
+| Independent review F04 (P2) | `reset design` left session status and next consumer action undefined | Defined `reset design` state in §4, §6.2, and §6.3: session status is written as `DESIGN_REWORK` with reason `RESET` and `bundle: null`; `design-status.mjs` maps `reason: RESET` directly to `request_review` |
+| Independent review F05 (P3) | Daily 20-run limit boundary was described ambiguously ("at most the limit", "refuses at threshold", "above the limit") | Clarified in §9: exactly 20 runs per rolling 24-hour window are admitted (`count <= 20`); the 21st run is refused with `HUMAN_REQUIRED / DAILY_LIMIT` |
+| Independent review F06 (P3) | Token-efficient agent orchestration, request tracking, and retry recovery | Defined non-LLM Deterministic Orchestrator boundary in §1 and §6.3 (0 LLM tokens for polling/waiting/retrying). Structured machine-readable JSON output for `design-status.mjs`. Added explicit target head marker `<!-- design-head:<H> -->` and `design.yml` `run-name`. Persisted `retryCount` in session state to deterministically enforce the 2-retry limit across restarts. Established the three-bucket cost model in §9 and updated AC5 |
 
 ### Changes from v0.6
 
