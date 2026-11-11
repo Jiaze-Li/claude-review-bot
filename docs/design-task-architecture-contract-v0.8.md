@@ -1,13 +1,13 @@
-# CRB-DESIGN-01 — Design Task Architecture Contract v0.7
+# CRB-DESIGN-01 — Design Task Architecture Contract v0.8
 
-**Status:** v0.6 received an independent **DESIGN PASS** on 2026-11-11, bound to blob `40b9823aa2d00282cf78d43b69fb45a55560dc0c`. v0.7 is v0.6 plus one correction to the decision function and one wording fix, both listed in §14. That pass does not cover the changed text. v0.7 has had no full independent review; whether to require one or to waive it is the user's decision and is recorded in the description of PR #70. Not approved for implementation by this document.
+**Status:** v0.6 received an independent **DESIGN PASS** on 2026-11-11, bound to blob `40b9823aa2d00282cf78d43b69fb45a55560dc0c`. v0.7 addressed bot review finding F001 (P2) and CRB-v06-F01 (P3). v0.8 incorporates independent design review finding CRB-v07-F06 (P3): defining the non-LLM deterministic orchestrator interface and separating deterministic polling/waiting/retrying (0 LLM inference tokens) from cognitive editing agent invocation (§6.3, §9, §12, §14). Not approved for implementation by this document.
 **Target repository:** `Jiaze-Li/claude-review-bot`
 **Engineering policy snapshot (`policy_sha`):** `ae4c3f538f9e8998fe534aaa01ff12daae1725aa`
 **Code baseline for the facts in §3 (read-only):** `b2ab0631ac0ef4192c2b6956ea100a8e3ca17047`, the merge of PR #71 on `main`.
 **Risk / gate:** Tier 3 / REQUIRED / PENDING, as classified by the Engineering Lead for v0.1. v0.5 narrowed the scope (§2); re-classification is the Lead's decision, not this document's.
-**Immutable `design_ref`:** `git:Jiaze-Li/claude-review-bot@<commit-of-this-file>:docs/design-task-architecture-contract-v0.7.md`, assigned in the PR description after commit.
-**Previous versions:** v0.6 at `62a15fab1c23c6b3f49bf2cda90bc529c2550300`, v0.5 at `5402aeca88697a94cf9ded791f1ba00ef61b4722`, v0.4 at `7c6b8c80e752f1f8e34e710cbf68b442baeda587`, v0.3 at `99682892968a76e0b47a9b44afcd97af377cabb7`, v0.2 at `b8034c3d3b6de60334c6f567a206723ef7559d0a`, v0.1 at `d424d833de44fddcf1fd804baf5630ff0027ac56`, all under `docs/`.
-**Authorship:** v0.1 and v0.2 were drafted in the user's GPT conversation. v0.3 to v0.7 were revised by a coding-agent session at the user's request. Whoever reviews v0.7 must be a separate context from both.
+**Immutable `design_ref`:** `git:Jiaze-Li/claude-review-bot@<commit-of-this-file>:docs/design-task-architecture-contract-v0.8.md`, assigned in the PR description after commit.
+**Previous versions:** v0.7 at `7b211fc52240ee75d3baca54ad352960e4ce50a1`, v0.6 at `62a15fab1c23c6b3f49bf2cda90bc529c2550300`, v0.5 at `5402aeca88697a94cf9ded791f1ba00ef61b4722`, v0.4 at `7c6b8c80e752f1f8e34e710cbf68b442baeda587`, v0.3 at `99682892968a76e0b47a9b44afcd97af377cabb7`, v0.2 at `b8034c3d3b6de60334c6f567a206723ef7559d0a`, v0.1 at `d424d833de44fddcf1fd804baf5630ff0027ac56`, all under `docs/`.
+**Authorship:** v0.1 and v0.2 were drafted in the user's GPT conversation. v0.3 to v0.8 were revised by a coding-agent session at the user's request. Whoever reviews v0.8 must be a separate context from both.
 
 This document proposes a change. It does not approve itself, and it grants no implementation, merge, deployment, credential or spending authority.
 
@@ -19,12 +19,12 @@ The workflow this serves:
 
 1. A person and a general AI agree on a short **brief**: goal, non-goals, decisions already made, what counts as done, and how far the work is authorized to go.
 2. The AI commits the brief and the contract documents to a task branch and opens a draft PR.
-3. `design` reviews the contract documents. An editing agent revises them and requests re-review until the verdict is pass, or the bot stops for a person.
+3. `design` reviews the contract documents. An external deterministic orchestrator checks status and coordinates the loop; when revision is required, an editing agent revises them. The orchestrator requests re-review until the verdict is pass, or the bot stops for a person.
 4. Implementation and the existing `review` follow on the same PR.
 
 ### Non-goals
 
-Free-form prompt commands. Any change to `review` commands, state, findings, threads, budgets or commit status. The reviewer editing contracts or code. A commit status, review threads or a PR review object for `design`. Contract files outside the target repository. `design` runs triggered by PR events. A `workflow_call` entry point for `design`. Starting or waking the editing agent. Use by anyone other than the owner (§2).
+Free-form prompt commands. Any change to `review` commands, state, findings, threads, budgets or commit status. The reviewer editing contracts or code. A commit status, review threads or a PR review object for `design`. Contract files outside the target repository. `design` runs triggered by PR events. A `workflow_call` entry point for `design`. Starting or waking the editing agent. Embedding a full local orchestrator runtime into the bot repository (an external non-LLM orchestrator or simple script consumes `design-status.mjs`). Use by anyone other than the owner (§2).
 
 ## 2. Scope and trust: recorded decision CRB-DEC-04
 
@@ -85,7 +85,9 @@ Not verified: the deployed Worker revision; how strictly the SDK enforces `maxBu
 
 All existing commands keep their current meaning and act on Review only.
 
-The Worker routes the three commands to a **separate workflow file**, `design.yml`, with the same kind of inputs Review receives (§3 row 4) and a `workflow_dispatch` trigger only. `review-v2.yml` is not modified.
+The Worker routes the three commands to a **separate workflow file**, `design.yml`, with the same kind of inputs Review receives (§3 row 4) and a `workflow_dispatch` trigger only. `design.yml` sets `run-name: Design PR #${{ inputs.pr_number }} @ ${{ inputs.head_sha }}`. `review-v2.yml` is not modified.
+
+When the deterministic orchestrator posts a command comment (`@claude design` or `@gemini design`), it includes a head marker `<!-- design-head:<40-hex-sha> -->` in the comment body to explicitly bind the command to head `H`. A manual comment from a person may omit the marker; in that case, the Worker binds the PR's head at dispatch time and `design.yml`'s `run-name` carries it.
 
 **All Design runs share one concurrency group.** `design.yml` uses a single group for every target repository and PR, does not cancel a running Design, and keeps pending runs with `queue: max`, as Review does per PR (§3 row 5). GitHub keeps at most 100 pending runs in a group; a run cancelled while pending has written nothing and is not an evaluation. At most one Design run executes at a time, anywhere. Its job has a 20-minute timeout (proposed). With one owner, Design runs are rare and waiting behind another PR's run is acceptable; in exchange, per-PR ordering and the daily lock (§9) need no further coordination.
 
@@ -176,40 +178,61 @@ Review selects its session by author plus a marker substring anywhere in the bod
 
 **A status alone never authorizes continuing.** An earlier `DESIGN_PASS` can stay visible after the documents change.
 
+**Consumer architecture: deterministic orchestrator vs cognitive editing agent.**
+The consumer of the decision function is an external **deterministic orchestrator** (a non-LLM script, runner, or CI harness), not an active LLM agent context. Deterministic orchestration — polling, waiting, command dispatch, deduplication, timeout handling, and retry limits — requires **zero LLM inference tokens**. LLM execution is reserved strictly for tasks requiring reasoning: modifying contract documents or manifests in response to findings.
+
 The only sanctioned way to act on a Design result is the decision function, shipped as `scripts/design-status.mjs`:
 
 1. Read the PR head, `H`.
-2. Select the session by ISO-2. Where the table below needs it, compute the bundle identity at `H` from the session's `manifestPath`.
+2. Select the session by ISO-2. Where the table below needs it, compute the bundle identity at `H` from the session's `manifestPath`. Check for an outstanding request: a Design command (`@claude design` or `@gemini design`) posted by a writer (§3 row 2) whose comment body contains `<!-- design-head:<H> -->` (or, if omitted, matching a queued or in-progress `design.yml` run for `H`), posted after `session.runStartedAt` when `reviewedHead == H` (or anytime if `reviewedHead != H` or no session exists), whose comment ID is not in `processedSourceComments`. If found, record it as `outstandingRequest: { commentId, postedAt }`, else null.
 3. Read the PR head again. If it is no longer `H`, start over, at most three times, then return `stop`.
-4. Return `{action, head: H, bundle}`.
+4. Output a structured machine-readable JSON object on stdout and return `{action, head: H, bundle, reason, round, findings, outstandingRequest}`:
+   ```json
+   {
+     "action": "wait" | "request_review" | "fix_input" | "retry" | "revise" | "stop" | "continue",
+     "head": "<git-sha>",
+     "bundle": "<bundle-identity-sha>",
+     "reason": "<reason-code>" | null,
+     "round": 1,
+     "findings": [],
+     "outstandingRequest": {
+       "commentId": 123456,
+       "postedAt": "2026-11-11T10:00:00Z"
+     } | null
+   }
+   ```
+   Exit code is 0 on successful status resolution (including `stop` verdicts), and non-zero on CLI or network failure (which also emits `{action: "stop"}` on stdout if possible). This interface permits an external non-LLM orchestrator to track outstanding requests, pipe findings, and resume after an interruption without maintaining an active LLM conversation.
 
 | Condition | `action` |
 | --- | --- |
 | Reading the PR or its comments fails, or the newest Design comment fails ISO-2 | `stop` |
-| No Design session exists | `request_review` |
-| Status is `DESIGN_IN_PROGRESS` and `runStartedAt` is less than 30 minutes ago | `wait` |
-| Status is `DESIGN_IN_PROGRESS` and `runStartedAt` is 30 minutes ago or more | `request_review` |
 | Status is `HUMAN_REQUIRED` | `stop` |
-| Status is `DESIGN_BLOCKED` and `H` differs from the session's `reviewedHead` | `request_review` |
-| Status is `DESIGN_BLOCKED` at `H`, reason `MANIFEST_INVALID` or `INPUT_INVALID` | `fix_input` |
-| Status is `DESIGN_BLOCKED` at `H`, any other reason | `retry` |
-| Status is `DESIGN_REWORK` or `DESIGN_PASS`, and the bundle identity at `H` differs from the session's or cannot be computed | `request_review` |
-| Status is `DESIGN_REWORK`, identity equal | `revise` |
 | Status is `DESIGN_PASS`, identity equal | `continue` |
+| Status is `DESIGN_REWORK`, identity equal | `revise` |
+| Status is `DESIGN_BLOCKED` at `H`, reason `MANIFEST_INVALID` or `INPUT_INVALID` | `fix_input` |
+| An `outstandingRequest` for head `H` was posted less than 30 minutes ago | `wait` |
+| Status is `DESIGN_IN_PROGRESS` and `runStartedAt` is less than 30 minutes ago | `wait` |
+| Status is `DESIGN_BLOCKED` at `H`, any other reason | `retry` |
+| Status is `DESIGN_IN_PROGRESS` and `runStartedAt` is 30 minutes ago or more | `request_review` |
+| No Design session exists | `request_review` |
+| Status is `DESIGN_BLOCKED` and `H` differs from the session's `reviewedHead` | `request_review` |
+| Status is `DESIGN_REWORK` or `DESIGN_PASS`, and the bundle identity at `H` differs from the session's or cannot be computed | `request_review` |
 
 The rows are evaluated in order. What each action asks of the consumer:
 
-- `wait`: call again later.
-- `request_review`: post the Design command.
-- `fix_input`: correct the manifest or the listed files, push, then post the Design command.
-- `retry`: nothing in the repository needs to change. Post the Design command again, at most twice for the same head and with a pause between attempts; if the result is still `retry`, stop and report.
-- `revise`: change the contract documents to address the open findings, push, then post the Design command.
-- `stop`: report to the person.
+- `wait`: non-LLM orchestrator pauses (sleep) and calls again later; consumes zero LLM tokens. If `outstandingRequest` is set, a command has been dispatched or is queued in GitHub Actions and has not yet written `DESIGN_IN_PROGRESS`.
+- `request_review`: non-LLM orchestrator posts the Design command.
+- `fix_input`: non-LLM orchestrator passes the error reason to the editing agent, which corrects the manifest or listed files and pushes; the orchestrator then posts the Design command.
+- `retry`: nothing in the repository needs to change. Non-LLM orchestrator posts the Design command again, at most twice for the same head and with a pause between attempts; if the result is still `retry`, stop and report.
+- `revise`: non-LLM orchestrator transfers open findings to the editing agent, which modifies the contract documents to address them and pushes; the orchestrator then posts the Design command.
+- `stop`: non-LLM orchestrator reports to the person and terminates.
 - `continue`: see below.
 
 **What `continue` authorizes.** Exactly this: the listed documents as they are at commit `H` passed. The result is a statement about `H`, not about the branch. A consumer bases its work on `H`, and calls the function again before relying on the pass at any later commit, in particular before it hands the task on.
 
-**Abandoned runs.** A run that is killed after writing `DESIGN_IN_PROGRESS` leaves that status behind, and nothing dispatches a successor by itself. The job timeout is 20 minutes, so a status still in progress after 30 minutes belongs to a dead run. The decision function then returns `request_review`. The consumer, which is the editing agent in the automated loop, posts the Design command again. That run settles the abandoned charge first and evaluates (§8, CRB-DEC-01). No person relays anything. Two evaluations cannot overlap, because Design runs execute one at a time (§4).
+**Outstanding requests and interruption recovery.** When the orchestrator posts a Design command comment (either for a new review or for a retry), GitHub Actions dispatches the workflow asynchronously. Until the workflow starts and writes `DESIGN_IN_PROGRESS`, the command comment is an unprocessed source comment. The orchestrator includes `<!-- design-head:<H> -->` in the comment body, explicitly binding the request to head `H`. By checking for unprocessed Design commands on the PR carrying `<!-- design-head:<H> -->` (or matching a queued `design.yml` run for `H`) and posted after `runStartedAt` when `reviewedHead == H`, `design-status.mjs` identifies active in-flight requests for `H` and returns `wait` with `outstandingRequest` populated, rather than prematurely emitting repeated `request_review` or `retry` actions during queue latency. Binding the target head SHA directly into the comment and run name eliminates reliance on committer timestamps, removes client clock drift, and guarantees commands dispatched for an earlier head are never attributed to `H`. An orchestrator process that restarts or recovers after interruption calls `design-status.mjs`, observes the outstanding request, and seamlessly resumes waiting with zero duplicate command dispatches. If an unprocessed command remains unhandled after 30 minutes, it is treated as abandoned and the table proceeds to `retry` or `request_review`. Commands carrying an earlier head marker are ignored and do not delay actions at `H`.
+
+**Abandoned runs.** A run that is killed after writing `DESIGN_IN_PROGRESS` leaves that status behind, and nothing dispatches a successor by itself. The job timeout is 20 minutes, so a status still in progress after 30 minutes belongs to a dead run. The decision function then returns `request_review`. The consumer, which is the deterministic orchestrator in the automated loop, posts the Design command again. That run settles the abandoned charge first and evaluates (§8, CRB-DEC-01). No person relays anything. Two evaluations cannot overlap, because Design runs execute one at a time (§4).
 
 A PR head can change at any time, so no check can promise the branch will not move afterwards. Binding the answer to `H` makes that harmless: an answer about `H` stays true, and it does not cover a later commit.
 
@@ -234,12 +257,12 @@ This is a tripwire for the case the workflow must catch: an agent editing the br
 3. **Validate, no model call.**
    - If the source comment is in `processedSourceComments`, write the settlement if step 2 made one, and stop.
    - For `reset`: apply §4, write the session, stop.
-   - Validate the manifest and files (§5), compute the bundle identity, read the policy, check the brief anchor.
+   - Validate the manifest and files (§5), compute the bundle identity, read the policy, check the brief anchor. If any check fails, or if `round` is exhausted, write the resulting `DESIGN_BLOCKED` or `HUMAN_REQUIRED` status with the source comment recorded in `processedSourceComments`, and stop.
    - If the session holds a pass or rework for this exact bundle identity, record the command as processed, re-surface the result and stop.
    - Check `round`.
 4. **Admit and charge.** Decide now whether this run may use Claude, by applying the three locks in §9. Write the session as `DESIGN_IN_PROGRESS` with `runStartedAt`, the brief anchor and, if Claude was admitted, `inFlight` set. If this write fails, stop before any model call.
-5. **Evaluate.** **A Design run makes at most one Claude SDK invocation.** There are no shards, no retries and no second fallback. `@gemini design` tries Gemini and, only if Gemini cannot complete and Claude was admitted in step 4, makes the one Claude invocation. `@claude design` makes the one Claude invocation. If that invocation fails, the run publishes `DESIGN_BLOCKED / PROVIDER_UNAVAILABLE`. Shared read-only provider execution. The model receives the listed files, the reviewer policy, prior findings, and the existing sanitized read-only tools over the snapshot at the head. It receives no GitHub token.
-6. **Publish.** Recompute the bundle identity at the PR's present head. If unchanged, write the verdict, findings, incremented `round`, the call's cost in place of the charge, `inFlight: null`, and the processed command. If changed, write `DESIGN_BLOCKED / INPUT_CHANGED` with the same spend settlement.
+5. **Evaluate.** **A Design run makes at most one Claude SDK invocation.** There are no shards, no retries and no second fallback. `@gemini design` tries Gemini and, only if Gemini cannot complete and Claude was admitted in step 4, makes the one Claude invocation. `@claude design` makes the one Claude invocation. If that invocation fails, the run publishes `DESIGN_BLOCKED / PROVIDER_UNAVAILABLE` with the source comment recorded in `processedSourceComments`. Shared read-only provider execution. The model receives the listed files, the reviewer policy, prior findings, and the existing sanitized read-only tools over the snapshot at the head. It receives no GitHub token.
+6. **Publish.** Recompute the bundle identity at the PR's present head. If unchanged, write the verdict, findings, incremented `round`, the call's cost in place of the charge, `inFlight: null`, and the processed command. If changed, write `DESIGN_BLOCKED / INPUT_CHANGED` with the same spend settlement and the processed command.
 
 `design.yml` does not print file contents, policy text or model output to logs or the job summary. Target repositories can be private while this repository's logs are public.
 
@@ -271,13 +294,21 @@ The three lock values were confirmed by the user on 2026-11-11. They limit usage
 
 What the locks are: admission accounting plus per-call limits passed to the SDK. What they are not: a verified hard ceiling on actual subscription token use, because SDK enforcement of `maxBudgetUsd` is unverified (§3).
 
+### Cost model and token efficiency
+
+The architecture separates three distinct cost dimensions:
+
+1. **Design Bot evaluation cost**: Model tokens consumed during evaluation runs on GitHub Actions. Bounded and controlled by the spend locks above (USD 2 per call, USD 6 per PR, 20 runs per day).
+2. **Editing Agent modification cost**: Model tokens consumed locally by the coding agent (e.g., Claude Code, Gemini CLI) when performing reasoning tasks (revising contracts or fixing input errors). Bounded by local agent configuration and turn limits.
+3. **Orchestration overhead**: Non-LLM operations. Polling, waiting, deduplicating, dispatching commands, and handling retries consume **zero LLM inference tokens**.
+
 ## 10. Recorded decisions
 
 Decisions of the user, all dated 2026-11-11. The behaviors listed are **intended, not defects**, and must not be reported or "fixed" as bugs without a new decision. The implementation cites each ID in a code comment at the relevant branch, in a test named for it, and in one README sentence. CRB-DEC-04 is in §2.
 
 ### CRB-DEC-01: an interrupted run is re-run automatically
 
-A run that finds `inFlight` set adds the full charge to `spend`, clears it and carries on. If the locks allow, the bundle is evaluated again with no person involved. The run that does this is started by the next Design command; in the automated loop the editing agent posts it after the decision function reports the abandoned run (§6.3).
+A run that finds `inFlight` set adds the full charge to `spend`, clears it and carries on. If the locks allow, the bundle is evaluated again with no person involved. The run that does this is started by the next Design command; in the automated loop the deterministic orchestrator posts it after the decision function reports the abandoned run (§6.3).
 
 Intended, not defects: a second paid evaluation of the same bundle after an interruption; charging the full per-call amount when the true cost is unknown; no stored intermediate result; no human stop after an interrupted call.
 
@@ -315,9 +346,9 @@ The reviewer does not rewrite the contract and does not decide product questions
 | AC2 | Isolation (§6.1) | Both task types on one PR in both orders. Model output and file content carrying Review markers, Design markers, HTML comments and encoded state. Wrong comment ID, changed `revision`, failed PATCH and DELETE. Review's planner and status sync select the same session as without Design, and Review sessions, findings, threads, PR reviews and statuses are unchanged |
 | AC3 | Validation | Base or head moved: the run writes nothing, an existing session is byte-identical afterwards, and no model is called. Zero or several manifests; malformed schema; unknown role; missing file; symlink; submodule; oversize input; unreadable policy; repeated source comment. Each gives the stated status with no model call |
 | AC4 | Brief tripwire | Changed, added or removed brief gives `BRIEF_CHANGED` with no model call. `reset design` re-anchors, zeroes `round`, keeps `spend` and processed commands |
-| AC5 | Freshness and abandonment (§6.3) | Every row of the decision table. `DESIGN_IN_PROGRESS` gives `wait` before 30 minutes and `request_review` from 30 minutes. No session gives `request_review`. `DESIGN_BLOCKED` gives `request_review` when the head has moved since, `fix_input` for the two input reasons and `retry` for every other reason. **Stale queued run:** with a pass recorded for the present head, a queued run dispatched for an earlier head changes nothing, and the decision function still returns `continue`; with a rework recorded, it still returns `revise`. A listed file changed after a pass gives `request_review`. A code-only commit after a pass gives `continue` with the new head. A push between the two head reads is detected. An unreadable session gives `stop`. No case returns `continue` with a head whose bundle was not evaluated |
+| AC5 | Freshness, abandonment, and token-efficient orchestration (§6.3, §9) | Every row of the decision table. `DESIGN_IN_PROGRESS` gives `wait` before 30 minutes and `request_review` from 30 minutes. No session gives `request_review`. `DESIGN_BLOCKED` gives `request_review` when the head has moved since, `fix_input` for the two input reasons and `retry` for every other reason. **Stale queued run:** with a pass recorded for the present head, a queued run dispatched for an earlier head changes nothing, and the decision function still returns `continue`; with a rework recorded, it still returns `revise`. A listed file changed after a pass gives `request_review`. A code-only commit after a pass gives `continue` with the new head. A push between the two head reads is detected. An unreadable session gives `stop`. No case returns `continue` with a head whose bundle was not evaluated. **Zero-token orchestration:** repeated status checks during a pending review consume zero LLM tokens; repeated polling does not emit duplicate review requests; target head binding (`<!-- design-head:<H> -->` / `run-name`) prevents earlier commands from stalling a new head; PASS and terminal states end orchestration without LLM invocation; REWORK transfers structured findings to the editing agent; an interrupted orchestrator resumes from `design-status.mjs` state without duplicate evaluations |
 | AC6 | Loop | A seeded contradiction gives rework; a fix gives a full re-review that rules the old finding fixed and passes; three reworks give `ROUNDS_EXHAUSTED` |
-| AC7 | Spend locks (§9) | Charge is written before the call. **One call per run:** with Gemini failing and Claude failing, the run makes exactly one Claude invocation and ends blocked; with USD 4 recorded, a run cannot make a second Claude invocation under one charge. **Abandoned run:** kill a run after the charge is written and post no human comment; after 30 minutes the decision function returns `request_review`, the agent's repeated command settles the charge first and re-evaluates, and no pass is visible before that evaluation completes (CRB-DEC-01). **Daily lock under concurrency:** with 19 runs counted, start Design on two different PRs at once, holding each just before admission; the runs execute one after the other and at most the limit is admitted; repeat after deleting a session comment and after repeated resets. With USD 4 recorded and USD 2 in flight, a `reset` followed by a command admits no Claude call. Reported cost above the per-call amount is recorded in full (CRB-DEC-02). The daily limit refuses at the threshold and when the count cannot be read. Review's ledger is unchanged throughout |
+| AC7 | Spend locks (§9) | Charge is written before the call. **One call per run:** with Gemini failing and Claude failing, the run makes exactly one Claude invocation and ends blocked; with USD 4 recorded, a run cannot make a second Claude invocation under one charge. **Abandoned run:** kill a run after the charge is written and post no human comment; after 30 minutes the decision function returns `request_review`, the orchestrator's repeated command settles the charge first and re-evaluates, and no pass is visible before that evaluation completes (CRB-DEC-01). **Daily lock under concurrency:** with 19 runs counted, start Design on two different PRs at once, holding each just before admission; the runs execute one after the other and at most the limit is admitted; repeat after deleting a session comment and after repeated resets. With USD 4 recorded and USD 2 in flight, a `reset` followed by a command admits no Claude call. Reported cost above the per-call amount is recorded in full (CRB-DEC-02). The daily limit refuses at the threshold and when the count cannot be read. Review's ledger is unchanged throughout |
 | AC8 | Logs | With a sentinel string in a listed file and in model output, the sentinel appears in no log or job summary |
 
 Evidence must separate tests run, CI logs, model claims and observations on a real PR. A live test must confirm the deployed Worker revision.
@@ -329,7 +360,15 @@ Evidence must separate tests run, CI logs, model claims and observations on a re
 - **S3 Evaluation.** Provider call, findings, rounds, spend locks. AC6 to AC8 with providers stubbed.
 - **S4 Live.** Only with separate authorization to deploy and to spend. One rework-to-pass loop and one Review lifecycle on real PRs.
 
-## 14. Changes from v0.6, and the response to the v0.5 review
+## 14. Changes from v0.7, and the response to earlier reviews
+
+### Changes from v0.7
+
+v0.7 addressed bot review finding F001 (P2). The independent design review of v0.7 raised one P3 architecture finding (CRB-v07-F06), which is addressed here:
+
+| Source | Problem | Correction |
+| --- | --- | --- |
+| Independent review CRB-v07-F06, P3 | v0.7 defined a deterministic decision interface (`design-status.mjs`) but did not specify how the consumer loop runs without unnecessary LLM inference. An implementation keeping an LLM agent active for polling and waiting would consume inference tokens on deterministic operations, and lacked outstanding request tracking to prevent duplicate commands during dispatch latency | Separated the non-LLM Deterministic Orchestrator from the cognitive Editing Agent in §1 and §6.3. Defined the machine-readable JSON output schema for `design-status.mjs` including `outstandingRequest` tracking to prevent duplicate review requests, enable external non-LLM orchestration, and guarantee interruption recovery. Established the three-bucket cost model in §9 and extended AC5 with zero-token orchestration acceptance criteria |
 
 ### Changes from v0.6
 
@@ -350,7 +389,7 @@ The v0.5 review accepted the trust model, the isolation rules, the head-bound de
 | --- | --- |
 | F01 P1, per-call reservation | A run makes at most one Claude SDK invocation: no shards, retries or second fallback. Admission happens once per run and covers that one call (§8 step 5, §9). AC7 |
 | F02 P1, daily lock atomicity | All Design runs share one concurrency group, so admission is globally serialized. The count is of runs created and errs toward refusing. The one assumption it rests on is named for verification (§4, §9). AC7 |
-| F03 P1, no recovery trigger | The decision function reports an in-progress status older than 30 minutes as `request_review`, and the editing agent posts the command again. Global serialization prevents overlapping evaluations (§6.3). AC5, AC7 |
+| F03 P1, no recovery trigger | The decision function reports an in-progress status older than 30 minutes as `request_review`, and the orchestrator posts the command again. Global serialization prevents overlapping evaluations (§6.3). AC5, AC7 |
 | Row 12 citation | Corrected to the Claude adapter's lines (§3) |
 
 Earlier findings, as the v0.5 reviewer ruled them: v0.4 F01 and F02 resolved; F03 partially resolved, now addressed above; F04 removed from scope by CRB-DEC-04.
