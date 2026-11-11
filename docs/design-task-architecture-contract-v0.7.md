@@ -1,13 +1,13 @@
-# CRB-DESIGN-01 — Design Task Architecture Contract v0.6
+# CRB-DESIGN-01 — Design Task Architecture Contract v0.7
 
-**Status:** REVISED DRAFT. Independent DESIGN Gate **PENDING** for v0.6. v0.1, v0.3, v0.4 and v0.5 were each DESIGN REWORK. v0.2 was not independently reviewed. Not approved for implementation.
+**Status:** v0.6 received an independent **DESIGN PASS** on 2026-11-11, bound to blob `40b9823aa2d00282cf78d43b69fb45a55560dc0c`. v0.7 is v0.6 plus one correction to the decision function and one wording fix, both listed in §14. That pass does not cover the changed text. v0.7 has had no full independent review; whether to require one or to waive it is the user's decision and is recorded in the description of PR #70. Not approved for implementation by this document.
 **Target repository:** `Jiaze-Li/claude-review-bot`
 **Engineering policy snapshot (`policy_sha`):** `ae4c3f538f9e8998fe534aaa01ff12daae1725aa`
 **Code baseline for the facts in §3 (read-only):** `b2ab0631ac0ef4192c2b6956ea100a8e3ca17047`, the merge of PR #71 on `main`.
 **Risk / gate:** Tier 3 / REQUIRED / PENDING, as classified by the Engineering Lead for v0.1. v0.5 narrowed the scope (§2); re-classification is the Lead's decision, not this document's.
-**Immutable `design_ref`:** `git:Jiaze-Li/claude-review-bot@<commit-of-this-file>:docs/design-task-architecture-contract-v0.6.md`, assigned in the PR description after commit.
-**Previous versions:** v0.5 at `5402aeca88697a94cf9ded791f1ba00ef61b4722`, v0.4 at `7c6b8c80e752f1f8e34e710cbf68b442baeda587`, v0.3 at `99682892968a76e0b47a9b44afcd97af377cabb7`, v0.2 at `b8034c3d3b6de60334c6f567a206723ef7559d0a`, v0.1 at `d424d833de44fddcf1fd804baf5630ff0027ac56`, all under `docs/`.
-**Authorship:** v0.1 and v0.2 were drafted in the user's GPT conversation. v0.3 to v0.6 were revised by a coding-agent session at the user's request. Whoever reviews v0.6 must be a separate context from both.
+**Immutable `design_ref`:** `git:Jiaze-Li/claude-review-bot@<commit-of-this-file>:docs/design-task-architecture-contract-v0.7.md`, assigned in the PR description after commit.
+**Previous versions:** v0.6 at `62a15fab1c23c6b3f49bf2cda90bc529c2550300`, v0.5 at `5402aeca88697a94cf9ded791f1ba00ef61b4722`, v0.4 at `7c6b8c80e752f1f8e34e710cbf68b442baeda587`, v0.3 at `99682892968a76e0b47a9b44afcd97af377cabb7`, v0.2 at `b8034c3d3b6de60334c6f567a206723ef7559d0a`, v0.1 at `d424d833de44fddcf1fd804baf5630ff0027ac56`, all under `docs/`.
+**Authorship:** v0.1 and v0.2 were drafted in the user's GPT conversation. v0.3 to v0.7 were revised by a coding-agent session at the user's request. Whoever reviews v0.7 must be a separate context from both.
 
 This document proposes a change. It does not approve itself, and it grants no implementation, merge, deployment, credential or spending authority.
 
@@ -64,7 +64,7 @@ Facts read at the baseline SHA above. They are source facts, not evidence about 
 | 2 | A comment command requires the author to have `write`, `maintain` or `admin`. | `worker/src/index.js:119-127` |
 | 3 | Comment commands run on draft PRs. Triggers with `sourceKind: pull_request` do not. | `worker/src/review-trigger.js:59-66`, `worker/src/index.js:131-133` |
 | 4 | The Worker dispatches one workflow, by default `review-v2.yml`, with `target_repo`, `pr_number`, `base_sha`, `head_sha`, `trigger_user`, `source_comment_id`, `source_kind`, `requested_mode`. The inputs are not signed. | `worker/src/index.js:145-175` |
-| 5 | `review-v2.yml` is serialized per PR, does not cancel a running review, and keeps every pending run (`queue: max`). Its job has a 30-minute timeout. | `.github/workflows/review-v2.yml:89-95,104` |
+| 5 | `review-v2.yml` is serialized per PR, does not cancel a running review, and keeps pending runs rather than replacing them (`queue: max`). Its job has a 30-minute timeout. | `.github/workflows/review-v2.yml:89-95,104` |
 | 6 | The workflow stops if the PR base or head differs from the dispatched SHAs. | `.github/workflows/review-v2.yml:224-228` |
 | 7 | The review session writer edits an in-progress state in place, posts a changed result as a new comment and deletes the old one on a best-effort basis. It mutates by the supplied comment ID without re-checking ownership. | `scripts/session-comment.mjs:20-36` |
 | 8 | Review selects its session as the newest comment whose author is the App identity and whose body **contains** `<!-- jiaze-review-session:v1 -->` anywhere. The planner treats an unreadable match as a hard error; the status sync returns nothing for it. | `scripts/plan-review-session.mjs:24-36`, `scripts/sync-commit-status.mjs:65-82` |
@@ -87,7 +87,7 @@ All existing commands keep their current meaning and act on Review only.
 
 The Worker routes the three commands to a **separate workflow file**, `design.yml`, with the same kind of inputs Review receives (§3 row 4) and a `workflow_dispatch` trigger only. `review-v2.yml` is not modified.
 
-**All Design runs share one concurrency group.** `design.yml` uses a single group for every target repository and PR, does not cancel a running Design, and keeps every pending run, as Review does per PR (§3 row 5). At most one Design run executes at a time, anywhere. Its job has a 20-minute timeout (proposed). With one owner, Design runs are rare and waiting behind another PR's run is acceptable; in exchange, per-PR ordering and the daily lock (§9) need no further coordination.
+**All Design runs share one concurrency group.** `design.yml` uses a single group for every target repository and PR, does not cancel a running Design, and keeps pending runs with `queue: max`, as Review does per PR (§3 row 5). GitHub keeps at most 100 pending runs in a group; a run cancelled while pending has written nothing and is not an evaluation. At most one Design run executes at a time, anywhere. Its job has a 20-minute timeout (proposed). With one owner, Design runs are rare and waiting behind another PR's run is acceptable; in exchange, per-PR ordering and the daily lock (§9) need no further coordination.
 
 The token `design.yml` uses on the target repository has contents-read and pull-requests-write. It has no statuses permission. Pull-requests-write would also allow review objects and threads; Design not touching them rests on `design.yml` invoking none of that code (§6.1), not on the token.
 
@@ -153,7 +153,7 @@ Review selects its session by author plus a marker substring anywhere in the bod
 | --- | --- |
 | `status`, `reason` | A status below and a machine reason code |
 | `repo`, `pr`, `taskId`, `manifestPath`, `revision` | Identity; `revision` increments on every write |
-| `bundle`, `reviewedHead` | Bundle identity of the verdict and the head it was read at |
+| `bundle`, `reviewedHead` | Bundle identity of the verdict, and the PR head the run that wrote this state was looking at. `reviewedHead` is set on every write, including `DESIGN_BLOCKED` |
 | `briefAnchor` | Set at the first validated run; cleared by `reset design` |
 | `round`, `maxRounds` | Completed evaluations and the limit |
 | `findings` | `{id, severity, status, file, location, title, detail}` |
@@ -167,7 +167,7 @@ Review selects its session by author plus a marker substring anywhere in the bod
 | `DESIGN_IN_PROGRESS` | A run is active | — |
 | `DESIGN_PASS` | No open blocking finding for the recorded bundle | — |
 | `DESIGN_REWORK` | Open blocking findings for the recorded bundle | — |
-| `DESIGN_BLOCKED` | No evaluation happened or none could be published | `HEAD_MOVED`, `MANIFEST_INVALID`, `INPUT_INVALID`, `POLICY_UNREADABLE`, `PROVIDER_UNAVAILABLE`, `INPUT_CHANGED`, `OUTPUT_REJECTED` |
+| `DESIGN_BLOCKED` | No evaluation happened or none could be published | `MANIFEST_INVALID`, `INPUT_INVALID`, `POLICY_UNREADABLE`, `PROVIDER_UNAVAILABLE`, `INPUT_CHANGED`, `OUTPUT_REJECTED` |
 | `HUMAN_REQUIRED` | A person must decide | `BRIEF_CHANGED`, `ROUNDS_EXHAUSTED`, `BUDGET_EXHAUSTED`, `DAILY_LIMIT` |
 
 `USER WAIVED` remains a human record under the engineering policy. It is not a bot state.
@@ -179,20 +179,33 @@ Review selects its session by author plus a marker substring anywhere in the bod
 The only sanctioned way to act on a Design result is the decision function, shipped as `scripts/design-status.mjs`:
 
 1. Read the PR head, `H`.
-2. Select the session by ISO-2 and compute the bundle identity at `H` from the session's `manifestPath`.
+2. Select the session by ISO-2. Where the table below needs it, compute the bundle identity at `H` from the session's `manifestPath`.
 3. Read the PR head again. If it is no longer `H`, start over, at most three times, then return `stop`.
 4. Return `{action, head: H, bundle}`.
 
 | Condition | `action` |
 | --- | --- |
-| Any step fails, the session is missing, or the manifest cannot be read | `stop` |
+| Reading the PR or its comments fails, or the newest Design comment fails ISO-2 | `stop` |
+| No Design session exists | `request_review` |
 | Status is `DESIGN_IN_PROGRESS` and `runStartedAt` is less than 30 minutes ago | `wait` |
 | Status is `DESIGN_IN_PROGRESS` and `runStartedAt` is 30 minutes ago or more | `request_review` |
 | Status is `HUMAN_REQUIRED` | `stop` |
-| Status is `DESIGN_BLOCKED` | `fix_input` |
-| Bundle identity at `H` differs from the session's | `request_review` |
+| Status is `DESIGN_BLOCKED` and `H` differs from the session's `reviewedHead` | `request_review` |
+| Status is `DESIGN_BLOCKED` at `H`, reason `MANIFEST_INVALID` or `INPUT_INVALID` | `fix_input` |
+| Status is `DESIGN_BLOCKED` at `H`, any other reason | `retry` |
+| Status is `DESIGN_REWORK` or `DESIGN_PASS`, and the bundle identity at `H` differs from the session's or cannot be computed | `request_review` |
 | Status is `DESIGN_REWORK`, identity equal | `revise` |
 | Status is `DESIGN_PASS`, identity equal | `continue` |
+
+The rows are evaluated in order. What each action asks of the consumer:
+
+- `wait`: call again later.
+- `request_review`: post the Design command.
+- `fix_input`: correct the manifest or the listed files, push, then post the Design command.
+- `retry`: nothing in the repository needs to change. Post the Design command again, at most twice for the same head and with a pause between attempts; if the result is still `retry`, stop and report.
+- `revise`: change the contract documents to address the open findings, push, then post the Design command.
+- `stop`: report to the person.
+- `continue`: see below.
 
 **What `continue` authorizes.** Exactly this: the listed documents as they are at commit `H` passed. The result is a statement about `H`, not about the branch. A consumer bases its work on `H`, and calls the function again before relying on the pass at any later commit, in particular before it hands the task on.
 
@@ -216,7 +229,7 @@ This is a tripwire for the case the workflow must catch: an agent editing the br
 
 ## 8. Run protocol
 
-1. **Load.** Check that the live PR is open and that its base and head equal the dispatched SHAs; otherwise `DESIGN_BLOCKED / HEAD_MOVED`. Select the session (ISO-2), or start an empty one.
+1. **Load.** Check that the live PR is open and that its base and head equal the dispatched SHAs. If they do not, the run ends here and **writes nothing**: a run that was queued for an earlier head must not replace the session, which may hold a valid verdict. The consumer learns what to do from the decision function at the present head (§6.3). Otherwise select the session (ISO-2), or start an empty one.
 2. **Settle first.** If `inFlight` is set, add `chargedUsd` to `spend` and clear it. This happens before anything else in every run that loads a session, including `reset` and runs that then stop for any reason (CRB-DEC-01).
 3. **Validate, no model call.**
    - If the source comment is in `processedSourceComments`, write the settlement if step 2 made one, and stop.
@@ -300,9 +313,9 @@ The reviewer does not rewrite the contract and does not decide product questions
 | --- | --- | --- |
 | AC1 | Review is unchanged | Existing suite passes with `review-v2.yml` and all Review scripts byte-identical; one live Review PR lifecycle |
 | AC2 | Isolation (§6.1) | Both task types on one PR in both orders. Model output and file content carrying Review markers, Design markers, HTML comments and encoded state. Wrong comment ID, changed `revision`, failed PATCH and DELETE. Review's planner and status sync select the same session as without Design, and Review sessions, findings, threads, PR reviews and statuses are unchanged |
-| AC3 | Validation | Base or head moved; zero or several manifests; malformed schema; unknown role; missing file; symlink; submodule; oversize input; unreadable policy; repeated source comment. Each gives the stated status with no model call |
+| AC3 | Validation | Base or head moved: the run writes nothing, an existing session is byte-identical afterwards, and no model is called. Zero or several manifests; malformed schema; unknown role; missing file; symlink; submodule; oversize input; unreadable policy; repeated source comment. Each gives the stated status with no model call |
 | AC4 | Brief tripwire | Changed, added or removed brief gives `BRIEF_CHANGED` with no model call. `reset design` re-anchors, zeroes `round`, keeps `spend` and processed commands |
-| AC5 | Freshness and abandonment (§6.3) | Every row of the decision table. `DESIGN_IN_PROGRESS` gives `wait` before 30 minutes and `request_review` from 30 minutes. A listed file changed after a pass gives `request_review`. A code-only commit after a pass gives `continue` with the new head. A push between the two head reads is detected. Session missing or unreadable gives `stop`. No case returns `continue` with a head whose bundle was not evaluated |
+| AC5 | Freshness and abandonment (§6.3) | Every row of the decision table. `DESIGN_IN_PROGRESS` gives `wait` before 30 minutes and `request_review` from 30 minutes. No session gives `request_review`. `DESIGN_BLOCKED` gives `request_review` when the head has moved since, `fix_input` for the two input reasons and `retry` for every other reason. **Stale queued run:** with a pass recorded for the present head, a queued run dispatched for an earlier head changes nothing, and the decision function still returns `continue`; with a rework recorded, it still returns `revise`. A listed file changed after a pass gives `request_review`. A code-only commit after a pass gives `continue` with the new head. A push between the two head reads is detected. An unreadable session gives `stop`. No case returns `continue` with a head whose bundle was not evaluated |
 | AC6 | Loop | A seeded contradiction gives rework; a fix gives a full re-review that rules the old finding fixed and passes; three reworks give `ROUNDS_EXHAUSTED` |
 | AC7 | Spend locks (§9) | Charge is written before the call. **One call per run:** with Gemini failing and Claude failing, the run makes exactly one Claude invocation and ends blocked; with USD 4 recorded, a run cannot make a second Claude invocation under one charge. **Abandoned run:** kill a run after the charge is written and post no human comment; after 30 minutes the decision function returns `request_review`, the agent's repeated command settles the charge first and re-evaluates, and no pass is visible before that evaluation completes (CRB-DEC-01). **Daily lock under concurrency:** with 19 runs counted, start Design on two different PRs at once, holding each just before admission; the runs execute one after the other and at most the limit is admitted; repeat after deleting a session comment and after repeated resets. With USD 4 recorded and USD 2 in flight, a `reset` followed by a command admits no Claude call. Reported cost above the per-call amount is recorded in full (CRB-DEC-02). The daily limit refuses at the threshold and when the count cannot be read. Review's ledger is unchanged throughout |
 | AC8 | Logs | With a sentinel string in a listed file and in model output, the sentinel appears in no log or job summary |
@@ -316,7 +329,20 @@ Evidence must separate tests run, CI logs, model claims and observations on a re
 - **S3 Evaluation.** Provider call, findings, rounds, spend locks. AC6 to AC8 with providers stubbed.
 - **S4 Live.** Only with separate authorization to deploy and to spend. One rework-to-pass loop and one Review lifecycle on real PRs.
 
-## 14. Response to the v0.5 review
+## 14. Changes from v0.6, and the response to the v0.5 review
+
+### Changes from v0.6
+
+v0.6 passed independent design review. The bot's own code review of this document then reported one P2 finding against §6.3 (review session finding F001 on PR #70). It was verified as real and corrected here.
+
+| Source | Problem | Correction |
+| --- | --- | --- |
+| Bot review F001, P2 | The decision function returned `fix_input` for every `DESIGN_BLOCKED`, including reasons where no input is wrong, and tested the status before anything else. A queued run dispatched for an earlier head wrote `DESIGN_BLOCKED / HEAD_MOVED` over a valid verdict, after which the agent was told to fix files that had no fault and never reached `request_review` | A run whose dispatched SHAs no longer match writes nothing (§8 step 1); the `HEAD_MOVED` reason is removed. The decision table distinguishes a blocked result for an earlier head, input reasons and all other reasons, adds a bounded `retry` action, and returns `request_review` when no session exists (§6.3). AC3 and AC5 extended |
+| v0.6 review CRB-v06-F01, P3 | `queue: max` was described as keeping every pending run; GitHub keeps at most 100 | Wording corrected (§3 row 5, §4) |
+
+Nothing else differs from v0.6.
+
+### Response to the v0.5 review
 
 The v0.5 review accepted the trust model, the isolation rules, the head-bound decision function, the brief tripwire and the settle-first rule. Its three findings all concern the spend locks first introduced in v0.5.
 
