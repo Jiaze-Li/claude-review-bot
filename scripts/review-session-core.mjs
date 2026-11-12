@@ -131,6 +131,19 @@ export function planReviewSession({ session = null, baseSha, headSha, reset = fa
         previousHead: ['verification', 'incremental'].includes(failedMode) ? previousHead : null,
         reason: 'manually retry provider-unavailable review on the same HEAD' };
     }
+    // The deep-review runner can fail closed on a temporary provider/quota outage
+    // without creating reviewFailure. Its existing resume logic already knows how
+    // to resume a FAILED run; the planner must route an explicit human retry to it.
+    // Never retry automatically, on a changed HEAD, or over material findings.
+    if (retryUnavailable && session.lastReviewedHead === headSha
+        && session.deepReview?.state === 'FAILED' && session.deepReview.head === headSha
+        && !session.reviewFailure
+        && ['AUDIT_PENDING', 'PARTIAL', 'READY'].includes(session.deepReview.resumeStatus)
+        && openMaterialFindings(session).length === 0
+        && unresolvedMaterialFindings(session).length === 0) {
+      return { mode: 'claude', previousHead: null,
+        reason: 'manual retry of failed deep review on the same HEAD; keep prior evidence and spend' };
+    }
     return { mode: 'human_required', previousHead: session.lastReviewedHead ?? null, reason: 'session already requires human judgment' };
   }
 
