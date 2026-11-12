@@ -41,6 +41,33 @@ test('plain UTF-8 Git paths and mixed quoting are parsed', () => {
   assert.equal(splitDiffByFile(mixed)[0].path, 'docs/new.md');
 });
 
+test('unquoted Git diff headers containing a literal b/ path segment are not truncated', () => {
+  // These headers are emitted without quotes by Git core.quotePath=true.
+  const paths = ['docs/a b/c.md', 'docs/a b/dir b/c.md', 'docs/name b/sub b/file.md'];
+  const chunks = splitDiffByFile(paths.map((path) => diff(path)).join(''));
+  assert.deepEqual(chunks.map((chunk) => chunk.path), paths);
+  assertDiffCoverage(paths, chunks);
+  assert.ok(chunks.every((chunk) => chunk.text.includes('diff --git a/')));
+});
+
+test('unquoted rename and copy paths containing b/ use Git destination metadata', () => {
+  const rename = 'diff --git a/docs/a b/c.md b/docs/new b/name.md\n'
+    + 'similarity index 100%\n'
+    + 'rename from docs/a b/c.md\n'
+    + 'rename to docs/new b/name.md\n';
+  const copy = 'diff --git a/docs/a b/c.md b/docs/new b/copy.md\n'
+    + 'similarity index 100%\n'
+    + 'copy from docs/a b/c.md\n'
+    + 'copy to docs/new b/copy.md\n';
+  const chunks = splitDiffByFile(rename + copy);
+  const expected = ['docs/new b/name.md', 'docs/new b/copy.md'];
+  assert.deepEqual(chunks.map((chunk) => chunk.path), expected);
+  assertDiffCoverage(expected, chunks);
+  // Without destination metadata there is no safe way to choose among b/ separators.
+  assert.throws(() => splitDiffByFile('diff --git a/docs/a b/c.md b/docs/new b/name.md\n'),
+    /Cannot disambiguate Git diff header/);
+});
+
 test('unparseable Git paths and missing diff blocks fail closed', () => {
   assert.throws(() => decodeGitPath(String.raw`"docs/\xFF.md"`), /unknown escape/);
   assert.throws(() => decodeGitPath(String.raw`"docs/\34.md"`), /invalid octal escape/);
