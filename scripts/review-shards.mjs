@@ -75,31 +75,50 @@ export function decodeGitPath(path) {
   return new TextDecoder('utf-8', { fatal: true }).decode(Uint8Array.from(bytes));
 }
 
-// The b/ path identifies the destination after renames. Both quoted/unquoted
-// sides are valid, and spaces in an unquoted filename are not separators.
-function parseDiffHeaderPath(line) {
+// Quoted paths have unambiguous boundaries. For unquoted headers Git does not
+// quote ordinary spaces, so the literal " b/" can also be part of either path.
+// Prefer matching identical source/destination names, then Git's rename/copy
+// metadata for ambiguous moves. Never guess between multiple boundaries.
+function parseDiffHeaderPath(line, followingLines = []) {
   const match = line.match(/^diff --git (?:"a\/((?:\\.|[^"\\])*)"|a\/(.+)) (?:"b\/((?:\\.|[^"\\])*)"|b\/(.+))$/);
   if (!match) throw new Error(`Cannot parse Git diff header: ${line.slice(0, 300)}`);
-  return match[3] === undefined ? match[4] : decodeGitPath(`"${match[3]}"`);
+  if (match[3] !== undefined) return decodeGitPath(`"${match[3]}"`);
+  if (match[1] !== undefined) return match[4];
+
+  const body = line.slice('diff --git a/'.length);
+  const candidates = [];
+  let position = -1;
+  while ((position = body.indexOf(' b/', position + 1)) !== -1) {
+    const source = body.slice(0, position);
+    const destination = body.slice(position + 3);
+    if (!source || !destination) continue;
+    if (source === destination) return destination;
+    candidates.push(destination);
+  }
+  if (candidates.length === 1) return candidates[0];
+  const metadata = followingLines.find((entry) => entry.startsWith('rename to ') || entry.startsWith('copy to '));
+  if (metadata) return decodeGitPath(metadata.slice(metadata.indexOf(' to ') + 4));
+  throw new Error(`Cannot disambiguate Git diff header: ${line.slice(0, 300)}`);
 }
 
 // One entry per `diff --git` block: { path, text, bytes }.
-// An unreadable header must fail closed rather than silently remove a file.
+// Parse after collecting metadata, and fail closed on unknown headers.
 export function splitDiffByFile(diffText) {
   const chunks = [];
   let current = null;
   for (const line of String(diffText ?? '').split('\n')) {
     if (line.startsWith('diff --git ')) {
-      current = { path: parseDiffHeaderPath(line), lines: [line] };
+      current = { lines: [line] };
       chunks.push(current);
     } else if (current) {
       current.lines.push(line);
     }
   }
   return chunks.map((c) => {
+    const path = parseDiffHeaderPath(c.lines[0], c.lines.slice(1));
     const joined = c.lines.join('\n');
     const text = joined.endsWith('\n') ? joined : `${joined}\n`;
-    return { path: c.path, text, bytes: Buffer.byteLength(text, 'utf8') };
+    return { path, text, bytes: Buffer.byteLength(text, 'utf8') };
   });
 }
 
