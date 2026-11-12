@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fullReviewDecision, planSession } from '../scripts/plan-review-session.mjs';
 import { findingMarker } from '../scripts/review-anchors.mjs';
-import { applyDiscoveryResult, pendingSessionMarker, renderSessionComment } from '../scripts/review-session-core.mjs';
+import { applyDiscoveryResult, beginDeepReview, completeDeepReview, failDeepReview, pendingSessionMarker, renderSessionComment } from '../scripts/review-session-core.mjs';
 
 const BASE='b'.repeat(40), A='a'.repeat(40), C='c'.repeat(40);
 const author='jiaze-claude-review-bot[bot]';
@@ -108,6 +108,46 @@ test('@claude review waits for a deep review already running on this HEAD, and a
   const resumed=await planSession({env:env({REQUESTED_MODE:'claude',SOURCE_KIND:'comment'}),fetchImpl:fetchState({comments:[comment(7,renderSessionComment(partial))]})});
   assert.equal(resumed.decision.mode,'claude');
   assert.match(resumed.decision.reason,/partial review/);
+});
+
+test('manual review retries a FAILED deep review on the exact HEAD without resetting the session',async()=>{
+  const pending=applyDiscoveryResult({result:{summary:'discovery clean',findings:[]},baseSha:BASE,headSha:A,sourceCommentId:'1'});
+  const begun=beginDeepReview({session:pending,baseSha:BASE,headSha:A,reserveUsd:5,now:'2026-11-12T02:00:00.000Z'});
+  const failed=failDeepReview({session:begun,headSha:A,reason:'Claude provider quota exhausted',spentUsd:5});
+  assert.equal(failed.status,'HUMAN_REQUIRED');
+  assert.equal(failed.deepReview.state,'FAILED');
+  assert.equal(failed.reviewFailure,undefined);
+  const saved=fetchState({comments:[comment(7,renderSessionComment(failed))]});
+
+  // Only a deliberate comment retries; routine webhook events do not loop.
+  const automated=await planSession({env:env({SOURCE_KIND:'pull_request'}),fetchImpl:saved});
+  assert.equal(automated.decision.mode,'human_required');
+  for(const command of ['auto','claude']){
+    const plan=await planSession({env:env({SOURCE_KIND:'comment',REQUESTED_MODE:command}),fetchImpl:saved});
+    assert.equal(plan.decision.mode,'claude');
+    assert.match(plan.decision.reason,/manual retry of failed deep review/);
+    assert.equal(plan.sessionCommentId,'7');
+    assert.equal(plan.session.deepSpendUsd,5);
+    assert.equal(plan.session.deepReview.state,'FAILED');
+    const resumed=beginDeepReview({session:plan.session,baseSha:BASE,headSha:A,reserveUsd:0,now:'2026-11-12T07:00:00.000Z'});
+    assert.equal(resumed.deepReview.resumeStatus,'AUDIT_PENDING');
+    assert.equal(resumed.deepReview.final,true);
+    const completed=completeDeepReview({session:resumed,headSha:A,result:{summary:'complete',findings:[],coverage:{complete:true,unreviewedPaths:[]}}});
+    assert.equal(completed.status,'READY');
+    assert.equal(completed.auditCompleted,true);
+  }
+  const moved=await planSession({env:env({HEAD_SHA:C,SOURCE_KIND:'comment'}),fetchImpl:saved});
+  assert.equal(moved.decision.mode,'human_required');
+});
+
+test('a failed deep review with real findings remains HUMAN_REQUIRED after a manual retry command',async()=>{
+  const rework=applyDiscoveryResult({result:{summary:'real bug',findings:[{
+    severity:'P2',title:'Broken commit',body:'Stale write overwrites new state',path:'a.js',line:1,riskClass:'state',
+  }]},baseSha:BASE,headSha:A,sourceCommentId:'1'});
+  const failed=failDeepReview({session:beginDeepReview({session:rework,baseSha:BASE,headSha:A}),headSha:A,reason:'provider quota'});
+  const plan=await planSession({env:env({SOURCE_KIND:'comment',REQUESTED_MODE:'auto'}),
+    fetchImpl:fetchState({comments:[comment(7,renderSessionComment(failed))]})});
+  assert.equal(plan.decision.mode,'human_required');
 });
 
 test('planner recovers a trusted pending current-HEAD review instead of rerunning Gemini',async()=>{
