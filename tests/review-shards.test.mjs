@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { DEFAULT_IGNORE, MAX_MERGED_FINDINGS, filePriority, matchesIgnore, mergeShardResults, parseIgnorePatterns, planShards, reconcileCoverage, splitDiffByFile } from '../scripts/review-shards.mjs';
+import { DEFAULT_IGNORE, MAX_MERGED_FINDINGS, assertDiffCoverage, decodeGitPath, filePriority, matchesIgnore, mergeShardResults, parseIgnorePatterns, planShards, reconcileCoverage, splitDiffByFile } from '../scripts/review-shards.mjs';
 
 const diff = (path, body = 'x'.repeat(10)) => `diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n@@ -1 +1 @@\n+${body}\n`;
 const finding = (severity, path = 'a.swift', title = 'bug') => ({ severity, title, body: 'b', path, line: 1 });
@@ -11,6 +11,42 @@ test('splitDiffByFile yields one chunk per file with exact byte sizes', () => {
   const chunks = splitDiffByFile(text);
   assert.deepEqual(chunks.map((c) => c.path), ['Sources/A.swift', 'Sources/B.swift']);
   assert.equal(chunks.reduce((n, c) => n + c.bytes, 0), Buffer.byteLength(text));
+});
+
+test('Git C-quoted paths match between --name-only and diff shards', () => {
+  // Git's default core.quotePath=true emits quoted UTF-8 octal bytes, not Unicode text.
+  const cases = [
+    { path: 'docs/测试.md', name: String.raw`"docs/\346\265\213\350\257\225.md"`, header: String.raw`diff --git "a/docs/\346\265\213\350\257\225.md" "b/docs/\346\265\213\350\257\225.md"` },
+    { path: 'docs/back\\file.md', name: String.raw`"docs/back\\file.md"`, header: String.raw`diff --git "a/docs/back\\file.md" "b/docs/back\\file.md"` },
+    { path: 'docs/quote"name.md', name: String.raw`"docs/quote\"name.md"`, header: String.raw`diff --git "a/docs/quote\"name.md" "b/docs/quote\"name.md"` },
+    { path: 'docs/tab\tfile.md', name: String.raw`"docs/tab\tfile.md"`, header: String.raw`diff --git "a/docs/tab\tfile.md" "b/docs/tab\tfile.md"` },
+    { path: 'docs/with space.md', name: 'docs/with space.md', header: 'diff --git a/docs/with space.md b/docs/with space.md' },
+    { path: 'docs/renamed.md', name: 'docs/renamed.md', header: 'diff --git a/docs/original.md b/docs/renamed.md' },
+  ];
+  const diffText = cases.map((c) => `${c.header}\n--- a/old\n+++ b/new\n@@ -0,0 +1 @@\n+content\n`).join('');
+  const chunks = splitDiffByFile(diffText);
+  const listed = cases.map((c) => decodeGitPath(c.name));
+  assert.deepEqual(listed, cases.map((c) => c.path));
+  assert.deepEqual(chunks.map((c) => c.path), listed);
+  assertDiffCoverage(listed, chunks);
+  const plan = planShards({ files: listed, chunks, targetBytes: 100_000 });
+  assert.equal(plan.deferred.length, 0);
+  assert.ok(plan.shards.flatMap((shard) => shard.files).every((file) =>
+    plan.shards.some((shard) => shard.files.includes(file) && shard.diff.includes('diff --git '))));
+});
+
+test('plain UTF-8 Git paths and mixed quoting are parsed', () => {
+  assert.deepEqual(splitDiffByFile(diff('docs/测试.md')).map((c) => c.path), ['docs/测试.md']);
+  const mixed = String.raw`diff --git "a/docs/old\ttab.md" b/docs/new.md`;
+  assert.equal(splitDiffByFile(mixed)[0].path, 'docs/new.md');
+});
+
+test('unparseable Git paths and missing diff blocks fail closed', () => {
+  assert.throws(() => decodeGitPath(String.raw`"docs/\xFF.md"`), /unknown escape/);
+  assert.throws(() => decodeGitPath(String.raw`"docs/\34.md"`), /invalid octal escape/);
+  assert.throws(() => decodeGitPath(String.raw`"docs/\377.md"`), /encoded data was not valid|not valid|invalid/i);
+  assert.throws(() => splitDiffByFile('diff --git invalid-header\n'), /Cannot parse Git diff header/);
+  assert.throws(() => assertDiffCoverage(['docs/测试.md'], splitDiffByFile(diff('docs/other.md'))), /Missing Git diff block/);
 });
 
 test('planShards groups by directory order, keeps every changed file, and files without a diff block still get a shard', () => {
