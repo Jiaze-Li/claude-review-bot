@@ -7,7 +7,7 @@ import { ReadOnlyToolGateway } from './tool-gateway.mjs';
 import { stateIntegrityProcedure } from './review-prompts.mjs';
 import { knownIssuesPromptBlock, matchesKnownDismissal, pathKey } from './review-session-core.mjs';
 import { GEMINI_SHARD_MAX_BYTES, GEMINI_SHARD_TIMEOUT_MS, runGeminiShard } from './gemini-shard.mjs';
-import { DEFAULT_IGNORE, matchesIgnore, mergeShardResults, parseIgnorePatterns, planShards, reconcileCoverage, splitDiffByFile } from './review-shards.mjs';
+import { DEFAULT_IGNORE, assertDiffCoverage, decodeGitPath, matchesIgnore, mergeShardResults, parseIgnorePatterns, planShards, reconcileCoverage, splitDiffByFile } from './review-shards.mjs';
 import { BudgetManager, CircuitBreaker, DeadlineTracker, runBoundedPool, executeWorkUnit, resolveProviderBudgetManagers } from './review-orchestrator.mjs';
 
 // Use Claude Code's moving Sonnet alias so reviews follow the current Sonnet
@@ -188,7 +188,7 @@ export async function runReview({ env = process.env, cwd = process.cwd() } = {})
   });
 
   const session = readSession(contextRoot);
-  const everyFile = [...new Set([...readLines(path.join(contextRoot, 'changed-files.txt')), ...splitDiffByFile(readText(path.join(contextRoot, 'pr.diff'))).map((chunk) => chunk.path)])].sort();
+  const everyFile = [...new Set([...readLines(path.join(contextRoot, 'changed-files.txt')).map(decodeGitPath), ...splitDiffByFile(readText(path.join(contextRoot, 'pr.diff'))).map((chunk) => chunk.path)])].sort();
   const ignorePatterns = [...DEFAULT_IGNORE, ...parseIgnorePatterns(readText(path.join(contextRoot, 'ignore-patterns.txt')))];
   const ignoredFiles = new Set(everyFile.filter((file) => matchesIgnore(file, ignorePatterns)));
   const allFiles = everyFile.filter((file) => !ignoredFiles.has(file));
@@ -197,6 +197,7 @@ export async function runReview({ env = process.env, cwd = process.cwd() } = {})
   const todo = new Set(allFiles.filter((file) => !earlierKeys.has(pathKey(file))));
   const changedFiles = [...todo];
   const chunks = splitDiffByFile(readText(path.join(contextRoot, 'pr.diff'))).filter((chunk) => todo.has(chunk.path));
+  assertDiffCoverage(changedFiles, chunks);
   const nothingToDo = allFiles.length > 0 && todo.size === 0;
   const plan = planShards({ files: changedFiles, chunks });
   const shards = plan.shards.length || nothingToDo ? plan.shards : [{ files: [], bytes: 0, diff: '' }];
