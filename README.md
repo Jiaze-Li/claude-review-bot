@@ -160,9 +160,14 @@ workflow itself (the `actions: write` permission is used only for that).
 
 ### Deploying a trigger change
 
-A GitHub commit updates the central workflow, but does not by itself prove the
-Cloudflare webhook Worker is running new code. Redeploy the existing Worker from
-the updated checkout (preserving its existing secrets):
+Merging to `main` deploys the Worker automatically whenever anything under `worker/`
+changes (`deploy-worker.yml`). It needs two repository secrets, `CLOUDFLARE_API_TOKEN`
+(an API token with the "Edit Cloudflare Workers" permission) and `CLOUDFLARE_ACCOUNT_ID`;
+if either is missing the run fails with a clear error instead of skipping. Check the
+run's result in the Actions tab after merging.
+
+A GitHub commit alone does not update the Cloudflare webhook Worker. To deploy by hand
+instead (preserving its existing secrets):
 
 ```bash
 npm test
