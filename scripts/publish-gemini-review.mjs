@@ -1,5 +1,5 @@
 import { saveSessionComment } from './session-comment.mjs';
-import { REVIEW_BODY_MAX_BYTES, anchorFindings, assertPrUnmoved, escapeHtml, githubJson, loadAnchors, pullUrl, requiredEnv as required } from './github-review-api.mjs';
+import { REVIEW_BODY_MAX_BYTES, anchorFindings, assertPrUnmoved, escapeHtml, foldedDetails, githubJson, loadAnchors, pullUrl, requiredEnv as required, splitSummary } from './github-review-api.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -78,26 +78,28 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
 
   const open = openMaterialFindings(session);
   const reviewKind = mode === 'incremental' ? 'Incremental' : 'Verification';
-  let body = '## ' + (raw._meta?.provider === 'claude' ? 'Claude' : 'Gemini') + ' ' + reviewKind + ' Review\n\n' + normalized.summary.trim();
+  const { visible: summaryHead, detail: summaryDetail } = splitSummary(normalized.summary);
+  let body = '## ' + (raw._meta?.provider === 'claude' ? 'Claude' : 'Gemini') + ' ' + reviewKind + ' Review\n\n' + summaryHead;
+  let detail = summaryDetail;
   if (mode === 'verification') {
-    body += '\n\n### Finding verification';
+    detail += '\n\n### Finding verification';
     for (const verdict of normalized.verifications) {
-      body += '\n- **' + verdict.findingId + ' — ' + verdict.status + '**: ' + verdict.reason;
+      detail += '\n- **' + verdict.findingId + ' — ' + verdict.status + '**: ' + verdict.reason;
     }
   }
   if (mode === 'incremental' && raw._validation) {
     const validations = Array.isArray(raw._validation.validations) ? raw._validation.validations : [];
     const count = (verdict) => validations.filter((entry) => entry.verdict === verdict).length;
-    body += '\n\n### Material finding validation';
+    detail += '\n\n### Material finding validation';
     if (raw._validation.status === 'SKIPPED') {
-      body += '\nNo P0/P1/P2 candidate required targeted validation.';
+      detail += '\nNo P0/P1/P2 candidate required targeted validation.';
     } else {
-      body += '\n**Confirmed:** ' + count('CONFIRMED')
+      detail += '\n**Confirmed:** ' + count('CONFIRMED')
         + ' · **Rejected:** ' + count('REJECTED')
         + ' · **Uncertain:** ' + count('UNCERTAIN');
       for (const entry of validations) {
         const title = entry.title ? ' — ' + entry.title : '';
-        body += '\n- **' + (entry.candidateId || '?') + ' · ' + (entry.severity || '?')
+        detail += '\n- **' + (entry.candidateId || '?') + ' · ' + (entry.severity || '?')
           + ' · ' + (entry.verdict || 'UNCERTAIN') + '**' + title + ': ' + (entry.reason || '');
       }
     }
@@ -109,15 +111,15 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
     ...droppedFindings(normalized.findings, newFindings),
   ];
   if (suppressed.length) {
-    body += '\n\n### Not re-raised (matched concerns already examined in this session)';
+    detail += '\n\n### Not re-raised (matched concerns already examined in this session)';
     for (const item of suppressed.slice(0, 6)) {
-      body += '\n- <code>' + escapeHtml(item.path) + '</code> — ' + escapeHtml(item.title);
+      detail += '\n- <code>' + escapeHtml(item.path) + '</code> — ' + escapeHtml(item.title);
     }
-    body += '\n_If one of these is actually a different bug, comment `@jiaze-claude-review-bot reset review`._';
+    detail += '\n_If one of these is actually a different bug, comment `@jiaze-claude-review-bot reset review`._';
   }
   const demoted = newFindings.filter((finding) => finding.downgradedFrom);
   for (const finding of demoted) {
-    body += '\n\n_' + finding.id + ' was reported as ' + finding.downgradedFrom
+    detail += '\n\n_' + finding.id + ' was reported as ' + finding.downgradedFrom
       + ' but gave no concrete failure path, so it is recorded as non-blocking P3._';
   }
   if (newFindings.length === 0) body += '\n\nNo new material finding was reported.';
@@ -139,8 +141,10 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
   } else if (session.status === 'HUMAN_REQUIRED') {
     body += '\n\nAutomatic review has stopped. Human judgment is required before merger.';
   }
-  body += formatRuntime(raw._meta, mode === 'verification' ? 'Verification runtime' : 'Incremental runtime');
-  body += formatRuntime(raw._validation?._meta, 'Validation runtime');
+  detail += formatRuntime(raw._meta, mode === 'verification' ? 'Verification runtime' : 'Incremental runtime');
+  detail += formatRuntime(raw._validation?._meta, 'Validation runtime');
+  const folded = foldedDetails('Review details (for AI)', detail);
+  if (folded) body += '\n\n' + folded;
   // This is intentionally NOT the processed-source marker. If durable session
   // persistence fails after the review POST, a retry remains eligible and can
   // recover this exact already-paid result without another Gemini call.

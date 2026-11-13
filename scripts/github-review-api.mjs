@@ -12,6 +12,19 @@ export function requiredEnv(env, key) {
   return String(value);
 }
 
+// Humans skim the top of a review comment; the full narrative stays in the body, folded, for AI readers.
+export function splitSummary(summary, maxVisible = 240) {
+  const text = String(summary ?? '').trim();
+  const first = text.split(/\n\s*\n/)[0].trim();
+  const visible = first.length > maxVisible ? first.slice(0, maxVisible - 1).trimEnd() + '…' : first;
+  return { visible, detail: text === visible ? '' : text };
+}
+
+export function foldedDetails(label, text) {
+  const body = String(text ?? '').trim();
+  return body ? '<details><summary>' + label + '</summary>\n\n' + body + '\n\n</details>' : '';
+}
+
 export function escapeHtml(value) {
   return String(value)
     .replaceAll('&', '&amp;')
