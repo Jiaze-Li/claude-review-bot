@@ -15,6 +15,7 @@ import { closeStaleDeepReview, findStaleDeepReviews } from '../scripts/sweep-sta
 
 const BASE = 'b'.repeat(40), A = 'a'.repeat(40), C = 'c'.repeat(40);
 const T0 = '2026-10-16T08:00:00.000Z';
+const LATER = new Date(Date.parse(T0) + DEEP_REVIEW_STALE_MS + 60_000).toISOString();
 const finding = (severity, extra = {}) => ({ severity, title: 'Race in cache', body: 'Two writers interleave and corrupt the entry.', path: 'a.js', line: 3, ...extra });
 function readySession(head = A) {
   return { ...applyDiscoveryResult({ result: { summary: 'ok', findings: [] }, baseSha: BASE, headSha: head, sourceCommentId: '1' }), status: 'READY', auditCompleted: true };
@@ -122,6 +123,7 @@ function fakeGitHub({ head = A, base = BASE } = {}) {
   const writes = [];
   const fetchImpl = async (url, init = {}) => {
     if (/\/pulls\/7$/.test(url)) return Response.json({ base: { sha: base }, head: { sha: head } });
+    if (/\/compare\//.test(url)) return Response.json({ ahead_by: 2 });
     if (init.method === 'DELETE') { writes.push({ url, method: 'DELETE', body: null }); return new Response(null, { status: 204 }); }
     if (init.method === 'POST' || init.method === 'PATCH') {
       writes.push({ url, method: init.method, body: JSON.parse(init.body) });
@@ -227,15 +229,35 @@ test('a killed run with no usage file is charged its allotted budget', async () 
   assert.equal(f.deepSpendUsd, 1.5);
 });
 
-test('if the PR moved, begin refuses and fail leaves the superseded marker alone', async () => {
+test('if the PR moved, begin refuses; fail keeps the interrupted run but marks it out of date', async () => {
   const moved = fakeGitHub({ head: C });
   const dir = ctxDir({ requestedMode: 'claude', decision: { mode: 'claude' }, session: readySession(), sessionCommentId: '300' });
   await assert.rejects(() => runDeepReviewCommand('begin', { env: cenv(dir), fetchImpl: moved.fetchImpl, now: T0 }), /PR moved/);
   const stale = beginDeepReview({ session: readySession(), baseSha: BASE, headSha: A, now: T0 });
   const dir2 = ctxDir({ decision: { mode: 'deep_review_stale' }, session: stale, sessionCommentId: '300' });
-  const r = await runDeepReviewCommand('fail', { env: cenv(dir2), fetchImpl: moved.fetchImpl, now: T0 });
+  const r = await runDeepReviewCommand('fail', { env: cenv(dir2), fetchImpl: moved.fetchImpl, now: LATER });
   assert.equal(r, null);
-  assert.equal(moved.writes.length, 0);
+  assert.equal(moved.writes.length, 1);
+  const body = moved.writes[0].body.body;
+  const saved = parseSessionComment(body);
+  assert.equal(saved.status, 'REVIEW_IN_PROGRESS');
+  assert.equal(saved.deepReview.resumeStatus, stale.deepReview.resumeStatus);
+  assert.equal(saved.staleFor, A);
+  assert.equal(saved.staleHead, C);
+  assert.equal(saved.staleCommits, 2);
+  assert.match(body, /NOT current/);
+  assert.match(body, /2 newer commits/);
+  // The newer commit still plans from the status the interrupted run started from.
+  assert.notEqual(planReviewSession({ session: saved, baseSha: BASE, headSha: C }).mode, 'noop_waiting');
+});
+
+test('if only the base branch moved, nothing newer will replace the marker, so the run fails closed', async () => {
+  const baseMoved = fakeGitHub({ head: A, base: 'd'.repeat(40) });
+  const begun = beginDeepReview({ session: readySession(), baseSha: BASE, headSha: A, now: T0 });
+  const dir = ctxDir({ decision: { mode: 'deep_review_stale' }, session: begun, sessionCommentId: '300' });
+  const r = await runDeepReviewCommand('fail', { env: cenv(dir), fetchImpl: baseMoved.fetchImpl, now: LATER });
+  assert.equal(r.status, 'HUMAN_REQUIRED');
+  assert.ok(baseMoved.writes.some((w) => /HUMAN_REQUIRED/.test(String(w.body?.body))));
 });
 
 // ---- required status check ----
