@@ -1,5 +1,5 @@
 import fs from 'node:fs';
-import { REVIEW_BODY_MAX_BYTES, anchorFindings, assertPrUnmoved, escapeHtml, githubJson, loadAnchors, pullUrl } from './github-review-api.mjs';
+import { REVIEW_BODY_MAX_BYTES, anchorFindings, assertPrUnmoved, escapeHtml, foldedDetails, githubJson, loadAnchors, pullUrl, splitSummary } from './github-review-api.mjs';
 
 // The review POST can carry many inline comments, so it gets a longer timeout than the other API calls.
 const REVIEW_POST_TIMEOUT_MS = 60_000;
@@ -39,7 +39,8 @@ const { inline: inlineComments, unanchored } = anchorFindings(anchors, review.fi
 
 const providerCounts = review._meta?.providers && typeof review._meta.providers === 'object' ? review._meta.providers : {};
 const heading = providerCounts.gemini > 0 ? (providerCounts.claude > 0 ? 'Gemini + Claude Code Review' : 'Gemini Code Review') : 'Claude Code Review';
-let body = `## ${heading}\n\n${review.summary.trim()}`;
+const { visible: summaryHead, detail: summaryDetail } = splitSummary(review.summary);
+let body = `## ${heading}\n\n${summaryHead}`;
 if (review.findings.length === 0) {
   body += '\n\n✅ No actionable issues found.';
 } else {
@@ -53,7 +54,7 @@ if (unanchored.length) {
   for (const finding of unanchored) {
     const locationText = finding.line ? `${finding.path}:${finding.line}` : finding.path;
     const entry = `\n- **[${finding.severity}] ${finding.title}** — <code>${escapeHtml(locationText)}</code>: ${finding.body}`;
-    const reserve = `\n\n_25 additional unanchored findings omitted because the GitHub review body reached its safe size limit._${runtimeSection}\n\n${sourceMarker}`;
+    const reserve = `\n\n_25 additional unanchored findings omitted because the GitHub review body reached its safe size limit._\n\n${foldedDetails('Review details (for AI)', summaryDetail + runtimeSection)}\n\n${sourceMarker}`;
 
     if (Buffer.byteLength(body + entry + reserve, 'utf8') <= REVIEW_BODY_MAX_BYTES) {
       body += entry;
@@ -67,7 +68,8 @@ if (unanchored.length) {
   }
 }
 
-body += runtimeSection;
+const folded = foldedDetails('Review details (for AI)', summaryDetail + runtimeSection);
+if (folded) body += `\n\n${folded}`;
 body += `\n\n${sourceMarker}`;
 
 if (Buffer.byteLength(body, 'utf8') > REVIEW_BODY_MAX_BYTES) {
