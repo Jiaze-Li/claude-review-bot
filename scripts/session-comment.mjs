@@ -7,13 +7,19 @@
 // REVIEW_IN_PROGRESS is a passing state: it is edited in place, and the finished result is compared with what the
 // PR looked like before the run started.
 
+export function isMarkedStale(session) {
+  return Boolean(session?.staleFor) && session.staleFor === session.lastReviewedHead;
+}
+
 export function visibleResultChanged(previous, next) {
   if (!previous) return false; // nothing to replace: it is created anyway
   if (next.status === 'REVIEW_IN_PROGRESS') return false;
   const running = previous.status === 'REVIEW_IN_PROGRESS';
   const baselineStatus = running ? (previous.deepReview?.resumeStatus ?? null) : previous.status;
   const baselineHead = running ? (previous.deepReview?.resumeHead ?? null) : (previous.lastReviewedHead ?? null);
-  return next.status !== baselineStatus || (next.lastReviewedHead ?? null) !== baselineHead;
+  if (next.status !== baselineStatus || (next.lastReviewedHead ?? null) !== baselineHead) return true;
+  // A push marking the result out of date (or a later review clearing the mark) changes what the PR shows.
+  return !running && isMarkedStale(previous) !== isMarkedStale(next);
 }
 
 // -> the id of the comment that now holds the session (as a string)

@@ -37,17 +37,20 @@ export function isReviewTrigger(body) {
   return parseReviewTrigger(body) !== null;
 }
 
-// Pushes (synchronize) deliberately do not review: a PR is reviewed when it opens
-// and then again only on an explicit `@gemini review` / `@claude review`.
+// Pushes (synchronize) deliberately do not start a review: a PR is reviewed when it opens and then again only
+// on an explicit `@gemini review` / `@claude review`. A push does, however, mark an existing result as
+// out of date ('stale': bookkeeping only, no model call) so a READY for an older commit is never read as current.
 const AUTO_PR_ACTIONS = new Set(['opened', 'ready_for_review', 'reopened']);
 
 export function parseAutomaticPullRequestTrigger(event, payload) {
   if (event !== 'pull_request' || !payload || typeof payload !== 'object') return null;
-  if (!AUTO_PR_ACTIONS.has(payload.action)) return null;
+  const isPush = payload.action === 'synchronize';
+  if (!isPush && !AUTO_PR_ACTIONS.has(payload.action)) return null;
 
   const pr = payload.pull_request;
   if (!pr || typeof pr !== 'object') return null;
   if (pr.state && pr.state !== 'open') return null;
+  if (isPush) return pr.draft === true ? null : { requestedMode: 'stale', sourceKind: 'pull_request' };
   if (pr.draft === true && payload.action !== 'ready_for_review') return null;
 
   return { requestedMode: 'auto', sourceKind: 'pull_request' };

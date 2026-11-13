@@ -42,6 +42,12 @@ A full review is used for: a PR's first review, the review after a big or risky 
   3 more runs, and `@gemini review` continues it by hand; an unrelated event (a reopened PR) does not.
 * **HUMAN_REQUIRED** means a person must decide: verification budget spent, an UNCERTAIN material candidate, or
   both providers unavailable. Use `@gemini dismiss F001` (with evidence) or `override review`.
+* **READY on an earlier commit (NOT current)**: pushes do not start a review, but a push after a result does mark that
+  result out of date at once (no model call, no cost): the status comment is re-posted saying which commit was reviewed
+  and how many newer commits no review has covered. It is not a new status of the review itself, only a warning on
+  the old one; the next review (`@gemini review` / `@claude review`) moves the reviewed commit and the warning goes
+  away on its own. That review covers only the new part when the change is small and low-risk (below), otherwise
+  everything.
 * A new commit never inherits an old READY. A READY PR with a small, low-risk new commit gets an *incremental*
   review (at most 50 changed lines in at most 3 files; no workflow/security/schema/dependency paths; every 15th is
   a full refresh); anything else gets a full review.

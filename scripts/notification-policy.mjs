@@ -47,6 +47,7 @@ export function decideNotificationAction({
     || (mode === 'override' && outcomes.override !== 'success')
     || (mode === 'dismiss' && outcomes.dismiss !== 'success')
     || (mode === 'threads' && outcomes.threads !== 'success')
+    || (mode === 'stale' && outcomes.stale !== 'success')
     || (mode === 'recover' && outcomes.recover !== 'success')
     || (mode === 'deep_review_stale' && outcomes.failDeep !== 'success');
 
@@ -107,6 +108,11 @@ export function decideNotificationAction({
       action: NOTIFICATION_ACTIONS.SILENT,
       reason: 'Thread sync produces no conversational status comments',
     };
+  }
+
+  // A push only marks the result out of date inside the session comment: never a new conversation comment.
+  if (mode === 'stale') {
+    return { action: NOTIFICATION_ACTIONS.SILENT, reason: 'Stale marking updates the session comment itself' };
   }
 
   // 5. Normal successful reviews (incremental, verification, claude) and mutations (override, dismiss):
