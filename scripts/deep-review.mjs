@@ -111,9 +111,21 @@ export async function runDeepReviewCommand(command, { env = process.env, fetchIm
       console.log('No in-progress deep review for this HEAD to fail; nothing to do.');
       return null;
     }
-    // If the PR moved, the stale marker is harmless: the new HEAD plans a fresh discovery.
-    if (!(await headUnmoved(ctx, fetchImpl))) {
-      console.log('PR moved; leaving the superseded in-progress marker for the new HEAD to replace.');
+    // A newer commit replaces this marker when it is reviewed, and the new HEAD plans from the status this run
+    // interrupted. Nothing guarantees that review happens soon, though, so until then the comment must not keep
+    // claiming a review is running: record the usual out-of-date mark and change nothing else.
+    const pr = await github(`https://api.github.com/repos/${ctx.target}/pulls/${ctx.prNumber}`, ctx.token, fetchImpl);
+    if (pr.head?.sha && pr.head.sha !== ctx.headSha) {
+      let commits = null;
+      try {
+        const compare = await github(`https://api.github.com/repos/${ctx.target}/compare/${ctx.headSha}...${pr.head.sha}`, ctx.token, fetchImpl);
+        if (Number.isInteger(compare.ahead_by) && compare.ahead_by >= 0) commits = compare.ahead_by;
+      } catch {
+        // the count is only a nicety for the comment
+      }
+      const marked = { ...session, staleFor: session.lastReviewedHead, staleHead: pr.head.sha, staleCommits: commits };
+      await upsertSession(ctx, marked, [ctx.sourceCommentId], fetchImpl, commentId, session);
+      console.log('PR moved; marked the interrupted deep review as out of date for the newer commit.');
       return null;
     }
     const failed = failDeepReview({
