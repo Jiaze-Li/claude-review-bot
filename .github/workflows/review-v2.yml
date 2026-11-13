@@ -404,6 +404,18 @@ jobs:
           REVIEW_CONTEXT_DIR: .review-context
         run: node scripts/apply-thread-resolutions.mjs
 
+      - name: Mark the review result out of date after a push
+        id: stale
+        if: steps.dedupe.outputs.duplicate != 'true' && steps.plan.outputs.mode == 'stale'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          SOURCE_COMMENT_ID: ${{ inputs.source_comment_id }}
+          REVIEW_CONTEXT_DIR: .review-context
+        run: node scripts/apply-stale.mjs
+
       - name: Install Claude fallback dependencies
         continue-on-error: true # only needed if Gemini is out of credits; must never block a healthy Gemini review
         if: steps.dedupe.outputs.duplicate != 'true' && (steps.plan.outputs.mode == 'incremental' || steps.plan.outputs.mode == 'verification')
@@ -602,6 +614,7 @@ jobs:
           OVERRIDE_OUTCOME: ${{ steps.override.outcome }}
           DISMISS_OUTCOME: ${{ steps.dismiss.outcome }}
           THREADS_OUTCOME: ${{ steps.threads.outcome }}
+          STALE_OUTCOME: ${{ steps.stale.outcome }}
           THREAD_PROBLEMS: ${{ steps.threads.outputs.thread_problems }}
           RECOVER_OUTCOME: ${{ steps.recover-session.outcome }}
           FAIL_DEEP_OUTCOME: ${{ steps.fail-deep.outcome }}

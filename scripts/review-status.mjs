@@ -14,7 +14,7 @@ const positiveId = /^[1-9]\d*$/;
 const reviewModes = new Set([
   'incremental', 'verification', 'recover', 'claude',
   'noop_ready', 'noop_waiting', 'human_required', 'deep_review_stale',
-  'override', 'dismiss', 'threads',
+  'override', 'dismiss', 'threads', 'stale',
 ]);
 const sourceKinds = new Set(['comment', 'pull_request']);
 
@@ -157,6 +157,7 @@ export async function publishRunStatus({ env = process.env, fetchImpl = fetch, p
       override: env.OVERRIDE_OUTCOME,
       dismiss: env.DISMISS_OUTCOME,
       threads: env.THREADS_OUTCOME,
+      stale: env.STALE_OUTCOME,
       recover: env.RECOVER_OUTCOME,
       failDeep: env.FAIL_DEEP_OUTCOME,
     },

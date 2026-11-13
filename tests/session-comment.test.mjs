@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { saveSessionComment, visibleResultChanged } from '../scripts/session-comment.mjs';
+import { isMarkedStale, saveSessionComment, visibleResultChanged } from '../scripts/session-comment.mjs';
 import { applyDiscoveryResult, beginDeepReview, completeDeepReview } from '../scripts/review-session-core.mjs';
 
 const BASE = 'b'.repeat(40), A = 'a'.repeat(40), C = 'c'.repeat(40);
@@ -58,4 +58,14 @@ test('a run in progress is edited in place and judged against what the PR looked
 test('failing to remove the old comment never fails the save: the new comment is already the newest', async () => {
   const rec = recorder({ failDelete: true });
   assert.equal(await save(rec, rework(A), { ...rework(A), status: 'READY' }), '900');
+});
+
+test('marking a result out of date is a visible change, and a later review clears it', () => {
+  const ready = { ...clean(A), status: 'READY', auditCompleted: true };
+  const marked = { ...ready, staleFor: A, staleHead: C, staleCommits: 2 };
+  assert.equal(visibleResultChanged(ready, marked), true);
+  assert.equal(visibleResultChanged(marked, marked), false);
+  assert.equal(isMarkedStale(marked), true);
+  const reviewedLater = { ...marked, lastReviewedHead: C };
+  assert.equal(isMarkedStale(reviewedLater), false); // the mark stops applying by itself
 });

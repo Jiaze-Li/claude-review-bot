@@ -218,9 +218,28 @@ for (const action of ['opened', 'ready_for_review', 'reopened']) {
   });
 }
 
+test('a push on a ready PR dispatches only a no-review stale marking, without collaborator gating', async (t) => {
+  const calls = fakeGithub(t, { permission: 'read' });
+  const payload = { ...pullRequestPayload, action: 'synchronize', pull_request: { ...pullRequestPayload.pull_request, draft: false } };
+  const response = await worker.fetch(request(payload, {}, 'pull_request'), env);
+  assert.equal(response.status, 202);
+  assert.equal((await response.json()).requested_mode, 'stale');
+  assert.equal(calls.some((call) => call.pathname.endsWith('/permission')), false);
+  const dispatches = calls.filter((call) => call.pathname.endsWith('/dispatches'));
+  assert.equal(dispatches.length, 1);
+  assert.equal(dispatches[0].body.inputs.requested_mode, 'stale');
+  assert.equal(dispatches[0].body.inputs.source_kind, 'pull_request');
+});
+
+test('push trigger parsing: stale for ready open PRs only', () => {
+  const pr = { state: 'open', draft: false };
+  assert.deepEqual(parseAutomaticPullRequestTrigger('pull_request', { action: 'synchronize', pull_request: pr }), { requestedMode: 'stale', sourceKind: 'pull_request' });
+  assert.equal(parseAutomaticPullRequestTrigger('pull_request', { action: 'synchronize', pull_request: { ...pr, draft: true } }), null);
+  assert.equal(parseAutomaticPullRequestTrigger('pull_request', { action: 'synchronize', pull_request: { ...pr, state: 'closed' } }), null);
+});
+
 for (const [name, payload, githubOptions] of [
   ['draft opened PR', { ...pullRequestPayload, pull_request: { ...pullRequestPayload.pull_request, draft: true } }, {}],
-  ['new push (synchronize) on a ready PR', { ...pullRequestPayload, action: 'synchronize', pull_request: { ...pullRequestPayload.pull_request, draft: false } }, {}],
   ['draft synchronize PR', { ...pullRequestPayload, action: 'synchronize', pull_request: { ...pullRequestPayload.pull_request, draft: true } }, {}],
   ['closed PR after webhook race', pullRequestPayload, { state: 'closed' }],
   ['still-draft PR after webhook race', pullRequestPayload, { draft: true }],

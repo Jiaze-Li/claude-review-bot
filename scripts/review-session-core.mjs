@@ -872,7 +872,13 @@ export function renderSessionComment(session, { sourceCommentIds = [] } = {}) {
   const unresolved = unresolvedMaterialFindings(session);
   const verification = `${session.verificationRound ?? 0}/${session.maxVerificationRounds ?? MAX_VERIFICATION_ROUNDS}`;
   const audit = session.auditCompleted === true ? 'complete' : session.status === 'AUDIT_PENDING' ? 'pending' : 'not run';
-  const next = session.reviewFailure?.code === 'REVIEWER_UNAVAILABLE'
+  const stale = Boolean(session.staleFor) && session.staleFor === session.lastReviewedHead;
+  const newer = Number.isInteger(session.staleCommits) && session.staleCommits > 0
+    ? `${session.staleCommits} newer commit${session.staleCommits === 1 ? '' : 's'}`
+    : 'newer commits';
+  const next = stale
+    ? `This result is for an earlier commit (${cleanInline(String(session.lastReviewedHead).slice(0, 12))}); the PR now has ${newer} that no review has covered, so it is NOT current. Comment \`@gemini review\` or \`@claude review\`: a small, low-risk change gets an incremental review of just the new part, anything else a full review.`
+    : session.reviewFailure?.code === 'REVIEWER_UNAVAILABLE'
     ? 'Provider review did not complete. Comment `@gemini review` to retry the latest HEAD, or `@claude review` for an existing exact-HEAD session. A manual request bypasses the automatic $6 cap but not provider quota or the $5 per-call ceiling.'
     : unresolved.length > 0
     ? 'Inconclusive material candidate(s): inspect the cited code. If disproven, use `@gemini dismiss F001` with Reason and Evidence links; otherwise fix and push for a fresh review. Manual override explicitly accepts risk.'
@@ -916,7 +922,7 @@ export function renderSessionComment(session, { sourceCommentIds = [] } = {}) {
     '<!-- jiaze-review-session:v1 -->',
     ...processedMarkers,
     '### Independent Review Session',
-    `Status: **${session.status}**${session.override ? ` (manually overridden by @${cleanInline(session.override.by)})` : ''}`,
+    `Status: **${stale ? `${session.status} on an earlier commit (NOT current)` : session.status}**${session.override ? ` (manually overridden by @${cleanInline(session.override.by)})` : ''}`,
     `Default reviewer: **Gemini Flash (latest) / medium thinking**`,
     `Discovery: **complete** · Final audit: **${audit}** · Verification: **${verification}**`,
     ...(session.incrementalReviewCount ? [`Incremental reviews since full audit: **${session.incrementalReviewCount}** (full-audit HEAD: ${cleanInline((session.fullAuditHead ?? session.discoveryHead ?? '').slice(0, 12))})`] : []),

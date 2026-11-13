@@ -18,7 +18,7 @@ export async function planSession({ env=process.env, fetchImpl=fetch }={}) {
   const headSha=required(env,'HEAD_SHA');
   if(!shaPattern.test(baseSha)||!shaPattern.test(headSha)) throw new Error('Invalid PR SHA');
   const requested=(env.REQUESTED_MODE||'auto').toLowerCase();
-  if(!['auto','claude','reset','override','dismiss','threads'].includes(requested)) throw new Error('Invalid REQUESTED_MODE');
+  if(!['auto','claude','reset','override','dismiss','threads','stale'].includes(requested)) throw new Error('Invalid REQUESTED_MODE');
 
   const expectedAuthor=required(env,'EXPECTED_REVIEW_AUTHOR');
   const comments=await loadComments(target,pr,env.GH_TOKEN,fetchImpl);
@@ -83,6 +83,22 @@ export async function planSession({ env=process.env, fetchImpl=fetch }={}) {
         }
       }
     }
+    return {requestedMode:requested,decision,session,sessionCommentId,pendingSession:null,pendingSourceCommentId:null,pendingReviewId:null};
+  }
+
+  // A push. Never reviews and never spends: it only marks a result for an older commit as out of date, once.
+  // The newest result may be a pending recovery or a running review; those write the session themselves.
+  if(requested==='stale'){
+    const already=session&&session.staleFor===session.lastReviewedHead&&session.staleHead===headSha;
+    const decision=!session
+      ?{mode:'noop_waiting',previousHead:null,reason:'there is no review session for this PR yet'}
+      :session.status==='REVIEW_IN_PROGRESS'
+        ?{mode:'noop_waiting',previousHead:session.lastReviewedHead,reason:'a review is running; it will record its own result'}
+        :session.lastReviewedHead===headSha
+          ?{mode:'noop_waiting',previousHead:headSha,reason:'this commit is the one that was reviewed'}
+          :already
+            ?{mode:'noop_waiting',previousHead:session.lastReviewedHead,reason:'the review result is already marked out of date for this commit'}
+            :{mode:'stale',previousHead:session.lastReviewedHead,reason:'a new commit was pushed after the last review; marking that result as out of date (no model call)'};
     return {requestedMode:requested,decision,session,sessionCommentId,pendingSession:null,pendingSourceCommentId:null,pendingReviewId:null};
   }
 
