@@ -22,11 +22,11 @@ test('new session gets one discovery pass',()=>{
   });
 });
 
-test('discovery with only P3 waits for the final audit and P3 is non-blocking',()=>{
+test('discovery with a P3 keeps it open and blocks until fixed',()=>{
   const s=applyDiscoveryResult({result:{summary:'ok',findings:[finding('P3')]},baseSha:BASE,headSha:A,sourceCommentId:'9'});
-  assert.equal(s.status,'AUDIT_PENDING');
-  assert.equal(openMaterialFindings(s).length,0);
-  assert.equal(s.findings[0].status,'DEFERRED');
+  assert.equal(s.status,'REWORK');
+  assert.equal(openMaterialFindings(s).length,1);
+  assert.equal(s.findings[0].status,'OPEN');
 });
 
 test('material discovery finding waits for a changed HEAD before verification',()=>{
@@ -60,7 +60,7 @@ test('missing verification verdict fails closed and bounded rounds end HUMAN_REQ
   assert.equal(planReviewSession({session:s,baseSha:BASE,headSha:C}).mode,'human_required');
 });
 
-test('verification may add only modeled repair regressions and P3 stays non-blocking',()=>{
+test('verification may add only modeled repair regressions and a new P3 is open too',()=>{
   let s=applyDiscoveryResult({result:{summary:'bug',findings:[finding('P1')]},baseSha:BASE,headSha:A,sourceCommentId:'9'});
   s=applyVerificationResult({session:s,headSha:B,result:{
     summary:'old fixed but regression',
@@ -68,7 +68,7 @@ test('verification may add only modeled repair regressions and P3 stays non-bloc
     findings:[finding('P2','Repair regression','repair-regression'),finding('P3','Minor','minor')],
   }});
   assert.equal(s.status,'REWORK');
-  assert.deepEqual(s.findings.map(x=>[x.id,x.status]),[['F001','FIXED'],['F002','OPEN'],['F003','DEFERRED']]);
+  assert.deepEqual(s.findings.map(x=>[x.id,x.status]),[['F001','FIXED'],['F002','OPEN'],['F003','OPEN']]);
 });
 
 test('a session waiting for its final review is finished by one complete full review, then READY is a free no-op',()=>{

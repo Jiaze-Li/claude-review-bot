@@ -1,5 +1,10 @@
 import { createHash } from 'node:crypto';
 const MATERIAL_SEVERITIES = new Set(['P0', 'P1', 'P2']);
+// A finding blocks until it is fixed (and its thread resolved) when it is P0-P2, or a P3 that was reported as P3.
+// A claim demoted to P3 for lacking a concrete failure path stays non-blocking.
+function isBlocking(finding) {
+  return MATERIAL_SEVERITIES.has(finding?.severity) || (finding?.severity === 'P3' && !finding.downgradedFrom);
+}
 export const SESSION_VERSION = 1;
 export const MAX_VERIFICATION_ROUNDS = 2;
 // A P0-P2 finding must carry a concrete failure path (trigger state -> wrong
@@ -111,7 +116,7 @@ export function planReviewSession({ session = null, baseSha, headSha, reset = fa
     // The exact unmodified HEAD still requires scoped, evidence-based adjudication.
     if (session.lastReviewedHead !== headSha
         && unresolvedMaterialFindings(session).length > 0
-        && !session.findings.some(f => f.status === 'OPEN' && MATERIAL_SEVERITIES.has(f.severity))) {
+        && !session.findings.some(f => f.status === 'OPEN' && isBlocking(f))) {
       return { mode: 'full_review', previousHead: null, reason: 'new HEAD after unresolved material candidate; run a fresh full review' };
     }
     // Only an explicit manual retry can resume a provider-unavailable stop. Never
@@ -160,7 +165,7 @@ export function applyDiscoveryResult({
   const findings = normalized.findings.map((finding) => ({
     id: findingId(nextFindingNumber++),
     ...compactFinding(finding),
-    status: MATERIAL_SEVERITIES.has(finding.severity) ? 'OPEN' : 'DEFERRED',
+    status: isBlocking(finding) ? 'OPEN' : 'DEFERRED',
     origin: 'DISCOVERY',
     introducedHead: headSha,
     lastCheckedHead: headSha,
@@ -210,14 +215,14 @@ export function applyIncrementalResult({
     findings.push({
       id: findingId(nextFindingNumber++),
       ...compactFinding(finding),
-      status: MATERIAL_SEVERITIES.has(finding.severity) ? 'OPEN' : 'DEFERRED',
+      status: isBlocking(finding) ? 'OPEN' : 'DEFERRED',
       origin: 'INCREMENTAL',
       introducedHead: headSha,
       lastCheckedHead: headSha,
       resolutionReason: null,
     });
   }
-  const open = findings.some((finding) => finding.status === 'OPEN' && MATERIAL_SEVERITIES.has(finding.severity));
+  const open = findings.some((finding) => finding.status === 'OPEN' && isBlocking(finding));
   const { reviewFailure: _oldFailure, ...base } = session;
   return {
     ...base,
@@ -277,7 +282,7 @@ export function applyVerificationResult({
     findings.push({
       id: findingId(nextFindingNumber++),
       ...compactFinding(finding),
-      status: MATERIAL_SEVERITIES.has(finding.severity) ? 'OPEN' : 'DEFERRED',
+      status: isBlocking(finding) ? 'OPEN' : 'DEFERRED',
       origin: 'REPAIR_REGRESSION',
       introducedHead: headSha,
       lastCheckedHead: headSha,
@@ -469,8 +474,9 @@ export function completeDeepReview({
     summary: String(result.summary ?? '').slice(0, 4000),
     findings: ordered.slice(0, 6),
   });
-  const omitted = ordered.slice(6).filter((f) => MATERIAL_SEVERITIES.has(f?.severity)).length;
-  if (omitted > 0) throw new Error(`deep review reported more than 6 material findings (${omitted} omitted); refusing to drop blockers`);
+  // Every severity counts: a reported P3 blocks too, so nothing past the sixth may be dropped silently.
+  const omitted = ordered.slice(6).length;
+  if (omitted > 0) throw new Error(`deep review reported more than 6 findings (${omitted} omitted); refusing to drop blockers`);
   const findings = session.findings.map((finding) => ({ ...finding }));
   let nextFindingNumber = Number.isInteger(session.nextFindingNumber) ? session.nextFindingNumber : findings.length + 1;
   // Claude's material findings are never suppressed by Gemini's rejection ledger; only an
@@ -480,14 +486,14 @@ export function completeDeepReview({
     findings.push({
       id: findingId(nextFindingNumber++),
       ...compactFinding({ ...finding, riskClass: finding.riskClass === 'uncategorized' ? 'deep-review' : finding.riskClass }),
-      status: MATERIAL_SEVERITIES.has(finding.severity) ? 'OPEN' : 'DEFERRED',
+      status: isBlocking(finding) ? 'OPEN' : 'DEFERRED',
       origin: 'CLAUDE_DEEP',
       introducedHead: headSha,
       lastCheckedHead: headSha,
       resolutionReason: null,
     });
   }
-  const open = findings.filter((finding) => finding.status === 'OPEN' && MATERIAL_SEVERITIES.has(finding.severity));
+  const open = findings.filter((finding) => finding.status === 'OPEN' && isBlocking(finding));
   const resume = session.deepReview?.resumeStatus;
   const verificationRound = session.verificationRound ?? 0;
   const providerRecovery = resume === 'HUMAN_REQUIRED'
@@ -722,7 +728,7 @@ export function applyFindingDismissal({
     }
   }
   const item = session.findings.find((finding) => finding.id === findingId);
-  if (!item || !['OPEN', 'UNCERTAIN'].includes(item.status) || !MATERIAL_SEVERITIES.has(item.severity)) {
+  if (!item || !['OPEN', 'UNCERTAIN'].includes(item.status) || !isBlocking(item)) {
     throw new Error('dismissal finding must be an OPEN or UNCERTAIN material candidate');
   }
   const findings = session.findings.map((finding) => finding.id === findingId
@@ -734,7 +740,7 @@ export function applyFindingDismissal({
     }
     : { ...finding });
   const remaining = findings.filter(finding =>
-    ['OPEN', 'UNCERTAIN'].includes(finding.status) && MATERIAL_SEVERITIES.has(finding.severity)).length;
+    ['OPEN', 'UNCERTAIN'].includes(finding.status) && isBlocking(finding)).length;
   const status = remaining
     ? findings.some(f => f.status === 'OPEN') ? 'REWORK' : 'HUMAN_REQUIRED'
     : session.auditCompleted === true ? 'READY' : 'AUDIT_PENDING';
@@ -813,12 +819,12 @@ export function applyThreadDecisions({ session, headSha, closed = [], reopened =
 
 export function openMaterialFindings(session) {
   validateSession(session);
-  return session.findings.filter((finding) => finding.status === 'OPEN' && MATERIAL_SEVERITIES.has(finding.severity));
+  return session.findings.filter((finding) => finding.status === 'OPEN' && isBlocking(finding));
 }
 
 export function unresolvedMaterialFindings(session) {
   return (session?.findings ?? []).filter(finding => finding.status === 'UNCERTAIN'
-    && MATERIAL_SEVERITIES.has(finding.severity));
+    && isBlocking(finding));
 }
 
 // The validator already performs a bounded, targeted evidence check. An
@@ -853,7 +859,7 @@ export function recordUncertainFindings(session, validations, headSha) {
       resolutionReason: null,
     });
   }
-  const confirmedOpen = findings.some(f => f.status === 'OPEN' && MATERIAL_SEVERITIES.has(f.severity));
+  const confirmedOpen = findings.some(f => f.status === 'OPEN' && isBlocking(f));
   const status = confirmedOpen && (session.verificationRound ?? 0) < MAX_VERIFICATION_ROUNDS
     ? 'REWORK' : 'HUMAN_REQUIRED';
   return {
@@ -944,7 +950,7 @@ export function renderSessionComment(session, { sourceCommentIds = [] } = {}) {
     '',
     `Next: ${next}`,
     '',
-    '<sub>P3 findings are non-blocking. Verification covers open findings and new delta regressions. Audited unchanged code is reused after safe incremental reviews; high-risk deltas receive full review.</sub>',
+    '<sub>Every reported finding, P3 included, stays open until it is fixed. Verification covers open findings and new delta regressions. Audited unchanged code is reused after safe incremental reviews; high-risk deltas receive full review.</sub>',
     `<!-- jiaze-review-state:${state} -->`,
   ].join('\n');
 }
@@ -998,7 +1004,7 @@ function normalizeFinding(value) {
   // Evidence rule: a material claim without a concrete failure path cannot
   // block. Findings that omit the field entirely (legacy sessions) are kept.
   const failurePath = typeof value.failurePath === 'string' ? value.failurePath.replace(/[\r\n]+/g, ' ').trim() : null;
-  let downgradedFrom = null;
+  let downgradedFrom = severity === 'P3' && ['P0', 'P1', 'P2'].includes(value.downgradedFrom) ? value.downgradedFrom : null;
   if (MATERIAL_SEVERITIES.has(severity) && failurePath !== null && failurePath.length < MIN_FAILURE_PATH_CHARS) {
     downgradedFrom = severity;
     severity = 'P3';
