@@ -63,10 +63,13 @@ test('a result for a different HEAD is refused and never advances the session', 
   assert.throws(() => completeDeepReview({ session: begun, result: { summary: 'x', findings: [] }, headSha: C }), /does not match/);
 });
 
-test('more than six material findings are refused rather than silently dropped', () => {
+test('more than six findings (P3 included) are refused rather than silently dropped', () => {
   const begun = beginDeepReview({ session: readySession(), baseSha: BASE, headSha: A, now: T0 });
   const many = Array.from({ length: 7 }, (_, i) => finding('P2', { title: `Bug number ${i} in module` }));
-  assert.throws(() => completeDeepReview({ session: begun, result: { summary: 'x', findings: many }, headSha: A }), /more than 6 material/);
+  assert.throws(() => completeDeepReview({ session: begun, result: { summary: 'x', findings: many }, headSha: A }), /more than 6 findings/);
+  const p3 = [...Array.from({ length: 6 }, (_, i) => finding('P2', { title: `Bug number ${i} in module` })), finding('P3', { title: 'Seventh blocking nit here' })];
+  assert.throws(() => completeDeepReview({ session: begun, result: { summary: 'x', findings: p3 }, headSha: A }), /more than 6 findings/);
+  assert.doesNotThrow(() => completeDeepReview({ session: begun, result: { summary: 'x', findings: p3.slice(0, 6) }, headSha: A }));
 });
 
 test('failure ends in HUMAN_REQUIRED, keeps spend, and reports an error status', () => {

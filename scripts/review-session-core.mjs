@@ -474,8 +474,9 @@ export function completeDeepReview({
     summary: String(result.summary ?? '').slice(0, 4000),
     findings: ordered.slice(0, 6),
   });
-  const omitted = ordered.slice(6).filter((f) => MATERIAL_SEVERITIES.has(f?.severity)).length;
-  if (omitted > 0) throw new Error(`deep review reported more than 6 material findings (${omitted} omitted); refusing to drop blockers`);
+  // Every severity counts: a reported P3 blocks too, so nothing past the sixth may be dropped silently.
+  const omitted = ordered.slice(6).length;
+  if (omitted > 0) throw new Error(`deep review reported more than 6 findings (${omitted} omitted); refusing to drop blockers`);
   const findings = session.findings.map((finding) => ({ ...finding }));
   let nextFindingNumber = Number.isInteger(session.nextFindingNumber) ? session.nextFindingNumber : findings.length + 1;
   // Claude's material findings are never suppressed by Gemini's rejection ledger; only an
