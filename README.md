@@ -58,7 +58,7 @@ A full review is used for: a PR's first review, the review after a big or risky 
 2. Read the findings. Each one is a review thread pinned to a line.
 3. Fix a problem, push, and click **Resolve** on its thread. Once *every* blocking thread is resolved and there is a
    new commit, the verification starts by itself and only its result decides READY; a finding that is not really
-   fixed gets its thread reopened with the reason. P3 threads: Resolve closes the finding for good, no model run.
+   fixed gets its thread reopened with the reason. P3 is treated like P0-P2: it stays open, blocks READY, and is checked on re-review; the bot resolves its thread once it is verified fixed. Only an unproven claim that was demoted to P3 (no concrete failure path) is non-blocking, and Resolve closes that one for good, no model run.
 4. When everything is settled, the final full review runs by itself, and the session turns READY.
 5. The newest comment at the bottom of the PR is always the session status: **when the status changes (or a new
    HEAD gets its result) it is posted as a new comment and the old one is removed**, so you do not have to look

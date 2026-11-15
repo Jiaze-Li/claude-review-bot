@@ -39,10 +39,11 @@ test('deep review with no material findings restores READY; a P2 blocks it', () 
   assert.equal(sessionCommitStatus(bad, A).state, 'failure');
 });
 
-test('P3-only deep findings do not block READY', () => {
+test('a reported P3 deep finding blocks READY until fixed', () => {
   const begun = beginDeepReview({ session: readySession(), baseSha: BASE, headSha: A, now: T0 });
   const s = completeDeepReview({ session: begun, result: { summary: 'nit', findings: [finding('P3')] }, headSha: A });
-  assert.equal(s.status, 'READY');
+  assert.equal(s.status, 'REWORK');
+  assert.equal(s.findings.at(-1).status, 'OPEN');
 });
 
 test('a full review of a HEAD with no session of its own starts one and keeps the spend of an earlier session', () => {

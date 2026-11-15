@@ -48,6 +48,15 @@ test('material finding with a weak failurePath is demoted to non-blocking P3', (
   const s = session(r.findings);
   assert.equal(openMaterialFindings(s).length, 0);
   assert.equal(s.status, 'AUDIT_PENDING');
+  assert.equal(normalizeReviewResult({ summary: 's', findings: r.findings }).findings[0].downgradedFrom, 'P1');
+});
+
+test('a reported P3 with a concrete failure path blocks like P0-P2 until fixed', () => {
+  const r = normalizeReviewResult({ summary: 's', findings: [finding({ severity: 'P3' })] });
+  assert.equal(r.findings[0].downgradedFrom, undefined);
+  const s = session(r.findings);
+  assert.equal(s.findings[0].status, 'OPEN');
+  assert.equal(s.status, 'REWORK');
 });
 
 test('material finding with a concrete failurePath stays blocking', () => {

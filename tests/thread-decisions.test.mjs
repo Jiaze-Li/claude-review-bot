@@ -14,12 +14,12 @@ const BOT = 'jiaze-claude-review-bot';
 const f = (title, severity = 'P2') => ({ severity, title, body: 'Trigger X causes wrong result Y.', path: `${title.replace(/\W+/g, '-')}.swift`, line: 3 });
 
 function reworkSession(extra = {}, head = HEAD) {
-  const base = applyDiscoveryResult({ result: { summary: 's', findings: [f('Bug one'), f('Bug two'), f('Small nit', 'P3')] }, baseSha: BASE, headSha: head, sourceCommentId: '1' });
+  const base = applyDiscoveryResult({ result: { summary: 's', findings: [f('Bug one'), f('Bug two'), { ...f('Small nit'), failurePath: 'too short' }] }, baseSha: BASE, headSha: head, sourceCommentId: '1' });
   return { ...base, ...extra };
 }
 const byId = (session) => Object.fromEntries(session.findings.map((finding) => [finding.id, finding]));
 
-test('resolving a P3 thread closes it for good without touching the status; reopening the thread reopens it', () => {
+test('resolving a demoted (unproven) P3 thread closes it for good without touching the status; reopening the thread reopens it', () => {
   const session = reworkSession();
   const closed = applyThreadDecisions({ session, headSha: HEAD, closed: [{ id: 'F003', by: 'jiaze-li' }] });
   assert.equal(byId(closed).F003.status, 'WAIVED');
