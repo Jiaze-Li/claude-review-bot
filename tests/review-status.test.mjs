@@ -414,7 +414,8 @@ test('v2 workflow isolates provider credentials and serializes durable PR sessio
   assert.doesNotMatch(claudeBlock, /GH_TOKEN|app-token\.outputs\.token/);
   assert.match(yml, /permission-issues: read/);
   assert.match(yml, /permission-pull-requests: write/);
-  assert.doesNotMatch(yml, /permission-contents: write/);
+  // Only the best-effort thread-resolution token has Contents write (see sync-review-threads tests).
+  assert.equal((yml.match(/permission-contents: write/g) ?? []).length, 1);
   // Every full review (first, after a big change, the final one) is the sharded engine; the staged steps only
   // handle repairs and small deltas.
   assert.doesNotMatch(yml, /steps\.plan\.outputs\.mode == 'discovery'|steps\.plan\.outputs\.mode == 'audit'/);
