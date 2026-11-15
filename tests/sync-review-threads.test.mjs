@@ -193,11 +193,18 @@ test('already-resolved threads cause no mutation and no problem report', async (
   assert.deepEqual([out.resolved, out.failed, out.skipped], [0, 0, 0]);
 });
 
-test('the workflow never widens the token itself: Contents stays read-only', async () => {
+test('Contents write exists only in the thread-resolution token, used only by the two thread steps', async () => {
   const { readFileSync } = await import('node:fs');
   const yml = readFileSync(new URL('../.github/workflows/review-v2.yml', import.meta.url), 'utf8');
-  assert.doesNotMatch(yml, /permission-contents: write/);
+  // The main review token stays read-only for Contents.
   assert.match(yml, /permission-contents: read\n\s+permission-pull-requests: write\n\s+permission-issues: read/);
+  // GitHub refuses to resolve/reopen threads without Contents write, so one narrow best-effort token has it.
+  assert.equal((yml.match(/permission-contents: write/g) ?? []).length, 1);
+  const start = yml.indexOf('id: thread-token');
+  const block = yml.slice(start, yml.indexOf('- name:', start));
+  assert.match(block, /continue-on-error: true/);
+  assert.match(block, /permission-contents: write\n\s+permission-pull-requests: write/);
+  assert.equal((yml.match(/steps\.thread-token\.outputs\.token \|\| steps\.app-token\.outputs\.token/g) ?? []).length, 2);
 });
 
 test('a reply-only failure still makes the CLI step exit non-zero, like any other incomplete sync', async () => {
