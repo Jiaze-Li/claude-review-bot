@@ -6,6 +6,10 @@ import { latestSession } from './sync-commit-status.mjs';
 //
 // - A finding that is now FIXED, DISMISSED or WAIVED: its thread is resolved, so "unresolved threads" on the PR
 //   means "problems still open".
+// - Once the session is READY (nothing blocking is open on this HEAD), the threads of non-blocking findings
+//   (P3, status DEFERRED) are resolved too: a repository that requires every conversation to be resolved before
+//   merging would otherwise be blocked by threads the review itself calls harmless. They stay recorded as
+//   DEFERRED (not WAIVED: only a person's own Resolve waives a finding).
 // - After a verification run: a finding that is still open (or uncertain) but whose thread a person resolved
 //   is put back, with the reviewer's reason, because resolving it was a claim that the change fixed it and the
 //   review has just checked that claim.
@@ -27,7 +31,8 @@ export async function syncReviewThreads({ env = process.env, fetchImpl = fetch, 
   const session = await latestSession({ target, prNumber, author, token, fetchImpl });
   if (!session) return { resolved: 0, reopened: 0, failed: 0, skipped: 0, replyFailed: 0, closed: 0, permissionDenied: false, errors: [] };
   const bounce = env.REVIEW_MODE === 'verification';
-  const wantsResolved = session.findings.filter((finding) => CLOSED.has(finding.status));
+  const wantsResolved = session.findings.filter((finding) =>
+    CLOSED.has(finding.status) || (session.status === 'READY' && finding.status === 'DEFERRED'));
   const stillOpen = session.findings.filter((finding) => MATERIAL.has(finding.severity) && ['OPEN', 'UNCERTAIN'].includes(finding.status));
   if (!wantsResolved.length && !(bounce && stillOpen.length)) return { resolved: 0, reopened: 0, failed: 0, skipped: 0, replyFailed: 0, closed: 0, permissionDenied: false, errors: [] };
 

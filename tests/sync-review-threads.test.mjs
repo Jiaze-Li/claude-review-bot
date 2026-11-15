@@ -55,6 +55,29 @@ test('threads for FIXED, DISMISSED and WAIVED findings are resolved; open ones a
   assert.deepEqual([out.resolved, out.failed, out.closed], [3, 0, 3]);
 });
 
+test('once the session is READY the non-blocking (DEFERRED) threads are resolved too', async () => {
+  const sess = { ...session({ 'Fixed bug': 'FIXED', 'Minor nit': 'DEFERRED', 'Other nit': 'DEFERRED' }), status: 'READY' };
+  const gh = fakeGitHub(sess, [thread('T1', 'Fixed bug'), thread('T2', 'Minor nit'), thread('T3', 'Other nit', { resolved: true })]);
+  const out = await syncReviewThreads({ env, fetchImpl: gh.fetchImpl, log: quiet });
+  assert.deepEqual(gh.resolved.sort(), ['T1', 'T2']);
+  assert.deepEqual([out.resolved, out.failed], [2, 0]);
+});
+
+test('while the session is not READY the non-blocking threads are left alone', async () => {
+  const sess = { ...session({ 'Minor nit': 'DEFERRED', 'Open bug': 'OPEN' }), status: 'REWORK' };
+  const gh = fakeGitHub(sess, [thread('T1', 'Minor nit'), thread('T2', 'Open bug')]);
+  const out = await syncReviewThreads({ env, fetchImpl: gh.fetchImpl, log: quiet });
+  assert.deepEqual(gh.resolved, []);
+  assert.equal(out.resolved, 0);
+});
+
+test('READY never resolves the thread of a finding that is still open', async () => {
+  const sess = { ...session({ 'Minor nit': 'DEFERRED', 'Open bug': 'OPEN' }), status: 'READY' };
+  const gh = fakeGitHub(sess, [thread('T1', 'Minor nit'), thread('T2', 'Open bug')]);
+  await syncReviewThreads({ env, fetchImpl: gh.fetchImpl, log: quiet });
+  assert.deepEqual(gh.resolved, ['T1']);
+});
+
 test('only the bot\'s own marked, still-open threads are touched', async () => {
   const sess = session({ 'Fixed bug': 'FIXED' });
   const gh = fakeGitHub(sess, [
