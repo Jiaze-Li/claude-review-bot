@@ -85,6 +85,9 @@ export async function runDeepReviewCommand(command, { env = process.env, fetchIm
     // The review covered exactly the commit it was triggered on, and its findings were already posted as review
     // threads. A push that arrived meanwhile must not make the result vanish: record it against the reviewed
     // commit and mark it out of date for the newer one, which plans from it (verification of open findings).
+    // Only a moved HEAD makes the result out of date. The target branch advancing under an unchanged HEAD is not new
+    // PR evidence (the session keeps the base it was discovered on as audit metadata, see planReviewSession), and
+    // refusing to record there would again leave posted threads without a record.
     const stale = await staleMarkerIfMoved(markerArgs(ctx, fetchImpl));
     let session = completeDeepReview({
       session: state.session, result, headSha: ctx.headSha, spentUsd: usage.cost, costSource: usage.source, now,

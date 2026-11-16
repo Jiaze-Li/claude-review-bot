@@ -298,6 +298,20 @@ test('a partial review while the PR moves stays PARTIAL, never READY', async () 
   assert.equal(planReviewSession({ session: saved, baseSha: BASE, headSha: C }).mode, 'full_review');
 });
 
+test('only the base branch moving during the review still records the result, not marked out of date', async () => {
+  const gh = fakeGitHub();
+  const dir = ctxDir({ requestedMode: 'claude', decision: { mode: 'claude' }, session: readySession(), sessionCommentId: '300' }, { total_cost_usd: 0.5 });
+  const env = cenv(dir, { GITHUB_OUTPUT: path.join(dir, 'out') });
+  await runDeepReviewCommand('begin', { env, fetchImpl: gh.fetchImpl, now: T0 });
+  const baseMoved = fakeGitHub({ head: A, base: 'd'.repeat(40) });
+  fs.writeFileSync(path.join(dir, 'review.json'), JSON.stringify({ summary: 'bug', findings: [finding('P2')] }));
+  const done = await runDeepReviewCommand('finalize', { env: { ...env, REVIEW_PATH: path.join(dir, 'review.json') }, fetchImpl: baseMoved.fetchImpl, now: T0 });
+  assert.equal(done.status, 'REWORK');
+  assert.equal(done.findings.filter((f) => f.status === 'OPEN').length, 1);
+  assert.equal(done.staleFor, undefined);
+  assert.equal(done.baseSha, BASE);
+});
+
 test('if only the base branch moved, nothing newer will replace the marker, so the run fails closed', async () => {
   const baseMoved = fakeGitHub({ head: A, base: 'd'.repeat(40) });
   const begun = beginDeepReview({ session: readySession(), baseSha: BASE, headSha: A, now: T0 });
