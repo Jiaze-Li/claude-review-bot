@@ -1,5 +1,5 @@
 import { saveSessionComment } from './session-comment.mjs';
-import { REVIEW_BODY_MAX_BYTES, anchorFindings, assertPrUnmoved, escapeHtml, foldedDetails, githubJson, loadAnchors, pullUrl, requiredEnv as required, splitSummary } from './github-review-api.mjs';
+import { REVIEW_BODY_MAX_BYTES, anchorFindings, assertPrUnmoved, staleMarkerIfMoved, escapeHtml, foldedDetails, githubJson, loadAnchors, pullUrl, requiredEnv as required, splitSummary } from './github-review-api.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -68,7 +68,7 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
       session = chargeClaudeFallback(session, meta.total_cost_usd, meta.cost_source === 'reserve' ? 'reserve' : 'sdk');
   }
 
-  const sessionBody = renderSessionComment(session, { sourceCommentIds: [sourceCommentId] });
+  let sessionBody = renderSessionComment(session, { sourceCommentIds: [sourceCommentId] });
   const pendingMarker = pendingSessionMarker(session, sourceCommentId);
   const anchors = await loadAnchors({ owner, repo, prNumber, token: env.GH_TOKEN, fetchImpl });
   const newFindings = session.findings.slice(plan.session.findings.length);
@@ -157,13 +157,14 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
       body: JSON.stringify({ commit_id: headSha, event: 'COMMENT', body, comments: inline }),
     });
 
-  // A review can be attached to an older commit even if the PR moves immediately
-  // after the first preflight. Never advance durable session state until the
-  // exact target HEAD is re-proven after review publication.
-  try {
-    await assertPrUnmoved({ owner, repo, prNumber, baseSha, headSha, token: env.GH_TOKEN, fetchImpl, when: 'while publishing the review' });
-  } catch (error) {
-    throw new Error(error.message + '; stale review may exist, but durable session state was not advanced');
+  // The review is already posted as threads on the reviewed commit. A push that arrived meanwhile must not make its
+  // result vanish: record it for the reviewed commit, marked out of date for the newer one (that commit then plans
+  // from it, e.g. verifies the open findings). Nothing is ever recorded as the status of the newer HEAD.
+  const stale = await staleMarkerIfMoved({ owner, repo, prNumber, headSha, token: env.GH_TOKEN, fetchImpl });
+  if (stale) {
+    session = { ...session, ...stale };
+    sessionBody = renderSessionComment(session, { sourceCommentIds: [sourceCommentId] });
+    console.log('PR moved while publishing; recording the review for the reviewed commit, marked out of date.');
   }
 
   const sessionCommentId = await saveSessionComment({
