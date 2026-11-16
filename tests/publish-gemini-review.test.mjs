@@ -79,34 +79,58 @@ test('publisher refuses stale HEAD before any write', async () => {
 });
 
 
-test('publisher does not advance durable session if HEAD moves after review publication', async () => {
-  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'publish-gemini-race-'));
-  fs.writeFileSync(path.join(dir,'session-plan.json'),incrementalPlan());
-  const reviewPath=path.join(dir,'review.json');
-  fs.writeFileSync(reviewPath,JSON.stringify({summary:'clean',findings:[]}));
-  let prReads=0;
-  const calls=[];
-  await assert.rejects(()=>publishGeminiReview({
-    env:{
-      GH_TOKEN:'token',TARGET_REPO:'acme/project',PR_NUMBER:'7',BASE_SHA:BASE,HEAD_SHA:A,
-      SOURCE_COMMENT_ID:'99',REVIEW_PATH:reviewPath,REVIEW_CONTEXT_DIR:dir,
+async function publishWhilePrMoves(findings) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'publish-gemini-race-'));
+  fs.writeFileSync(path.join(dir, 'session-plan.json'), incrementalPlan());
+  const reviewPath = path.join(dir, 'review.json');
+  fs.writeFileSync(reviewPath, JSON.stringify({ summary: findings.length ? 'bug' : 'clean', findings }));
+  const C = 'c'.repeat(40);
+  let prReads = 0;
+  const calls = [];
+  const out = await publishGeminiReview({
+    env: {
+      GH_TOKEN: 'token', TARGET_REPO: 'acme/project', PR_NUMBER: '7', BASE_SHA: BASE, HEAD_SHA: A,
+      SOURCE_COMMENT_ID: '99', REVIEW_PATH: reviewPath, REVIEW_CONTEXT_DIR: dir,
     },
-    fetchImpl:async(url,init={})=>{
-      calls.push({url,method:init.method||'GET'});
-      if(url.endsWith('/pulls/7')){
-        prReads+=1;
-        return Response.json({base:{sha:BASE},head:{sha:prReads===1?A:'c'.repeat(40)}});
+    fetchImpl: async (url, init = {}) => {
+      calls.push({ url, method: init.method || 'GET', body: init.body ? JSON.parse(init.body) : null });
+      if (url.endsWith('/pulls/7')) {
+        prReads += 1;
+        return Response.json({ base: { sha: BASE }, head: { sha: prReads === 1 ? A : C } });
       }
-      if(url.includes('/pulls/7/files')) return Response.json([]);
-      if(url.endsWith('/pulls/7/reviews')) return Response.json({id:202});
-      if(url.endsWith('/issues/7/comments')) return Response.json({id:101});
-      assert.fail('unexpected URL '+url);
+      if (/\/compare\//.test(url)) return Response.json({ ahead_by: 3 });
+      if (url.includes('/pulls/7/files')) return Response.json([{ filename: 'a.js', patch: '@@ -0,0 +1 @@\n+bug' }]);
+      if (url.endsWith('/pulls/7/reviews')) return Response.json({ id: 202 });
+      if (url.endsWith('/issues/7/comments')) return Response.json({ id: 101 });
+      assert.fail('unexpected URL ' + url);
     },
-  }),/durable session state was not advanced/);
-  assert.equal(calls.filter(c=>c.url.endsWith('/pulls/7/reviews')).length,1);
-  assert.equal(calls.filter(c=>c.url.endsWith('/issues/7/comments')).length,0);
+  });
+  return { out, calls, C };
+}
+
+test('HEAD moving after the review was posted still records the review for the reviewed commit, marked out of date', async () => {
+  const bug = [{ severity: 'P1', title: 'Bug', body: 'Trigger X causes Y; expected Z.', path: 'a.js', line: 1, riskClass: 'state' }];
+  const { out, calls, C } = await publishWhilePrMoves(bug);
+  assert.equal(calls.filter((c) => c.url.endsWith('/pulls/7/reviews')).length, 1);
+  const saved = calls.find((c) => c.url.endsWith('/issues/7/comments'));
+  assert.ok(saved, 'the session comment is written');
+  assert.match(saved.body.body, /NOT current/);
+  assert.match(saved.body.body, /3 newer commits/);
+  assert.match(saved.body.body, /F001/);
+  assert.equal(out.session.status, 'REWORK');
+  assert.equal(out.session.lastReviewedHead, A);
+  assert.equal(out.session.staleFor, A);
+  assert.equal(out.session.staleHead, C);
+  assert.notEqual(sessionCommitStatus(out.session, C).state, 'success');
 });
 
+test('a clean review whose HEAD moved is recorded for the old commit only', async () => {
+  const { out, C } = await publishWhilePrMoves([]);
+  assert.equal(out.session.status, 'READY');
+  assert.equal(out.session.lastReviewedHead, A);
+  assert.equal(out.session.staleHead, C);
+  assert.notEqual(sessionCommitStatus(out.session, C).state, 'success');
+});
 
 test('review publication followed by session-write failure remains recoverable without processed marker', async () => {
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'publish-gemini-partial-'));

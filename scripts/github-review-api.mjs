@@ -68,6 +68,22 @@ export async function assertPrUnmoved({ owner, repo, prNumber, baseSha, headSha,
   if (pr.head?.sha !== headSha) throw new Error('PR head moved ' + when + '; refusing stale review');
 }
 
+// After a review of `headSha` was already posted: has the PR moved on? Returns the out-of-date marker for the session
+// ({ staleFor, staleHead, staleCommits }) when the head changed, else null. Used to record the result for the
+// reviewed commit instead of dropping it; the commit count is only a nicety, so null on any trouble.
+export async function staleMarkerIfMoved({ owner, repo, prNumber, headSha, token, fetchImpl }) {
+  const pr = await githubJson(pullUrl({ owner, repo, prNumber }), token, fetchImpl);
+  if (!pr.head?.sha || pr.head.sha === headSha) return null;
+  let staleCommits = null;
+  try {
+    const compare = await githubJson(`https://api.github.com/repos/${owner}/${repo}/compare/${headSha}...${pr.head.sha}`, token, fetchImpl);
+    if (Number.isInteger(compare.ahead_by) && compare.ahead_by >= 0) staleCommits = compare.ahead_by;
+  } catch {
+    // only a nicety for the comment
+  }
+  return { staleFor: headSha, staleHead: pr.head.sha, staleCommits };
+}
+
 export async function loadAnchors({ owner, repo, prNumber, token, fetchImpl }) {
   const anchors = new Map();
   for (let page = 1; page <= 100; page += 1) {
