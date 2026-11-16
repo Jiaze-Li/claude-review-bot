@@ -255,6 +255,49 @@ test('if the PR moved, begin refuses; fail keeps the interrupted run but marks i
   assert.notEqual(planReviewSession({ session: saved, baseSha: BASE, headSha: C }).mode, 'noop_waiting');
 });
 
+async function finalizeWhilePrMoves(review) {
+  const gh = fakeGitHub();
+  const dir = ctxDir({ requestedMode: 'claude', decision: { mode: 'claude' }, session: readySession(), sessionCommentId: '300' }, { total_cost_usd: 0.5 });
+  const env = cenv(dir, { GITHUB_OUTPUT: path.join(dir, 'out') });
+  await runDeepReviewCommand('begin', { env, fetchImpl: gh.fetchImpl, now: T0 });
+  const moved = fakeGitHub({ head: C });
+  fs.writeFileSync(path.join(dir, 'review.json'), JSON.stringify(review));
+  const done = await runDeepReviewCommand('finalize', { env: { ...env, REVIEW_PATH: path.join(dir, 'review.json') }, fetchImpl: moved.fetchImpl, now: T0 });
+  return { done, moved, saved: parseSessionComment(moved.writes.find((w) => w.body?.body)?.body.body) };
+}
+
+test('a push during the review still records its findings for the reviewed commit, marked out of date', async () => {
+  const { done, saved } = await finalizeWhilePrMoves({ summary: 'bug', findings: [finding('P2')] });
+  assert.equal(done.status, 'REWORK');
+  assert.equal(saved.status, 'REWORK');
+  assert.equal(saved.lastReviewedHead, A);
+  assert.equal(saved.findings.filter((f) => f.status === 'OPEN').length, 1);
+  assert.equal(saved.staleFor, A);
+  assert.equal(saved.staleHead, C);
+  assert.equal(saved.staleCommits, 2);
+  // The newer commit verifies the recorded finding instead of starting over, and is never green by itself.
+  assert.equal(planReviewSession({ session: saved, baseSha: BASE, headSha: C }).mode, 'verification');
+  assert.notEqual(sessionCommitStatus(saved, C).state, 'success');
+});
+
+test('a clean review of the reviewed commit is recorded as READY for that commit only', async () => {
+  const { saved, moved } = await finalizeWhilePrMoves({ summary: 'fine', findings: [] });
+  assert.equal(saved.status, 'READY');
+  assert.equal(saved.staleFor, A);
+  assert.match(moved.writes.find((w) => w.body?.body).body.body, /NOT current/);
+  assert.equal(sessionCommitStatus(saved, A).state, 'success');
+  assert.notEqual(sessionCommitStatus(saved, C).state, 'success');
+  assert.equal(planReviewSession({ session: saved, baseSha: BASE, headSha: C }).mode, 'incremental_candidate');
+});
+
+test('a partial review while the PR moves stays PARTIAL, never READY', async () => {
+  const { saved } = await finalizeWhilePrMoves({ summary: 'ran out', findings: [], coverage: { complete: false, unreviewedPaths: ['ui/Layout.swift'] } });
+  assert.equal(saved.status, 'PARTIAL');
+  assert.deepEqual(saved.coverage.unreviewedPaths, ['ui/Layout.swift']);
+  assert.equal(saved.staleHead, C);
+  assert.equal(planReviewSession({ session: saved, baseSha: BASE, headSha: C }).mode, 'full_review');
+});
+
 test('if only the base branch moved, nothing newer will replace the marker, so the run fails closed', async () => {
   const baseMoved = fakeGitHub({ head: A, base: 'd'.repeat(40) });
   const begun = beginDeepReview({ session: readySession(), baseSha: BASE, headSha: A, now: T0 });

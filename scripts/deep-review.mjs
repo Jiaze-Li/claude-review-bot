@@ -81,10 +81,17 @@ export async function runDeepReviewCommand(command, { env = process.env, fetchIm
     const state = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
     const result = JSON.parse(fs.readFileSync(required(env, 'REVIEW_PATH'), 'utf8'));
     const usage = readUsage(ctx.contextRoot, allottedBudget(env));
-    await assertHeadUnmoved(ctx, fetchImpl);
-    const session = completeDeepReview({
+    // The review covered exactly the commit it was triggered on, and its findings were already posted as review
+    // threads. A push that arrived meanwhile must not make the result vanish: record it against the reviewed
+    // commit and mark it out of date for the newer one, which plans from it (verification of open findings).
+    const newerHead = await movedHead(ctx, fetchImpl);
+    let session = completeDeepReview({
       session: state.session, result, headSha: ctx.headSha, spentUsd: usage.cost, costSource: usage.source, now,
     });
+    if (newerHead) {
+      session = { ...session, staleFor: ctx.headSha, staleHead: newerHead, staleCommits: await commitsAhead(ctx, newerHead, fetchImpl) };
+      console.log('PR moved during the review; recording the result for the reviewed commit, marked out of date.');
+    }
     const savedId = await upsertSession(ctx, session, [ctx.sourceCommentId], fetchImpl, state.sessionCommentId, state.session);
     fs.writeFileSync(stateFile, JSON.stringify({ session, sessionCommentId: savedId }) + '\n', { mode: 0o600 });
     console.log(`Deep review merged into session; status ${session.status}.`);
@@ -116,13 +123,7 @@ export async function runDeepReviewCommand(command, { env = process.env, fetchIm
     // claiming a review is running: record the usual out-of-date mark and change nothing else.
     const pr = await github(`https://api.github.com/repos/${ctx.target}/pulls/${ctx.prNumber}`, ctx.token, fetchImpl);
     if (pr.head?.sha && pr.head.sha !== ctx.headSha) {
-      let commits = null;
-      try {
-        const compare = await github(`https://api.github.com/repos/${ctx.target}/compare/${ctx.headSha}...${pr.head.sha}`, ctx.token, fetchImpl);
-        if (Number.isInteger(compare.ahead_by) && compare.ahead_by >= 0) commits = compare.ahead_by;
-      } catch {
-        // the count is only a nicety for the comment
-      }
+      const commits = await commitsAhead(ctx, pr.head.sha, fetchImpl);
       const marked = { ...session, staleFor: session.lastReviewedHead, staleHead: pr.head.sha, staleCommits: commits };
       await upsertSession(ctx, marked, [ctx.sourceCommentId], fetchImpl, commentId, session);
       console.log('PR moved; marked the interrupted deep review as out of date for the newer commit.');
@@ -177,6 +178,23 @@ function allottedBudget(env) {
 async function headUnmoved(ctx, fetchImpl) {
   const pr = await github(`https://api.github.com/repos/${ctx.target}/pulls/${ctx.prNumber}`, ctx.token, fetchImpl);
   return pr.base?.sha === ctx.baseSha && pr.head?.sha === ctx.headSha;
+}
+
+// The PR's current HEAD when it is no longer the reviewed one, else null.
+async function movedHead(ctx, fetchImpl) {
+  const pr = await github(`https://api.github.com/repos/${ctx.target}/pulls/${ctx.prNumber}`, ctx.token, fetchImpl);
+  return pr.head?.sha && pr.head.sha !== ctx.headSha ? pr.head.sha : null;
+}
+
+// How many commits the PR is ahead of the reviewed one; only a nicety for the comment, so null on any trouble.
+async function commitsAhead(ctx, newHead, fetchImpl) {
+  try {
+    const compare = await github(`https://api.github.com/repos/${ctx.target}/compare/${ctx.headSha}...${newHead}`, ctx.token, fetchImpl);
+    if (Number.isInteger(compare.ahead_by) && compare.ahead_by >= 0) return compare.ahead_by;
+  } catch {
+    // ignore
+  }
+  return null;
 }
 
 async function assertHeadUnmoved(ctx, fetchImpl) {
