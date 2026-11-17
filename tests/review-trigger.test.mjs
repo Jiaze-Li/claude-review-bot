@@ -159,7 +159,7 @@ function fakeGithub(t, {
     else if (pathname === '/repos/acme/project/issues/7/comments') out = processedNoop
       ? [{ user: { login: 'jiaze-claude-review-bot[bot]' }, body: `<!-- jiaze-review-source-comment:${duplicateMarkerId} -->` }]
       : [];
-    else if (pathname === '/repos/Jiaze-Li/review-bot/installation') out = { id: 11 };
+    else if (pathname === '/repos/Jiaze-Li/pr-bot/installation') out = { id: 11 };
     else assert.fail(`Unexpected GitHub endpoint: ${method} ${pathname}`);
     return Response.json(out);
   });
@@ -394,13 +394,13 @@ test('the Worker control-repository setting and its code fallback name the same 
   const toml = fs.readFileSync(new URL('../worker/wrangler.toml', import.meta.url), 'utf8');
   const source = fs.readFileSync(new URL('../worker/src/index.js', import.meta.url), 'utf8');
   const { configured, fallback } = controlRepoValues(toml, source);
-  assert.equal(configured, 'Jiaze-Li/review-bot');
+  assert.equal(configured, 'Jiaze-Li/pr-bot');
   assert.equal(fallback, configured);
 
   // The same comparison must fail when either side drifts back to the old name.
-  const driftedSource = controlRepoValues(toml, source.replace(`|| '${fallback}'`, "|| 'Jiaze-Li/claude-review-bot'"));
+  const driftedSource = controlRepoValues(toml, source.replace(`|| '${fallback}'`, "|| 'Jiaze-Li/review-bot'"));
   assert.throws(() => assert.equal(driftedSource.fallback, driftedSource.configured));
-  const driftedToml = controlRepoValues(toml.replace(configured, 'Jiaze-Li/claude-review-bot'), source);
+  const driftedToml = controlRepoValues(toml.replace(configured, 'Jiaze-Li/review-bot'), source);
   assert.throws(() => assert.equal(driftedToml.fallback, driftedToml.configured));
 });
 
