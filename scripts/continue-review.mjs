@@ -1,4 +1,6 @@
+import fs from 'node:fs';
 import { pathToFileURL } from 'node:url';
+import { currentCoverage } from './review-session-core.mjs';
 import { latestSession } from './sync-commit-status.mjs';
 
 // A review that is not finished when a run ends continues by itself: the next run is started on the same HEAD,
@@ -34,6 +36,19 @@ export function nextChainId(sourceCommentId, runId) {
   return `8${chainIndex(sourceCommentId) + 1}${run}`;
 }
 
+// What the session comment says about the final review, from the very same decision that starts it.
+// -> { startsByItself: boolean, reason }
+export function finalReviewOutlook(input) {
+  const decision = decideContinuation(input);
+  return { startsByItself: decision.continue, reason: decision.continue ? decision.reason : explainNoContinuation(decision.reason) };
+}
+
+function explainNoContinuation(reason) {
+  if (reason === 'continuation limit reached') return `it already continued by itself ${MAX_CONTINUATIONS} times in a row`;
+  if (reason === 'nothing left to continue') return 'this run did not leave a review to continue automatically';
+  return reason;
+}
+
 // -> { continue: boolean, reason }
 export function decideContinuation({ session, headSha, sourceCommentId, planMode }) {
   if (!session || session.lastReviewedHead !== headSha) return { continue: false, reason: 'no review of this HEAD to continue' };
@@ -43,7 +58,7 @@ export function decideContinuation({ session, headSha, sourceCommentId, planMode
   }
   // Only a run that did review work leads straight into the final review; a bookkeeping run (a closed P3 thread,
   // an override) does not start paid work on its own.
-  if (session.status === 'AUDIT_PENDING' && !session.coverage && REVIEW_WORK.has(planMode)) {
+  if (session.status === 'AUDIT_PENDING' && !currentCoverage(session) && REVIEW_WORK.has(planMode)) {
     return { continue: true, reason: 'only the final full review is left' };
   }
   return { continue: false, reason: 'nothing left to continue' };
@@ -58,9 +73,11 @@ export async function continueReview({ env = process.env, fetchImpl = fetch, log
   const decision = decideContinuation({
     session, headSha, sourceCommentId, planMode: env.REVIEW_MODE,
   });
-  if (!decision.continue) { log.log?.(`No continuation: ${decision.reason}.`); return decision; }
+  if (!decision.continue) { log.log?.(`No continuation: ${decision.reason}.`); return { ...decision, dispatched: false }; }
   const next = nextChainId(sourceCommentId, env.GITHUB_RUN_ID);
-  const response = await fetchImpl(`https://api.github.com/repos/${need('GITHUB_REPOSITORY')}/actions/workflows/review-v2.yml/dispatches`, {
+  let response;
+  try {
+    response = await fetchImpl(`https://api.github.com/repos/${need('GITHUB_REPOSITORY')}/actions/workflows/review-v2.yml/dispatches`, {
     method: 'POST',
     headers: { Accept: 'application/vnd.github+json', Authorization: `Bearer ${need('DISPATCH_TOKEN')}`, 'Content-Type': 'application/json', 'X-GitHub-Api-Version': '2022-11-28', 'User-Agent': 'jiaze-review-bot' },
     body: JSON.stringify({
@@ -75,14 +92,29 @@ export async function continueReview({ env = process.env, fetchImpl = fetch, log
     }),
     signal: AbortSignal.timeout(15000),
   });
-  if (!response.ok) throw new Error(`Could not start the next review run (HTTP ${response.status})`);
+  } catch (error) {
+    return failedDispatch(decision, `network error: ${error.message}`, log);
+  }
+  if (!response.ok) return failedDispatch(decision, `HTTP ${response.status}`, log);
   log.log?.(`Continuing in another run (${decision.reason}); trigger ${next}.`);
-  return { ...decision, next };
+  return { ...decision, next, dispatched: true };
+}
+
+// Best effort: a failed dispatch must not fail the run, but it must never be silent either.
+function failedDispatch(decision, why, log) {
+  log.log?.(`::warning::Could not start the next review run (${why}); comment @gemini review to continue by hand.`);
+  return { continue: true, reason: decision.reason, dispatched: false, failure: why };
+}
+
+// The status mirror reads this to say whether the final review really is on its way.
+function publishOutcome(result, env = process.env) {
+  if (!env.GITHUB_OUTPUT) return;
+  fs.appendFileSync(env.GITHUB_OUTPUT, `dispatched=${result.dispatched === true}\n`);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   try {
-    await continueReview();
+    publishOutcome(await continueReview());
   } catch (error) {
     console.error(error.message);
     process.exitCode = 1;

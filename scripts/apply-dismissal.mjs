@@ -1,4 +1,5 @@
 import { saveSessionComment } from './session-comment.mjs';
+import { finalReviewOutlook } from './continue-review.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -61,7 +62,7 @@ export async function applyManualDismissal({ env = process.env, fetchImpl = fetc
     reason: decision.reason, evidence: decision.evidence, sourceCommentId: sourceId,
   });
   await proveHead();
-  const body = renderSessionComment(session, { sourceCommentIds: [sourceId] });
+  const body = renderSessionComment(session, { sourceCommentIds: [sourceId], finalReview: finalReviewOutlook({ session, headSha, sourceCommentId: env.SOURCE_COMMENT_ID, planMode: 'dismiss' }) });
   const savedId = await saveSessionComment({
     target: repo, prNumber, token: env.GH_TOKEN, fetchImpl, existingId: plan.sessionCommentId, previous: durable, session, body,
   });

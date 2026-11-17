@@ -584,6 +584,7 @@ jobs:
         run: node scripts/sync-review-threads.mjs
 
       - name: Continue a big review in the next run
+        id: continue
         if: always() && steps.dedupe.outputs.duplicate != 'true' && job.status == 'success' && inputs.source_kind != '' && steps.plan.outputs.mode != 'noop_waiting'
         continue-on-error: true # best effort: the next run can always be started by hand
         env:
@@ -646,4 +647,5 @@ jobs:
           STATUS_STRICT: ${{ vars.REQUIRE_STATUS_CHECK }}
           DEEP_REVIEW_ATTEMPTED: ${{ steps.begin-deep.outcome != 'skipped' && steps.begin-deep.outcome != '' }}
           JOB_FAILED: ${{ job.status == 'failure' || job.status == 'cancelled' }}
+          FINAL_REVIEW_DISPATCHED: ${{ steps.continue.outputs.dispatched }}
         run: node scripts/sync-commit-status.mjs

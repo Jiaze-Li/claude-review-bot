@@ -68,3 +68,7 @@ Furthermore, within a single `review-v2.yml` run:
      - They execute sequentially in the exact same runner job. Step 580 only begins after step 451 has fully finished.
      - `publishGeminiReview` from a second run cannot execute concurrently because the second run is serialized by the per-PR concurrency group.
   2. **Stale Snapshot Claim**: `recordSessionMarker` immediately executes `GET /issues/comments/${id}` and parses `currentSession = parseSessionComment(data?.body)`. It never uses pre-run snapshots (such as `session-plan.json`), and it fails closed if the comment is corrupted or unreadable.
+
+## 4. RB-AUDIT-CONTINUE-01 — no new writer
+
+The final-review continuation fix adds **no** session-comment writer and no session field. The existing writers that already render the comment (`publish-gemini-review`, `apply-dismissal`) only pass an extra render input computed by the same pure decision the continue step uses. The continue step still writes nothing to the session: it only reports `dispatched=true|false` as a step output, which the commit-status mirror reads.

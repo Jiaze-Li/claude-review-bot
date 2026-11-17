@@ -1,4 +1,5 @@
 import { saveSessionComment } from './session-comment.mjs';
+import { finalReviewOutlook } from './continue-review.mjs';
 import { REVIEW_BODY_MAX_BYTES, anchorFindings, assertPrUnmoved, staleMarkerIfMoved, escapeHtml, foldedDetails, githubJson, loadAnchors, pullUrl, requiredEnv as required, splitSummary } from './github-review-api.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -68,7 +69,7 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
       session = chargeClaudeFallback(session, meta.total_cost_usd, meta.cost_source === 'reserve' ? 'reserve' : 'sdk');
   }
 
-  let sessionBody = renderSessionComment(session, { sourceCommentIds: [sourceCommentId] });
+  let sessionBody = renderSessionComment(session, { sourceCommentIds: [sourceCommentId], finalReview: finalReviewOutlook({ session, headSha, sourceCommentId, planMode: mode }) });
   const pendingMarker = pendingSessionMarker(session, sourceCommentId);
   const anchors = await loadAnchors({ owner, repo, prNumber, token: env.GH_TOKEN, fetchImpl });
   const newFindings = session.findings.slice(plan.session.findings.length);
@@ -163,7 +164,7 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
   const stale = await staleMarkerIfMoved({ owner, repo, prNumber, headSha, token: env.GH_TOKEN, fetchImpl });
   if (stale) {
     session = { ...session, ...stale };
-    sessionBody = renderSessionComment(session, { sourceCommentIds: [sourceCommentId] });
+    sessionBody = renderSessionComment(session, { sourceCommentIds: [sourceCommentId], finalReview: finalReviewOutlook({ session, headSha, sourceCommentId, planMode: mode }) });
     console.log('PR moved while publishing; recording the review for the reviewed commit, marked out of date.');
   }
 
