@@ -1,135 +1,47 @@
 # Plan — RB-CONVERGENCE-01：PR 机器人顶层收敛、P3 规则对齐与改名 `pr-bot`
 
-- **状态**：Plan v1.0（已落盘，等待用户说 Design）
-- **任务仓库**：`Jiaze-Li/review-bot`（目标改名 `Jiaze-Li/pr-bot`），基线 `main` = `e8128cd99794bd8be8d558f5fa008b1cebc08135`
-- **policy_sha**：`7f01e5a3ff53ed13ba763d684a098c0989425ec4`
+- **状态**：Plan v1.0（等待 Design 审查） · **仓库**：`Jiaze-Li/review-bot`（目标 `Jiaze-Li/pr-bot`），基线 `main` = `e8128cd99794bd8be8d558f5fa008b1cebc08135` · **policy_sha**：`7f01e5a3ff53ed13ba763d684a098c0989425ec4`
 
----
-
-## 1. 要解决的真实问题（已核实背景）
-
-近期针对具体故障连续打了十余个局部补丁（改写历史恢复、终审接力、孤儿评论对账、P3 升级为阻塞、推送过期标记等）。每次补丁都为了不动既有状态机而在外围叠加逻辑，导致当前系统存在 4 处真实问题：
+## 1. 要解决的真实问题与已核实源码摘录（已内联关键代码，无需额外读取大体积脚本）
 
 1. **P3 阻塞规则前后不一致（现存卡死漏洞）**：
-   - 最近将模型直接报告的 P3 改成了“与 P0–P2 一样保持开启并阻塞，直到修好并经复查确认”，但评论区线程认领检查与复查后自动重开线程的逻辑仍只认 P0–P2。
-   - 后果：① 当 PR 上只剩原发 P3 时，开发者修完推代码并在评论区点 Resolve，机器人认为“没有阻塞问题被认领”，既不触发复查、也不关闭该 P3，流程直接卡死；② 当原发 P3 与 P0–P2 并存时，只要解决了 P0–P2 就会提前触发复查，且若复查判定 P3 仍未修好，被手动点掉的 P3 线程不会被重新打开；③ 增量与验证审查的提示词仍在告诉模型“拿不准具体故障路径就报 P3，P3 不阻塞”，模型按提示词报出 P3 后反而被宿主当成阻塞项拦住。
-2. **跨状态流转的旧临时状态残留**：
-   - 会话流转时直接展开旧会话对象，未清理属于上一次运行或旧提交的临时状态。例如模型不可用停在需人工判断后，若仓库写权限者执行人工放行（Override），会话顶部变成 `READY`，但旧的失败记录仍留在会话里，导致评论底部下一步提示和中断栏仍在说“审查未完成，请重试”。
-3. **跨提交清空问题账本与“爬评论区认领孤儿”自相矛盾，且规划流程碎片化**：
-   - 当会话在部分覆盖（PARTIAL）或待终审（AUDIT_PENDING）等状态收到新提交并启动全量审查时，新建会话会主动丢弃已有的未解决（OPEN）和已结案（FIXED 等）问题记录，只保留待确认项。这导致机器人自己发过的评论线程仍在 GitHub 上，账本却失忆了，直接制造出“孤儿线程”。
-   - 随后为了弥补账本失忆，又在规划脚本末尾外挂了一套“抓评论区 Markdown 正则反推问题并重新领养”的补丁，且该补丁仅在自动验证或待终审时才领养，落入全量或增量审查时依然只汇报不核实、永远关不掉。
-   - 同时，规划阶段被拆成“核心状态机决策 → 改写历史后置改写 → 增量拆分 → 孤儿领养后置改写”多段拼装，后置步骤直接推翻前置结论并改写本地差异文件，边界复杂且易互相踩脚。
-4. **名称与本地工具链撞车，且根目录留有历史改名临时文档**：
-   - 当前仓库名 `review-bot` 与本地审查工具 `ReviewLoop` 过于相似，未能体现其“GitHub PR 全生命周期守门人”的真实职责；且仓库根目录还残留着上一次改名任务的临时 `Plan.md` 与 `Design.md`。
+   - `scripts/review-session-core.mjs:2-7`：`const MATERIAL_SEVERITIES = new Set(['P0', 'P1', 'P2']); function isBlocking(finding) { return MATERIAL_SEVERITIES.has(finding?.severity) || (finding?.severity === 'P3' && !finding.downgradedFrom); }`（原发 P3 状态为 `OPEN` 且阻塞，缺少 30 字符 `failurePath` 的降级项带 `downgradedFrom` 为 `DEFERRED`；但 `isBlocking` 未导出，且 `:1074` 仅对 `MATERIAL_SEVERITIES` 判 `failurePath` 降级）。
+   - `scripts/review-threads.mjs:15,82`（`blockingClaims`）与 `scripts/sync-review-threads.mjs:15,31`（`stillOpen`）仍各自写死 `const MATERIAL = new Set(['P0', 'P1', 'P2']);` 并用 `MATERIAL.has(finding.severity)` 过滤。导致仅剩原发 P3 时点 Resolve 不触发复查也不关闭（`apply-thread-resolutions.mjs:52` 只关 `DEFERRED`），复查未过也不重开 P3 线程。
+   - `scripts/run-gemini-review.mjs:52-53` 提示词仍写 `"A P0/P1/P2 without a concrete failurePath is automatically demoted to non-blocking P3, so use P3 when you cannot name one.\nP3 is non-blocking and should be rare."`，与阻塞规则直接矛盾。
+2. **跨状态/跨提交的旧临时状态残留**：
+   - `scripts/review-session-core.mjs:786-812`（`applyOverride`）返回 `{ ...session, status: 'READY', ... }` 时未清除 `reviewFailure`、`coverage`、`deepReview`、`staleFor`/`staleHead`/`staleCommits`；而 `renderSessionComment`（`:919,974`）优先于 `READY` 判断 `session.reviewFailure`，导致 Override 后顶部显示 `READY`，底部却显示 `Review stopped` 和重试提示。`applyVerificationResult`（`:302`）、`applyIncrementalResult`（`:226`）、`completeDeepReview`（`:521`）换提交时也未统一清理旧提交的上述临时字段。
+3. **跨提交清空问题账本自造“孤儿线程”，且规划器尾部碎片化**：
+   - `scripts/review-session-core.mjs:396-438`（`seedSession` / `beginDeepReview`）：当 `!session || session.lastReviewedHead !== headSha` 时，只携带 `unresolvedMaterialFindings`（及 `carryOpen` 时的 `openMaterialFindings`），丢弃了所有已结案记录（`FIXED`/`DISMISSED`/`WAIVED`/`DEFERRED`）与 `previous.dismissed`，導致 `findOrphanBotThreads`（`review-threads.mjs:162`）把历史线程误判为孤儿；同时同 HEAD 下发 `reset review` 因 `lastReviewedHead === headSha` 根本未调 `seedSession` 清空旧问题。
+   - `scripts/plan-review-session.mjs:385-406` 在 CLI 尾部串联 `planSession`、`resolveVerificationScope`、`prepareIncrementalDelta`、`reconcileOrphanThreads`，缺少统一导出入口。
+4. **命名与无用历史文件清理**：
+   - `worker/wrangler.toml:6`（`CONTROL_REPO = "Jiaze-Li/review-bot"`）、`worker/src/index.js:145`（`|| 'Jiaze-Li/review-bot'`）、`package.json:2`、`README.md:1`、`scripts/notification-policy.mjs:2` 及测试需改为 `Jiaze-Li/pr-bot` / `pr-bot`。
+   - 根目录 `Plan.md`、`Design.md`（PR #87 遗留）及 4 个冻结无引用的试验脚本（`scripts/spike-gptwb-fixer.mjs`、`scripts/spike-gptwb-fixer-stage2.mjs`、`scripts/patch-gptwb-idempotency.mjs`、`scripts/test-gptwb-idempotency.mjs`）和 `docs/fixer-spike-status.md` 需清理删除。
 
----
+## 2. 谁用与失败代价
+- 仓库维护者及所有接入该 App 的 PR。失败会导致 P3 点 Resolve 卡死、Override 后提示矛盾、换提交丢失问题或已修好线程关不掉。坚持 fail-closed，绝不把未核实改动标为 `READY`。
 
-## 2. 谁用，失败一次的代价
+## 3. 目标（同一任务内按 3 个有序阶段完成）
+- **阶段 1（修 P3 与残留状态）**：导出唯一阻塞判定并在会话、线程认领、线程重开中统一使用；修正增量/验证 P3 提示词并对无有效 `failurePath` 的 P3 同样降级为 `DEFERRED`；在 Override 及换提交状态流转中清除旧 `reviewFailure`、`staleFor`/`staleHead`/`staleCommits`、过期 `coverage` 与 `deepReview`。
+- **阶段 2（持久账本与规划收口）**：非 `reset` 跨提交启动全量审查时保留已结案记录、驳回账本、未决阻塞记录与累计花费，不再自造孤儿线程且不重复发帖；显式 `reset`（含同 HEAD）清空问题与驳回账本但保留累计花费；规划器收口为统一导出函数 `runSessionPlanner`。
+- **阶段 3（改名 `pr-bot` 与清理无用文件）**：控制仓库配置、回退值、文档、包名与测试统一改为 `Jiaze-Li/pr-bot` / `pr-bot`；删除根目录旧 `Plan.md`、`Design.md` 及上述 5 个 `gptwb` 试验文件。
 
-- **使用者**：仓库维护者及所有安装该 GitHub App 的仓库 PR。
-- **失败代价**：修完 P3 点 Resolve 后审查无响应卡死；人工放行后评论提示自相矛盾；换提交后旧问题被静默遗忘（漏放行真缺陷）或已修好的旧线程永远关不掉；名称混淆增加日常维护心智负担。
-- **基本原则**：宁可停下明确告知原因（fail-closed），绝不把未核实的改动标为通过（READY）。
+## 4. 非目标与硬性约束
+- **三个外部标识绝不改动**：GitHub App 名与 `@jiaze-claude-review-bot`/`@gemini`/`@claude` 命令、Worker 服务名 `claude-review-bot` 与 URL、提交状态名 `claude-review-bot/review`。
+- **不改上限与权威**：$6/$5 预算、模型、20 分片、2 轮验证、3 次接力、64 条问题与 24 KB 编码上限、READY 与问题关闭权威、`v1` 会话兼容性、并发写入边界均不变；不碰非机器人手写评论。
+- **外部动作后置**：Code 阶段不改 GitHub 远端仓库名、不触发线上部署、不改本机目录名、不跑付费真实 PR 复测。
 
----
+## 5. 可观察的验收条件（AC1–AC9）
+- **AC1**：存在未解决原发 P3 时，必须所有阻塞问题（含原发 P3）线程被写权限者点 Resolve 且有新提交才触发验证；验证后仍未修好的原发 P3 自动重开线程并回复原因；降级 P3（`DEFERRED`）点 Resolve 仍直接记 `WAIVED`（零花费）。
+- **AC2**：增量、验证与全量提示词一致要求 P0–P3 给出具体 `failurePath`，不再写“P3 不阻塞”；带过短 `failurePath` 的 P3 降级为 `DEFERRED`。
+- **AC3**：对失败会话执行 `override review` 或换提交审查后，不再残留旧 `reviewFailure`、旧 `staleFor`、旧 `coverage` 或旧 `deepReview`。
+- **AC4**：非 `reset` 跨提交启动全量审查保留历史已结案问题、驳回账本、未决阻塞问题与花费，不再自造孤儿线程，且不对已开启/待确认或已驳回的同路径+同标题问题重复入账。
+- **AC5**：跨提交保留的未解决阻塞问题未经验证 `FIXED`（或人工 `dismiss`/`override`）持续阻挡 `READY`；显式 `reset review`（含同 HEAD）清空问题从零开始并保留花费。
+- **AC6**：规划器 `runSessionPlanner` 统一串联规划步骤，普通修复、改写历史、增量、孤儿保底对账、自动接力零回归。
+- **AC7**：`worker/wrangler.toml` 与 `worker/src/index.js` 一致为 `Jiaze-Li/pr-bot`（有防漂移测试），`package.json`、`README.md` 及测试更新为 `pr-bot`，7 个历史临时/试验文件已删除，三个外部标识不变。
+- **AC8**：仓库与 `worker/` 自动化测试及 `node --check` 全部通过。
+- **AC9（合并后外部关口，不在 Code 内）**：合并后经用户确认执行 GitHub 仓库改名、Worker 部署验证与本机目录改名。
 
-## 3. 目标（在一个任务内按 3 个有序阶段完成）
-
-### 阶段 1：修好 P3 规则不一致与旧状态残留
-- **G1.1** 全链路统一“阻塞问题”的判定口径：会话状态、评论区点 Resolve 触发复查、复查未通过自动重开线程、以及异常携带上限检查，全部使用同一阻塞判定规则（P0–P2 及非降级原发 P3 均为阻塞；仅因缺少具体故障路径从 P0–P2 降级的条目为非阻塞建议项）。
-- **G1.2** 统一模型提示词中对 P3 的说明：明确 P3 是具体、可复现的轻微缺陷且同样阻塞至修好，不再诱导模型把缺乏具体故障路径的猜测报成 P3。
-- **G1.3** 清理状态切换后的残留提示：人工放行（Override）或正常恢复后，清除旧的运行失败记录与过期标记，确保评论顶部状态与底部“下一步”提示完全一致。
-
-### 阶段 2：顶层架构瘦身（PR 持久账本与当前提交快照分离 + 规划收口）
-- **G2.1** 问题账本跨提交常驻：只要用户未显式发出 `reset review`，PR 会话中的问题账本（含未解决、待确认、已修好、已驳回、已豁免记录）与累计花费跨提交持续保留，不再因换提交启动全量审查而把旧问题丢弃，从根源上不再自造“孤儿线程”。
-- **G2.2** 临时状态随提交或结案自动清零：属于单次提交或单次运行的临时状态（部分覆盖文件清单、单次失败原因、推送过期标记等）在换提交或人工放行时自动归零，不再靠读取侧打补丁遮掩。
-- **G2.3** 规划器收口为单入口清晰流水线：将“提交关系判定（原地 / 普通追加 / 历史改写）→ 账本待核实问题盘点（含历史遗留孤儿线程保底对账）→ 本轮运行模式确定”收拢为统一的规划流程，消除尾部多重覆写。
-
-### 阶段 3：代码与配置改名 `pr-bot` 及清理历史临时文档
-- **G3.1** 将仓库内运行时控制仓库配置、回退值、说明文档、包描述与测试中的仓库名从 `Jiaze-Li/review-bot` 统一更新为 `Jiaze-Li/pr-bot`，并用自动化测试守护配置与回退值一致。
-- **G3.2** 清理仓库根目录遗留的旧改名临时文档（`Plan.md`、`Design.md`）以及早期已冻结停用的 4 个网页桥接修复试验脚本（`scripts/spike-gptwb-fixer.mjs`、`scripts/spike-gptwb-fixer-stage2.mjs`、`scripts/patch-gptwb-idempotency.mjs`、`scripts/test-gptwb-idempotency.mjs`）与说明文档（`docs/fixer-spike-status.md`），保持仓库结构整洁。
-- **G3.3** 代码全部验证通过并经用户最终确认后，完成 GitHub 远端仓库改名 `Jiaze-Li/pr-bot`、Worker 部署验证，最后顺手修改本机文件夹名称。
-
----
-
-## 4. 明确不做什么（非目标）
-
-- **不改三个外部固定对接标识**：
-  1. GitHub App 身份及触发命令（`@jiaze-claude-review-bot ...`、`@gemini ...`、`@claude ...`）；
-  2. Cloudflare Worker 服务名（`claude-review-bot`）与 Webhook URL；
-  3. GitHub 必选提交状态检查上下文名（`claude-review-bot/review`）。
-- **不改预算与运行上限**：$6 自动累计上限、$5 手动单次上限、模型选择、20 片分片上限、2 轮验证上限、3 次自动接力上限均保持不变。
-- **不放松 READY 与问题关闭权威**：任何阻塞问题仍须经验证显式判定 `FIXED`、或由写权限者凭证据 `dismiss`、或由写权限者 `override` 才算结案；不能靠新审查未提及而静默关闭。
-- **不碰非机器人评论**：用户或其他人手写的评论与线程一律不读取正文、不修改、不关闭。
-- **不在本仓库任务内直接修改其他仓库代码**（如 `ReviewLoop` 仓库的文档链接更新需单独处理或授权）。
-
----
-
-## 5. 硬性边界约束
-
-- **C1 向前与向后兼容**：现有已发布在 PR 上的 `v1` 会话评论必须无需迁移即可被正常解析；状态编码 24 KB 上限与最多 64 条问题上限保持有效。
-- **C2 不新增并发写入源**：保持现有受并发组保护的会话写入边界，不引入新的会话竞争写入者。
-- **C3 外部动作后置关口**：在阶段 1–3 的本地代码开发与本地审查期间，不得擅自调用 GitHub 接口改仓库名、不得触发线上部署、不得在会话进行中重命名本机工作目录（`/Users/jack/Downloads/scripts/review-bot`），以免弄断当前工具链与工作目录绑定。
-
----
-
-## 6. 可观察的验收条件（AC）
-
-- **AC1（P3 线程联动一致）**：
-  - 当会话存在未解决的原发 P3（无论是否同时存在 P0–P2），必须所有未解决阻塞问题（含原发 P3）的线程均被有写权限的人点 Resolve 且有新提交时，才触发自动验证；只解决 P0–P2 而留下原发 P3 未解决时不会提前触发验证；只剩原发 P3 且全部被点 Resolve 并有新提交时，正常触发验证。
-  - 验证后若原发 P3 仍为未解决，机器人会自动重新打开被人工点掉的 P3 线程并回复原因。
-  - 因缺乏具体故障路径而被降级的非阻塞 P3（状态为 `DEFERRED`），点 Resolve 仍直接关闭（记为 `WAIVED`），不消耗模型额度。
-- **AC2（提示词与判分规则一致）**：
-  - 增量、验证与全量审查提示词对 P3 的描述一致：P3 为真实、具体、有明确故障路径的低影响缺陷且同样需要修复；不再出现“拿不准故障路径就用 P3，P3 不阻塞”的矛盾表述。
-- **AC3（状态切换与换提交无脏残留）**：
-  - 当会话处于模型不可用或深审失败的 `HUMAN_REQUIRED` 状态时，执行 `override review` 后，会话状态变为 `READY`，且不再残留旧的失败记录或“审查未完成请重试”提示。
-  - 当会话切换到新提交时，属于旧提交的过期提示、未审完文件清单、单次运行失败记录不会残留污染新提交的评论展示与接力判断。
-- **AC4（问题账本跨提交常驻，不自造孤儿）**：
-  - 在 `PARTIAL`、`AUDIT_PENDING`、`REWORK`、`HUMAN_REQUIRED` 或 `READY` 状态下收到新提交并启动下一轮审查（非 `reset review`）时，原账本中的问题记录与累计花费得以保留，不会因为启动新一轮全量分片审查而把旧的未解决问题清空。
-  - 新一轮分片全量审查不会对账本中已处于开启/待确认状态的同一路径+同标题问题重复发评论线程。
-- **AC5（跨提交未解决问题的核实与阻塞闭环）**：
-  - 跨提交保留下来的未解决阻塞问题，在后续审查中除非经验证明确判定 `FIXED`（或人工 `dismiss` / `override`），否则持续阻挡 `READY`；显式 `reset review` 仍清空会话从零开始。
-- **AC6（规划收口与既有场景零回归）**：
-  - 规划器对普通修复、改写历史（装得下验证 / 装不下转分片全量审查）、增量审查、历史遗留孤儿线程保底对账、自动接力（含终审接力与部分覆盖接力）的行为自洽且零回归。
-- **AC7（`pr-bot` 命名与无用文件清理）**：
-  - `worker/wrangler.toml` 的 `CONTROL_REPO` 与 `worker/src/index.js` 的回退值均更新为 `Jiaze-Li/pr-bot` 并由自动化测试守护一致；`package.json`、`README.md` 及相关测试更新为 `pr-bot`；仓库根目录遗留的 `Plan.md`、`Design.md` 以及已停用的 4 个 `gptwb` 试验脚本与 `docs/fixer-spike-status.md` 已清理删除；三个外部固定标识（App 命令、Worker 服务名、状态检查名）保持原样。
-- **AC8（自动化测试全绿）**：
-  - 仓库根目录与 `worker/` 的自动化测试全部通过，新增/更新测试覆盖 AC1–AC7 的正向、负向与旧会话兼容场景。
-- **AC9（最终外部切换关口——不在 Code 本地审查内，合并后经用户确认执行）**：
-  - 合并 PR 后，将 GitHub 仓库改名为 `Jiaze-Li/pr-bot`，确认自动/手动部署 Worker 生效，最后将本机文件夹顺手改名为 `pr-bot`。
-
----
-
-## 7. 已确认的决定与未知前提（供 Design 查实）
-
-### 已确认的决定
-- **D1**：走完整 `Plan → Design → Code` 流程，每个阶段结束停下等用户明确指令。
-- **D2**：将“修 P3 与残留状态 Bug → 持久账本与临时状态分离及规划收口 → 改名 `pr-bot`（最后改本机文件夹）”合并为同一任务的 3 个阶段依次完成。
-- **D3**：用户已授权本任务的常规仓库开发操作（新建任务分支、写方案/设计/代码与测试、commit、push、创建与更新草稿 PR）；合并、GitHub 远端仓库改名、Worker 部署、改本机文件夹名、触发付费复测仍需在收尾时由用户确认。
-- **D4**：用户已确认早期冻结的 `gptwb` 网页桥接试验脚本与根目录旧改名临时文档一并清理删除，并下令进入 Design 阶段。
-
-### 未知前提（Design 阶段必须查实并给出明确方案，不得假设）
-- **U1（跨提交进入分片全量审查时的旧 OPEN 问题状态）**：当会话带着未解决的 `OPEN` 问题进入新一轮全量分片审查（例如 `PARTIAL` 后推了新提交，或改写历史后整个 PR 太大装不下一次验证）时，统一保留为 `OPEN` 还是转为待确认（`UNCERTAIN` / `CARRIED_OPEN`），还是让后续流程统一衔接？Design 需比较最简方案，确保不丢问题、不重复发帖、且能用既有机制关闭。
-- **U2（持久账本的容量淘汰策略）**：账本跨提交持续保留后，若一个长生命周期 PR 累计的问题总数逼近 64 条上限或 24 KB 状态上限，如何安全裁剪（例如仅淘汰最早已结案的 `FIXED`/`WAIVED`/`DEFERRED` 记录，严禁淘汰任何 `OPEN`/`UNCERTAIN` 阻塞项，若阻塞项本身超限则 fail-closed 转人工）？
-- **U3（历史遗留孤儿对账的去留边界）**：账本不再跨提交失忆后，新会话不会再自造孤儿线程；对于 PR #90 刚加入的孤儿线程识别代码，是保留作为读取旧 PR 时的保底兼容层并收进统一规划流程，还是做简化？Design 需比较改动面与回归风险。
-- **U4（根目录旧 `Plan.md` / `Design.md` 的处理方式）**：PR #87 留在仓库根目录的 `Plan.md` 与 `Design.md` 是直接删除（历史已在 Git 记录与 PR #87 中），还是移入 `docs/` 子目录？
-
----
-
-## 8. 授权边界
-
-| 操作 | 当前授权状态 |
-|---|---|
-| 新建任务分支 `feat/pr-bot-convergence` | **已授权** |
-| 在本仓库创建/修改方案、设计、代码、测试与文档 | **已授权**（仍严格遵守 Plan → Design → Code 阶段停止点） |
-| commit / push 到任务分支 `feat/pr-bot-convergence` | **已授权** |
-| 创建并更新本任务的草稿 PR | **已授权** |
-| 进入 Design 阶段 / 进入 Code 阶段 | **每个阶段停下，等用户说“Design” / “Code”** |
-| 合并 PR / 标记 PR Ready | **未授权**（需用户单独决定） |
-| 执行 GitHub 仓库改名 `Jiaze-Li/pr-bot` / 部署 Worker / 修改本机目录名 | **未授权**（代码完成后最后由用户确认执行） |
-| 触发消耗额度的真实 PR 审查复测 | **未授权** |
-
----
-
-## 9. 下一步
-
-本 Plan 落盘并创建草稿 PR 后停止。用户核对并回复 **“Design”** 后，进入 Design 阶段。
+## 6. 已确认决定、未知前提与授权
+- **已确认决定**：D1 走 `Plan → Design → Code` 阶段停点；D2 分三阶段在同一任务完成；D3 已授权分支修改/commit/push/更新草稿 PR；D4 确认删除 7 个历史临时/试验文件。
+- **Design 需明确事项**：U1 跨提交全量审查时旧 `OPEN` 与已结案问题的保留形式；U2 64 条上限下的 FIFO 裁剪规则；U3 孤儿对账在统一规划器中的保底位置；U4 7 个无用文件的删除验证。
+- **未授权操作**：合并 PR、标记 Ready、GitHub 远端改名、线上部署、改本机目录名、触发付费复测。
