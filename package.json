@@ -1,5 +1,5 @@
 {
-  "name": "claude-review-bot",
+  "name": "review-bot",
   "private": true,
   "type": "module",
   "scripts": {
