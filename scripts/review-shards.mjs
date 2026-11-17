@@ -3,6 +3,8 @@
 
 export const SHARD_TARGET_BYTES = 100_000;
 export const MAX_SHARDS = 20;
+// One staged (single-provider-call) review request, diff plus fixed context, must fit under this many bytes.
+export const SINGLE_REQUEST_MAX_BYTES = 300_000;
 // Findings recorded in the durable session are capped; material ones are kept first.
 export const MAX_MERGED_FINDINGS = 6;
 const SEVERITY_ORDER = { P0: 0, P1: 1, P2: 2, P3: 3 };
@@ -267,4 +269,19 @@ export function mergeShardResults({ shards, results, deferred = [], allFiles, pr
 export function dropIgnoredFiles(diffText, ignoreText = '') {
   const patterns = [...DEFAULT_IGNORE, ...parseIgnorePatterns(ignoreText)];
   return splitDiffByFile(diffText).filter((chunk) => !matchesIgnore(chunk.path, patterns)).map((chunk) => chunk.text).join('');
+}
+
+// Bytes every staged review request carries besides the diff: the PR metadata, the durable session and the risk profile.
+export function stagedFixedBytes({ prJson, session, riskProfile }) {
+  return Buffer.byteLength(prJson, 'utf8') + Buffer.byteLength(JSON.stringify(session ?? {}), 'utf8') + Buffer.byteLength(JSON.stringify(riskProfile), 'utf8');
+}
+
+// The one answer to "does this (already ignore-filtered) diff fit a staged delta review?", used by the staged runner
+// and by the planner so they can never disagree. `single`: one request. `sharded`: split by file into at most
+// MAX_SHARDS parts. `too_large`: some files would not fit even then.
+export function stagedReviewCapacity({ diff, fixedBytes }) {
+  if (Buffer.byteLength(diff, 'utf8') + fixedBytes <= SINGLE_REQUEST_MAX_BYTES) return { kind: 'single', chunks: null, parts: null, deferred: [] };
+  const chunks = splitDiffByFile(diff);
+  const { shards: parts, deferred } = planShards({ files: chunks.map((chunk) => chunk.path), chunks });
+  return { kind: deferred.length || !parts.length ? 'too_large' : 'sharded', chunks, parts, deferred };
 }

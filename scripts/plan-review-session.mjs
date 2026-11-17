@@ -1,13 +1,15 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { isDeepReviewStale, parsePendingSessionReview, parseSessionComment, planReviewSession } from './review-session-core.mjs';
+import { isDeepReviewStale, openMaterialFindings, parsePendingSessionReview, parseSessionComment, planReviewSession, unresolvedMaterialFindings } from './review-session-core.mjs';
+import { dropIgnoredFiles, splitDiffByFile, stagedFixedBytes, stagedReviewCapacity } from './review-shards.mjs';
 import { blockingClaims, fetchReviewThreads, isWriter, threadsByFinding } from './review-threads.mjs';
 import { prepareIncrementalDelta } from './select-incremental-review.mjs';
 import { chainIndex } from './continue-review.mjs';
 
 const repoPattern=/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const shaPattern=/^[0-9a-f]{40}$/i;
+export const MAX_CARRIED_FINDINGS=8;
 
 export async function planSession({ env=process.env, fetchImpl=fetch }={}) {
   const target=required(env,'TARGET_REPO');
@@ -140,6 +142,80 @@ export async function planSession({ env=process.env, fetchImpl=fetch }={}) {
 }
 
 
+// Is the "last reviewed HEAD -> new HEAD" two-point diff still a fix delta? It is when the old HEAD is an ancestor of the
+// new one and the PR's merge base with its target did not move (an ordinary fix push). After a rebase, force-push, a
+// merge of the target branch into the PR branch or a changed base, that diff also holds unrelated history.
+// Read-only (GitHub compare). "Cannot tell" throws; it is never treated as an ordinary delta.
+export async function classifyReviewBaseline({ previousHead, headSha, baseSha, mergeBaseNow, target, token, fetchImpl = fetch }) {
+  if (!shaPattern.test(String(mergeBaseNow ?? ''))) throw new Error('The current PR merge base is missing or invalid; refusing to guess the review scope');
+  const compare = async (from, to) => {
+    const response = await fetchImpl(`https://api.github.com/repos/${target}/compare/${from}...${to}?per_page=1`, {
+      headers: { Accept: 'application/vnd.github+json', Authorization: `Bearer ${token}`, 'X-GitHub-Api-Version': '2022-11-28', 'User-Agent': 'jiaze-review-bot' },
+      signal: AbortSignal.timeout(15000),
+    });
+    if (response.status === 404 || response.status === 422) return null;
+    if (!response.ok) throw new Error(`GitHub compare failed (HTTP ${response.status})`);
+    return response.json();
+  };
+  const forward = await compare(previousHead, headSha);
+  if (!forward) return { kind: 'rewritten', reason: 'the previously reviewed commit is no longer reachable' };
+  if (['diverged', 'behind'].includes(forward.status)) return { kind: 'rewritten', reason: 'the PR was rebased or force-pushed since the last review' };
+  if (!['ahead', 'identical'].includes(forward.status)) throw new Error(`Unexpected GitHub compare status: ${forward.status}`);
+  const old = await compare(baseSha, previousHead);
+  const mergeBaseOld = old?.merge_base_commit?.sha;
+  if (!shaPattern.test(String(mergeBaseOld ?? ''))) return { kind: 'rewritten', reason: 'the previous review base can no longer be determined' };
+  if (mergeBaseOld.toLowerCase() !== mergeBaseNow.toLowerCase()) return { kind: 'rewritten', reason: 'the target branch was merged into the PR branch, or the PR base changed, since the last review' };
+  return { kind: 'delta', reason: 'ordinary fix commits on the same base' };
+}
+
+// Called once for a `verification` decision before it is used (the workflow's two-point diff is its default scope).
+// Ordinary fix: decision unchanged. Rewritten history: verify against the whole current PR diff when that fits one
+// staged review (the workflow then skips its own two-point diff because repair.diff already exists), else review the
+// whole PR in shards with the old blocking findings carried as "needs confirmation". Never closes a finding itself.
+export async function resolveVerificationScope({ plan, env = process.env, fetchImpl = fetch }) {
+  const decision = plan.decision;
+  if (decision?.mode !== 'verification' || !decision.previousHead) return plan.decision;
+  const contextDir = path.resolve(env.REVIEW_CONTEXT_DIR || '.review-context');
+  const read = (name) => fs.readFileSync(path.join(contextDir, name), 'utf8');
+  const baseSha = required(env, 'BASE_SHA');
+  const headSha = required(env, 'HEAD_SHA');
+  let mergeBaseNow;
+  try { mergeBaseNow = read('merge-base.txt').trim(); } catch { mergeBaseNow = ''; }
+  const verdict = await classifyReviewBaseline({
+    previousHead: decision.previousHead, headSha, baseSha, mergeBaseNow, target: required(env, 'TARGET_REPO'), token: env.GH_TOKEN, fetchImpl,
+  });
+  if (verdict.kind === 'delta') return decision;
+
+  const prDiff = read('pr.diff');
+  const ignoreFile = path.join(contextDir, 'ignore-patterns.txt');
+  const diff = dropIgnoredFiles(prDiff, fs.existsSync(ignoreFile) ? fs.readFileSync(ignoreFile, 'utf8') : '');
+  const riskFile = path.join(contextDir, 'risk-profile.json');
+  const riskProfile = fs.existsSync(riskFile) ? JSON.parse(fs.readFileSync(riskFile, 'utf8')) : { version: 1, stateIntegrity: false, signals: { synchronization: [], durableState: [], multiActor: [] } };
+  const capacity = stagedReviewCapacity({ diff, fixedBytes: stagedFixedBytes({ prJson: read('pr.json'), session: plan.session, riskProfile }) });
+  const files = splitDiffByFile(diff).length;
+  const where = `base ${mergeBaseNow.slice(0, 7)}, head ${headSha.slice(0, 7)}`;
+  if (capacity.kind !== 'too_large') {
+    fs.mkdirSync(contextDir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(contextDir, 'repair.diff'), prDiff, { mode: 0o600 });
+    return {
+      mode: 'verification', previousHead: decision.previousHead, scope: 'current-pr',
+      reason: `PR history was rewritten since the last review (${verdict.reason}); verifying the open findings against the whole current PR diff (${files} files, ${where})`,
+    };
+  }
+  const carried = openMaterialFindings(plan.session).length + unresolvedMaterialFindings(plan.session).length;
+  if (carried > MAX_CARRIED_FINDINGS) {
+    return {
+      mode: 'human_required', previousHead: decision.previousHead,
+      reason: `PR history was rewritten (${verdict.reason}) and the whole current PR diff is too large to verify in one pass (${files} files, ${where}), and ${carried} blocking findings are still open (more than the ${MAX_CARRIED_FINDINGS} that can be carried safely); a finding cannot be dismissed until a review has covered the current HEAD, so a repository writer decides: comment "reset review" to discard the session and review the PR from scratch, or "override review" to accept the risk and waive the open findings`,
+    };
+  }
+  return {
+    ...fullReviewDecision(env, plan.requestedMode,
+      `PR history was rewritten (${verdict.reason}) and the whole current PR diff (${files} files, ${where}) is too large for one verification; earlier open findings are carried as "needs confirmation", keep blocking until a person confirms them with a dismiss decision, and this review does not close them`),
+    carryOpen: true,
+  };
+}
+
 // The one decision for any review of the whole PR.
 export function fullReviewDecision(env,requested,why){
   const diffBytes=fileBytes(path.join(path.resolve(env.REVIEW_CONTEXT_DIR||'.review-context'),'pr.diff'));
@@ -205,6 +281,7 @@ function appendOutput(name,value,env){
 if(process.argv[1] && import.meta.url===pathToFileURL(process.argv[1]).href){
   try{
     const plan=await planSession();
+    plan.decision = await resolveVerificationScope({ plan, env: process.env });
     if (plan.decision.mode === 'incremental_candidate') {
       const previousHead = plan.decision.previousHead;
       const scope = prepareIncrementalDelta({

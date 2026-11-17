@@ -393,7 +393,7 @@ export function stopUnavailableReviewSession({
 // `@claude review` is a reviewer in its own right. When this exact HEAD has no session it
 // starts a standalone one, so Claude and Gemini run as parallel reviewers instead of
 // Claude gating on a Gemini session. Spend carries over from any earlier session.
-function seedSession({ previous, baseSha, headSha, now }) {
+function seedSession({ previous, baseSha, headSha, now, carryOpen = false }) {
   const seed = applyDiscoveryResult({ result: { summary: 'Claude review started', findings: [] }, baseSha, headSha, sourceCommentId: 'claude', now });
   const spend = {};
   for (const key of ['deepSpendUsd', 'fallbackSpendUsd', 'claudeSdkSpendUsd', 'claudeUnknownReserveUsd']) {
@@ -407,11 +407,22 @@ function seedSession({ previous, baseSha, headSha, now }) {
     ...entry, id: findingId(nextFindingNumber++), origin: 'CARRIED_UNCERTAIN', status: 'UNCERTAIN',
     lastCheckedHead: entry.lastCheckedHead ?? previous.lastReviewedHead, resolutionReason: null,
   }));
+  // Only when the planner asks (the PR's history was rewritten and the whole PR cannot be verified in one staged
+  // review): the earlier blocking OPEN findings are carried too, as "needs confirmation". A full review never
+  // verifies them, so they cannot be closed by silence; they keep blocking until a person decides.
+  if (carryOpen) {
+    for (const entry of openMaterialFindings(previous ?? { findings: [] })) {
+      findings.push({
+        ...entry, id: findingId(nextFindingNumber++), origin: 'CARRIED_OPEN', status: 'UNCERTAIN', carriedFromId: entry.id,
+        lastCheckedHead: entry.lastCheckedHead ?? previous.lastReviewedHead, resolutionReason: null,
+      });
+    }
+  }
   return { ...seed, ...spend, findings, nextFindingNumber };
 }
 
 export function beginDeepReview({
-  session = null, baseSha, headSha, runId = null, reserveUsd = 0, now = new Date().toISOString(),
+  session = null, baseSha, headSha, runId = null, reserveUsd = 0, now = new Date().toISOString(), carryOpen = false,
 } = {}) {
   checkedSha(baseSha, 'baseSha');
   checkedSha(headSha, 'headSha');
@@ -423,7 +434,7 @@ export function beginDeepReview({
   const settledAndWaiting = Boolean(session) && session.lastReviewedHead === headSha && session.status === 'AUDIT_PENDING';
   // A full review of a HEAD that has no session yet starts one; spend carries over from an earlier session.
   if (!session || session.lastReviewedHead !== headSha) {
-    session = seedSession({ previous: session, baseSha, headSha, now });
+    session = seedSession({ previous: session, baseSha, headSha, now, carryOpen });
   }
   if (session.status === 'REVIEW_IN_PROGRESS' && !isDeepReviewStale(session, Date.parse(now))) {
     throw new Error('a deep review is already in progress for this HEAD');
@@ -480,8 +491,9 @@ export function completeDeepReview({
   const findings = session.findings.map((finding) => ({ ...finding }));
   let nextFindingNumber = Number.isInteger(session.nextFindingNumber) ? session.nextFindingNumber : findings.length + 1;
   // Claude's material findings are never suppressed by Gemini's rejection ledger; only an
-  // identical still-OPEN finding is skipped to avoid duplicates.
-  const openKeys = new Set(findings.filter((f) => f.status === 'OPEN').map((f) => `${f.path}\0${String(f.title).trim().toLowerCase()}`));
+  // identical still-OPEN finding is skipped to avoid duplicates. An earlier OPEN finding carried as "needs
+  // confirmation" after a history rewrite is the same open concern, so it suppresses a re-report too.
+  const openKeys = new Set(findings.filter((f) => f.status === 'OPEN' || (f.origin === 'CARRIED_OPEN' && f.status === 'UNCERTAIN')).map((f) => `${f.path}\0${String(f.title).trim().toLowerCase()}`));
   for (const finding of normalized.findings.filter((f) => !openKeys.has(`${f.path}\0${String(f.title).trim().toLowerCase()}`))) {
     findings.push({
       id: findingId(nextFindingNumber++),
