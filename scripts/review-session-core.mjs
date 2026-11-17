@@ -30,7 +30,7 @@ function stripTransientState(session, headSha, { clearAllCoverageDeepReview = fa
 export const SESSION_VERSION = 1;
 export const MAX_VERIFICATION_ROUNDS = 2;
 export const MAX_DISMISS_ATTEMPTS_PER_HEAD = 2;
-export const MAX_DISMISS_LEDGER = 8;
+export const MAX_DISMISS_LEDGER = 48;
 // A P0-P2 finding must carry a concrete failure path (trigger state -> wrong
 // result). Without one it is demoted to non-blocking P3 instead of blocking.
 export const MIN_FAILURE_PATH_CHARS = 30;
@@ -807,6 +807,10 @@ export function checkDismissEligibility({ session, findingId, headSha, sourceCom
   if (adjudicated.length >= MAX_DISMISS_ATTEMPTS_PER_HEAD) {
     return { eligible: false, kind: 'attempt_limit', entries: adjudicated };
   }
+  const sameHeadAll = ledger.filter((entry) => entry?.head === headSha);
+  if (sameHeadAll.length >= MAX_DISMISS_LEDGER) {
+    return { eligible: false, kind: 'attempt_limit', entries: sameHeadAll };
+  }
   return { eligible: true };
 }
 
@@ -835,10 +839,13 @@ export function recordDismissAttempt({
     inputHash: String(inputHash ?? '').slice(0, 16),
     verdict,
     ...(unavailable ? { unavailable: true } : {}),
-    ...(reason ? { reason: compactText(reason, 220) } : {}),
+    ...(reason ? { reason: compactText(reason, 120) } : {}),
     at: now,
   };
-  const dismissLedger = [...existing, entry].slice(-MAX_DISMISS_LEDGER);
+  const dismissLedger = [...existing, entry];
+  if (dismissLedger.length > MAX_DISMISS_LEDGER) {
+    throw new Error('dismissal ledger capacity reached for this HEAD');
+  }
   return {
     ...next,
     dismissLedger,

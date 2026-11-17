@@ -385,7 +385,16 @@ test('idempotency and per-HEAD attempt cap block repeated rebuttals (including I
   let s2 = initial();
   s2 = recordDismissAttempt({ session: s2, findingId: 'F001', headSha: A, sourceCommentId: '61', inputHash: 'h1', verdict: 'INCONCLUSIVE', unavailable: true, reason: '429' });
   assert.equal(checkDismissEligibility({ session: s2, findingId: 'F001', headSha: A, sourceCommentId: '62', inputHash: 'h1' }).eligible, true);
+  // More than 8 entries on the same HEAD never evict older dedup/limit entries
+  let s3 = initial(5);
+  for (let i = 1; i <= 10; i += 1) {
+    const fid = `F${String(((i - 1) % 5) + 1).padStart(3, '0')}`;
+    s3 = recordDismissAttempt({ session: s3, findingId: fid, headSha: A, sourceCommentId: String(100 + i), inputHash: `hash-${i}`, verdict: 'REJECTED', reason: 'r' });
+  }
+  assert.equal(checkDismissEligibility({ session: s3, findingId: 'F001', headSha: A, sourceCommentId: '101', inputHash: 'hash-1' }).kind, 'duplicate_comment');
+  assert.equal(checkDismissEligibility({ session: s3, findingId: 'F001', headSha: A, sourceCommentId: '201', inputHash: 'hash-1' }).kind, 'duplicate_rebuttal');
   assert.ok(encodeSessionState(s).length > 0);
+  assert.ok(encodeSessionState(s3).length > 0);
 });
 
 test('limit-rejected comment is recorded in dismissLedger and Claude spend is preserved on TOCTOU abort', async () => {
