@@ -312,7 +312,7 @@ jobs:
 
       - name: Materialize safe source snapshot
         id: snapshot
-        if: steps.dedupe.outputs.duplicate != 'true' && (steps.plan.outputs.mode == 'claude' || steps.plan.outputs.mode == 'incremental' || steps.plan.outputs.mode == 'verification')
+        if: steps.dedupe.outputs.duplicate != 'true' && (steps.plan.outputs.mode == 'claude' || steps.plan.outputs.mode == 'incremental' || steps.plan.outputs.mode == 'verification' || steps.plan.outputs.mode == 'dismiss')
         env:
           HEAD_SHA: ${{ inputs.head_sha }}
           SOURCE_REPO_DIR: target
@@ -386,22 +386,6 @@ jobs:
           REVIEW_CONTEXT_DIR: .review-context
         run: node scripts/apply-override.mjs
 
-      - name: Apply evidence-based finding dismissal
-        id: dismiss
-        if: steps.dedupe.outputs.duplicate != 'true' && steps.plan.outputs.mode == 'dismiss'
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          TARGET_REPO: ${{ inputs.target_repo }}
-          PR_NUMBER: ${{ inputs.pr_number }}
-          BASE_SHA: ${{ inputs.base_sha }}
-          HEAD_SHA: ${{ inputs.head_sha }}
-          TRIGGER_USER: ${{ inputs.trigger_user }}
-          SOURCE_COMMENT_ID: ${{ inputs.source_comment_id }}
-          SOURCE_KIND: ${{ inputs.source_kind }}
-          EXPECTED_REVIEW_AUTHOR: ${{ steps.app-token.outputs.app-slug }}[bot]
-          REVIEW_CONTEXT_DIR: .review-context
-        run: node scripts/apply-dismissal.mjs
-
       - name: Apply review-thread decisions
         id: threads
         if: steps.dedupe.outputs.duplicate != 'true' && steps.plan.outputs.mode == 'threads'
@@ -430,7 +414,7 @@ jobs:
 
       - name: Install Claude fallback dependencies
         continue-on-error: true # only needed if Gemini is out of credits; must never block a healthy Gemini review
-        if: steps.dedupe.outputs.duplicate != 'true' && (steps.plan.outputs.mode == 'incremental' || steps.plan.outputs.mode == 'verification')
+        if: steps.dedupe.outputs.duplicate != 'true' && (steps.plan.outputs.mode == 'incremental' || steps.plan.outputs.mode == 'verification' || steps.plan.outputs.mode == 'dismiss')
         shell: bash
         run: npm ci --legacy-peer-deps --ignore-scripts --no-audit --no-fund --omit=dev
 
@@ -511,6 +495,27 @@ jobs:
           REVIEW_CONTEXT_DIR: .review-context
           REVIEW_PATH: .review-context/review-publish.json
         run: node scripts/publish-gemini-review.mjs
+
+      - name: Apply evidence-based finding dismissal
+        id: dismiss
+        if: steps.dedupe.outputs.duplicate != 'true' && steps.plan.outputs.mode == 'dismiss'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          BASE_SHA: ${{ inputs.base_sha }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          TRIGGER_USER: ${{ inputs.trigger_user }}
+          SOURCE_COMMENT_ID: ${{ inputs.source_comment_id }}
+          SOURCE_KIND: ${{ inputs.source_kind }}
+          EXPECTED_REVIEW_AUTHOR: ${{ steps.app-token.outputs.app-slug }}[bot]
+          SAFE_REPO_DIR: safe-target
+          REVIEW_PROVIDERS: ${{ inputs.review_providers || vars.REVIEW_PROVIDERS || '' }}
+          PROVIDER_BUDGETS: ${{ inputs.provider_budgets || vars.PROVIDER_BUDGETS || '' }}
+          REVIEW_CONTEXT_DIR: .review-context
+        run: node scripts/apply-dismissal.mjs
 
       - name: Run Claude explicit deep review
         timeout-minutes: 20

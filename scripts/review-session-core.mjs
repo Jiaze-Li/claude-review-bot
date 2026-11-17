@@ -13,6 +13,11 @@ function stripTransientState(session, headSha, { clearAllCoverageDeepReview = fa
   delete next.staleFor;
   delete next.staleHead;
   delete next.staleCommits;
+  if (Array.isArray(next.dismissLedger)) {
+    const kept = next.dismissLedger.filter((entry) => entry?.head === headSha);
+    if (kept.length) next.dismissLedger = kept;
+    else delete next.dismissLedger;
+  }
   if (clearAllCoverageDeepReview) {
     delete next.coverage;
     delete next.deepReview;
@@ -24,6 +29,8 @@ function stripTransientState(session, headSha, { clearAllCoverageDeepReview = fa
 }
 export const SESSION_VERSION = 1;
 export const MAX_VERIFICATION_ROUNDS = 2;
+export const MAX_DISMISS_ATTEMPTS_PER_HEAD = 2;
+export const MAX_DISMISS_LEDGER = 48;
 // A P0-P2 finding must carry a concrete failure path (trigger state -> wrong
 // result). Without one it is demoted to non-blocking P3 instead of blocking.
 export const MIN_FAILURE_PATH_CHARS = 30;
@@ -775,9 +782,80 @@ function dropKnownRepeats(findings, session) {
 // ---- Evidence-based finding dismissal ----------------------------------
 // Scoped, human-attested adjudication; unlike the broad override, this never
 // pretends an unfinished final audit already completed.
+export function checkDismissEligibility({ session, findingId, headSha, sourceCommentId, inputHash } = {}) {
+  validateSession(session);
+  checkedSha(headSha, 'headSha');
+  const ledger = Array.isArray(session.dismissLedger) ? session.dismissLedger : [];
+  const commentKey = String(sourceCommentId ?? '');
+  const byComment = ledger.find((entry) => String(entry?.commentId ?? '') === commentKey);
+  if (byComment) {
+    return { eligible: false, kind: 'duplicate_comment', entry: byComment };
+  }
+  const sameHeadFinding = ledger.filter(
+    (entry) => entry?.head === headSha && entry?.findingId === findingId,
+  );
+  const hashKey = String(inputHash ?? '').slice(0, 16);
+  const duplicateRebuttal = hashKey
+    ? sameHeadFinding.find((entry) => entry?.inputHash === hashKey && !entry?.unavailable && ['DISMISSED', 'REJECTED', 'INCONCLUSIVE'].includes(entry?.verdict))
+    : null;
+  if (duplicateRebuttal) {
+    return { eligible: false, kind: 'duplicate_rebuttal', entry: duplicateRebuttal };
+  }
+  const adjudicated = sameHeadFinding.filter(
+    (entry) => !entry?.unavailable && ['DISMISSED', 'REJECTED', 'INCONCLUSIVE'].includes(entry?.verdict),
+  );
+  if (adjudicated.length >= MAX_DISMISS_ATTEMPTS_PER_HEAD) {
+    return { eligible: false, kind: 'attempt_limit', entries: adjudicated };
+  }
+  const sameHeadAll = ledger.filter((entry) => entry?.head === headSha);
+  if (sameHeadAll.length >= MAX_DISMISS_LEDGER) {
+    return { eligible: false, kind: 'attempt_limit', entries: sameHeadAll };
+  }
+  return { eligible: true };
+}
+
+export function recordDismissAttempt({
+  session, findingId, headSha, sourceCommentId, inputHash = '', verdict,
+  reason = '', unavailable = false, claudeCharge = null, now = new Date().toISOString(),
+} = {}) {
+  validateSession(session);
+  checkedSha(headSha, 'headSha');
+  if (!/^F[0-9]{3,}$/.test(String(findingId ?? ''))) throw new Error('invalid dismissal finding id');
+  if (!/^[1-9]\d*$/.test(String(sourceCommentId ?? ''))) throw new Error('invalid dismissal source comment id');
+  if (!['DISMISSED', 'REJECTED', 'INCONCLUSIVE'].includes(verdict)) {
+    throw new Error('invalid dismiss verdict');
+  }
+  let next = session;
+  if (claudeCharge && Number.isFinite(claudeCharge.amount) && claudeCharge.amount > 0) {
+    next = chargeClaudeFallback(next, claudeCharge.amount, claudeCharge.source || 'sdk');
+  }
+  const commentKey = String(sourceCommentId);
+  const existing = (Array.isArray(next.dismissLedger) ? next.dismissLedger : [])
+    .filter((entry) => entry?.head === headSha && String(entry?.commentId ?? '') !== commentKey);
+  const entry = {
+    findingId,
+    head: headSha,
+    commentId: commentKey,
+    inputHash: String(inputHash ?? '').slice(0, 16),
+    verdict,
+    ...(unavailable ? { unavailable: true } : {}),
+    ...(reason ? { reason: compactText(reason, 120) } : {}),
+    at: now,
+  };
+  const dismissLedger = [...existing, entry];
+  if (dismissLedger.length > MAX_DISMISS_LEDGER) {
+    throw new Error('dismissal ledger capacity reached for this HEAD');
+  }
+  return {
+    ...next,
+    dismissLedger,
+    updatedAt: now,
+  };
+}
+
 export function applyFindingDismissal({
   session, findingId, headSha, by, reason, evidence, sourceCommentId,
-  now = new Date().toISOString(),
+  verification = null, inputHash = '', now = new Date().toISOString(),
 } = {}) {
   validateSession(session);
   checkedSha(headSha, 'headSha');
@@ -807,12 +885,32 @@ export function applyFindingDismissal({
   if (!item || !['OPEN', 'UNCERTAIN'].includes(item.status) || !isBlocking(item)) {
     throw new Error('dismissal finding must be an OPEN or UNCERTAIN material candidate');
   }
+  const verificationMeta = verification && typeof verification === 'object' ? {
+    verifiedBy: compactText(verification.provider || 'gemini', 24),
+    ...(verification.model ? { model: compactText(verification.model, 80) } : {}),
+    ...(verification.reason ? { verdictReason: compactText(verification.reason, 300) } : {}),
+    ...(Array.isArray(verification.sourceAnchors) && verification.sourceAnchors.length
+      ? {
+        sourceAnchors: verification.sourceAnchors
+          .slice(0, 2)
+          .filter((a) => a && typeof a.path === 'string' && Number.isInteger(a.line))
+          .map((a) => ({ path: compactText(a.path, 200), line: a.line })),
+      }
+      : {}),
+  } : {};
   const findings = session.findings.map((finding) => finding.id === findingId
     ? {
       ...finding, status: 'DISMISSED', lastCheckedHead: headSha,
-      resolutionReason: compactText('Dismissed by @' + by + ': ' + explanation, 300),
-      dismissal: { by, at: now, head: headSha, sourceCommentId: String(sourceCommentId),
-        reason: explanation, evidence: [...evidence] },
+      resolutionReason: compactText(
+        verificationMeta.verifiedBy
+          ? `Verified dismissed (${verificationMeta.verifiedBy}) for @${by}: ${verificationMeta.verdictReason || explanation}`
+          : 'Dismissed by @' + by + ': ' + explanation,
+        300,
+      ),
+      dismissal: {
+        by, at: now, head: headSha, sourceCommentId: String(sourceCommentId),
+        reason: explanation, evidence: [...evidence], ...verificationMeta,
+      },
     }
     : { ...finding });
   const remaining = findings.filter(finding =>
@@ -820,10 +918,30 @@ export function applyFindingDismissal({
   const status = remaining
     ? findings.some(f => f.status === 'OPEN') ? 'REWORK' : 'HUMAN_REQUIRED'
     : session.auditCompleted === true ? 'READY' : 'AUDIT_PENDING';
-  const base = remaining === 0 ? stripTransientState(session, headSha) : session;
+  let next = session;
+  if (verification?.claudeCharge && Number.isFinite(verification.claudeCharge.amount) && verification.claudeCharge.amount > 0) {
+    next = chargeClaudeFallback(next, verification.claudeCharge.amount, verification.claudeCharge.source || 'sdk');
+  }
+  if (verificationMeta.verifiedBy || inputHash) {
+    next = recordDismissAttempt({
+      session: next,
+      findingId,
+      headSha,
+      sourceCommentId,
+      inputHash,
+      verdict: 'DISMISSED',
+      reason: verificationMeta.verdictReason || explanation,
+      now,
+    });
+  }
+  const base = remaining === 0 ? stripTransientState(next, headSha) : next;
   return {
     ...base, findings, status,
-    lastSummary: compactText('Human-dismissed ' + findingId + ' by @' + by + '; remaining material findings: ' + remaining + '.', 800),
+    lastSummary: compactText(
+      (verificationMeta.verifiedBy ? `Verified dismissal (${verificationMeta.verifiedBy}) of ` : 'Human-dismissed ')
+      + findingId + ' by @' + by + '; remaining material findings: ' + remaining + '.',
+      800,
+    ),
     updatedAt: now,
   };
 }
@@ -984,9 +1102,11 @@ export function renderSessionComment(session, { sourceCommentIds = [], finalRevi
         ? 'Push a repair for real bugs; for a disproven finding post `@gemini dismiss F001` with Reason and Evidence lines. Dismissal does not change product code.'
         : 'Automatic review budget is exhausted. Use human judgment or a targeted Codex/Claude review; do not restart full discovery automatically.';
   const dismissed = session.findings.filter((finding) => finding.status === 'DISMISSED').slice(-4);
+  const hasVerifiedDismissal = dismissed.some((finding) => Boolean(finding.dismissal?.verifiedBy));
   const dismissalLines = dismissed.flatMap((finding) => [
-    '- ' + finding.id + ' dismissed by @' + cleanInline(finding.dismissal?.by ?? 'unknown')
-      + ' — ' + cleanInline(finding.dismissal?.reason ?? ''),
+    '- ' + finding.id + (finding.dismissal?.verifiedBy ? ` [verified by ${cleanInline(finding.dismissal.verifiedBy)}]` : '')
+      + ' dismissed by @' + cleanInline(finding.dismissal?.by ?? 'unknown')
+      + ' — ' + cleanInline(finding.dismissal?.verdictReason || finding.dismissal?.reason || ''),
     '  - Evidence: ' + (finding.dismissal?.evidence ?? []).map(cleanInline).join(' · '),
   ]);
   const threadLines = session.findings
@@ -1030,7 +1150,7 @@ export function renderSessionComment(session, { sourceCommentIds = [], finalRevi
     ] : []),
     '',
     ...findingLines,
-    ...(dismissalLines.length ? ['', 'Human-dismissed findings (cited, not machine-verified):', ...dismissalLines] : []),
+    ...(dismissalLines.length ? ['', hasVerifiedDismissal ? 'Dismissed findings (bot-verified):' : 'Human-dismissed findings (cited, not machine-verified):', ...dismissalLines] : []),
     ...(threadLines.length ? ['', 'Closed by people (review thread resolved):', ...threadLines] : []),
     ...(orphanLine ? ['', orphanLine] : []),
     '',
