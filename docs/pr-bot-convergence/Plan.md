@@ -46,7 +46,7 @@
 
 ### 阶段 3：代码与配置改名 `pr-bot` 及清理历史临时文档
 - **G3.1** 将仓库内运行时控制仓库配置、回退值、说明文档、包描述与测试中的仓库名从 `Jiaze-Li/review-bot` 统一更新为 `Jiaze-Li/pr-bot`，并用自动化测试守护配置与回退值一致。
-- **G3.2** 清理仓库根目录遗留的旧改名临时文档（`Plan.md`、`Design.md`），保持文档结构整洁。
+- **G3.2** 清理仓库根目录遗留的旧改名临时文档（`Plan.md`、`Design.md`）以及早期已冻结停用的 4 个网页桥接修复试验脚本（`scripts/spike-gptwb-fixer.mjs`、`scripts/spike-gptwb-fixer-stage2.mjs`、`scripts/patch-gptwb-idempotency.mjs`、`scripts/test-gptwb-idempotency.mjs`）与说明文档（`docs/fixer-spike-status.md`），保持仓库结构整洁。
 - **G3.3** 代码全部验证通过并经用户最终确认后，完成 GitHub 远端仓库改名 `Jiaze-Li/pr-bot`、Worker 部署验证，最后顺手修改本机文件夹名称。
 
 ---
@@ -90,8 +90,8 @@
   - 跨提交保留下来的未解决阻塞问题，在后续审查中除非经验证明确判定 `FIXED`（或人工 `dismiss` / `override`），否则持续阻挡 `READY`；显式 `reset review` 仍清空会话从零开始。
 - **AC6（规划收口与既有场景零回归）**：
   - 规划器对普通修复、改写历史（装得下验证 / 装不下转分片全量审查）、增量审查、历史遗留孤儿线程保底对账、自动接力（含终审接力与部分覆盖接力）的行为自洽且零回归。
-- **AC7（`pr-bot` 命名与根目录清理）**：
-  - `worker/wrangler.toml` 的 `CONTROL_REPO` 与 `worker/src/index.js` 的回退值均更新为 `Jiaze-Li/pr-bot` 并由自动化测试守护一致；`package.json`、`README.md` 及相关测试更新为 `pr-bot`；仓库根目录遗留的 `Plan.md` 与 `Design.md` 已清理；三个外部固定标识（App 命令、Worker 服务名、状态检查名）保持原样。
+- **AC7（`pr-bot` 命名与无用文件清理）**：
+  - `worker/wrangler.toml` 的 `CONTROL_REPO` 与 `worker/src/index.js` 的回退值均更新为 `Jiaze-Li/pr-bot` 并由自动化测试守护一致；`package.json`、`README.md` 及相关测试更新为 `pr-bot`；仓库根目录遗留的 `Plan.md`、`Design.md` 以及已停用的 4 个 `gptwb` 试验脚本与 `docs/fixer-spike-status.md` 已清理删除；三个外部固定标识（App 命令、Worker 服务名、状态检查名）保持原样。
 - **AC8（自动化测试全绿）**：
   - 仓库根目录与 `worker/` 的自动化测试全部通过，新增/更新测试覆盖 AC1–AC7 的正向、负向与旧会话兼容场景。
 - **AC9（最终外部切换关口——不在 Code 本地审查内，合并后经用户确认执行）**：
@@ -105,6 +105,7 @@
 - **D1**：走完整 `Plan → Design → Code` 流程，每个阶段结束停下等用户明确指令。
 - **D2**：将“修 P3 与残留状态 Bug → 持久账本与临时状态分离及规划收口 → 改名 `pr-bot`（最后改本机文件夹）”合并为同一任务的 3 个阶段依次完成。
 - **D3**：用户已授权本任务的常规仓库开发操作（新建任务分支、写方案/设计/代码与测试、commit、push、创建与更新草稿 PR）；合并、GitHub 远端仓库改名、Worker 部署、改本机文件夹名、触发付费复测仍需在收尾时由用户确认。
+- **D4**：用户已确认早期冻结的 `gptwb` 网页桥接试验脚本与根目录旧改名临时文档一并清理删除，并下令进入 Design 阶段。
 
 ### 未知前提（Design 阶段必须查实并给出明确方案，不得假设）
 - **U1（跨提交进入分片全量审查时的旧 OPEN 问题状态）**：当会话带着未解决的 `OPEN` 问题进入新一轮全量分片审查（例如 `PARTIAL` 后推了新提交，或改写历史后整个 PR 太大装不下一次验证）时，统一保留为 `OPEN` 还是转为待确认（`UNCERTAIN` / `CARRIED_OPEN`），还是让后续流程统一衔接？Design 需比较最简方案，确保不丢问题、不重复发帖、且能用既有机制关闭。
