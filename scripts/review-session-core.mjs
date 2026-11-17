@@ -796,12 +796,14 @@ export function checkDismissEligibility({ session, findingId, headSha, sourceCom
   );
   const hashKey = String(inputHash ?? '').slice(0, 16);
   const duplicateRebuttal = hashKey
-    ? sameHeadFinding.find((entry) => entry?.inputHash === hashKey && ['DISMISSED', 'REJECTED'].includes(entry?.verdict))
+    ? sameHeadFinding.find((entry) => entry?.inputHash === hashKey && !entry?.unavailable && ['DISMISSED', 'REJECTED', 'INCONCLUSIVE'].includes(entry?.verdict))
     : null;
   if (duplicateRebuttal) {
     return { eligible: false, kind: 'duplicate_rebuttal', entry: duplicateRebuttal };
   }
-  const adjudicated = sameHeadFinding.filter((entry) => ['DISMISSED', 'REJECTED'].includes(entry?.verdict));
+  const adjudicated = sameHeadFinding.filter(
+    (entry) => !entry?.unavailable && ['DISMISSED', 'REJECTED', 'INCONCLUSIVE'].includes(entry?.verdict),
+  );
   if (adjudicated.length >= MAX_DISMISS_ATTEMPTS_PER_HEAD) {
     return { eligible: false, kind: 'attempt_limit', entries: adjudicated };
   }
@@ -810,7 +812,7 @@ export function checkDismissEligibility({ session, findingId, headSha, sourceCom
 
 export function recordDismissAttempt({
   session, findingId, headSha, sourceCommentId, inputHash = '', verdict,
-  reason = '', claudeCharge = null, now = new Date().toISOString(),
+  reason = '', unavailable = false, claudeCharge = null, now = new Date().toISOString(),
 } = {}) {
   validateSession(session);
   checkedSha(headSha, 'headSha');
@@ -832,6 +834,7 @@ export function recordDismissAttempt({
     commentId: commentKey,
     inputHash: String(inputHash ?? '').slice(0, 16),
     verdict,
+    ...(unavailable ? { unavailable: true } : {}),
     ...(reason ? { reason: compactText(reason, 220) } : {}),
     at: now,
   };

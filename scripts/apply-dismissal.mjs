@@ -6,6 +6,7 @@ import { saveSessionComment } from './session-comment.mjs';
 import { finalReviewOutlook } from './continue-review.mjs';
 import {
   applyFindingDismissal,
+  chargeClaudeFallback,
   checkDismissEligibility,
   isBlockingFinding,
   parseSessionComment,
@@ -101,23 +102,32 @@ export async function applyManualDismissal({
     const message = eligibility.kind === 'duplicate_rebuttal'
       ? `Repeated identical rebuttal for **${decision.findingId}** on this commit was not re-run. ${priorReason}`
       : `Per-commit dismissal verification limit reached for **${decision.findingId}** on this commit without new code changes.`;
-    const body = renderSessionComment(durable, {
+    const recorded = recordDismissAttempt({
+      session: durable,
+      findingId: decision.findingId,
+      headSha,
+      sourceCommentId: sourceId,
+      inputHash,
+      verdict: 'REJECTED',
+      reason: message,
+    });
+    const body = renderSessionComment(recorded, {
       sourceCommentIds: [sourceId],
-      finalReview: finalReviewOutlook({ session: durable, headSha, sourceCommentId: env.SOURCE_COMMENT_ID, planMode: 'dismiss' }),
+      finalReview: finalReviewOutlook({ session: recorded, headSha, sourceCommentId: env.SOURCE_COMMENT_ID, planMode: 'dismiss' }),
     });
     const savedId = await saveSessionComment({
       target: repo, prNumber, token: env.GH_TOKEN, fetchImpl,
-      existingId: plan.sessionCommentId, previous: durable, session: durable, body,
+      existingId: plan.sessionCommentId, previous: durable, session: recorded, body,
     });
     await postDismissalOutcomeReply({
-      repo, prNumber, expectedAuthor, session: durable, findingId: decision.findingId,
+      repo, prNumber, expectedAuthor, session: recorded, findingId: decision.findingId,
       heading: `**${decision.findingId} dismissal not re-run**`,
       reason: message,
       nextStep: 'Push a code/test fix, or have a repository maintainer use `override review` if accepting risk.',
       env, fetchImpl,
     });
-    writePublishedSession(contextRoot, { mode: 'dismiss', verdict: 'REJECTED', skippedModel: true, session: durable, sessionCommentId: savedId });
-    return durable;
+    writePublishedSession(contextRoot, { mode: 'dismiss', verdict: 'REJECTED', skippedModel: true, session: recorded, sessionCommentId: savedId });
+    return recorded;
   }
 
   const repoRoot = path.resolve(env.SAFE_REPO_DIR || env.TARGET_REPO_DIR || 'safe-target');
@@ -141,10 +151,31 @@ export async function applyManualDismissal({
   });
 
   // Re-verify PR HEAD and durable session before writing any state (TOCTOU guard).
-  await proveHead();
-  const latestDurable = await loadCurrentDurable();
-  if (!latestDurable || JSON.stringify(latestDurable) !== JSON.stringify(durable)) {
-    throw new Error('Durable review session changed during dismissal verification; refusing stale verdict');
+  // If either changed after Claude ran, persist the Claude spend best-effort on the
+  // latest durable session before aborting so budget accounting is never lost.
+  try {
+    await proveHead();
+    const latestDurable = await loadCurrentDurable();
+    if (!latestDurable || JSON.stringify(latestDurable) !== JSON.stringify(durable)) {
+      throw new Error('Durable review session changed during dismissal verification; refusing stale verdict');
+    }
+  } catch (staleError) {
+    if (verdict.claudeCharge && Number.isFinite(verdict.claudeCharge.amount) && verdict.claudeCharge.amount > 0) {
+      try {
+        const latestForSpend = await loadCurrentDurable();
+        if (latestForSpend) {
+          const charged = chargeClaudeFallback(latestForSpend, verdict.claudeCharge.amount, verdict.claudeCharge.source || 'sdk');
+          const chargedBody = renderSessionComment(charged, { sourceCommentIds: [sourceId] });
+          await saveSessionComment({
+            target: repo, prNumber, token: env.GH_TOKEN, fetchImpl,
+            existingId: plan.sessionCommentId, previous: latestForSpend, session: charged, body: chargedBody,
+          });
+        }
+      } catch {
+        // Best-effort spend persistence must never mask the stale-state abort.
+      }
+    }
+    throw staleError;
   }
 
   if (verdict.verdict === 'DISMISSED') {
@@ -180,6 +211,7 @@ export async function applyManualDismissal({
     inputHash,
     verdict: verdict.verdict,
     reason: verdict.reason,
+    unavailable: Boolean(verdict.unavailable),
     claudeCharge: verdict.claudeCharge,
   });
   const body = renderSessionComment(session, {

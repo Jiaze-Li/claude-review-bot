@@ -373,15 +373,56 @@ test('TOCTOU guard aborts write if PR HEAD or durable session changes during ver
   assert.equal(mock2.calls.filter(c => ['PATCH', 'POST', 'DELETE'].includes(c.method)).length, 0);
 });
 
-test('idempotency and per-HEAD attempt cap block repeated rebuttals without model calls', () => {
+test('idempotency and per-HEAD attempt cap block repeated rebuttals (including INCONCLUSIVE) without model calls', () => {
   let s = initial();
-  s = recordDismissAttempt({ session: s, findingId: 'F001', headSha: A, sourceCommentId: '51', inputHash: 'h1', verdict: 'REJECTED', reason: 'r1' });
+  s = recordDismissAttempt({ session: s, findingId: 'F001', headSha: A, sourceCommentId: '51', inputHash: 'h1', verdict: 'INCONCLUSIVE', reason: 'ungrounded' });
   assert.equal(checkDismissEligibility({ session: s, findingId: 'F001', headSha: A, sourceCommentId: '51', inputHash: 'h1' }).kind, 'duplicate_comment');
   assert.equal(checkDismissEligibility({ session: s, findingId: 'F001', headSha: A, sourceCommentId: '52', inputHash: 'h1' }).kind, 'duplicate_rebuttal');
   assert.equal(checkDismissEligibility({ session: s, findingId: 'F001', headSha: A, sourceCommentId: '52', inputHash: 'h2' }).eligible, true);
   s = recordDismissAttempt({ session: s, findingId: 'F001', headSha: A, sourceCommentId: '52', inputHash: 'h2', verdict: 'REJECTED', reason: 'r2' });
   assert.equal(checkDismissEligibility({ session: s, findingId: 'F001', headSha: A, sourceCommentId: '53', inputHash: 'h3' }).kind, 'attempt_limit');
+  // Provider-unavailable INCONCLUSIVE does not consume the rebuttal attempt cap
+  let s2 = initial();
+  s2 = recordDismissAttempt({ session: s2, findingId: 'F001', headSha: A, sourceCommentId: '61', inputHash: 'h1', verdict: 'INCONCLUSIVE', unavailable: true, reason: '429' });
+  assert.equal(checkDismissEligibility({ session: s2, findingId: 'F001', headSha: A, sourceCommentId: '62', inputHash: 'h1' }).eligible, true);
   assert.ok(encodeSessionState(s).length > 0);
+});
+
+test('limit-rejected comment is recorded in dismissLedger and Claude spend is preserved on TOCTOU abort', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'finding-dismiss-'));
+  let s = initial();
+  s = recordDismissAttempt({ session: s, findingId: 'F001', headSha: A, sourceCommentId: '51', inputHash: 'h1', verdict: 'REJECTED', reason: 'r1' });
+  s = recordDismissAttempt({ session: s, findingId: 'F001', headSha: A, sourceCommentId: '52', inputHash: 'h2', verdict: 'REJECTED', reason: 'r2' });
+  writePlan(root, s);
+  const mock = mockGitHub(s, { threads: [] });
+  const out = await applyManualDismissal({
+    env: env(root), fetchImpl: mock.fetchImpl,
+    modelFetchImpl: async () => { throw new Error('must not call model'); },
+  });
+  assert.ok(out.dismissLedger.some((entry) => entry.commentId === '99'));
+
+  // Claude spend preserved when PR HEAD moves during Claude fallback
+  const root2 = fs.mkdtempSync(path.join(os.tmpdir(), 'finding-dismiss-'));
+  const s2 = initial(); writePlan(root2, s2);
+  const mock2 = mockGitHub(s2, { mutateHeadAfterReads: 2 });
+  await assert.rejects(
+    applyManualDismissal({
+      env: env(root2),
+      fetchImpl: mock2.fetchImpl,
+      modelFetchImpl: async () => new Response('quota', { status: 429 }),
+      queryImpl: () => (async function* () {
+        yield {
+          type: 'result', subtype: 'success', total_cost_usd: 0.31,
+          usage: { input_tokens: 50, output_tokens: 20 },
+          structured_output: { verdict: 'REJECTED', reason: 'Still buggy.', nextStep: 'Fix it.', sourceAnchors: [] },
+        };
+      })(),
+    }),
+    /PR moved/,
+  );
+  const patchCall = mock2.calls.find((c) => c.method === 'PATCH' && c.pathname === '/repos/acme/project/issues/comments/5');
+  assert.ok(patchCall);
+  assert.equal(parseSessionComment(JSON.parse(patchCall.body).body).deepSpendUsd, 0.31);
 });
 
 test('planner selects dismissal only for a blocking OPEN/UNCERTAIN finding on the same reviewed HEAD', async () => {
