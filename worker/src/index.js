@@ -142,7 +142,7 @@ export default {
       return json({ ignored: true, reason: 'review trigger already processed for this HEAD' });
     }
 
-    const controlRepo = env.CONTROL_REPO || 'Jiaze-Li/review-bot';
+    const controlRepo = env.CONTROL_REPO || 'Jiaze-Li/pr-bot';
     const controlWorkflow = env.CONTROL_WORKFLOW || 'review-v2.yml';
     const controlRef = env.CONTROL_REF || 'main';
 

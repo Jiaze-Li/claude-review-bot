@@ -1,6 +1,6 @@
-# review-bot
+# pr-bot
 
-> **Name note.** This repository was renamed from `claude-review-bot` to `review-bot` (GitHub keeps the old URLs
+> **Name note.** This repository was renamed from `review-bot` (originally `claude-review-bot`) to `pr-bot` (GitHub keeps the old URLs
 > redirecting). Three identifiers deliberately keep the old name, because other repositories and users depend on them:
 > the GitHub App and its `@jiaze-claude-review-bot` command/author name, the Cloudflare Worker service name and
 > webhook URL, and the commit-status context `claude-review-bot/review`.
