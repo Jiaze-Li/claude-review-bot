@@ -4,7 +4,7 @@ import { pathToFileURL } from 'node:url';
 import { CLAUDE_AUTO_MIN_BUDGET_USD, DEEP_REVIEW_MANUAL_RUN_BUDGET_USD, GEMINI_MAX_CONTEXT_BYTES, claudeFallbackCallBudget, isManualBudgetExemptReview, knownIssuesPromptBlock, normalizeReviewResult, normalizeVerificationResult, openMaterialFindings } from './review-session-core.mjs';
 import {isGeminiUnavailableStatus,runClaudeStructured} from './claude-fallback.mjs';
 import {geminiBaseUrl} from './gemini-config.mjs';
-import {MAX_SHARDS,dropIgnoredFiles,planShards,splitDiffByFile} from './review-shards.mjs';
+import {SINGLE_REQUEST_MAX_BYTES,dropIgnoredFiles,stagedFixedBytes,stagedReviewCapacity} from './review-shards.mjs';
 import {defaultProviderRegistry, getProviderAdapter, parseReviewProviders, PROVIDER_KINDS, OUTCOME_KINDS} from './provider-adapter.mjs';
 import {ReadOnlyToolGateway} from './tool-gateway.mjs';
 import {BudgetManager, CircuitBreaker, DeadlineTracker, runBoundedPool, executeWorkUnit, resolveProviderBudgetManagers} from './review-orchestrator.mjs';
@@ -120,7 +120,7 @@ ${diff}`,
 // same provider chain as the sharded engine: Gemini first, Claude for whatever Gemini cannot do. A
 // diff above SINGLE_REQUEST_MAX_BYTES is split by file into parts reviewed independently, so a large
 // delta no longer fails for size. A small diff is exactly one request, as before.
-export const SINGLE_REQUEST_MAX_BYTES=300_000;
+export {SINGLE_REQUEST_MAX_BYTES};
 const PART_CONCURRENCY=3;
 // Parts run side by side, so each Claude call is capped well below the whole run budget; together they still
 // stay inside it (the per-call reservations are counted before the next part starts).
@@ -181,14 +181,11 @@ export async function runGeminiReview({env=process.env,fetchImpl=fetch,logImpl=c
   const ctx={claudeOnly,env,fetchImpl,logImpl,queryImpl,apiKey,repo,prNumber,headSha,contextRoot,plan,mode,prJson,session,riskProfile,diffName,manual,providers};
   const shared={circuitBreaker,budgetManager,providerBudgetManagers};
 
-  const fixedBytes=Buffer.byteLength(prJson,'utf8')+Buffer.byteLength(JSON.stringify(session??{}),'utf8')+Buffer.byteLength(JSON.stringify(riskProfile),'utf8');
-  if(Buffer.byteLength(diff,'utf8')+fixedBytes<=SINGLE_REQUEST_MAX_BYTES){
-    return reviewPart(ctx,diff,shared);
-  }
+  const capacity=stagedReviewCapacity({diff,fixedBytes:stagedFixedBytes({prJson,session,riskProfile})});
+  if(capacity.kind==='single') return reviewPart(ctx,diff,shared);
 
-  const chunks=splitDiffByFile(diff);
-  const {shards:parts,deferred}=planShards({files:chunks.map((chunk)=>chunk.path),chunks});
-  if(deferred.length||!parts.length) throw new Error(`The ${mode} diff spans too many parts (${parts.length+(deferred.length?'+':'')}) for one staged review even after skipping ignored files; add generated or bulk files to .reviewbotignore, or ask for a sharded review`);
+  const {chunks,parts,deferred}=capacity;
+  if(capacity.kind==='too_large') throw new Error(`The ${mode} diff spans too many parts (${parts.length+(deferred.length?'+':'')}) for one staged review even after skipping ignored files; add generated or bulk files to .reviewbotignore, or ask for a sharded review`);
   shared.budgetManager.perCallCap=PART_CLAUDE_CAP_USD;
   logImpl(`Large ${mode} diff: reviewing ${chunks.length} file(s) in ${parts.length} part(s)`);
   const deadlineTracker=new DeadlineTracker({totalMs:PARTS_DEADLINE_MS,minBufferMs:0});

@@ -51,6 +51,7 @@ A full review is used for: a PR's first review, the review after a big or risky 
 * A new commit never inherits an old READY. A READY PR with a small, low-risk new commit gets an *incremental*
   review (at most 50 changed lines in at most 3 files; no workflow/security/schema/dependency paths; every 15th is
   a full refresh); anything else gets a full review.
+* If the PR's history was rewritten since the last review (rebase, force-push, the target branch merged in, a changed base), the verification uses the whole current PR diff instead of the old-HEAD-to-new-HEAD diff; if that is too large for one staged review it is reviewed in shards and the old open findings are carried as "needs confirmation" until a person dismisses them (see `docs/rewritten-history-review.md`).
 
 ## What you do
 
