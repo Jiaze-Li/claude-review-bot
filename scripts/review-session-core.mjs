@@ -592,8 +592,8 @@ export function currentCoverage(session) {
 }
 
 // GitHub commit status for the exact HEAD the session reviewed. Only READY is success.
-// `finalReviewStarted` (true | false | undefined) says whether this run actually handed the final review on;
-// it only matters while the final review is the only thing left.
+// `finalReviewStarted` (true | false | undefined): true = this run handed the final review on, false = this run tried
+// and could not, undefined = this run did not try (no claim either way). Only matters while the final review is all that is left.
 export function sessionCommitStatus(session, headSha, { finalReviewStarted } = {}) {
   if (!session || session.lastReviewedHead !== headSha) {
     return { state: 'pending', description: 'Independent review has not completed for this commit' };
@@ -604,9 +604,12 @@ export function sessionCommitStatus(session, headSha, { finalReviewStarted } = {
       ? { state: 'error', description: 'Review evidence incomplete or material candidates unresolved' }
       : { state: 'success', description: 'Independent review complete: READY' };
     case 'REVIEW_IN_PROGRESS': return { state: 'pending', description: 'Claude deep review in progress' };
-    case 'AUDIT_PENDING': return finalReviewStarted === true
-      ? { state: 'pending', description: 'Final review starting automatically' }
-      : { state: 'error', description: 'Final review is NOT running: comment @gemini review' };
+    case 'AUDIT_PENDING':
+      if (finalReviewStarted === true) return { state: 'pending', description: 'Final review starting automatically' };
+      // Red only when this run tried to hand the final review on and said it could not. A run that never reached
+      // that step (waiting, bookkeeping) knows nothing about an earlier run's review, so it keeps the old yellow.
+      if (finalReviewStarted === false) return { state: 'error', description: 'Final review is NOT running: comment @gemini review' };
+      return { state: 'pending', description: 'Final audit pending' };
     case 'REWORK': return { state: 'failure', description: 'Open material findings: rework needed' };
     case 'PARTIAL': return { state: 'error', description: 'Review coverage partial: some changed files were not reviewed' };
     default: return { state: 'error', description: 'Automatic review stopped: human judgment required' };

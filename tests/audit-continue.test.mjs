@@ -75,11 +75,11 @@ test('AC6: other statuses read exactly as before', () => {
 
 test('AC5: the final review is yellow only when it really was handed on, red otherwise', () => {
   assert.deepEqual(sessionCommitStatus(awaiting, HEAD, { finalReviewStarted: true }), { state: 'pending', description: 'Final review starting automatically' });
-  for (const arg of [{ finalReviewStarted: false }, {}, undefined]) {
-    const status = sessionCommitStatus(awaiting, HEAD, arg);
-    assert.equal(status.state, 'error');
-    assert.match(status.description, /NOT running.*@gemini review/);
-  }
+  const red = sessionCommitStatus(awaiting, HEAD, { finalReviewStarted: false });
+  assert.equal(red.state, 'error');
+  assert.match(red.description, /NOT running.*@gemini review/);
+  // a run that never tried to hand the review on makes no claim: the old yellow stays
+  for (const arg of [{}, undefined]) assert.deepEqual(sessionCommitStatus(awaiting, HEAD, arg), { state: 'pending', description: 'Final audit pending' });
 });
 
 const SYNC_ENV = { TARGET_REPO: 'acme/p', PR_NUMBER: '7', HEAD_SHA: HEAD, STATUS_TOKEN: 's', GH_TOKEN: 't', EXPECTED_REVIEW_AUTHOR: 'bot[bot]' };
@@ -98,7 +98,8 @@ async function mirror(extra) {
 test('AC5: the mirror step turns the dispatch result into the commit status', async () => {
   assert.equal((await mirror({ FINAL_REVIEW_DISPATCHED: 'true' })).state, 'pending');
   assert.equal((await mirror({ FINAL_REVIEW_DISPATCHED: 'false' })).state, 'error');
-  assert.equal((await mirror({})).state, 'error'); // the continue step never ran
+  assert.equal((await mirror({})).state, 'pending'); // the continue step was skipped (waiting/bookkeeping run): no claim, stays yellow
+  assert.equal((await mirror({ FINAL_REVIEW_DISPATCHED: '' })).state, 'pending');
 });
 
 const RUN_ENV = { TARGET_REPO: 'acme/p', PR_NUMBER: '7', BASE_SHA: BASE, HEAD_SHA: HEAD, SOURCE_COMMENT_ID: '6492010062', SOURCE_KIND: 'comment', REQUESTED_MODE: 'auto', TRIGGER_USER: 'j', REVIEW_MODE: 'verification', GH_TOKEN: 't', DISPATCH_TOKEN: 'd', GITHUB_REPOSITORY: 'ctl/repo', GITHUB_RUN_ID: '40844152995', EXPECTED_REVIEW_AUTHOR: 'bot[bot]' };

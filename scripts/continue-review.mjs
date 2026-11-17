@@ -117,6 +117,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     publishOutcome(await continueReview());
   } catch (error) {
     console.error(error.message);
+    publishOutcome({ dispatched: false }); // it tried and could not: never leave the mirror guessing
     process.exitCode = 1;
   }
 }
