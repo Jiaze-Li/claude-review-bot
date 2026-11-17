@@ -847,4 +847,7 @@ test('V5: explicit reset (including same HEAD) clears findings and dismissed whi
   assert.equal(sameHeadReset.dismissed.length, 0);
   assert.equal(sameHeadReset.deepSpendUsd, 2.25);
   assert.equal(sameHeadReset.nextFindingNumber, 1);
+
+  const inProgress = beginDeepReview({ session: readySession(), baseSha: BASE, headSha: A, now: T0 });
+  assert.throws(() => beginDeepReview({ session: inProgress, baseSha: BASE, headSha: A, now: T0, reset: true }), /already in progress/);
 });

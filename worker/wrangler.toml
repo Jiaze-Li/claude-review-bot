@@ -3,6 +3,6 @@ main = "src/index.js"
 compatibility_date = "2026-08-29"
 
 [vars]
-CONTROL_REPO = "Jiaze-Li/pr-bot"
+CONTROL_REPO = "Jiaze-Li/review-bot"
 CONTROL_WORKFLOW = "review-v2.yml"
 CONTROL_REF = "main"

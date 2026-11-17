@@ -471,13 +471,13 @@ export function beginDeepReview({
   // A review that begins from an existing session waiting for its final review (AUDIT_PENDING) IS that final review:
   // it is owed once, so findings it adds are verified and the PR then needs no second full review. A review that
   // starts a session of its own is not (a clean one is simply READY).
+  if (session?.lastReviewedHead === headSha && session.status === 'REVIEW_IN_PROGRESS' && !isDeepReviewStale(session, Date.parse(now))) {
+    throw new Error('a deep review is already in progress for this HEAD');
+  }
   const settledAndWaiting = Boolean(session) && !reset && session.lastReviewedHead === headSha && session.status === 'AUDIT_PENDING';
   // A full review of a HEAD that has no session yet (or an explicit reset) starts a seeded session; spend carries over.
   if (reset || !session || session.lastReviewedHead !== headSha) {
     session = seedSession({ previous: session, baseSha, headSha, now, carryOpen, reset });
-  }
-  if (session.status === 'REVIEW_IN_PROGRESS' && !isDeepReviewStale(session, Date.parse(now))) {
-    throw new Error('a deep review is already in progress for this HEAD');
   }
   // A stale in-progress marker is replaced; the status it interrupted is remembered.
   // A deep review that failed closed is the only reason for that HUMAN_REQUIRED (no findings,

@@ -107,7 +107,7 @@ export async function planSession({ env=process.env, fetchImpl=fetch }={}) {
   // `@claude review` plans exactly like `@gemini review` (first review, incremental, verification or final
   // audit, whatever the session calls for); only the model differs: Claude alone instead of Gemini first.
   // A run still in progress for this exact HEAD is the one thing to wait for rather than start again.
-  if(requested==='claude' && session && session.lastReviewedHead===headSha && session.status==='REVIEW_IN_PROGRESS' && !isDeepReviewStale(session)){
+  if(['claude','reset'].includes(requested) && session && session.lastReviewedHead===headSha && session.status==='REVIEW_IN_PROGRESS' && !isDeepReviewStale(session)){
     const decision={mode:'noop_waiting',previousHead:headSha,reason:'a deep review is already in progress for this HEAD'};
     return {requestedMode:requested,decision,session,sessionCommentId,pendingSession:null,pendingSourceCommentId:null,pendingReviewId:null};
   }
