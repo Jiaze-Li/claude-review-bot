@@ -1,14 +1,29 @@
-import { saveSessionComment } from './session-comment.mjs';
-import { finalReviewOutlook } from './continue-review.mjs';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { applyFindingDismissal, parseSessionComment, renderSessionComment } from './review-session-core.mjs';
+import { saveSessionComment } from './session-comment.mjs';
+import { finalReviewOutlook } from './continue-review.mjs';
+import {
+  applyFindingDismissal,
+  checkDismissEligibility,
+  isBlockingFinding,
+  parseSessionComment,
+  recordDismissAttempt,
+  renderSessionComment,
+} from './review-session-core.mjs';
+import { fetchReviewThreads, replyToThread, threadsByFinding } from './review-threads.mjs';
+import { verifyDismissalWithModel } from './dismiss-verifier.mjs';
 import { parseDismissalRequest } from '../worker/src/review-trigger.js';
 
-// No product-code mutation or model call. All user-origin facts are re-fetched
-// from GitHub rather than trusted from a workflow_dispatch request.
-export async function applyManualDismissal({ env = process.env, fetchImpl = fetch } = {}) {
+// Independent model verification for @gemini dismiss F001. All user-origin
+// facts are re-fetched from GitHub rather than trusted from workflow_dispatch.
+export async function applyManualDismissal({
+  env = process.env,
+  fetchImpl = fetch,
+  modelFetchImpl = fetchImpl,
+  queryImpl = null,
+} = {}) {
   const repo = required(env, 'TARGET_REPO');
   if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) throw new Error('Invalid TARGET_REPO');
   const prNumber = required(env, 'PR_NUMBER');
@@ -50,30 +65,190 @@ export async function applyManualDismissal({ env = process.env, fetchImpl = fetc
     throw new Error('Finding dismissal requires repository write permission');
   }
 
-  // Reject a stale read: only the bot-authored, still-identical session may be
-  // updated. The workflow also serializes all bot writes per target PR.
-  const current = await github(root + '/issues/comments/' + plan.sessionCommentId, env.GH_TOKEN, fetchImpl);
-  const durable = String(current.user?.login || '') === expectedAuthor ? parseSessionComment(current.body) : null;
+  const loadCurrentDurable = async () => {
+    const current = await github(root + '/issues/comments/' + plan.sessionCommentId, env.GH_TOKEN, fetchImpl);
+    return String(current.user?.login || '') === expectedAuthor ? parseSessionComment(current.body) : null;
+  };
+  const durable = await loadCurrentDurable();
   if (!durable || JSON.stringify(durable) !== JSON.stringify(plan.session)) {
     throw new Error('Durable review session changed since planning; refusing stale dismissal');
   }
-  const session = applyFindingDismissal({
-    session: durable, findingId: decision.findingId, headSha, by,
-    reason: decision.reason, evidence: decision.evidence, sourceCommentId: sourceId,
-  });
-  await proveHead();
-  const body = renderSessionComment(session, { sourceCommentIds: [sourceId], finalReview: finalReviewOutlook({ session, headSha, sourceCommentId: env.SOURCE_COMMENT_ID, planMode: 'dismiss' }) });
-  const savedId = await saveSessionComment({
-    target: repo, prNumber, token: env.GH_TOKEN, fetchImpl, existingId: plan.sessionCommentId, previous: durable, session, body,
+
+  const targetFinding = durable.findings.find((f) => f.id === decision.findingId);
+  if (!targetFinding || !['OPEN', 'UNCERTAIN'].includes(targetFinding.status) || !isBlockingFinding(targetFinding)) {
+    throw new Error('dismissal finding must be an OPEN or UNCERTAIN material candidate');
+  }
+
+  const inputHash = createHash('sha256')
+    .update(decision.reason.trim() + '\n' + decision.evidence.join('\n'))
+    .digest('hex')
+    .slice(0, 16);
+
+  const eligibility = checkDismissEligibility({
+    session: durable,
+    findingId: decision.findingId,
+    headSha,
+    sourceCommentId: sourceId,
+    inputHash,
   });
 
-  // The ordinary auto-audit step consumes this same contract after either a
-  // verification or an evidence-based dismissal reaches AUDIT_PENDING.
-  fs.writeFileSync(path.join(contextRoot, 'published-session.json'), JSON.stringify({
-    mode: 'dismiss', session, sessionCommentId: savedId,
-  }, null, 2) + '\n', { mode: 0o600 });
-  console.log('Human-evidenced dismissal recorded: ' + decision.findingId + '; status ' + session.status + '.');
+  if (!eligibility.eligible) {
+    if (eligibility.kind === 'duplicate_comment') {
+      console.log(`Dismissal comment ${sourceId} already processed; skipping.`);
+      return durable;
+    }
+    const priorReason = eligibility.entry?.reason || 'Previous dismissal rebuttal on this HEAD was already rejected.';
+    const message = eligibility.kind === 'duplicate_rebuttal'
+      ? `Repeated identical rebuttal for **${decision.findingId}** on this commit was not re-run. ${priorReason}`
+      : `Per-commit dismissal verification limit reached for **${decision.findingId}** on this commit without new code changes.`;
+    const body = renderSessionComment(durable, {
+      sourceCommentIds: [sourceId],
+      finalReview: finalReviewOutlook({ session: durable, headSha, sourceCommentId: env.SOURCE_COMMENT_ID, planMode: 'dismiss' }),
+    });
+    const savedId = await saveSessionComment({
+      target: repo, prNumber, token: env.GH_TOKEN, fetchImpl,
+      existingId: plan.sessionCommentId, previous: durable, session: durable, body,
+    });
+    await postDismissalOutcomeReply({
+      repo, prNumber, expectedAuthor, session: durable, findingId: decision.findingId,
+      heading: `**${decision.findingId} dismissal not re-run**`,
+      reason: message,
+      nextStep: 'Push a code/test fix, or have a repository maintainer use `override review` if accepting risk.',
+      env, fetchImpl,
+    });
+    writePublishedSession(contextRoot, { mode: 'dismiss', verdict: 'REJECTED', skippedModel: true, session: durable, sessionCommentId: savedId });
+    return durable;
+  }
+
+  const repoRoot = path.resolve(env.SAFE_REPO_DIR || env.TARGET_REPO_DIR || 'safe-target');
+  const diffPath = path.join(contextRoot, 'pr.diff');
+  const prDiff = fs.existsSync(diffPath) ? fs.readFileSync(diffPath, 'utf8') : '';
+
+  const verdict = await verifyDismissalWithModel({
+    repo,
+    prNumber,
+    headSha,
+    finding: targetFinding,
+    reason: decision.reason,
+    evidence: decision.evidence,
+    session: durable,
+    repoRoot,
+    prDiff,
+    env,
+    fetchImpl: modelFetchImpl,
+    githubFetchImpl: fetchImpl,
+    queryImpl,
+  });
+
+  // Re-verify PR HEAD and durable session before writing any state (TOCTOU guard).
+  await proveHead();
+  const latestDurable = await loadCurrentDurable();
+  if (!latestDurable || JSON.stringify(latestDurable) !== JSON.stringify(durable)) {
+    throw new Error('Durable review session changed during dismissal verification; refusing stale verdict');
+  }
+
+  if (verdict.verdict === 'DISMISSED') {
+    const session = applyFindingDismissal({
+      session: durable,
+      findingId: decision.findingId,
+      headSha,
+      by,
+      reason: decision.reason,
+      evidence: decision.evidence,
+      sourceCommentId: sourceId,
+      verification: verdict,
+      inputHash,
+    });
+    const body = renderSessionComment(session, {
+      sourceCommentIds: [sourceId],
+      finalReview: finalReviewOutlook({ session, headSha, sourceCommentId: env.SOURCE_COMMENT_ID, planMode: 'dismiss' }),
+    });
+    const savedId = await saveSessionComment({
+      target: repo, prNumber, token: env.GH_TOKEN, fetchImpl,
+      existingId: plan.sessionCommentId, previous: durable, session, body,
+    });
+    writePublishedSession(contextRoot, { mode: 'dismiss', verdict: 'DISMISSED', session, sessionCommentId: savedId });
+    console.log(`Verified dismissal recorded (${verdict.provider}): ${decision.findingId}; status ${session.status}.`);
+    return session;
+  }
+
+  const session = recordDismissAttempt({
+    session: durable,
+    findingId: decision.findingId,
+    headSha,
+    sourceCommentId: sourceId,
+    inputHash,
+    verdict: verdict.verdict,
+    reason: verdict.reason,
+    claudeCharge: verdict.claudeCharge,
+  });
+  const body = renderSessionComment(session, {
+    sourceCommentIds: [sourceId],
+    finalReview: finalReviewOutlook({ session, headSha, sourceCommentId: env.SOURCE_COMMENT_ID, planMode: 'dismiss' }),
+  });
+  const savedId = await saveSessionComment({
+    target: repo, prNumber, token: env.GH_TOKEN, fetchImpl,
+    existingId: plan.sessionCommentId, previous: durable, session, body,
+  });
+
+  const isRejected = verdict.verdict === 'REJECTED';
+  await postDismissalOutcomeReply({
+    repo,
+    prNumber,
+    expectedAuthor,
+    session,
+    findingId: decision.findingId,
+    heading: isRejected
+      ? `**${decision.findingId} dismissal rejected**`
+      : `**${decision.findingId} dismissal inconclusive (kept blocking)**`,
+    reason: verdict.reason,
+    nextStep: verdict.nextStep,
+    env,
+    fetchImpl,
+  });
+  writePublishedSession(contextRoot, { mode: 'dismiss', verdict: verdict.verdict, session, sessionCommentId: savedId });
+  console.log(`Dismissal ${verdict.verdict.toLowerCase()} for ${decision.findingId}; status ${session.status} remains blocking.`);
   return session;
+}
+
+async function postDismissalOutcomeReply({
+  repo, prNumber, expectedAuthor, session, findingId, heading, reason, nextStep, env, fetchImpl,
+}) {
+  const token = env.THREAD_TOKEN || env.GH_TOKEN;
+  const botLogin = expectedAuthor.replace(/\[bot\]$/, '');
+  const [owner, repoName] = repo.split('/');
+  const message = `${heading}\n\n${reason}${nextStep ? `\n\n**Next:** ${nextStep}` : ''}`;
+
+  let postedInThread = false;
+  try {
+    const threads = await fetchReviewThreads({ owner, repo: repoName, number: Number(prNumber), token, fetchImpl });
+    const byFinding = threadsByFinding({ session, threads, botLogin });
+    const targetThread = (byFinding.get(findingId) ?? []).find((t) => Boolean(t.commentId));
+    if (targetThread) {
+      await replyToThread({
+        target: repo,
+        prNumber,
+        commentId: targetThread.commentId,
+        body: message,
+        token,
+        fetchImpl,
+      });
+      postedInThread = true;
+    }
+  } catch (error) {
+    console.warn(`Could not reply in original review thread for ${findingId}: ${String(error?.message || error).slice(0, 200)}`);
+  }
+
+  if (!postedInThread) {
+    await github(`https://api.github.com/repos/${repo}/issues/${prNumber}/comments`, env.GH_TOKEN, fetchImpl, {
+      method: 'POST',
+      body: JSON.stringify({ body: message }),
+    });
+  }
+}
+
+function writePublishedSession(contextRoot, payload) {
+  fs.writeFileSync(path.join(contextRoot, 'published-session.json'), JSON.stringify(payload, null, 2) + '\n', { mode: 0o600 });
 }
 
 async function github(url, token, fetchImpl, init = {}) {

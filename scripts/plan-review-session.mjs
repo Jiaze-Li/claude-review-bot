@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { isDeepReviewStale, openMaterialFindings, parsePendingSessionReview, parseSessionComment, planReviewSession, unresolvedMaterialFindings } from './review-session-core.mjs';
+import { isBlockingFinding, isDeepReviewStale, openMaterialFindings, parsePendingSessionReview, parseSessionComment, planReviewSession, unresolvedMaterialFindings } from './review-session-core.mjs';
 import { dropIgnoredFiles, splitDiffByFile, stagedFixedBytes, stagedReviewCapacity } from './review-shards.mjs';
 import { adoptOrphanFindings, blockingClaims, fetchReviewThreads, findOrphanBotThreads, isWriter, threadsByFinding } from './review-threads.mjs';
 import { prepareIncrementalDelta } from './select-incremental-review.mjs';
@@ -113,11 +113,15 @@ export async function planSession({ env=process.env, fetchImpl=fetch }={}) {
   }
 
   if(requested==='dismiss'){
-    const eligible=session && ['REWORK','HUMAN_REQUIRED'].includes(session.status)
-      && session.lastReviewedHead===headSha && session.findings.some(f=>['OPEN','UNCERTAIN'].includes(f.status));
-    const decision=eligible
-      ?{mode:'dismiss',previousHead:null,reason:'adjudicate one evidenced finding without bypassing final audit'}
-      :{mode:'noop_waiting',previousHead:null,reason:'no OPEN or UNCERTAIN finding on the last-reviewed HEAD; review the current HEAD first'};
+    const alreadyHandled=Boolean(env.SOURCE_COMMENT_ID) && Array.isArray(session?.dismissLedger)
+      && session.dismissLedger.some(entry=>String(entry?.commentId??'')===String(env.SOURCE_COMMENT_ID));
+    const eligible=!alreadyHandled && session && ['REWORK','HUMAN_REQUIRED'].includes(session.status)
+      && session.lastReviewedHead===headSha && session.findings.some(f=>['OPEN','UNCERTAIN'].includes(f.status) && isBlockingFinding(f));
+    const decision=alreadyHandled
+      ?{mode:'noop_waiting',previousHead:null,reason:'this dismissal comment was already adjudicated'}
+      :eligible
+        ?{mode:'dismiss',previousHead:null,reason:'adjudicate one evidenced finding without bypassing final audit'}
+        :{mode:'noop_waiting',previousHead:null,reason:'no OPEN or UNCERTAIN finding on the last-reviewed HEAD; review the current HEAD first'};
     return {requestedMode:requested,decision,session,sessionCommentId,pendingSession:null,pendingSourceCommentId:null,pendingReviewId:null};
   }
 
