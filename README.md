@@ -1,4 +1,9 @@
-# claude-review-bot
+# review-bot
+
+> **Name note.** This repository was renamed from `claude-review-bot` to `review-bot` (GitHub keeps the old URLs
+> redirecting). Three identifiers deliberately keep the old name, because other repositories and users depend on them:
+> the GitHub App and its `@jiaze-claude-review-bot` command/author name, the Cloudflare Worker service name and
+> webhook URL, and the commit-status context `claude-review-bot/review`.
 
 Account-wide bounded PR review service for GitHub: Gemini first, Claude where Gemini cannot, one session per PR.
 

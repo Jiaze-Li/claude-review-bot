@@ -159,7 +159,7 @@ function fakeGithub(t, {
     else if (pathname === '/repos/acme/project/issues/7/comments') out = processedNoop
       ? [{ user: { login: 'jiaze-claude-review-bot[bot]' }, body: `<!-- jiaze-review-source-comment:${duplicateMarkerId} -->` }]
       : [];
-    else if (pathname === '/repos/Jiaze-Li/claude-review-bot/installation') out = { id: 11 };
+    else if (pathname === '/repos/Jiaze-Li/review-bot/installation') out = { id: 11 };
     else assert.fail(`Unexpected GitHub endpoint: ${method} ${pathname}`);
     return Response.json(out);
   });
@@ -383,4 +383,23 @@ test('a person without write access resolving a thread is ignored', async (t) =>
   const response = await worker.fetch(request(threadPayload('resolved'), {}, 'pull_request_review_thread'), env);
   assert.equal((await response.json()).ignored, true);
   assert.equal(calls.some((call) => call.pathname.endsWith('/dispatches')), false);
+});
+
+const controlRepoValues = (toml, source) => ({
+  configured: toml.match(/^CONTROL_REPO\s*=\s*"([^"]+)"/m)?.[1],
+  fallback: source.match(/env\.CONTROL_REPO \|\| '([^']+)'/)?.[1],
+});
+
+test('the Worker control-repository setting and its code fallback name the same repository', () => {
+  const toml = fs.readFileSync(new URL('../worker/wrangler.toml', import.meta.url), 'utf8');
+  const source = fs.readFileSync(new URL('../worker/src/index.js', import.meta.url), 'utf8');
+  const { configured, fallback } = controlRepoValues(toml, source);
+  assert.equal(configured, 'Jiaze-Li/review-bot');
+  assert.equal(fallback, configured);
+
+  // The same comparison must fail when either side drifts back to the old name.
+  const driftedSource = controlRepoValues(toml, source.replace(`|| '${fallback}'`, "|| 'Jiaze-Li/claude-review-bot'"));
+  assert.throws(() => assert.equal(driftedSource.fallback, driftedSource.configured));
+  const driftedToml = controlRepoValues(toml.replace(configured, 'Jiaze-Li/claude-review-bot'), source);
+  assert.throws(() => assert.equal(driftedToml.fallback, driftedToml.configured));
 });

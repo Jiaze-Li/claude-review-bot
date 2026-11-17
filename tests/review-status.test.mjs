@@ -8,7 +8,7 @@ import { renderSessionComment } from '../scripts/review-session-core.mjs';
 
 const baseEnv = {
   GITHUB_ACTIONS: 'true',
-  GITHUB_REPOSITORY: 'Jiaze-Li/claude-review-bot',
+  GITHUB_REPOSITORY: 'Jiaze-Li/review-bot',
   GITHUB_RUN_ID: '1234',
   GITHUB_RUN_ATTEMPT: '2',
   GH_TOKEN: 'synthetic-test-token',
