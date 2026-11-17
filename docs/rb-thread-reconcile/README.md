@@ -1,0 +1,11 @@
+# Old Bot Thread Reconciliation (`RB-THREAD-RECONCILE-01`)
+
+Every verification-capable review run reconciles the pull request's review threads against the durable review session so that old bot-authored threads missing from the current session ("orphan threads") are neither silently forgotten nor closed without verification.
+
+## How it works
+
+1. **Identify**: In `scripts/review-threads.mjs` (`findOrphanBotThreads`), the planner fetches PR review threads (`path`, `line`, `isOutdated`, `isResolved`, `resolvedBy`, and first comment `body`/`author`). Only threads started by the bot (`first.author.login === botLogin`) with a valid `<!-- jiaze-finding:<key> -->` marker whose key is absent from `session.findings` and not resolved by the bot itself are considered. Non-bot threads are never read or touched.
+2. **Reconstruct & verify key**: Each candidate's `severity`, `title`, `body`, and `riskClass` are parsed from the bot's first comment and cross-checked with `findingKey(thread.path, title)`. Mismatches or missing paths are counted as `unrecognizable` and never adopted.
+3. **Adopt (verification runs only)**: On `auto` `verification` runs or `AUDIT_PENDING` before the final full review (and only when the whole `pr.diff` fits within `stagedReviewCapacity`), up to **8** in-diff orphans per round (P0–P2 prioritized over P3, respecting the 64-finding session cap) are appended to `plan.session.findings` with `origin: 'THREAD_ORPHAN'` and `status: 'OPEN'`, and `repair.diff` is set to `pr.diff`.
+4. **Verify, close, or reopen**: The existing verification pipeline (`run-gemini-review.mjs` → `applyVerificationResult` → `sync-review-threads.mjs`) verifies each adopted orphan: `FIXED` threads are resolved on GitHub; `STILL_OPEN` or omitted threads remain `OPEN` (fail-closed) and are reopened with an explanation if a person had resolved them.
+5. **Report honestly**: `renderSessionComment` reports `Old bot threads reconciled` with verified fixed/open counts plus any deferred (next round), unrecognizable, outside-diff, or too-large-PR counts. On `READY` incremental runs, `@claude review`, `PARTIAL`, `HUMAN_REQUIRED`, and one-shot commands, run types are never altered and orphans are only reported.

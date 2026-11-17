@@ -902,7 +902,8 @@ export function recordUncertainFindings(session, validations, headSha) {
 }
 
 // finalReview: { startsByItself, reason } — what the caller knows about whether the final review starts by itself.
-export function renderSessionComment(session, { sourceCommentIds = [], finalReview } = {}) {
+// orphanReconcile: { found, adopted, deferred, unrecognizable, outsideDiff, tooLarge, reportOnly } — optional planner summary.
+export function renderSessionComment(session, { sourceCommentIds = [], finalReview, orphanReconcile } = {}) {
   validateSession(session);
   const open = openMaterialFindings(session);
   const unresolved = unresolvedMaterialFindings(session);
@@ -955,6 +956,7 @@ export function renderSessionComment(session, { sourceCommentIds = [], finalRevi
     ]),
   ];
   if (!findingLines.length) findingLines.push('- none');
+  const orphanLine = formatOrphanReconcileLine(session, orphanReconcile);
   const state = encodeSessionState(session);
   const processedMarkers = [...new Set(sourceCommentIds.map(String).filter((id) => /^[1-9]\d*$/.test(id)))]
     .slice(-8)
@@ -982,12 +984,41 @@ export function renderSessionComment(session, { sourceCommentIds = [], finalRevi
     ...findingLines,
     ...(dismissalLines.length ? ['', 'Human-dismissed findings (cited, not machine-verified):', ...dismissalLines] : []),
     ...(threadLines.length ? ['', 'Closed by people (review thread resolved):', ...threadLines] : []),
+    ...(orphanLine ? ['', orphanLine] : []),
     '',
     `Next: ${next}`,
     '',
     '<sub>Every reported finding, P3 included, stays open until it is fixed. Verification covers open findings and new delta regressions. Audited unchanged code is reused after safe incremental reviews; high-risk deltas receive full review.</sub>',
     `<!-- jiaze-review-state:${state} -->`,
   ].join('\n');
+}
+
+function formatOrphanReconcileLine(session, orphanReconcile) {
+  const orphanFindings = session.findings.filter((f) => f.origin === 'THREAD_ORPHAN');
+  const totalFound = Number.isInteger(orphanReconcile?.found) ? orphanReconcile.found : orphanFindings.length;
+  if (totalFound <= 0 && orphanFindings.length === 0) return null;
+
+  const fixedCount = orphanFindings.filter((f) => f.status === 'FIXED').length;
+  const openCount = orphanFindings.filter((f) => ['OPEN', 'UNCERTAIN'].includes(f.status)).length;
+  const parts = [];
+  if (orphanFindings.length > 0) {
+    parts.push(`verified **${fixedCount}** fixed (closed), **${openCount}** still open`);
+  }
+  if (orphanReconcile?.deferred > 0) {
+    parts.push(orphanReconcile.reportOnly
+      ? `${orphanReconcile.deferred} not verified in this run`
+      : `${orphanReconcile.deferred} remaining for next round`);
+  }
+  if (orphanReconcile?.unrecognizable > 0) {
+    parts.push(`${orphanReconcile.unrecognizable} unrecognizable`);
+  }
+  if (orphanReconcile?.outsideDiff > 0) {
+    parts.push(`${orphanReconcile.outsideDiff} in files outside this PR diff`);
+  }
+  if (orphanReconcile?.tooLarge > 0) {
+    parts.push(`${orphanReconcile.tooLarge} not verified (PR too large for one pass)`);
+  }
+  return `Old bot threads reconciled: found **${totalFound}**${parts.length ? ` — ${parts.join('; ')}` : ''}`;
 }
 
 export function parseSessionComment(body) {

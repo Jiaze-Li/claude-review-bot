@@ -69,7 +69,7 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
       session = chargeClaudeFallback(session, meta.total_cost_usd, meta.cost_source === 'reserve' ? 'reserve' : 'sdk');
   }
 
-  let sessionBody = renderSessionComment(session, { sourceCommentIds: [sourceCommentId], finalReview: finalReviewOutlook({ session, headSha, sourceCommentId, planMode: mode }) });
+  let sessionBody = renderSessionComment(session, { sourceCommentIds: [sourceCommentId], finalReview: finalReviewOutlook({ session, headSha, sourceCommentId, planMode: mode }), orphanReconcile: plan.orphanReconcile });
   const pendingMarker = pendingSessionMarker(session, sourceCommentId);
   const anchors = await loadAnchors({ owner, repo, prNumber, token: env.GH_TOKEN, fetchImpl });
   const newFindings = session.findings.slice(plan.session.findings.length);
@@ -164,7 +164,7 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
   const stale = await staleMarkerIfMoved({ owner, repo, prNumber, headSha, token: env.GH_TOKEN, fetchImpl });
   if (stale) {
     session = { ...session, ...stale };
-    sessionBody = renderSessionComment(session, { sourceCommentIds: [sourceCommentId], finalReview: finalReviewOutlook({ session, headSha, sourceCommentId, planMode: mode }) });
+    sessionBody = renderSessionComment(session, { sourceCommentIds: [sourceCommentId], finalReview: finalReviewOutlook({ session, headSha, sourceCommentId, planMode: mode }), orphanReconcile: plan.orphanReconcile });
     console.log('PR moved while publishing; recording the review for the reviewed commit, marked out of date.');
   }
 
