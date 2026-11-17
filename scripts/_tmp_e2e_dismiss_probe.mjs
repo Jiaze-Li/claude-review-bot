@@ -2,13 +2,13 @@
 
 export function crashOnNull(items) {
   if (items == null) {
-    return items.length;
+    return 0;
   }
   return items.length;
 }
 
-export function safeLookup(map, key) {
-  if (!(map instanceof Map)) return null;
-  if (!map.has(key)) return null;
-  return map.get(key);
+export function safeNullProtoAssign(userKey, value) {
+  const dict = Object.create(null);
+  dict[userKey] = value;
+  return dict;
 }
