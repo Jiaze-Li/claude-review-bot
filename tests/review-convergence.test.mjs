@@ -241,7 +241,7 @@ const uncertainCandidate = (over={}) => ({
 const adjudicate = (s,id='F001',head=A) => applyFindingDismissal({
   session:s,findingId:id,headSha:head,by:'maintainer',
   reason:'The changed caller has an exact-HEAD guard that prevents this write path.',
-  evidence:['https://github.com/Jiaze-Li/claude-review-bot/blob/main/README.md'],
+  evidence:['https://github.com/Jiaze-Li/review-bot/blob/main/README.md'],
   sourceCommentId:'304',
 });
 
