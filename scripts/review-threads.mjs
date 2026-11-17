@@ -6,7 +6,7 @@ const THREADS_QUERY = `query($owner:String!,$repo:String!,$number:Int!,$after:St
   repository(owner:$owner,name:$repo){pullRequest(number:$number){
     reviewThreads(first:100,after:$after){
       pageInfo{hasNextPage endCursor}
-      nodes{id isResolved resolvedBy{login} comments(first:1){nodes{databaseId body author{login}}}}
+      nodes{id path line isOutdated isResolved resolvedBy{login} comments(first:1){nodes{databaseId body author{login}}}}
     }
   }}
 }`;
@@ -127,4 +127,124 @@ export function reportThreadProblem({ env, log, heading, counts, errors = [], pe
   if (env.GITHUB_STEP_SUMMARY) {
     try { appendFileSync(env.GITHUB_STEP_SUMMARY, `${lines.join('\n')}\n`); } catch { /* summary is optional */ }
   }
+}
+
+const MAX_SESSION_FINDINGS = 64;
+
+function compactOrphanText(value, max) {
+  return String(value ?? '').replace(/[\r\n]+/g, ' ').trim().slice(0, max);
+}
+
+// Reconstruct { severity, title, body, riskClass } from a bot-authored review thread's first comment.
+// Returns null if the comment does not match the bot's own thread formats.
+export function parseBotThreadBody(rawBody) {
+  if (typeof rawBody !== 'string') return null;
+  let text = rawBody.replace(/\s*<!--\s*jiaze-finding:[0-9a-f]{10}\s*-->\s*$/i, '').trimEnd();
+  text = text.replace(/\n\n_Pinned to the nearest changed line:[^\n]*_\s*$/, '').trimEnd();
+  let riskClass = 'uncategorized';
+  const riskMatch = text.match(/\n\nRisk class:\s*([^\r\n]+)\s*$/);
+  if (riskMatch) {
+    riskClass = riskMatch[1].trim() || 'uncategorized';
+    text = text.slice(0, riskMatch.index).trimEnd();
+  }
+  const header = text.match(/^\*\*\[(?:[A-Za-z0-9_-]+\s*·\s*)?(P[0-3])\]\s+([^\r\n]+?)\*\*\r?\n\r?\n([\s\S]*)$/);
+  if (!header) return null;
+  const severity = header[1];
+  const title = header[2].trim();
+  const body = header[3].trim() || title;
+  if (!title) return null;
+  return { severity, title, body, riskClass };
+}
+
+// Identify bot-authored review threads whose marker key is missing from the current session and that were
+// not resolved by the bot itself. Non-bot threads are never read beyond checking the first author (I1).
+export function findOrphanBotThreads({ session, threads, botLogin }) {
+  const sessionKeys = new Set((session?.findings ?? []).map((f) => findingKey(f.path, f.title)));
+  const orphans = [];
+  let unrecognizable = 0;
+
+  for (const thread of threads ?? []) {
+    const first = thread?.comments?.nodes?.[0];
+    if (!first || first.author?.login !== botLogin) continue;
+    const key = markerKey(first.body);
+    if (!key || sessionKeys.has(key)) continue;
+    if (thread.isResolved && thread.resolvedBy?.login === botLogin) continue;
+
+    const threadPath = typeof thread.path === 'string' ? thread.path.trim() : '';
+    const validPath = Boolean(threadPath) && !threadPath.startsWith('/') && !threadPath.split('/').includes('..') && !threadPath.includes('\0');
+    const parsed = validPath ? parseBotThreadBody(first.body) : null;
+    if (!parsed || findingKey(threadPath, parsed.title) !== key) {
+      unrecognizable += 1;
+      continue;
+    }
+
+    orphans.push({
+      threadId: thread.id,
+      commentId: first.databaseId ?? null,
+      key,
+      path: threadPath,
+      line: Number.isInteger(thread.line) && thread.line >= 1 ? thread.line : null,
+      isOutdated: Boolean(thread.isOutdated),
+      isResolved: Boolean(thread.isResolved),
+      resolvedBy: thread.resolvedBy?.login ?? null,
+      severity: parsed.severity,
+      title: parsed.title,
+      body: parsed.body,
+      riskClass: parsed.riskClass,
+    });
+  }
+
+  return { total: orphans.length + unrecognizable, orphans, unrecognizable };
+}
+
+// Adopt up to `maxAdopt` in-diff orphan findings into `session.findings` (P0-P2 before P3, preserving order),
+// respecting the 64-finding session cap and without mutating `session.status` or adding session fields (I3).
+export function adoptOrphanFindings({ session, orphans, diffPaths, headSha, maxAdopt = 8 }) {
+  const existingKeys = new Set((session?.findings ?? []).map((f) => findingKey(f.path, f.title)));
+  const inDiff = [];
+  let outsideDiffCount = 0;
+
+  for (const orphan of orphans ?? []) {
+    if (diffPaths && !diffPaths.has(orphan.path)) {
+      outsideDiffCount += 1;
+      continue;
+    }
+    if (existingKeys.has(orphan.key)) continue;
+    existingKeys.add(orphan.key);
+    inDiff.push(orphan);
+  }
+
+  const prioritized = [...inDiff].sort((a, b) => (MATERIAL.has(a.severity) ? 0 : 1) - (MATERIAL.has(b.severity) ? 0 : 1));
+  const existingFindings = session?.findings ?? [];
+  const room = Math.max(0, MAX_SESSION_FINDINGS - existingFindings.length);
+  const limit = Math.min(maxAdopt, room);
+  const toAdopt = prioritized.slice(0, limit);
+  const deferredCount = prioritized.length - toAdopt.length;
+
+  let nextFindingNumber = Number.isInteger(session?.nextFindingNumber) ? session.nextFindingNumber : existingFindings.length + 1;
+  const adopted = toAdopt.map((orphan) => ({
+    id: `F${String(nextFindingNumber++).padStart(3, '0')}`,
+    severity: orphan.severity,
+    title: compactOrphanText(orphan.title, 140),
+    body: compactOrphanText(orphan.body, 450),
+    path: compactOrphanText(orphan.path, 240),
+    line: orphan.line,
+    riskClass: compactOrphanText(orphan.riskClass || 'uncategorized', 60),
+    status: 'OPEN',
+    origin: 'THREAD_ORPHAN',
+    introducedHead: headSha,
+    lastCheckedHead: session.lastReviewedHead,
+    resolutionReason: null,
+  }));
+
+  return {
+    session: {
+      ...session,
+      findings: [...existingFindings, ...adopted],
+      nextFindingNumber,
+    },
+    adoptedCount: adopted.length,
+    deferredCount,
+    outsideDiffCount,
+  };
 }

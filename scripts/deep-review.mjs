@@ -195,7 +195,7 @@ async function assertHeadUnmoved(ctx, fetchImpl) {
 function upsertSession(ctx, session, sourceCommentIds, fetchImpl, existingId, previous) {
   return saveSessionComment({
     target: ctx.target, prNumber: ctx.prNumber, token: ctx.token, fetchImpl, existingId, previous, session,
-    body: renderSessionComment(session, { sourceCommentIds }),
+    body: renderSessionComment(session, { sourceCommentIds, orphanReconcile: ctx.plan?.orphanReconcile }),
   });
 }
 

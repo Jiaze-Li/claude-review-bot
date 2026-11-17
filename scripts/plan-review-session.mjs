@@ -3,7 +3,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { isDeepReviewStale, openMaterialFindings, parsePendingSessionReview, parseSessionComment, planReviewSession, unresolvedMaterialFindings } from './review-session-core.mjs';
 import { dropIgnoredFiles, splitDiffByFile, stagedFixedBytes, stagedReviewCapacity } from './review-shards.mjs';
-import { blockingClaims, fetchReviewThreads, isWriter, threadsByFinding } from './review-threads.mjs';
+import { adoptOrphanFindings, blockingClaims, fetchReviewThreads, findOrphanBotThreads, isWriter, threadsByFinding } from './review-threads.mjs';
 import { prepareIncrementalDelta } from './select-incremental-review.mjs';
 import { chainIndex } from './continue-review.mjs';
 
@@ -168,6 +168,18 @@ export async function classifyReviewBaseline({ previousHead, headSha, baseSha, m
   return { kind: 'delta', reason: 'ordinary fix commits on the same base' };
 }
 
+function readCurrentPrScope({ contextDir, session }) {
+  const read = (name) => fs.readFileSync(path.join(contextDir, name), 'utf8');
+  const prDiff = read('pr.diff');
+  const ignoreFile = path.join(contextDir, 'ignore-patterns.txt');
+  const diff = dropIgnoredFiles(prDiff, fs.existsSync(ignoreFile) ? fs.readFileSync(ignoreFile, 'utf8') : '');
+  const riskFile = path.join(contextDir, 'risk-profile.json');
+  const riskProfile = fs.existsSync(riskFile) ? JSON.parse(fs.readFileSync(riskFile, 'utf8')) : { version: 1, stateIntegrity: false, signals: { synchronization: [], durableState: [], multiActor: [] } };
+  const capacity = stagedReviewCapacity({ diff, fixedBytes: stagedFixedBytes({ prJson: read('pr.json'), session, riskProfile }) });
+  const chunks = splitDiffByFile(diff);
+  return { prDiff, diff, chunks, capacity, files: chunks.length };
+}
+
 // Called once for a `verification` decision before it is used (the workflow's two-point diff is its default scope).
 // Ordinary fix: decision unchanged. Rewritten history: verify against the whole current PR diff when that fits one
 // staged review (the workflow then skips its own two-point diff because repair.diff already exists), else review the
@@ -176,23 +188,16 @@ export async function resolveVerificationScope({ plan, env = process.env, fetchI
   const decision = plan.decision;
   if (decision?.mode !== 'verification' || !decision.previousHead) return plan.decision;
   const contextDir = path.resolve(env.REVIEW_CONTEXT_DIR || '.review-context');
-  const read = (name) => fs.readFileSync(path.join(contextDir, name), 'utf8');
   const baseSha = required(env, 'BASE_SHA');
   const headSha = required(env, 'HEAD_SHA');
   let mergeBaseNow;
-  try { mergeBaseNow = read('merge-base.txt').trim(); } catch { mergeBaseNow = ''; }
+  try { mergeBaseNow = fs.readFileSync(path.join(contextDir, 'merge-base.txt'), 'utf8').trim(); } catch { mergeBaseNow = ''; }
   const verdict = await classifyReviewBaseline({
     previousHead: decision.previousHead, headSha, baseSha, mergeBaseNow, target: required(env, 'TARGET_REPO'), token: env.GH_TOKEN, fetchImpl,
   });
   if (verdict.kind === 'delta') return decision;
 
-  const prDiff = read('pr.diff');
-  const ignoreFile = path.join(contextDir, 'ignore-patterns.txt');
-  const diff = dropIgnoredFiles(prDiff, fs.existsSync(ignoreFile) ? fs.readFileSync(ignoreFile, 'utf8') : '');
-  const riskFile = path.join(contextDir, 'risk-profile.json');
-  const riskProfile = fs.existsSync(riskFile) ? JSON.parse(fs.readFileSync(riskFile, 'utf8')) : { version: 1, stateIntegrity: false, signals: { synchronization: [], durableState: [], multiActor: [] } };
-  const capacity = stagedReviewCapacity({ diff, fixedBytes: stagedFixedBytes({ prJson: read('pr.json'), session: plan.session, riskProfile }) });
-  const files = splitDiffByFile(diff).length;
+  const { prDiff, capacity, files } = readCurrentPrScope({ contextDir, session: plan.session });
   const where = `base ${mergeBaseNow.slice(0, 7)}, head ${headSha.slice(0, 7)}`;
   if (capacity.kind !== 'too_large') {
     fs.mkdirSync(contextDir, { recursive: true, mode: 0o700 });
@@ -278,9 +283,108 @@ function appendOutput(name,value,env){
   fs.appendFileSync(env.GITHUB_OUTPUT,`${name}=${String(value??'')}\n`);
 }
 
+const ORPHAN_RECONCILE_MODES = new Set(['verification', 'incremental', 'claude', 'human_required']);
+
+// Reconcile bot-authored review threads missing from the current session.
+// Only `auto` verification runs (or AUDIT_PENDING before final full review) adopt and verify orphans;
+// all other runs report them without changing `decision.mode` or `session`. GraphQL errors degrade to no-op (I6).
+export async function reconcileOrphanThreads({ plan, env = process.env, fetchImpl = fetch, log = console } = {}) {
+  if (!plan?.session || !env.GH_TOKEN || plan.requestedMode === 'reset') return plan;
+  if (!ORPHAN_RECONCILE_MODES.has(plan.decision?.mode)) return plan;
+
+  const target = required(env, 'TARGET_REPO');
+  const prNumber = Number(required(env, 'PR_NUMBER'));
+  const headSha = required(env, 'HEAD_SHA');
+  const botLogin = required(env, 'EXPECTED_REVIEW_AUTHOR').replace(/\[bot\]$/, '');
+  const [owner, repo] = target.split('/');
+
+  let threads;
+  try {
+    threads = await fetchReviewThreads({ owner, repo, number: prNumber, token: env.GH_TOKEN, fetchImpl });
+  } catch (error) {
+    log.warn?.(`Could not fetch review threads for orphan reconciliation; continuing without orphans: ${String(error.message).slice(0, 200)}`);
+    return plan;
+  }
+
+  const found = findOrphanBotThreads({ session: plan.session, threads, botLogin });
+  if (found.total === 0) return plan;
+
+  const canAdopt = plan.requestedMode === 'auto'
+    && (plan.decision.mode === 'verification' || (plan.session.status === 'AUDIT_PENDING' && plan.decision.mode === 'claude'));
+
+  if (!canAdopt) {
+    return {
+      ...plan,
+      orphanReconcile: {
+        found: found.total,
+        adopted: 0,
+        deferred: found.orphans.length,
+        unrecognizable: found.unrecognizable,
+        outsideDiff: 0,
+        tooLarge: 0,
+        reportOnly: true,
+      },
+    };
+  }
+
+  const contextDir = path.resolve(env.REVIEW_CONTEXT_DIR || '.review-context');
+  const { prDiff, chunks, capacity } = readCurrentPrScope({ contextDir, session: plan.session });
+  if (capacity.kind === 'too_large') {
+    return {
+      ...plan,
+      orphanReconcile: {
+        found: found.total,
+        adopted: 0,
+        deferred: 0,
+        unrecognizable: found.unrecognizable,
+        outsideDiff: 0,
+        tooLarge: found.orphans.length,
+        reportOnly: false,
+      },
+    };
+  }
+
+  const diffPaths = new Set(chunks.map((c) => c.path));
+  const adopted = adoptOrphanFindings({
+    session: plan.session,
+    orphans: found.orphans,
+    diffPaths,
+    headSha,
+    maxAdopt: MAX_CARRIED_FINDINGS,
+  });
+
+  const orphanReconcile = {
+    found: found.total,
+    adopted: adopted.adoptedCount,
+    deferred: adopted.deferredCount,
+    unrecognizable: found.unrecognizable,
+    outsideDiff: adopted.outsideDiffCount,
+    tooLarge: 0,
+    reportOnly: false,
+  };
+
+  if (adopted.adoptedCount === 0) {
+    return { ...plan, orphanReconcile };
+  }
+
+  fs.mkdirSync(contextDir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(contextDir, 'repair.diff'), prDiff, { mode: 0o600 });
+  return {
+    ...plan,
+    session: adopted.session,
+    decision: {
+      mode: 'verification',
+      previousHead: plan.decision.previousHead ?? plan.session.lastReviewedHead,
+      scope: 'current-pr',
+      reason: `reconciling ${adopted.adoptedCount} old bot thread(s) against the current PR diff (${plan.decision.reason})`,
+    },
+    orphanReconcile,
+  };
+}
+
 if(process.argv[1] && import.meta.url===pathToFileURL(process.argv[1]).href){
   try{
-    const plan=await planSession();
+    let plan=await planSession();
     plan.decision = await resolveVerificationScope({ plan, env: process.env });
     if (plan.decision.mode === 'incremental_candidate') {
       const previousHead = plan.decision.previousHead;
@@ -298,6 +402,7 @@ if(process.argv[1] && import.meta.url===pathToFileURL(process.argv[1]).href){
       console.log('Review scope: ' + scope.mode + ' — ' + scope.reason
         + (scope.changedLines == null ? '' : ' (' + scope.files + ' files, ' + scope.changedLines + ' lines)'));
     }
+    plan = await reconcileOrphanThreads({ plan, env: process.env });
     const output=path.resolve(process.env.REVIEW_CONTEXT_DIR||'.review-context','session-plan.json');
     fs.mkdirSync(path.dirname(output),{recursive:true,mode:0o700});
     fs.writeFileSync(output,JSON.stringify(plan,null,2)+'\n',{mode:0o600});
