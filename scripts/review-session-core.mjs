@@ -436,7 +436,15 @@ function seedSession({ previous, baseSha, headSha, now, carryOpen = false, reset
   // A material concern nobody has settled is not forgotten because the PR moved on or the review started over:
   // silence from a new review never resolves it, only a human decision does.
   const carried = unresolvedMaterialFindings(previous).slice(0, 8);
-  const nextFindingNumber = Math.max(seed.nextFindingNumber ?? 1, Number.isInteger(previous.nextFindingNumber) ? previous.nextFindingNumber : 1);
+  const maxPreviousId = (previous.findings ?? []).reduce((max, entry) => {
+    const match = /^F(\d+)$/.exec(String(entry?.id ?? ''));
+    return match ? Math.max(max, Number(match[1]) + 1) : max;
+  }, 1);
+  const nextFindingNumber = Math.max(
+    seed.nextFindingNumber ?? 1,
+    Number.isInteger(previous.nextFindingNumber) ? previous.nextFindingNumber : (previous.findings?.length ?? 0) + 1,
+    maxPreviousId,
+  );
   const findings = carried.map((entry) => ({
     ...entry, id: entry.id, origin: 'CARRIED_UNCERTAIN', status: 'UNCERTAIN',
     lastCheckedHead: entry.lastCheckedHead ?? previous.lastReviewedHead, resolutionReason: null,

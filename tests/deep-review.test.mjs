@@ -850,4 +850,16 @@ test('V5: explicit reset (including same HEAD) clears findings and dismissed whi
 
   const inProgress = beginDeepReview({ session: readySession(), baseSha: BASE, headSha: A, now: T0 });
   assert.throws(() => beginDeepReview({ session: inProgress, baseSha: BASE, headSha: A, now: T0, reset: true }), /already in progress/);
+
+  // Legacy session without nextFindingNumber never collides with carried finding IDs
+  const legacyNoCounter = {
+    ...readySession(),
+    findings: [{ id: 'F005', severity: 'P2', title: 'Old fixed', body: 'x', path: 'a.js', line: 1, riskClass: 'state', status: 'FIXED', origin: 'DISCOVERY', introducedHead: A, lastCheckedHead: A, resolutionReason: 'done' }],
+  };
+  delete legacyNoCounter.nextFindingNumber;
+  const legacyBegun = beginDeepReview({ session: legacyNoCounter, baseSha: BASE, headSha: C, now: T0 });
+  assert.equal(legacyBegun.nextFindingNumber, 6);
+  const legacyDone = completeDeepReview({ session: legacyBegun, headSha: C, result: { summary: 'new', findings: [finding('P1')], coverage: { complete: true, unreviewedPaths: [] } } });
+  assert.equal(legacyDone.findings.filter((f) => f.id === 'F005').length, 1);
+  assert.equal(legacyDone.findings.at(-1).id, 'F006');
 });
