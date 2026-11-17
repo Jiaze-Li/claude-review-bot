@@ -2,8 +2,25 @@ import { createHash } from 'node:crypto';
 const MATERIAL_SEVERITIES = new Set(['P0', 'P1', 'P2']);
 // A finding blocks until it is fixed (and its thread resolved) when it is P0-P2, or a P3 that was reported as P3.
 // A claim demoted to P3 for lacking a concrete failure path stays non-blocking.
-function isBlocking(finding) {
+export function isBlockingFinding(finding) {
   return MATERIAL_SEVERITIES.has(finding?.severity) || (finding?.severity === 'P3' && !finding.downgradedFrom);
+}
+const isBlocking = isBlockingFinding;
+
+function stripTransientState(session, headSha, { clearAllCoverageDeepReview = false, keepDeepReview = false } = {}) {
+  const next = { ...session };
+  delete next.reviewFailure;
+  delete next.staleFor;
+  delete next.staleHead;
+  delete next.staleCommits;
+  if (clearAllCoverageDeepReview) {
+    delete next.coverage;
+    delete next.deepReview;
+  } else {
+    if (next.coverage && next.coverage.head !== headSha) delete next.coverage;
+    if (!keepDeepReview && next.deepReview && next.deepReview.head !== headSha) delete next.deepReview;
+  }
+  return next;
 }
 export const SESSION_VERSION = 1;
 export const MAX_VERIFICATION_ROUNDS = 2;
@@ -23,6 +40,19 @@ export const DEEP_REVIEW_PR_BUDGET_USD = 6;
 export const GEMINI_MAX_CONTEXT_BYTES = 1_500_000;
 const MAX_UNREVIEWED_PATHS = 20;
 const MAX_REVIEWED_KEYS = 400;
+const CLOSED_FINDING_STATUSES = new Set(['FIXED', 'DISMISSED', 'WAIVED', 'DEFERRED']);
+const MAX_CARRIED_CLOSED_FINDINGS = 32;
+const MAX_SESSION_FINDINGS = 64;
+
+function pruneFindingsToCap(findings, max = MAX_SESSION_FINDINGS) {
+  const next = [...findings];
+  while (next.length > max) {
+    const idx = next.findIndex((f) => CLOSED_FINDING_STATUSES.has(f.status));
+    if (idx === -1) break;
+    next.splice(idx, 1);
+  }
+  return next;
+}
 
 // Short stable key for a path, so a session can remember which files a partial review
 // already covered without storing every path in its 24 KB state.
@@ -223,11 +253,12 @@ export function applyIncrementalResult({
     });
   }
   const open = findings.some((finding) => finding.status === 'OPEN' && isBlocking(finding));
-  const { reviewFailure: _oldFailure, ...base } = session;
+  const fullAuditHead = session.fullAuditHead ?? (retry ? session.reviewFailure.previousHead : session.lastReviewedHead);
+  const base = stripTransientState(session, headSha);
   return {
     ...base,
     lastReviewedHead: headSha,
-    fullAuditHead: session.fullAuditHead ?? (retry ? session.reviewFailure.previousHead : session.lastReviewedHead),
+    fullAuditHead,
     incrementalReviewCount: (session.incrementalReviewCount ?? 0) + 1,
     status: open ? 'REWORK' : 'READY',
     auditCompleted: true,
@@ -300,7 +331,7 @@ export function applyVerificationResult({
       : 'REWORK';
 
   return {
-    ...session,
+    ...stripTransientState(session, headSha),
     lastReviewedHead: headSha,
     status,
     verificationRound,
@@ -393,36 +424,53 @@ export function stopUnavailableReviewSession({
 // `@claude review` is a reviewer in its own right. When this exact HEAD has no session it
 // starts a standalone one, so Claude and Gemini run as parallel reviewers instead of
 // Claude gating on a Gemini session. Spend carries over from any earlier session.
-function seedSession({ previous, baseSha, headSha, now, carryOpen = false }) {
+function seedSession({ previous, baseSha, headSha, now, carryOpen = false, reset = false }) {
   const seed = applyDiscoveryResult({ result: { summary: 'Claude review started', findings: [] }, baseSha, headSha, sourceCommentId: 'claude', now });
   const spend = {};
   for (const key of ['deepSpendUsd', 'fallbackSpendUsd', 'claudeSdkSpendUsd', 'claudeUnknownReserveUsd']) {
     if (Number.isFinite(previous?.[key]) && previous[key] > 0) spend[key] = previous[key];
   }
+  if (reset || !previous) {
+    return { ...seed, ...spend, findings: [], dismissed: [], nextFindingNumber: 1 };
+  }
   // A material concern nobody has settled is not forgotten because the PR moved on or the review started over:
   // silence from a new review never resolves it, only a human decision does.
   const carried = unresolvedMaterialFindings(previous).slice(0, 8);
-  let nextFindingNumber = seed.nextFindingNumber ?? 1;
+  const maxPreviousId = (previous.findings ?? []).reduce((max, entry) => {
+    const match = /^F(\d+)$/.exec(String(entry?.id ?? ''));
+    return match ? Math.max(max, Number(match[1]) + 1) : max;
+  }, 1);
+  const nextFindingNumber = Math.max(
+    seed.nextFindingNumber ?? 1,
+    Number.isInteger(previous.nextFindingNumber) ? previous.nextFindingNumber : (previous.findings?.length ?? 0) + 1,
+    maxPreviousId,
+  );
   const findings = carried.map((entry) => ({
-    ...entry, id: findingId(nextFindingNumber++), origin: 'CARRIED_UNCERTAIN', status: 'UNCERTAIN',
+    ...entry, id: entry.id, origin: 'CARRIED_UNCERTAIN', status: 'UNCERTAIN',
     lastCheckedHead: entry.lastCheckedHead ?? previous.lastReviewedHead, resolutionReason: null,
   }));
-  // Only when the planner asks (the PR's history was rewritten and the whole PR cannot be verified in one staged
-  // review): the earlier blocking OPEN findings are carried too, as "needs confirmation". A full review never
+  // Only when the planner asks (the PR's history was rewritten or a non-reset full review on a new HEAD):
+  // the earlier blocking OPEN findings are carried too, as "needs confirmation". A full review never
   // verifies them, so they cannot be closed by silence; they keep blocking until a person decides.
   if (carryOpen) {
-    for (const entry of openMaterialFindings(previous ?? { findings: [] })) {
+    for (const entry of openMaterialFindings(previous)) {
       findings.push({
-        ...entry, id: findingId(nextFindingNumber++), origin: 'CARRIED_OPEN', status: 'UNCERTAIN', carriedFromId: entry.id,
+        ...entry, id: entry.id, origin: 'CARRIED_OPEN', status: 'UNCERTAIN', carriedFromId: entry.id,
         lastCheckedHead: entry.lastCheckedHead ?? previous.lastReviewedHead, resolutionReason: null,
       });
     }
   }
-  return { ...seed, ...spend, findings, nextFindingNumber };
+  const closed = (previous.findings ?? [])
+    .filter((entry) => CLOSED_FINDING_STATUSES.has(entry.status))
+    .slice(-MAX_CARRIED_CLOSED_FINDINGS)
+    .map((entry) => ({ ...entry }));
+  const merged = pruneFindingsToCap([...closed, ...findings], MAX_SESSION_FINDINGS);
+  const dismissed = Array.isArray(previous.dismissed) ? previous.dismissed.slice(-MAX_DISMISSED) : [];
+  return { ...seed, ...spend, findings: merged, dismissed, nextFindingNumber };
 }
 
 export function beginDeepReview({
-  session = null, baseSha, headSha, runId = null, reserveUsd = 0, now = new Date().toISOString(), carryOpen = false,
+  session = null, baseSha, headSha, runId = null, reserveUsd = 0, now = new Date().toISOString(), carryOpen = false, reset = false,
 } = {}) {
   checkedSha(baseSha, 'baseSha');
   checkedSha(headSha, 'headSha');
@@ -431,13 +479,13 @@ export function beginDeepReview({
   // A review that begins from an existing session waiting for its final review (AUDIT_PENDING) IS that final review:
   // it is owed once, so findings it adds are verified and the PR then needs no second full review. A review that
   // starts a session of its own is not (a clean one is simply READY).
-  const settledAndWaiting = Boolean(session) && session.lastReviewedHead === headSha && session.status === 'AUDIT_PENDING';
-  // A full review of a HEAD that has no session yet starts one; spend carries over from an earlier session.
-  if (!session || session.lastReviewedHead !== headSha) {
-    session = seedSession({ previous: session, baseSha, headSha, now, carryOpen });
-  }
-  if (session.status === 'REVIEW_IN_PROGRESS' && !isDeepReviewStale(session, Date.parse(now))) {
+  if (session?.lastReviewedHead === headSha && session.status === 'REVIEW_IN_PROGRESS' && !isDeepReviewStale(session, Date.parse(now))) {
     throw new Error('a deep review is already in progress for this HEAD');
+  }
+  const settledAndWaiting = Boolean(session) && !reset && session.lastReviewedHead === headSha && session.status === 'AUDIT_PENDING';
+  // A full review of a HEAD that has no session yet (or an explicit reset) starts a seeded session; spend carries over.
+  if (reset || !session || session.lastReviewedHead !== headSha) {
+    session = seedSession({ previous: session, baseSha, headSha, now, carryOpen, reset });
   }
   // A stale in-progress marker is replaced; the status it interrupted is remembered.
   // A deep review that failed closed is the only reason for that HUMAN_REQUIRED (no findings,
@@ -490,11 +538,9 @@ export function completeDeepReview({
   if (omitted > 0) throw new Error(`deep review reported more than 6 findings (${omitted} omitted); refusing to drop blockers`);
   const findings = session.findings.map((finding) => ({ ...finding }));
   let nextFindingNumber = Number.isInteger(session.nextFindingNumber) ? session.nextFindingNumber : findings.length + 1;
-  // Claude's material findings are never suppressed by Gemini's rejection ledger; only an
-  // identical still-OPEN finding is skipped to avoid duplicates. An earlier OPEN finding carried as "needs
-  // confirmation" after a history rewrite is the same open concern, so it suppresses a re-report too.
-  const openKeys = new Set(findings.filter((f) => f.status === 'OPEN' || (f.origin === 'CARRIED_OPEN' && f.status === 'UNCERTAIN')).map((f) => `${f.path}\0${String(f.title).trim().toLowerCase()}`));
-  for (const finding of normalized.findings.filter((f) => !openKeys.has(`${f.path}\0${String(f.title).trim().toLowerCase()}`))) {
+  // Deduplicate against all active OPEN/UNCERTAIN findings (same path+title) and known dismissals.
+  const openKeys = new Set(findings.filter((f) => ['OPEN', 'UNCERTAIN'].includes(f.status)).map((f) => `${f.path}\0${String(f.title).trim().toLowerCase()}`));
+  for (const finding of normalized.findings.filter((f) => !openKeys.has(`${f.path}\0${String(f.title).trim().toLowerCase()}`) && !matchesKnownDismissal(f, session))) {
     findings.push({
       id: findingId(nextFindingNumber++),
       ...compactFinding({ ...finding, riskClass: finding.riskClass === 'uncategorized' ? 'deep-review' : finding.riskClass }),
@@ -505,7 +551,8 @@ export function completeDeepReview({
       resolutionReason: null,
     });
   }
-  const open = findings.filter((finding) => finding.status === 'OPEN' && isBlocking(finding));
+  const cappedFindings = pruneFindingsToCap(findings, MAX_SESSION_FINDINGS);
+  const open = cappedFindings.filter((finding) => finding.status === 'OPEN' && isBlocking(finding));
   const resume = session.deepReview?.resumeStatus;
   const verificationRound = session.verificationRound ?? 0;
   const providerRecovery = resume === 'HUMAN_REQUIRED'
@@ -522,7 +569,7 @@ export function completeDeepReview({
     ...session,
     ...reconcileDeepSpend(session, spentUsd, costSource),
     status,
-    findings,
+    findings: cappedFindings,
     nextFindingNumber,
     deepReview: { ...session.deepReview, state: 'COMPLETE', completedAt: now },
     lastSummary: compactText(normalized.summary, 800),
@@ -541,7 +588,7 @@ export function completeDeepReview({
   // comment can name exactly what no reviewer has seen yet.
   if (coverage && !coverage.complete) completed.coverage = { ...coverage, head: headSha };
   else delete completed.coverage;
-  return completed;
+  return stripTransientState(completed, headSha, { keepDeepReview: true });
 }
 
 // Absent coverage means a legacy result that predates the field and is treated as
@@ -773,8 +820,9 @@ export function applyFindingDismissal({
   const status = remaining
     ? findings.some(f => f.status === 'OPEN') ? 'REWORK' : 'HUMAN_REQUIRED'
     : session.auditCompleted === true ? 'READY' : 'AUDIT_PENDING';
+  const base = remaining === 0 ? stripTransientState(session, headSha) : session;
   return {
-    ...session, findings, status,
+    ...base, findings, status,
     lastSummary: compactText('Human-dismissed ' + findingId + ' by @' + by + '; remaining material findings: ' + remaining + '.', 800),
     updatedAt: now,
   };
@@ -800,7 +848,7 @@ export function applyOverride({ session, headSha, by, now = new Date().toISOStri
     };
   });
   return {
-    ...session,
+    ...stripTransientState(session, headSha, { clearAllCoverageDeepReview: true }),
     status: 'READY',
     auditCompleted: true,
     lastReviewedHead: headSha,
@@ -1070,9 +1118,9 @@ function normalizeFinding(value) {
   // Evidence rule: a material claim without a concrete failure path cannot
   // block. Findings that omit the field entirely (legacy sessions) are kept.
   const failurePath = typeof value.failurePath === 'string' ? value.failurePath.replace(/[\r\n]+/g, ' ').trim() : null;
-  let downgradedFrom = severity === 'P3' && ['P0', 'P1', 'P2'].includes(value.downgradedFrom) ? value.downgradedFrom : null;
-  if (MATERIAL_SEVERITIES.has(severity) && failurePath !== null && failurePath.length < MIN_FAILURE_PATH_CHARS) {
-    downgradedFrom = severity;
+  let downgradedFrom = severity === 'P3' && ['P0', 'P1', 'P2', 'P3'].includes(value.downgradedFrom) ? value.downgradedFrom : null;
+  if (['P0', 'P1', 'P2', 'P3'].includes(severity) && failurePath !== null && failurePath.length < MIN_FAILURE_PATH_CHARS) {
+    downgradedFrom = downgradedFrom ?? severity;
     severity = 'P3';
   }
   const path = checkedText(value.path, 1000, 'finding path');

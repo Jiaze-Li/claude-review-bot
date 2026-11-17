@@ -195,3 +195,37 @@ test('the workflow hands the thread problem count to the final status without ma
   const apply = yml.slice(yml.indexOf('- name: Apply review-thread decisions'));
   assert.doesNotMatch(apply.slice(0, apply.indexOf('run: node scripts/apply-thread-resolutions.mjs')), /continue-on-error/);
 });
+
+test('V1: original P3 is treated as blocking on thread resolve, while downgraded P3 is waived', async () => {
+  const s = applyDiscoveryResult({
+    result: {
+      summary: 'p3s',
+      findings: [
+        { severity: 'P3', title: 'Original P3', body: 'Trigger X causes Y; expected Z.', path: 'a.js', line: 1, riskClass: 'state', failurePath: 'Call fn() with empty input -> returns NaN instead of 0.' },
+        { severity: 'P3', title: 'Weak P3', body: 'Maybe issue.', path: 'b.js', line: 2, riskClass: 'state', failurePath: 'short' },
+      ],
+    },
+    baseSha: BASE, headSha: HEAD, sourceCommentId: '1',
+  });
+  const [origP3, weakP3] = s.findings;
+  assert.equal(origP3.status, 'OPEN');
+  assert.equal(weakP3.status, 'DEFERRED');
+  const gh = setup(s, [
+    threadNode('T1', origP3, { resolvedBy: 'jiaze-li' }),
+    threadNode('T2', weakP3, { resolvedBy: 'jiaze-li' }),
+  ]);
+  const inner = gh.fetchImpl;
+  const unresolves = [];
+  const fetchImpl = async (url, init = {}) => {
+    if (url.endsWith('/graphql') && /unresolveReviewThread/.test(init.body)) {
+      unresolves.push(JSON.parse(init.body).variables.id);
+      return Response.json({ data: {} });
+    }
+    if (/\/comments\/\d+\/replies$/.test(url)) return Response.json({ id: 1 });
+    return inner(url, init);
+  };
+  const out = await applyThreadResolutions({ env: gh.env, fetchImpl, log: quiet });
+  assert.deepEqual(out.closed, [{ id: weakP3.id, by: 'jiaze-li' }]);
+  assert.equal(byId(out.session)[origP3.id].status, 'OPEN');
+  assert.deepEqual(unresolves, ['T1']);
+});

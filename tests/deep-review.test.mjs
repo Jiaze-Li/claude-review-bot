@@ -388,14 +388,14 @@ test('reservation is reconciled to actual spend on success and kept when actual 
   assert.equal(failDeepReview({ session: begun, headSha: A, reason: 'x', spentUsd: 2 }).deepSpendUsd, 2);
 });
 
-test('Claude blocker is not suppressed by a concern Gemini already rejected', () => {
+test('completeDeepReview suppresses a finding already covered by matchesKnownDismissal', () => {
   let s = readySession();
   s = { ...s, findings: [{ id: 'F001', severity: 'P2', title: 'Race in cache', body: 'x', path: 'a.js', line: 3, riskClass: 'r', status: 'DISMISSED', origin: 'DISCOVERY', introducedHead: A, lastCheckedHead: A, resolutionReason: 'rejected' }],
     dismissed: [{ title: 'Race in cache', path: 'a.js', riskClass: 'r', reason: 'rejected' }] };
   const begun = beginDeepReview({ session: s, baseSha: BASE, headSha: A, now: T0 });
   const done = completeDeepReview({ session: begun, result: { summary: 'bug', findings: [finding('P1')] }, headSha: A });
-  assert.equal(done.status, 'REWORK');
-  assert.equal(done.findings.at(-1).origin, 'CLAUDE_DEEP');
+  assert.equal(done.status, 'READY');
+  assert.equal(done.findings.length, 1);
 });
 
 test('begin posts the pending status BEFORE the durable write, so a failed write cannot leave an old green', async () => {
@@ -748,4 +748,118 @@ test('the final full review is owed once: findings it adds are verified and no s
   assert.equal(again.deepReview.final, true);
   const done = completeDeepReview({ session: again, result: full([finding('P2')]), headSha: A });
   assert.equal(done.auditCompleted, true);
+});
+
+test('V5: non-reset cross-commit keeps closed findings (<=32) and dismissed (<=20), deduplicates known dismissals, and FIFO-evicts closed items past 64', () => {
+  const closed = Array.from({ length: 35 }, (_, i) => ({
+    id: `F${String(i + 1).padStart(3, '0')}`,
+    severity: 'P2',
+    title: `Closed ${i + 1}`,
+    body: 'Fixed in earlier commit.',
+    path: `src/f${i + 1}.js`,
+    line: 1,
+    riskClass: 'state',
+    status: i % 2 === 0 ? 'FIXED' : 'DISMISSED',
+    origin: 'DISCOVERY',
+    introducedHead: A,
+    lastCheckedHead: A,
+    resolutionReason: 'done',
+  }));
+  const dismissed = Array.from({ length: 22 }, (_, i) => ({
+    title: `Rejected ${i + 1}`,
+    path: `src/r${i + 1}.js`,
+    riskClass: 'state',
+    verdict: 'REJECTED',
+    reason: 'not a bug',
+  }));
+  const prior = { ...readySession(), findings: closed, dismissed, nextFindingNumber: 36, deepSpendUsd: 1.5 };
+  const begun = beginDeepReview({ session: prior, baseSha: BASE, headSha: C, now: T0, carryOpen: true, reset: false });
+  assert.equal(begun.findings.length, 32);
+  assert.equal(begun.findings[0].id, 'F004');
+  assert.equal(begun.dismissed.length, 20);
+  assert.equal(begun.dismissed[0].title, 'Rejected 3');
+  assert.equal(begun.deepSpendUsd, 1.5);
+
+  const dupResult = completeDeepReview({
+    session: begun,
+    headSha: C,
+    result: {
+      summary: 'checked',
+      findings: [
+        { severity: 'P2', title: 'Rejected 22', body: 'Trigger X causes Y.', path: 'src/r22.js', line: 5, riskClass: 'state' },
+        finding('P1'),
+      ],
+      coverage: { complete: true, unreviewedPaths: [] },
+    },
+  });
+  assert.equal(dupResult.findings.filter((f) => f.title === 'Rejected 22').length, 0);
+  assert.equal(dupResult.findings.filter((f) => f.status === 'OPEN').length, 1);
+
+  // Fill to 64+ with closed findings and verify FIFO eviction never drops OPEN
+  const manyClosed = Array.from({ length: 63 }, (_, i) => ({
+    id: `F${String(i + 100).padStart(3, '0')}`,
+    severity: 'P2',
+    title: `Old ${i + 1}`,
+    body: 'done',
+    path: `src/o${i + 1}.js`,
+    line: 1,
+    riskClass: 'state',
+    status: 'FIXED',
+    origin: 'DISCOVERY',
+    introducedHead: A,
+    lastCheckedHead: A,
+    resolutionReason: 'done',
+  }));
+  const fullBegun = beginDeepReview({ session: { ...readySession(), findings: manyClosed, nextFindingNumber: 200 }, baseSha: BASE, headSha: C, now: T0 });
+  // 32 kept + 2 new <= 64, so test direct completeDeepReview on 63 closed + 2 new = 65 -> capped at 64, earliest closed F100 evicted
+  const nearCap = {
+    ...fullBegun,
+    findings: [...manyClosed],
+    nextFindingNumber: 200,
+  };
+  const capped = completeDeepReview({
+    session: nearCap,
+    headSha: C,
+    result: {
+      summary: 'capped',
+      findings: [
+        finding('P1'),
+        { ...finding('P2'), title: 'Second new', path: 'src/b.js' },
+      ],
+      coverage: { complete: true, unreviewedPaths: [] },
+    },
+  });
+  assert.equal(capped.findings.length, 64);
+  assert.equal(capped.findings.some((f) => f.id === 'F100'), false);
+  assert.equal(capped.findings.filter((f) => f.status === 'OPEN').length, 2);
+});
+
+test('V5: explicit reset (including same HEAD) clears findings and dismissed while keeping spend', () => {
+  const prior = {
+    ...readySession(),
+    findings: [{ id: 'F001', severity: 'P1', title: 'Old bug', body: 'x', path: 'a.js', line: 1, riskClass: 'state', status: 'OPEN', origin: 'DISCOVERY', introducedHead: A, lastCheckedHead: A, resolutionReason: null }],
+    dismissed: [{ title: 'Old rejected', path: 'a.js', riskClass: 'state', verdict: 'REJECTED', reason: 'no' }],
+    deepSpendUsd: 2.25,
+    nextFindingNumber: 2,
+  };
+  const sameHeadReset = beginDeepReview({ session: prior, baseSha: BASE, headSha: A, now: T0, reset: true });
+  assert.equal(sameHeadReset.findings.length, 0);
+  assert.equal(sameHeadReset.dismissed.length, 0);
+  assert.equal(sameHeadReset.deepSpendUsd, 2.25);
+  assert.equal(sameHeadReset.nextFindingNumber, 1);
+
+  const inProgress = beginDeepReview({ session: readySession(), baseSha: BASE, headSha: A, now: T0 });
+  assert.throws(() => beginDeepReview({ session: inProgress, baseSha: BASE, headSha: A, now: T0, reset: true }), /already in progress/);
+
+  // Legacy session without nextFindingNumber never collides with carried finding IDs
+  const legacyNoCounter = {
+    ...readySession(),
+    findings: [{ id: 'F005', severity: 'P2', title: 'Old fixed', body: 'x', path: 'a.js', line: 1, riskClass: 'state', status: 'FIXED', origin: 'DISCOVERY', introducedHead: A, lastCheckedHead: A, resolutionReason: 'done' }],
+  };
+  delete legacyNoCounter.nextFindingNumber;
+  const legacyBegun = beginDeepReview({ session: legacyNoCounter, baseSha: BASE, headSha: C, now: T0 });
+  assert.equal(legacyBegun.nextFindingNumber, 6);
+  const legacyDone = completeDeepReview({ session: legacyBegun, headSha: C, result: { summary: 'new', findings: [finding('P1')], coverage: { complete: true, unreviewedPaths: [] } } });
+  assert.equal(legacyDone.findings.filter((f) => f.id === 'F005').length, 1);
+  assert.equal(legacyDone.findings.at(-1).id, 'F006');
 });

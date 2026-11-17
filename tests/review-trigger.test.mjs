@@ -403,3 +403,18 @@ test('the Worker control-repository setting and its code fallback name the same 
   const driftedToml = controlRepoValues(toml.replace(configured, 'Jiaze-Li/claude-review-bot'), source);
   assert.throws(() => assert.equal(driftedToml.fallback, driftedToml.configured));
 });
+
+test('V7: legacy spike and root plan/design files are removed', () => {
+  const removed = [
+    'Plan.md',
+    'Design.md',
+    'docs/fixer-spike-status.md',
+    'scripts/patch-gptwb-idempotency.mjs',
+    'scripts/spike-gptwb-fixer.mjs',
+    'scripts/spike-gptwb-fixer-stage2.mjs',
+    'scripts/test-gptwb-idempotency.mjs',
+  ];
+  for (const rel of removed) {
+    assert.equal(fs.existsSync(new URL(`../${rel}`, import.meta.url)), false, `${rel} should be removed`);
+  }
+});

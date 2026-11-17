@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import {
   MAX_VERIFICATION_ROUNDS,
     applyDiscoveryResult,
+  applyOverride,
   applyVerificationResult,
   openMaterialFindings,
   parseSessionComment,
@@ -190,4 +191,34 @@ test('verification reason may be detailed while durable resolution is compacted'
   }});
   assert.equal(s.status,'REWORK');
   assert.equal(s.findings[0].resolutionReason.length,600);
+});
+
+test('V4: override and head-changing transitions strip stale, reviewFailure, and expired coverage/deepReview',()=>{
+  const s=applyDiscoveryResult({result:{summary:'bug',findings:[finding('P1')]},baseSha:BASE,headSha:A,sourceCommentId:'9'});
+  const dirty={
+    ...s,
+    staleFor:A,staleHead:B,staleCommits:2,
+    reviewFailure:{code:'REVIEWER_UNAVAILABLE',mode:'verification',head:A,previousHead:A,reason:'402'},
+    coverage:{complete:false,unreviewedCount:1,unreviewedPaths:['x.js'],reviewedKeys:[],head:A},
+    deepReview:{head:A,startedAt:'2026-01-01T00:00:00Z',state:'COMPLETE'},
+  };
+  const overridden=applyOverride({session:dirty,headSha:B,by:'jiaze-li'});
+  assert.equal(overridden.status,'READY');
+  assert.equal(overridden.reviewFailure,undefined);
+  assert.equal(overridden.staleFor,undefined);
+  assert.equal(overridden.staleHead,undefined);
+  assert.equal(overridden.staleCommits,undefined);
+  assert.equal(overridden.coverage,undefined);
+  assert.equal(overridden.deepReview,undefined);
+  const body=renderSessionComment(overridden);
+  assert.doesNotMatch(body,/Review stopped/);
+  assert.doesNotMatch(body,/NOT current/);
+
+  const verified=applyVerificationResult({session:dirty,headSha:B,result:{
+    summary:'fixed',verifications:[{findingId:'F001',status:'FIXED',reason:'fixed'}],findings:[],
+  }});
+  assert.equal(verified.reviewFailure,undefined);
+  assert.equal(verified.staleFor,undefined);
+  assert.equal(verified.coverage,undefined);
+  assert.equal(verified.deepReview,undefined);
 });

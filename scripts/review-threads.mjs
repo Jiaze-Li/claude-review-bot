@@ -1,6 +1,7 @@
 // The bot's review threads, read and changed through GitHub's GraphQL API, and how they map to findings.
 import { appendFileSync } from 'node:fs';
 import { findingKey, markerKey } from './review-anchors.mjs';
+import { isBlockingFinding } from './review-session-core.mjs';
 
 const THREADS_QUERY = `query($owner:String!,$repo:String!,$number:Int!,$after:String){
   repository(owner:$owner,name:$repo){pullRequest(number:$number){
@@ -75,11 +76,11 @@ export function threadsByFinding({ session, threads, botLogin }) {
   return byFinding;
 }
 
-// The blocking findings (P0-P2, open or uncertain), and whether every one of them has been resolved by a
+// The blocking findings (P0-P2, or non-downgraded P3, open or uncertain), and whether every one of them has been resolved by a
 // person in all of its threads. A blocking finding with no thread at all (posted in a review body) can never
 // be claimed this way, so it keeps the session from counting as "all resolved".
 export function blockingClaims({ session, byFinding, botLogin }) {
-  const blocking = (session?.findings ?? []).filter((finding) => MATERIAL.has(finding.severity) && ['OPEN', 'UNCERTAIN'].includes(finding.status));
+  const blocking = (session?.findings ?? []).filter((finding) => isBlockingFinding(finding) && ['OPEN', 'UNCERTAIN'].includes(finding.status));
   const claimed = [];
   const unclaimed = [];
   for (const finding of blocking) {

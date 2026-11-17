@@ -1,5 +1,5 @@
 /**
- * Unified notification decision rules for review-bot.
+ * Unified notification decision rules for pr-bot.
  * Determines when PR conversation comments should be published, when idempotency markers
  * should be silently attached to the durable session, and when runs must remain completely silent.
  */

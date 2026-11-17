@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fullReviewDecision, planSession } from '../scripts/plan-review-session.mjs';
+import { fullReviewDecision, planSession, runSessionPlanner } from '../scripts/plan-review-session.mjs';
 import { findingMarker } from '../scripts/review-anchors.mjs';
 import { applyDiscoveryResult, beginDeepReview, completeDeepReview, failDeepReview, pendingSessionMarker, renderSessionComment } from '../scripts/review-session-core.mjs';
 
@@ -281,6 +281,52 @@ test('resolved threads do not start a review when nothing is pushed, a resolver 
   assert.equal((await run({HEAD_SHA:C},{permission:'read'})).decision.mode,'threads');
   assert.equal((await run({HEAD_SHA:C},{resolvedBy:null})).decision.mode,'threads');
   assert.equal((await run({HEAD_SHA:C},{resolvedBy:author.replace('[bot]','')})).decision.mode,'threads');
+});
+
+test('V1: resolving original P3 after new commits triggers verification, and unresolved original P3 blocks verification',async()=>{
+  const p3={severity:'P3',title:'Real P3',body:'Trigger X causes Y; expected Z.',path:'b.js',line:2,riskClass:'state',failurePath:'Call f() with null -> throws TypeError instead of returning null.'};
+  const session=applyDiscoveryResult({result:{summary:'bugs',findings:[bug,p3]},baseSha:BASE,headSha:A,sourceCommentId:'1'});
+  const allResolved=await planSession({env:env({REQUESTED_MODE:'threads',SOURCE_KIND:'pull_request',HEAD_SHA:C}),
+    fetchImpl:threadFetch({session,findings:session.findings})});
+  assert.equal(allResolved.decision.mode,'verification');
+
+  const p1OnlyFetch=async(url,init={})=>{
+    if(url.endsWith('/graphql')) return Response.json({data:{repository:{pullRequest:{reviewThreads:{pageInfo:{hasNextPage:false},nodes:[
+      {id:'T0',isResolved:true,resolvedBy:{login:'jiaze-li'},comments:{nodes:[{databaseId:1,author:{login:author.replace('[bot]','')},body:'x\n\n'+findingMarker(bug.path,bug.title)}]}},
+      {id:'T1',isResolved:false,resolvedBy:null,comments:{nodes:[{databaseId:2,author:{login:author.replace('[bot]','')},body:'x\n\n'+findingMarker(p3.path,p3.title)}]}},
+    ]}}}}});
+    return threadFetch({session,findings:session.findings})(url,init);
+  };
+  const partialResolved=await planSession({env:env({REQUESTED_MODE:'threads',SOURCE_KIND:'pull_request',HEAD_SHA:C}),fetchImpl:p1OnlyFetch});
+  assert.equal(partialResolved.decision.mode,'threads');
+});
+
+test('V6: runSessionPlanner orchestrates planning and non-reset new-HEAD full review carries open findings or stops at >8',async()=>{
+  const partialWithOpen={
+    ...applyDiscoveryResult({result:{summary:'bugs',findings:[bug]},baseSha:BASE,headSha:A,sourceCommentId:'1'}),
+    status:'PARTIAL',
+    coverage:{complete:false,unreviewedCount:1,unreviewedPaths:['x.js'],reviewedKeys:[],head:A},
+  };
+  const planned=await runSessionPlanner({
+    env:env({HEAD_SHA:C,REQUESTED_MODE:'auto',SOURCE_KIND:'comment'}),
+    fetchImpl:fetchState({comments:[comment(7,renderSessionComment(partialWithOpen))]}),
+  });
+  assert.equal(planned.decision.mode,'claude');
+  assert.equal(planned.decision.carryOpen,true);
+
+  const manyOpen={
+    ...partialWithOpen,
+    findings:Array.from({length:9},(_,i)=>({
+      id:`F${String(i+1).padStart(3,'0')}`,severity:'P1',title:`Bug ${i+1}`,body:'x',path:`f${i}.js`,line:1,riskClass:'state',
+      status:'OPEN',origin:'DISCOVERY',introducedHead:A,lastCheckedHead:A,resolutionReason:null,
+    })),
+    nextFindingNumber:10,
+  };
+  const blocked=await runSessionPlanner({
+    env:env({HEAD_SHA:C,REQUESTED_MODE:'auto',SOURCE_KIND:'comment'}),
+    fetchImpl:fetchState({comments:[comment(7,renderSessionComment(manyOpen))]}),
+  });
+  assert.equal(blocked.decision.mode,'human_required');
 });
 
 test('the final review of a PR is a full review in the engine, whatever the size; a delta that needs a full look is too',async()=>{

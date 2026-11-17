@@ -1,5 +1,6 @@
 import { pathToFileURL } from 'node:url';
 import { fetchReviewThreads, replyToThread, reportThreadProblem, resolveThread, threadsByFinding, unresolveThread } from './review-threads.mjs';
+import { isBlockingFinding } from './review-session-core.mjs';
 import { latestSession } from './sync-commit-status.mjs';
 
 // Keeps the PR's review threads in step with the durable session at the end of a review run.
@@ -12,7 +13,6 @@ import { latestSession } from './sync-commit-status.mjs';
 // Only threads the bot started are touched, a person's own resolve of a closed finding is never undone, and a
 // failure here never fails a review (best effort).
 const CLOSED = new Set(['FIXED', 'DISMISSED', 'WAIVED']);
-const MATERIAL = new Set(['P0', 'P1', 'P2']);
 
 export async function syncReviewThreads({ env = process.env, fetchImpl = fetch, log = console } = {}) {
   const target = required(env, 'TARGET_REPO');
@@ -28,7 +28,7 @@ export async function syncReviewThreads({ env = process.env, fetchImpl = fetch, 
   if (!session) return { resolved: 0, reopened: 0, failed: 0, skipped: 0, replyFailed: 0, closed: 0, permissionDenied: false, errors: [] };
   const bounce = env.REVIEW_MODE === 'verification';
   const wantsResolved = session.findings.filter((finding) => CLOSED.has(finding.status));
-  const stillOpen = session.findings.filter((finding) => MATERIAL.has(finding.severity) && ['OPEN', 'UNCERTAIN'].includes(finding.status));
+  const stillOpen = session.findings.filter((finding) => isBlockingFinding(finding) && ['OPEN', 'UNCERTAIN'].includes(finding.status));
   if (!wantsResolved.length && !(bounce && stillOpen.length)) return { resolved: 0, reopened: 0, failed: 0, skipped: 0, replyFailed: 0, closed: 0, permissionDenied: false, errors: [] };
 
   const threads = await fetchReviewThreads({ owner, repo, number: Number(prNumber), token, fetchImpl });

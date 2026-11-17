@@ -44,7 +44,8 @@ test('the staged pipeline only reviews a repair or a small delta; a full review 
   const {prompt}=buildGeminiRequest({mode:'incremental',repo:'a/b',prNumber:'1',headSha:A,prJson:'{}',diff:'delta',session:null});
   assert.match(prompt,/INCREMENTAL REVIEW/);
   assert.match(prompt,/not architecture redesign/i);
-  assert.match(prompt,/P3 is non-blocking/);
+  assert.match(prompt,/P3 is a concrete low-impact defect that still blocks until fixed/);
+  assert.doesNotMatch(prompt,/P3 is non-blocking/);
 });
 
 test('the state-integrity procedure is shared text for every full review, and empty for an ordinary PR',()=>{
