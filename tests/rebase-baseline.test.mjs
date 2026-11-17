@@ -290,3 +290,24 @@ test('the deep-review begin step hands the planner\'s carryOpen to the new sessi
     assert.equal(begun.findings.filter((f) => f.carriedFromId === 'F001' && f.status === 'UNCERTAIN').length, expected);
   }
 });
+
+test('F001 a carried needs-confirmation finding suppresses a re-report of the same path and title, nothing else', () => {
+  const carriedSession = () => beginDeepReview({ session: reworkSession(), baseSha: BASE, headSha: NEW, carryOpen: true });
+  const complete = (session, findings) => completeDeepReview({ session, headSha: NEW, result: { summary: 's', findings, coverage: { complete: true, unreviewedPaths: [] } } });
+  const same = { ...finding(), title: '  STALE write ' };
+  const duplicate = complete(carriedSession(), [same]);
+  assert.equal(duplicate.findings.length, 1);
+  assert.equal(duplicate.findings[0].status, 'UNCERTAIN');
+  assert.equal(duplicate.findings[0].origin, 'CARRIED_OPEN');
+  assert.equal(duplicate.status, 'HUMAN_REQUIRED');
+
+  const different = complete(carriedSession(), [{ ...finding('Another bug'), path: 'a.js' }, { ...finding(), path: 'other.js' }]);
+  assert.equal(different.findings.length, 3);
+  assert.equal(different.findings.filter((f) => f.status === 'OPEN').length, 2);
+  assert.equal(different.status, 'REWORK');
+
+  // Other UNCERTAIN carries are untouched: they do not suppress a re-report.
+  const plain = carriedSession();
+  plain.findings = plain.findings.map((f) => ({ ...f, origin: 'CARRIED_UNCERTAIN' }));
+  assert.equal(complete(plain, [finding()]).findings.filter((f) => f.status === 'OPEN').length, 1);
+});

@@ -491,8 +491,9 @@ export function completeDeepReview({
   const findings = session.findings.map((finding) => ({ ...finding }));
   let nextFindingNumber = Number.isInteger(session.nextFindingNumber) ? session.nextFindingNumber : findings.length + 1;
   // Claude's material findings are never suppressed by Gemini's rejection ledger; only an
-  // identical still-OPEN finding is skipped to avoid duplicates.
-  const openKeys = new Set(findings.filter((f) => f.status === 'OPEN').map((f) => `${f.path}\0${String(f.title).trim().toLowerCase()}`));
+  // identical still-OPEN finding is skipped to avoid duplicates. An earlier OPEN finding carried as "needs
+  // confirmation" after a history rewrite is the same open concern, so it suppresses a re-report too.
+  const openKeys = new Set(findings.filter((f) => f.status === 'OPEN' || (f.origin === 'CARRIED_OPEN' && f.status === 'UNCERTAIN')).map((f) => `${f.path}\0${String(f.title).trim().toLowerCase()}`));
   for (const finding of normalized.findings.filter((f) => !openKeys.has(`${f.path}\0${String(f.title).trim().toLowerCase()}`))) {
     findings.push({
       id: findingId(nextFindingNumber++),
