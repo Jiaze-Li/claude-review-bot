@@ -581,8 +581,20 @@ export function failDeepReview({
   };
 }
 
+// The "not fully reviewed" record that still describes the commit under review. A record written for an older
+// commit (its head differs) is history, not a blocker; a record with no head at all is treated as current, so a
+// file that really was left unreviewed is never mistaken for reviewed.
+export function currentCoverage(session) {
+  const coverage = session?.coverage;
+  if (!coverage) return null;
+  if (coverage.head && coverage.head !== session.lastReviewedHead) return null;
+  return coverage;
+}
+
 // GitHub commit status for the exact HEAD the session reviewed. Only READY is success.
-export function sessionCommitStatus(session, headSha) {
+// `finalReviewStarted` (true | false | undefined): true = this run handed the final review on, false = this run tried
+// and could not, undefined = this run did not try (no claim either way). Only matters while the final review is all that is left.
+export function sessionCommitStatus(session, headSha, { finalReviewStarted } = {}) {
   if (!session || session.lastReviewedHead !== headSha) {
     return { state: 'pending', description: 'Independent review has not completed for this commit' };
   }
@@ -592,7 +604,12 @@ export function sessionCommitStatus(session, headSha) {
       ? { state: 'error', description: 'Review evidence incomplete or material candidates unresolved' }
       : { state: 'success', description: 'Independent review complete: READY' };
     case 'REVIEW_IN_PROGRESS': return { state: 'pending', description: 'Claude deep review in progress' };
-    case 'AUDIT_PENDING': return { state: 'pending', description: 'Final audit pending' };
+    case 'AUDIT_PENDING':
+      if (finalReviewStarted === true) return { state: 'pending', description: 'Final review starting automatically' };
+      // Red only when this run tried to hand the final review on and said it could not. A run that never reached
+      // that step (waiting, bookkeeping) knows nothing about an earlier run's review, so it keeps the old yellow.
+      if (finalReviewStarted === false) return { state: 'error', description: 'Final review is NOT running: comment @gemini review' };
+      return { state: 'pending', description: 'Final audit pending' };
     case 'REWORK': return { state: 'failure', description: 'Open material findings: rework needed' };
     case 'PARTIAL': return { state: 'error', description: 'Review coverage partial: some changed files were not reviewed' };
     default: return { state: 'error', description: 'Automatic review stopped: human judgment required' };
@@ -884,7 +901,8 @@ export function recordUncertainFindings(session, validations, headSha) {
   };
 }
 
-export function renderSessionComment(session, { sourceCommentIds = [] } = {}) {
+// finalReview: { startsByItself, reason } — what the caller knows about whether the final review starts by itself.
+export function renderSessionComment(session, { sourceCommentIds = [], finalReview } = {}) {
   validateSession(session);
   const open = openMaterialFindings(session);
   const unresolved = unresolvedMaterialFindings(session);
@@ -894,6 +912,7 @@ export function renderSessionComment(session, { sourceCommentIds = [] } = {}) {
   const newer = Number.isInteger(session.staleCommits) && session.staleCommits > 0
     ? `${session.staleCommits} newer commit${session.staleCommits === 1 ? '' : 's'}`
     : 'newer commits';
+  const shownCoverage = currentCoverage(session);
   const next = stale
     ? `This result is for an earlier commit (${cleanInline(String(session.lastReviewedHead).slice(0, 12))}); the PR now has ${newer} that no review has covered, so it is NOT current. Comment \`@gemini review\` or \`@claude review\`: a small, low-risk change gets an incremental review of just the new part, anything else a full review.`
     : session.reviewFailure?.code === 'REVIEWER_UNAVAILABLE'
@@ -907,7 +926,11 @@ export function renderSessionComment(session, { sourceCommentIds = [] } = {}) {
     : session.status === 'REVIEW_IN_PROGRESS'
       ? 'Claude deep review is running for this exact commit; the PR is not READY until it finishes. If it stops, comment `@claude review` to restart.'
     : session.status === 'AUDIT_PENDING'
-      ? 'The final full review runs automatically (Gemini first, Claude continues). If the workflow stops, comment `@gemini review` to resume it.'
+      ? (finalReview?.startsByItself === true
+        ? 'The final full review is starting automatically (Gemini first, Claude continues). If it does not appear, comment `@gemini review`.'
+        : finalReview
+          ? `The final full review is NOT running right now: ${cleanInline(finalReview.reason || 'it did not start')}. Comment \`@gemini review\` to start it.`
+          : 'The final full review is the next step, but it may not be running right now. If no new run appears on this PR, comment `@gemini review` to start it.')
       : session.status === 'REWORK'
         ? 'Push a repair for real bugs; for a disproven finding post `@gemini dismiss F001` with Reason and Evidence lines. Dismissal does not change product code.'
         : 'Automatic review budget is exhausted. Use human judgment or a targeted Codex/Claude review; do not restart full discovery automatically.';
@@ -950,10 +973,10 @@ export function renderSessionComment(session, { sourceCommentIds = [] } = {}) {
     ...(session.deepSpendUsd > 0 ? [`Claude charged ledger (SDK cost + conservative reserves): **${session.deepSpendUsd.toFixed(2)}** · automatic per-PR cap ${DEEP_REVIEW_PR_BUDGET_USD.toFixed(2)} · automatic remaining ${deepReviewBudgetLeft(session).toFixed(2)}`] : []),
     ...(session.deepSpendUsd > 0 ? [`Cost breakdown: SDK-reported **${(session.claudeSdkSpendUsd ?? 0).toFixed(4)}** · unknown-usage reserve **${(session.claudeUnknownReserveUsd ?? 0).toFixed(4)}** · historical/unclassified **${Math.max(0, roundUsd(session.deepSpendUsd - (session.claudeSdkSpendUsd ?? 0) - (session.claudeUnknownReserveUsd ?? 0) - (session.deepReview?.state === 'IN_PROGRESS' ? session.deepReview.reservedUsd ?? 0 : 0))).toFixed(4)}**`] : []),
     `Automatic Claude budget remaining: **${claudeFallbackBudgetLeft(session).toFixed(2)}** of ${DEEP_REVIEW_PR_BUDGET_USD.toFixed(2)} per PR · manual review: up to ${DEEP_REVIEW_MANUAL_RUN_BUDGET_USD.toFixed(2)} per Claude call regardless of cumulative spend`,
-    ...(session.coverage && !session.coverage.complete ? [
-      `Review coverage: **PARTIAL** — ${session.coverage.unreviewedCount} changed file(s) not reviewed${session.coverage.note ? ` (${cleanInline(session.coverage.note)})` : ''}`,
-      ...session.coverage.unreviewedPaths.map((p) => `  - \`${cleanInline(p).replace(/`/g, '')}\``),
-      ...(session.coverage.unreviewedCount > session.coverage.unreviewedPaths.length ? [`  - …and ${session.coverage.unreviewedCount - session.coverage.unreviewedPaths.length} more`] : []),
+    ...(shownCoverage && !shownCoverage.complete ? [
+      `Review coverage: **PARTIAL** — ${shownCoverage.unreviewedCount} changed file(s) not reviewed${shownCoverage.note ? ` (${cleanInline(shownCoverage.note)})` : ''}`,
+      ...shownCoverage.unreviewedPaths.map((p) => `  - \`${cleanInline(p).replace(/`/g, '')}\``),
+      ...(shownCoverage.unreviewedCount > shownCoverage.unreviewedPaths.length ? [`  - …and ${shownCoverage.unreviewedCount - shownCoverage.unreviewedPaths.length} more`] : []),
     ] : []),
     '',
     ...findingLines,

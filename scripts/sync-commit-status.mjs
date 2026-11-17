@@ -16,7 +16,7 @@ export async function syncCommitStatus({ env = process.env, fetchImpl = fetch } 
   if (!/^[0-9a-f]{40}$/i.test(headSha)) throw new Error('Invalid HEAD_SHA');
   if (!env.STATUS_TOKEN) return postCommitStatus({ env, fetchImpl, target, headSha, status: null }); // warns, or throws in strict mode
   const session = await latestSession({ target, prNumber, author: required(env, 'EXPECTED_REVIEW_AUTHOR'), token: required(env, 'GH_TOKEN'), fetchImpl });
-  let status = sessionCommitStatus(session, headSha);
+  let status = sessionCommitStatus(session, headSha, { finalReviewStarted: { true: true, false: false }[env.FINAL_REVIEW_DISPATCHED] });
   if (env.JOB_FAILED === 'true' && status.state === 'pending' && (!session || session.lastReviewedHead !== headSha)) {
     status = { state: 'error', description: 'Review run failed for this commit; comment @gemini review to retry' };
   }
