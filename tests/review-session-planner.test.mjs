@@ -283,6 +283,24 @@ test('resolved threads do not start a review when nothing is pushed, a resolver 
   assert.equal((await run({HEAD_SHA:C},{resolvedBy:author.replace('[bot]','')})).decision.mode,'threads');
 });
 
+test('V1: resolving original P3 after new commits triggers verification, and unresolved original P3 blocks verification',async()=>{
+  const p3={severity:'P3',title:'Real P3',body:'Trigger X causes Y; expected Z.',path:'b.js',line:2,riskClass:'state',failurePath:'Call f() with null -> throws TypeError instead of returning null.'};
+  const session=applyDiscoveryResult({result:{summary:'bugs',findings:[bug,p3]},baseSha:BASE,headSha:A,sourceCommentId:'1'});
+  const allResolved=await planSession({env:env({REQUESTED_MODE:'threads',SOURCE_KIND:'pull_request',HEAD_SHA:C}),
+    fetchImpl:threadFetch({session,findings:session.findings})});
+  assert.equal(allResolved.decision.mode,'verification');
+
+  const p1OnlyFetch=async(url,init={})=>{
+    if(url.endsWith('/graphql')) return Response.json({data:{repository:{pullRequest:{reviewThreads:{pageInfo:{hasNextPage:false},nodes:[
+      {id:'T0',isResolved:true,resolvedBy:{login:'jiaze-li'},comments:{nodes:[{databaseId:1,author:{login:author.replace('[bot]','')},body:'x\n\n'+findingMarker(bug.path,bug.title)}]}},
+      {id:'T1',isResolved:false,resolvedBy:null,comments:{nodes:[{databaseId:2,author:{login:author.replace('[bot]','')},body:'x\n\n'+findingMarker(p3.path,p3.title)}]}},
+    ]}}}}});
+    return threadFetch({session,findings:session.findings})(url,init);
+  };
+  const partialResolved=await planSession({env:env({REQUESTED_MODE:'threads',SOURCE_KIND:'pull_request',HEAD_SHA:C}),fetchImpl:p1OnlyFetch});
+  assert.equal(partialResolved.decision.mode,'threads');
+});
+
 test('the final review of a PR is a full review in the engine, whatever the size; a delta that needs a full look is too',async()=>{
   const awaiting=applyDiscoveryResult({result:{summary:'clean',findings:[]},baseSha:BASE,headSha:A,sourceCommentId:'1'});
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'plan-audit-'));

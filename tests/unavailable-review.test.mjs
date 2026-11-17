@@ -10,7 +10,7 @@ import { planSession } from '../scripts/plan-review-session.mjs';
 import {
   CLAUDE_AUTO_MIN_BUDGET_USD, DEEP_REVIEW_PR_BUDGET_USD,
   chargeClaudeFallback, claudeFallbackBudgetLeft, claudeFallbackCallBudget, isManualBudgetExemptReview,
-  applyDiscoveryResult, planReviewSession, renderSessionComment,
+  applyDiscoveryResult, applyFindingDismissal, applyIncrementalResult, planReviewSession, renderSessionComment,
   sessionCommitStatus, stopUnavailableReviewSession,
 } from '../scripts/review-session-core.mjs';
 
@@ -254,4 +254,35 @@ test('only explicit review comments qualify for manual budget exemption',()=>{
     assert.equal(isManualBudgetExemptReview({sourceKind:'comment',requestedMode}),false);
   }
   assert.equal(isManualBudgetExemptReview({sourceKind:'pull_request',requestedMode:'auto'}),false);
+});
+
+test('V4: incremental retry and clearing dismissal strip stale markers and reviewFailure',()=>{
+  const ready=applyFullReview({
+    session:applyDiscoveryResult({result:{summary:'clean',findings:[]},baseSha:BASE,headSha:HEAD,sourceCommentId:'1'}),
+    headSha:HEAD,result:{summary:'clean',findings:[]},
+  });
+  const NEXT='c'.repeat(40);
+  const incFail={
+    ...stopUnavailableReviewSession({session:ready,baseSha:BASE,headSha:NEXT,sourceCommentId:'2',mode:'incremental',reason:'402'}),
+    staleFor:HEAD,staleHead:NEXT,staleCommits:1,
+  };
+  const incDone=applyIncrementalResult({session:incFail,headSha:NEXT,result:{summary:'clean',findings:[]}});
+  assert.equal(incDone.status,'READY');
+  assert.equal(incDone.reviewFailure,undefined);
+  assert.equal(incDone.staleFor,undefined);
+
+  const rework=applyDiscoveryResult({result:{summary:'bug',findings:[{
+    severity:'P1',title:'Bug',body:'Trigger X causes Y; expected Z.',path:'a.js',line:1,riskClass:'state',
+  }]},baseSha:BASE,headSha:HEAD,sourceCommentId:'3'});
+  const stoppedRework={
+    ...stopUnavailableReviewSession({session:rework,baseSha:BASE,headSha:HEAD,sourceCommentId:'4',mode:'verification',reason:'402'}),
+    staleFor:HEAD,staleHead:NEXT,staleCommits:1,
+  };
+  const dismissed=applyFindingDismissal({
+    session:stoppedRework,headSha:HEAD,findingId:'F001',by:'jiaze-li',sourceCommentId:'5',
+    reason:'This is a false positive because the guard already handles null.',
+    evidence:['https://github.com/Jiaze-Li/review-bot/blob/main/a.js'],
+  });
+  assert.equal(dismissed.reviewFailure,undefined);
+  assert.equal(dismissed.staleFor,undefined);
 });

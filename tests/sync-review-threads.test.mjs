@@ -241,3 +241,30 @@ test('a reply-only failure still makes the CLI step exit non-zero, like any othe
   assert.equal(run.status, 1);
   assert.match(run.stderr, /::warning/);
 });
+
+test('V2: verification leaving an original P3 open reopens its thread and posts the reason', async () => {
+  const sess = applyDiscoveryResult({
+    result: {
+      summary: 'p3 open',
+      findings: [{
+        severity: 'P3',
+        title: 'Original P3 bug',
+        body: 'Trigger X causes Y; expected Z.',
+        path: 'Original-P3-bug.swift',
+        line: 1,
+        riskClass: 'state',
+        failurePath: 'Call fn() with empty array -> returns undefined instead of 0.',
+      }],
+    },
+    baseSha: BASE,
+    headSha: HEAD,
+    sourceCommentId: '1',
+  });
+  sess.findings[0].resolutionReason = 'The P3 defect is still reproducible on HEAD.';
+  const resolvedByPerson = { ...thread('T1', 'Original P3 bug', { resolved: true }), resolvedBy: { login: 'jiaze-li' } };
+  const gh = fakeGitHub(sess, [resolvedByPerson]);
+  const out = await syncReviewThreads({ env: { ...env, REVIEW_MODE: 'verification' }, fetchImpl: gh.fetchImpl, log: quiet });
+  assert.deepEqual(gh.reopened, ['T1']);
+  assert.equal(out.reopened, 1);
+  assert.match(gh.replies[0], /still reproducible/);
+});

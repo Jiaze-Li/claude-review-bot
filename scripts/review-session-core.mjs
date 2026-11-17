@@ -2,8 +2,25 @@ import { createHash } from 'node:crypto';
 const MATERIAL_SEVERITIES = new Set(['P0', 'P1', 'P2']);
 // A finding blocks until it is fixed (and its thread resolved) when it is P0-P2, or a P3 that was reported as P3.
 // A claim demoted to P3 for lacking a concrete failure path stays non-blocking.
-function isBlocking(finding) {
+export function isBlockingFinding(finding) {
   return MATERIAL_SEVERITIES.has(finding?.severity) || (finding?.severity === 'P3' && !finding.downgradedFrom);
+}
+const isBlocking = isBlockingFinding;
+
+function stripTransientState(session, headSha, { clearAllCoverageDeepReview = false, keepDeepReview = false } = {}) {
+  const next = { ...session };
+  delete next.reviewFailure;
+  delete next.staleFor;
+  delete next.staleHead;
+  delete next.staleCommits;
+  if (clearAllCoverageDeepReview) {
+    delete next.coverage;
+    delete next.deepReview;
+  } else {
+    if (next.coverage && next.coverage.head !== headSha) delete next.coverage;
+    if (!keepDeepReview && next.deepReview && next.deepReview.head !== headSha) delete next.deepReview;
+  }
+  return next;
 }
 export const SESSION_VERSION = 1;
 export const MAX_VERIFICATION_ROUNDS = 2;
@@ -223,11 +240,12 @@ export function applyIncrementalResult({
     });
   }
   const open = findings.some((finding) => finding.status === 'OPEN' && isBlocking(finding));
-  const { reviewFailure: _oldFailure, ...base } = session;
+  const fullAuditHead = session.fullAuditHead ?? (retry ? session.reviewFailure.previousHead : session.lastReviewedHead);
+  const base = stripTransientState(session, headSha);
   return {
     ...base,
     lastReviewedHead: headSha,
-    fullAuditHead: session.fullAuditHead ?? (retry ? session.reviewFailure.previousHead : session.lastReviewedHead),
+    fullAuditHead,
     incrementalReviewCount: (session.incrementalReviewCount ?? 0) + 1,
     status: open ? 'REWORK' : 'READY',
     auditCompleted: true,
@@ -300,7 +318,7 @@ export function applyVerificationResult({
       : 'REWORK';
 
   return {
-    ...session,
+    ...stripTransientState(session, headSha),
     lastReviewedHead: headSha,
     status,
     verificationRound,
@@ -541,7 +559,7 @@ export function completeDeepReview({
   // comment can name exactly what no reviewer has seen yet.
   if (coverage && !coverage.complete) completed.coverage = { ...coverage, head: headSha };
   else delete completed.coverage;
-  return completed;
+  return stripTransientState(completed, headSha, { keepDeepReview: true });
 }
 
 // Absent coverage means a legacy result that predates the field and is treated as
@@ -773,8 +791,9 @@ export function applyFindingDismissal({
   const status = remaining
     ? findings.some(f => f.status === 'OPEN') ? 'REWORK' : 'HUMAN_REQUIRED'
     : session.auditCompleted === true ? 'READY' : 'AUDIT_PENDING';
+  const base = remaining === 0 ? stripTransientState(session, headSha) : session;
   return {
-    ...session, findings, status,
+    ...base, findings, status,
     lastSummary: compactText('Human-dismissed ' + findingId + ' by @' + by + '; remaining material findings: ' + remaining + '.', 800),
     updatedAt: now,
   };
@@ -800,7 +819,7 @@ export function applyOverride({ session, headSha, by, now = new Date().toISOStri
     };
   });
   return {
-    ...session,
+    ...stripTransientState(session, headSha, { clearAllCoverageDeepReview: true }),
     status: 'READY',
     auditCompleted: true,
     lastReviewedHead: headSha,
@@ -1070,9 +1089,9 @@ function normalizeFinding(value) {
   // Evidence rule: a material claim without a concrete failure path cannot
   // block. Findings that omit the field entirely (legacy sessions) are kept.
   const failurePath = typeof value.failurePath === 'string' ? value.failurePath.replace(/[\r\n]+/g, ' ').trim() : null;
-  let downgradedFrom = severity === 'P3' && ['P0', 'P1', 'P2'].includes(value.downgradedFrom) ? value.downgradedFrom : null;
-  if (MATERIAL_SEVERITIES.has(severity) && failurePath !== null && failurePath.length < MIN_FAILURE_PATH_CHARS) {
-    downgradedFrom = severity;
+  let downgradedFrom = severity === 'P3' && ['P0', 'P1', 'P2', 'P3'].includes(value.downgradedFrom) ? value.downgradedFrom : null;
+  if (['P0', 'P1', 'P2', 'P3'].includes(severity) && failurePath !== null && failurePath.length < MIN_FAILURE_PATH_CHARS) {
+    downgradedFrom = downgradedFrom ?? severity;
     severity = 'P3';
   }
   const path = checkedText(value.path, 1000, 'finding path');
