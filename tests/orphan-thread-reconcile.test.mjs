@@ -387,3 +387,44 @@ test('I6: GraphQL failure degrades to no-op with warning and does not fail the r
   assert.equal(warnings.length, 1);
   assert.match(warnings[0], /orphan reconciliation/);
 });
+
+test('F001/F002: respects 16-OPEN verification cap and guards null/undefined session', async () => {
+  // F002: null/undefined session returns empty adoption safely without throwing
+  const empty = adoptOrphanFindings({
+    session: null,
+    orphans: [{ key: 'aaaaaaaaaa', path: 'src/a.js', severity: 'P2', title: 'Orphan', body: 'Body', line: 2, riskClass: 'correctness' }],
+    diffPaths: new Set(['src/a.js']),
+    headSha: HEAD_NEW,
+  });
+  assert.equal(empty.session, null);
+  assert.equal(empty.adoptedCount, 0);
+
+  // F001: session with 12 OPEN findings only has room for 4 more under the 16-entry verification cap
+  const dir = makeContextDir(['src/a.js']);
+  const session = baseSession('REWORK');
+  session.findings = Array.from({ length: 12 }, (_, i) => ({
+    id: `F${String(i + 1).padStart(3, '0')}`,
+    severity: 'P2',
+    title: `Existing open ${i}`,
+    body: 'Body',
+    path: 'src/b.js',
+    line: 1,
+    riskClass: 'uncategorized',
+    status: 'OPEN',
+    origin: 'DISCOVERY',
+    introducedHead: HEAD_OLD,
+    lastCheckedHead: HEAD_OLD,
+    resolutionReason: null,
+  }));
+  session.nextFindingNumber = 13;
+
+  const threads = Array.from({ length: 8 }, (_, i) => makeBotThread({ id: `TO_${i}`, path: 'src/a.js', severity: 'P2', title: `Orphan ${i}` }));
+  const next = await reconcileOrphanThreads({
+    plan: { requestedMode: 'auto', decision: { mode: 'verification', previousHead: HEAD_OLD, reason: 'verify' }, session, sessionCommentId: '7' },
+    env: makeEnv(dir),
+    fetchImpl: graphqlFetch(threads),
+  });
+  assert.equal(next.session.findings.filter((f) => f.status === 'OPEN').length, 16);
+  assert.equal(next.orphanReconcile.adopted, 4);
+  assert.equal(next.orphanReconcile.deferred, 4);
+});

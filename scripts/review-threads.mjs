@@ -130,6 +130,7 @@ export function reportThreadProblem({ env, log, heading, counts, errors = [], pe
 }
 
 const MAX_SESSION_FINDINGS = 64;
+const MAX_OPEN_VERIFICATIONS = 16;
 
 function compactOrphanText(value, max) {
   return String(value ?? '').replace(/[\r\n]+/g, ' ').trim().slice(0, max);
@@ -198,9 +199,13 @@ export function findOrphanBotThreads({ session, threads, botLogin }) {
 }
 
 // Adopt up to `maxAdopt` in-diff orphan findings into `session.findings` (P0-P2 before P3, preserving order),
-// respecting the 64-finding session cap and without mutating `session.status` or adding session fields (I3).
+// respecting the 64-finding session cap and the 16-entry verification cap without mutating `session.status` (I3).
 export function adoptOrphanFindings({ session, orphans, diffPaths, headSha, maxAdopt = 8 }) {
-  const existingKeys = new Set((session?.findings ?? []).map((f) => findingKey(f.path, f.title)));
+  if (!session || typeof session !== 'object') {
+    return { session: session ?? null, adoptedCount: 0, deferredCount: 0, outsideDiffCount: 0 };
+  }
+  const existingFindings = Array.isArray(session.findings) ? session.findings : [];
+  const existingKeys = new Set(existingFindings.map((f) => findingKey(f.path, f.title)));
   const inDiff = [];
   let outsideDiffCount = 0;
 
@@ -215,13 +220,14 @@ export function adoptOrphanFindings({ session, orphans, diffPaths, headSha, maxA
   }
 
   const prioritized = [...inDiff].sort((a, b) => (MATERIAL.has(a.severity) ? 0 : 1) - (MATERIAL.has(b.severity) ? 0 : 1));
-  const existingFindings = session?.findings ?? [];
   const room = Math.max(0, MAX_SESSION_FINDINGS - existingFindings.length);
-  const limit = Math.min(maxAdopt, room);
+  const openCount = existingFindings.filter((f) => f.status === 'OPEN').length;
+  const openRoom = Math.max(0, MAX_OPEN_VERIFICATIONS - openCount);
+  const limit = Math.min(maxAdopt, room, openRoom);
   const toAdopt = prioritized.slice(0, limit);
   const deferredCount = prioritized.length - toAdopt.length;
 
-  let nextFindingNumber = Number.isInteger(session?.nextFindingNumber) ? session.nextFindingNumber : existingFindings.length + 1;
+  let nextFindingNumber = Number.isInteger(session.nextFindingNumber) ? session.nextFindingNumber : existingFindings.length + 1;
   const adopted = toAdopt.map((orphan) => ({
     id: `F${String(nextFindingNumber++).padStart(3, '0')}`,
     severity: orphan.severity,
