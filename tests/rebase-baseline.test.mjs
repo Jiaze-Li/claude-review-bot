@@ -309,10 +309,10 @@ test('F001 a carried needs-confirmation finding suppresses a re-report of the sa
   assert.equal(different.findings.filter((f) => f.status === 'OPEN').length, 2);
   assert.equal(different.status, 'REWORK');
 
-  // Other UNCERTAIN carries are untouched: they do not suppress a re-report.
+  // Any UNCERTAIN carry (including CARRIED_UNCERTAIN) suppresses a duplicate re-report of the same path and title.
   const plain = carriedSession();
   plain.findings = plain.findings.map((f) => ({ ...f, origin: 'CARRIED_UNCERTAIN' }));
-  assert.equal(complete(plain, [finding()]).findings.filter((f) => f.status === 'OPEN').length, 1);
+  assert.equal(complete(plain, [finding()]).findings.filter((f) => f.status === 'OPEN').length, 0);
 });
 
 test('P2 the exits named for a stopped rewritten-history session are the ones that actually work on the new HEAD', async () => {

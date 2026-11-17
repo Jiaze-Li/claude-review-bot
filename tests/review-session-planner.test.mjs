@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fullReviewDecision, planSession } from '../scripts/plan-review-session.mjs';
+import { fullReviewDecision, planSession, runSessionPlanner } from '../scripts/plan-review-session.mjs';
 import { findingMarker } from '../scripts/review-anchors.mjs';
 import { applyDiscoveryResult, beginDeepReview, completeDeepReview, failDeepReview, pendingSessionMarker, renderSessionComment } from '../scripts/review-session-core.mjs';
 
@@ -299,6 +299,34 @@ test('V1: resolving original P3 after new commits triggers verification, and unr
   };
   const partialResolved=await planSession({env:env({REQUESTED_MODE:'threads',SOURCE_KIND:'pull_request',HEAD_SHA:C}),fetchImpl:p1OnlyFetch});
   assert.equal(partialResolved.decision.mode,'threads');
+});
+
+test('V6: runSessionPlanner orchestrates planning and non-reset new-HEAD full review carries open findings or stops at >8',async()=>{
+  const partialWithOpen={
+    ...applyDiscoveryResult({result:{summary:'bugs',findings:[bug]},baseSha:BASE,headSha:A,sourceCommentId:'1'}),
+    status:'PARTIAL',
+    coverage:{complete:false,unreviewedCount:1,unreviewedPaths:['x.js'],reviewedKeys:[],head:A},
+  };
+  const planned=await runSessionPlanner({
+    env:env({HEAD_SHA:C,REQUESTED_MODE:'auto',SOURCE_KIND:'comment'}),
+    fetchImpl:fetchState({comments:[comment(7,renderSessionComment(partialWithOpen))]}),
+  });
+  assert.equal(planned.decision.mode,'claude');
+  assert.equal(planned.decision.carryOpen,true);
+
+  const manyOpen={
+    ...partialWithOpen,
+    findings:Array.from({length:9},(_,i)=>({
+      id:`F${String(i+1).padStart(3,'0')}`,severity:'P1',title:`Bug ${i+1}`,body:'x',path:`f${i}.js`,line:1,riskClass:'state',
+      status:'OPEN',origin:'DISCOVERY',introducedHead:A,lastCheckedHead:A,resolutionReason:null,
+    })),
+    nextFindingNumber:10,
+  };
+  const blocked=await runSessionPlanner({
+    env:env({HEAD_SHA:C,REQUESTED_MODE:'auto',SOURCE_KIND:'comment'}),
+    fetchImpl:fetchState({comments:[comment(7,renderSessionComment(manyOpen))]}),
+  });
+  assert.equal(blocked.decision.mode,'human_required');
 });
 
 test('the final review of a PR is a full review in the engine, whatever the size; a delta that needs a full look is too',async()=>{

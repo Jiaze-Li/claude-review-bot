@@ -136,7 +136,22 @@ export async function planSession({ env=process.env, fetchImpl=fetch }={}) {
   // or risky change, the final review before READY): the sharded engine, Gemini first, Claude continuing what Gemini
   // cannot. Only delta reviews (incremental, verification) use the staged pipeline.
   if(decision.mode==='full_review'){
-    decision=fullReviewDecision(env,requested,decision.reason);
+    if(requested!=='reset' && session && session.lastReviewedHead!==headSha){
+      const carried=openMaterialFindings(session).length+unresolvedMaterialFindings(session).length;
+      if(carried>MAX_CARRIED_FINDINGS){
+        decision={
+          mode:'human_required',
+          previousHead:session.lastReviewedHead,
+          reason:`${carried} blocking findings are still open (more than the ${MAX_CARRIED_FINDINGS} that can be carried safely); comment "reset review" to discard the session or "override review" to waive them`,
+        };
+      }else{
+        const hasOpen=openMaterialFindings(session).length>0;
+        decision=fullReviewDecision(env,requested,decision.reason);
+        if(hasOpen) decision={...decision,carryOpen:true};
+      }
+    }else{
+      decision=fullReviewDecision(env,requested,decision.reason);
+    }
   }
   return {requestedMode:requested,decision,session,sessionCommentId,pendingSession:null,pendingSourceCommentId:null,pendingReviewId:null};
 }
@@ -382,27 +397,32 @@ export async function reconcileOrphanThreads({ plan, env = process.env, fetchImp
   };
 }
 
+export async function runSessionPlanner({ env = process.env, fetchImpl = fetch, log = console } = {}) {
+  let plan = await planSession({ env, fetchImpl });
+  plan.decision = await resolveVerificationScope({ plan, env, fetchImpl });
+  if (plan.decision.mode === 'incremental_candidate') {
+    const previousHead = plan.decision.previousHead;
+    const scope = prepareIncrementalDelta({
+      repoDir: path.resolve(env.SOURCE_REPO_DIR || 'target'),
+      contextDir: path.resolve(env.REVIEW_CONTEXT_DIR || '.review-context'),
+      previousHead,
+      headSha: required(env, 'HEAD_SHA'),
+      session: plan.session,
+      token: env.GH_TOKEN,
+    });
+    plan.decision = scope.mode === 'incremental'
+      ? { mode: 'incremental', previousHead, reason: scope.reason }
+      : fullReviewDecision(env, plan.requestedMode, scope.reason);
+    log.log?.('Review scope: ' + scope.mode + ' — ' + scope.reason
+      + (scope.changedLines == null ? '' : ' (' + scope.files + ' files, ' + scope.changedLines + ' lines)'));
+  }
+  plan = await reconcileOrphanThreads({ plan, env, fetchImpl, log });
+  return plan;
+}
+
 if(process.argv[1] && import.meta.url===pathToFileURL(process.argv[1]).href){
   try{
-    let plan=await planSession();
-    plan.decision = await resolveVerificationScope({ plan, env: process.env });
-    if (plan.decision.mode === 'incremental_candidate') {
-      const previousHead = plan.decision.previousHead;
-      const scope = prepareIncrementalDelta({
-        repoDir: path.resolve(process.env.SOURCE_REPO_DIR || 'target'),
-        contextDir: path.resolve(process.env.REVIEW_CONTEXT_DIR || '.review-context'),
-        previousHead,
-        headSha: required(process.env, 'HEAD_SHA'),
-        session: plan.session,
-        token: process.env.GH_TOKEN,
-      });
-      plan.decision = scope.mode === 'incremental'
-        ? { mode: 'incremental', previousHead, reason: scope.reason }
-        : fullReviewDecision(process.env, plan.requestedMode, scope.reason);
-      console.log('Review scope: ' + scope.mode + ' — ' + scope.reason
-        + (scope.changedLines == null ? '' : ' (' + scope.files + ' files, ' + scope.changedLines + ' lines)'));
-    }
-    plan = await reconcileOrphanThreads({ plan, env: process.env });
+    const plan = await runSessionPlanner({ env: process.env });
     const output=path.resolve(process.env.REVIEW_CONTEXT_DIR||'.review-context','session-plan.json');
     fs.mkdirSync(path.dirname(output),{recursive:true,mode:0o700});
     fs.writeFileSync(output,JSON.stringify(plan,null,2)+'\n',{mode:0o600});
