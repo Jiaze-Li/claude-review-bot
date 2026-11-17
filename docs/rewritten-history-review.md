@@ -20,4 +20,6 @@ When rewritten:
   2-round verification budget applies.
 * **Too large**: a sharded full review runs instead and the old blocking OPEN findings are carried as `UNCERTAIN`
   (`origin: CARRIED_OPEN`, `carriedFromId`). The result is `HUMAN_REQUIRED` until a person dismisses them. More than 8
-  blocking findings stops at `human_required` without a model call (nothing is truncated).
+  blocking findings stops at `human_required` without a model call (nothing is truncated). `dismiss` is not available
+  there (the session still points at the old HEAD); a writer uses `reset review` (review from scratch, old findings
+  are not kept) or `override review` (accept the risk).

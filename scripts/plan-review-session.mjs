@@ -206,7 +206,7 @@ export async function resolveVerificationScope({ plan, env = process.env, fetchI
   if (carried > MAX_CARRIED_FINDINGS) {
     return {
       mode: 'human_required', previousHead: decision.previousHead,
-      reason: `PR history was rewritten (${verdict.reason}) and the whole current PR diff is too large to verify in one pass (${files} files, ${where}), and ${carried} blocking findings are still open (more than the ${MAX_CARRIED_FINDINGS} that can be carried safely); a person needs to confirm or dismiss them first`,
+      reason: `PR history was rewritten (${verdict.reason}) and the whole current PR diff is too large to verify in one pass (${files} files, ${where}), and ${carried} blocking findings are still open (more than the ${MAX_CARRIED_FINDINGS} that can be carried safely); a finding cannot be dismissed until a review has covered the current HEAD, so a repository writer decides: comment "reset review" to discard the session and review the PR from scratch, or "override review" to accept the risk and waive the open findings`,
     };
   }
   return {

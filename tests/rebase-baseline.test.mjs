@@ -157,6 +157,9 @@ test('T7b more than 8 blocking findings stops for a person instead of truncating
   assert.equal(decision.mode, 'human_required');
   assert.equal(decision.carryOpen, undefined);
   assert.match(decision.reason, /9 blocking findings/);
+  assert.match(decision.reason, /reset review/);
+  assert.match(decision.reason, /override review/);
+  assert.doesNotMatch(decision.reason, /dismiss them|confirm or dismiss/);
   assert.match(decision.reason, new RegExp(`25 files, base ${MB_NEW.slice(0, 7)}, head ${NEW.slice(0, 7)}`));
   assert.equal(plan.session.findings.length, 9);
   // Exactly 8 still fits.
@@ -310,4 +313,17 @@ test('F001 a carried needs-confirmation finding suppresses a re-report of the sa
   const plain = carriedSession();
   plain.findings = plain.findings.map((f) => ({ ...f, origin: 'CARRIED_UNCERTAIN' }));
   assert.equal(complete(plain, [finding()]).findings.filter((f) => f.status === 'OPEN').length, 1);
+});
+
+test('P2 the exits named for a stopped rewritten-history session are the ones that actually work on the new HEAD', async () => {
+  const session = reworkSession(9);
+  const fetchImpl = async (url) => {
+    if (/issues\/7\/comments/.test(url)) return Response.json([{ id: 7, user: { login: author }, body: renderSessionComment(session) }]);
+    if (/pulls\/7\/reviews/.test(url)) return Response.json([]);
+    assert.fail(`unexpected URL ${url}`);
+  };
+  const plan = (requested) => planSession({ env: env(context(), { REQUESTED_MODE: requested, SOURCE_KIND: 'comment', EXPECTED_REVIEW_AUTHOR: author }), fetchImpl });
+  assert.equal((await plan('dismiss')).decision.mode, 'noop_waiting', 'dismiss is NOT available on the new HEAD');
+  assert.equal((await plan('override')).decision.mode, 'override');
+  assert.notEqual((await plan('reset')).decision.mode, 'noop_waiting');
 });
