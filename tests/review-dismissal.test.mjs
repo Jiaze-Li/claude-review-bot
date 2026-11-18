@@ -13,6 +13,7 @@ import {
 import { parseDismissalRequest, parseReviewTrigger } from '../worker/src/review-trigger.js';
 import { planSession } from '../scripts/plan-review-session.mjs';
 import { applyManualDismissal } from '../scripts/apply-dismissal.mjs';
+import { extractSameRepoEvidence } from '../scripts/dismiss-verifier.mjs';
 import { findingMarker } from '../scripts/review-anchors.mjs';
 
 const BASE = 'b'.repeat(40), A = 'a'.repeat(40), B = 'c'.repeat(40);
@@ -47,7 +48,7 @@ test('parse only the first-line command and require explicit HTTPS evidence', ()
   assert.throws(() => parseDismissalRequest('@gemini dismiss F001\nReason: ' + reason), /Evidence/);
   assert.throws(() => parseDismissalRequest(command.replace('https:', 'http:')), /HTTPS/);
   assert.throws(() => parseDismissalRequest(command + '\nEvidence: ' + EVIDENCE_URL), /Duplicate/);
-  assert.throws(() => parseDismissalRequest(command.replace('Reason: ' + reason, 'Reason: trivial')), /30-400/);
+  assert.throws(() => parseDismissalRequest(command.replace('Reason: ' + reason, 'Reason: trivial')), /30-1200/);
   assert.throws(() => parseDismissalRequest(command + '\nArbitrary extra input'), /exactly one/);
 });
 
@@ -93,13 +94,15 @@ test('after the one final full review has run, no second full review is owed', (
   assert.equal(planReviewSession({ session: out, baseSha: BASE, headSha: A }).mode, 'noop_ready');
 });
 
-test('dismissal refuses stale, duplicate, unknown and non-blocking findings', () => {
+test('dismissal refuses duplicate, unknown and non-blocking findings, and allows cross-commit dismissal without READY', () => {
   const session = initial();
-  assert.throws(() => dismiss(session, { headSha: B }), /exact last-reviewed HEAD/);
+  const crossCommit = dismiss({ ...session, auditCompleted: true }, { headSha: B });
+  assert.equal(crossCommit.status, 'AUDIT_PENDING');
+  assert.equal(crossCommit.lastReviewedHead, A);
   assert.throws(() => dismiss(session, { findingId: 'F999' }), /must be an OPEN or UNCERTAIN/);
   assert.throws(() => dismiss(dismiss(session)), /REWORK or HUMAN_REQUIRED/);
   assert.throws(() => dismiss(session, { reason: 'short' }), /at least 30/);
-  assert.throws(() => dismiss(session, { evidence: ['http://invalid.test/'] }), /invalid dismissal evidence/);
+  assert.throws(() => dismiss(session, { evidence: ['http://invalid.test/'] }), /HTTPS URL/);
   assert.throws(() => dismiss({ ...session, status: 'READY' }), /REWORK or HUMAN_REQUIRED/);
 });
 
@@ -235,7 +238,6 @@ test('workflow verifies rebuttal with model, writes evidence and produces final-
 for (const [name, opts, error] of [
   ['non-writer', { permission: 'read' }, /write permission/],
   ['wrong author', { actor: 'attacker' }, /does not belong/],
-  ['missing evidence', { sourceBody: '@gemini dismiss F001' }, /Evidence/],
   ['moved HEAD', { head: B }, /PR moved/],
   ['stale bot session', { commentBody: renderSessionComment(dismiss(initial())) }, /changed since planning/],
 ]) {
@@ -444,7 +446,7 @@ test('planner selects dismissal only for a blocking OPEN/UNCERTAIN finding on th
   const base = { GH_TOKEN: 'token', TARGET_REPO: 'acme/project', PR_NUMBER: '7',
     BASE_SHA: BASE, HEAD_SHA: A, EXPECTED_REVIEW_AUTHOR: AUTHOR, REQUESTED_MODE: 'dismiss' };
   assert.equal((await planSession({ env: base, fetchImpl })).decision.mode, 'dismiss');
-  assert.equal((await planSession({ env: { ...base, HEAD_SHA: B }, fetchImpl })).decision.mode, 'noop_waiting');
+  assert.equal((await planSession({ env: { ...base, HEAD_SHA: B }, fetchImpl })).decision.mode, 'dismiss');
   const downgradedP3 = applyDiscoveryResult({
     result: { summary: 'p3', findings: [{ severity: 'P3', downgradedFrom: 'P2', title: 'Weak', body: 'Weak', path: 'a.js', line: 1, riskClass: 'API' }] },
     baseSha: BASE, headSha: A, sourceCommentId: '9',
@@ -473,4 +475,71 @@ test('the dismissal step uses safe-target and model credentials, and the final r
   assert.match(block, /CLAUDE_CODE_OAUTH_TOKEN/);
   assert.match(block, /SAFE_REPO_DIR: safe-target/);
   assert.doesNotMatch(yml, /auto-audit|final-gemini-run/);
+});
+
+test('V2: parseDismissalRequest allows 30-1200 char Reason and repo-relative Evidence paths while rejecting unsafe inputs', () => {
+  const r600 = 'x'.repeat(600);
+  const r1200 = 'y'.repeat(1200);
+  const r1201 = 'z'.repeat(1201);
+  assert.equal(parseDismissalRequest(`@gemini dismiss F001\nReason: ${r600}\nEvidence: Sources/App.swift:42`).reason.length, 600);
+  assert.deepEqual(
+    parseDismissalRequest(`@gemini dismiss F001\nReason: ${r1200}\nEvidence: docs/Design.md#L10-L20\nEvidence: README.md:5\nEvidence: Makefile:10`).evidence,
+    ['docs/Design.md#L10-L20', 'README.md:5', 'Makefile:10'],
+  );
+  assert.throws(() => parseDismissalRequest(`@gemini dismiss F001\nReason: ${r1201}\nEvidence: README.md`), /30-1200/);
+  assert.throws(() => parseDismissalRequest(`@gemini dismiss F001\nReason: ${reason}\nEvidence: ../secret.txt`), /traversal|inside/);
+  assert.throws(() => parseDismissalRequest(`@gemini dismiss F001\nReason: ${reason}\nEvidence: /etc/passwd`), /traversal|inside/);
+  assert.throws(() => parseDismissalRequest(`@gemini dismiss F001\nReason: ${reason}\nEvidence: http://example.com/a`), /HTTPS URL/);
+});
+
+test('V3: extractSameRepoEvidence reads bounded excerpts for repo-relative paths and rejects traversal/symlink escape', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dismiss-ev-'));
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'dismiss-outside-'));
+  fs.mkdirSync(path.join(root, 'src'), { recursive: true });
+  const lines = Array.from({ length: 40 }, (_, i) => `line-${i + 1}`).join('\n');
+  fs.writeFileSync(path.join(root, 'src', 'app.js'), lines, 'utf8');
+  fs.writeFileSync(path.join(root, 'README.md'), lines, 'utf8');
+  fs.writeFileSync(path.join(outside, 'secret.txt'), 'TOP_SECRET', 'utf8');
+  fs.symlinkSync(path.join(outside, 'secret.txt'), path.join(root, 'src', 'leak.txt'));
+
+  const excerpt = extractSameRepoEvidence({
+    evidence: ['src/app.js:20', 'src/app.js#L5-L8', 'README.md:5', '../outside/secret.txt', 'src/leak.txt', 'https://example.com/docs'],
+    repo: 'acme/project',
+    headSha: A,
+    repoRoot: root,
+  });
+  assert.match(excerpt, /Cited repository evidence \(src\/app\.js:5-40\)/);
+  assert.match(excerpt, /20: line-20/);
+  assert.match(excerpt, /Cited repository evidence \(src\/app\.js:1-23\)/);
+  assert.match(excerpt, /Cited repository evidence \(README\.md:1-30\)/);
+  assert.doesNotMatch(excerpt, /TOP_SECRET/);
+});
+
+test('V4: applyManualDismissal posts clear guidance reply on malformed format or non-existent/closed finding without model calls', async () => {
+  for (const [label, sourceBody, expectedText] of [
+    ['malformed format', '@gemini dismiss F001', /Dismissal command format invalid/],
+    ['unknown finding', `@gemini dismiss F999\nReason: ${reason}\nEvidence: README.md`, /F999.*not found/],
+  ]) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'finding-dismiss-guidance-'));
+    const session = initial();
+    writePlan(root, session);
+    const mock = mockGitHub(session, { sourceBody });
+    let modelCalls = 0;
+    const out = await applyManualDismissal({
+      env: env(root),
+      fetchImpl: mock.fetchImpl,
+      modelFetchImpl: async () => { modelCalls += 1; throw new Error('should not run'); },
+    });
+    assert.equal(modelCalls, 0, `${label}: should not call model`);
+    assert.equal(out.status, 'REWORK');
+    const postComment = mock.calls.find((c) => c.method === 'POST' && c.pathname === '/repos/acme/project/issues/7/comments');
+    assert.ok(postComment, `${label}: should post PR guidance comment`);
+    const body = JSON.parse(postComment.body).body;
+    assert.match(body, expectedText);
+    assert.match(body, /<!-- jiaze-review-source-comment:99 -->/);
+    assert.match(body, /Reason:/);
+    assert.match(body, /Evidence:/);
+    const handoff = JSON.parse(fs.readFileSync(path.join(root, 'published-session.json'), 'utf8'));
+    assert.equal(handoff.verdict, 'INVALID');
+  }
 });

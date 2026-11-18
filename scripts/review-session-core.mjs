@@ -853,6 +853,42 @@ export function recordDismissAttempt({
   };
 }
 
+const REPO_RELATIVE_EVIDENCE_RE = /^([^:#]+)(?::(\d+)(?:-(\d+))?|#L(\d+)(?:-L(\d+))?)?$/;
+const URL_SCHEME_RE = /^(?:https?|ftp|file|javascript|data|vbscript|mailto):/i;
+
+function validateDismissalEvidence(raw) {
+  if (typeof raw !== 'string' || !raw || raw.length > 500) {
+    throw new Error('Evidence must be a credential-free HTTPS URL or a safe repo-relative path (max 500 chars)');
+  }
+  if (/[\s\x00-\x1f\x7f]/.test(raw) || raw.includes('\\')) {
+    throw new Error('Evidence must not contain whitespace, backslashes, or control characters');
+  }
+  if (raw.includes('://') || URL_SCHEME_RE.test(raw)) {
+    let url;
+    try { url = new URL(raw); } catch { throw new Error('Evidence must be a valid HTTPS URL or repo-relative path'); }
+    if (url.protocol !== 'https:' || !url.hostname || url.username || url.password) {
+      throw new Error('Evidence must be a credential-free HTTPS URL (max 500 chars)');
+    }
+    return;
+  }
+  const match = raw.match(REPO_RELATIVE_EVIDENCE_RE);
+  if (!match) throw new Error('Evidence repo-relative path has invalid line anchor syntax');
+  const relPath = match[1];
+  const segments = relPath.split('/');
+  if (relPath.startsWith('/') || relPath === '.' || segments.some((seg) => !seg || seg === '..')) {
+    throw new Error('Evidence repo-relative path must stay inside the repository without traversal or leading slash');
+  }
+  const startRaw = match[2] || match[4];
+  const endRaw = match[3] || match[5];
+  if (startRaw !== undefined) {
+    const start = Number(startRaw);
+    const end = endRaw !== undefined ? Number(endRaw) : start;
+    if (!Number.isInteger(start) || start < 1 || !Number.isInteger(end) || end < start) {
+      throw new Error('Evidence line range must use positive integers with end >= start');
+    }
+  }
+}
+
 export function applyFindingDismissal({
   session, findingId, headSha, by, reason, evidence, sourceCommentId,
   verification = null, inputHash = '', now = new Date().toISOString(),
@@ -862,24 +898,18 @@ export function applyFindingDismissal({
   if (!['REWORK', 'HUMAN_REQUIRED'].includes(session.status)) {
     throw new Error('dismissal requires REWORK or HUMAN_REQUIRED');
   }
-  if (session.lastReviewedHead !== headSha) throw new Error('dismissal requires the exact last-reviewed HEAD');
   if (!/^F[0-9]{3,}$/.test(String(findingId ?? ''))) throw new Error('invalid dismissal finding id');
   if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})(?:\[bot\])?$/.test(String(by ?? ''))) {
     throw new Error('invalid dismissal actor');
   }
   if (!/^[1-9]\d*$/.test(String(sourceCommentId ?? ''))) throw new Error('invalid dismissal source comment id');
-  const explanation = checkedText(reason, 400, 'dismissal reason');
+  const explanation = checkedText(reason, 1200, 'dismissal reason');
   if (explanation.length < 30) throw new Error('dismissal reason must be at least 30 characters');
   if (!Array.isArray(evidence) || evidence.length < 1 || evidence.length > 3) {
-    throw new Error('dismissal needs 1-3 cited evidence URLs');
+    throw new Error('dismissal needs 1-3 cited evidence items');
   }
   for (const link of evidence) {
-    if (typeof link !== 'string' || link.length > 500) throw new Error('invalid dismissal evidence link');
-    let url;
-    try { url = new URL(link); } catch { throw new Error('invalid dismissal evidence URL'); }
-    if (url.protocol !== 'https:' || !url.hostname || url.username || url.password) {
-      throw new Error('invalid dismissal evidence URL');
-    }
+    validateDismissalEvidence(link);
   }
   const item = session.findings.find((finding) => finding.id === findingId);
   if (!item || !['OPEN', 'UNCERTAIN'].includes(item.status) || !isBlocking(item)) {
@@ -917,7 +947,7 @@ export function applyFindingDismissal({
     ['OPEN', 'UNCERTAIN'].includes(finding.status) && isBlocking(finding)).length;
   const status = remaining
     ? findings.some(f => f.status === 'OPEN') ? 'REWORK' : 'HUMAN_REQUIRED'
-    : session.auditCompleted === true ? 'READY' : 'AUDIT_PENDING';
+    : session.auditCompleted === true && session.lastReviewedHead === headSha ? 'READY' : 'AUDIT_PENDING';
   let next = session;
   if (verification?.claudeCharge && Number.isFinite(verification.claudeCharge.amount) && verification.claudeCharge.amount > 0) {
     next = chargeClaudeFallback(next, verification.claudeCharge.amount, verification.claudeCharge.source || 'sdk');

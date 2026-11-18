@@ -82,6 +82,49 @@ export function automaticSourceId(deliveryId) {
 }
 
 
+const REPO_RELATIVE_EVIDENCE_RE = /^([^:#]+)(?::(\d+)(?:-(\d+))?|#L(\d+)(?:-L(\d+))?)?$/;
+const URL_SCHEME_RE = /^(?:https?|ftp|file|javascript|data|vbscript|mailto):/i;
+
+/**
+ * Validates a single dismissal evidence item: either a credential-free HTTPS URL
+ * or a safe repo-relative path with optional `:line` / `:start-end` / `#Lline` / `#Lstart-Lend`.
+ */
+export function validateDismissalEvidence(raw) {
+  if (typeof raw !== 'string' || !raw || raw.length > 500) {
+    throw new Error('Evidence must be a credential-free HTTPS URL or a safe repo-relative path (max 500 chars)');
+  }
+  if (/[\s\x00-\x1f\x7f]/.test(raw) || raw.includes('\\')) {
+    throw new Error('Evidence must not contain whitespace, backslashes, or control characters');
+  }
+  if (raw.includes('://') || URL_SCHEME_RE.test(raw)) {
+    let url;
+    try { url = new URL(raw); } catch { throw new Error('Evidence must be a valid HTTPS URL or repo-relative path'); }
+    if (url.protocol !== 'https:' || !url.hostname || url.username || url.password) {
+      throw new Error('Evidence must be a credential-free HTTPS URL (max 500 chars)');
+    }
+    return { kind: 'url', value: raw };
+  }
+  const match = raw.match(REPO_RELATIVE_EVIDENCE_RE);
+  if (!match) {
+    throw new Error('Evidence repo-relative path has invalid line anchor syntax');
+  }
+  const relPath = match[1];
+  const segments = relPath.split('/');
+  if (relPath.startsWith('/') || relPath === '.' || segments.some((seg) => !seg || seg === '..')) {
+    throw new Error('Evidence repo-relative path must stay inside the repository without traversal or leading slash');
+  }
+  const startRaw = match[2] || match[4];
+  const endRaw = match[3] || match[5];
+  if (startRaw !== undefined) {
+    const start = Number(startRaw);
+    const end = endRaw !== undefined ? Number(endRaw) : start;
+    if (!Number.isInteger(start) || start < 1 || !Number.isInteger(end) || end < start) {
+      throw new Error('Evidence line range must use positive integers with end >= start');
+    }
+  }
+  return { kind: 'path', value: raw, relPath };
+}
+
 // A human-attested decision, NOT an automatically verified external fact.
 // Parse a strict small format and prevent unrelated prose from being evidence.
 export function parseDismissalRequest(body) {
@@ -103,19 +146,15 @@ export function parseDismissalRequest(body) {
       reason = reasonMatch[1].trim();
     } else if (evidenceMatch) {
       const raw = evidenceMatch[1];
-      let url;
-      try { url = new URL(raw); } catch { throw new Error('Evidence must be a valid HTTPS URL'); }
-      if (url.protocol !== 'https:' || !url.hostname || url.username || url.password || raw.length > 500) {
-        throw new Error('Evidence must be a credential-free HTTPS URL (max 500 chars)');
-      }
-      if (evidence.includes(raw)) throw new Error('Duplicate dismissal evidence URL');
+      validateDismissalEvidence(raw);
+      if (evidence.includes(raw)) throw new Error('Duplicate dismissal evidence');
       evidence.push(raw);
     } else {
-      throw new Error('Dismissal requires exactly one Reason: line and 1-3 Evidence: URL lines');
+      throw new Error('Dismissal requires exactly one Reason: line and 1-3 Evidence: lines');
     }
   }
-  if (!reason || reason.length < 30 || reason.length > 400 || evidence.length < 1 || evidence.length > 3) {
-    throw new Error('Dismissal requires a 30-400 character Reason and 1-3 Evidence URLs');
+  if (!reason || reason.length < 30 || reason.length > 1200 || evidence.length < 1 || evidence.length > 3) {
+    throw new Error('Dismissal requires a 30-1200 character Reason and 1-3 Evidence items (HTTPS URL or repo-relative path)');
   }
   return { findingId: match[2].toUpperCase(), reason, evidence };
 }

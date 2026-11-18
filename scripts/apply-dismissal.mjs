@@ -60,10 +60,27 @@ export async function applyManualDismissal({
       || String(source.user?.login || '').toLowerCase() !== by.toLowerCase()) {
     throw new Error('Dismissal source comment does not belong to this PR or actor');
   }
-  const decision = parseDismissalRequest(source.body);
   const permission = await github(root + '/collaborators/' + encodeURIComponent(by) + '/permission', env.GH_TOKEN, fetchImpl);
   if (!['write', 'maintain', 'admin'].includes(permission.permission)) {
     throw new Error('Finding dismissal requires repository write permission');
+  }
+
+  let decision;
+  try {
+    decision = parseDismissalRequest(source.body);
+  } catch (parseError) {
+    await postInvalidDismissalReply({
+      repo,
+      prNumber,
+      sourceId,
+      heading: '**Dismissal command format invalid**',
+      reason: String(parseError?.message || parseError),
+      fetchImpl,
+      env,
+    });
+    writePublishedSession(contextRoot, { mode: 'dismiss', verdict: 'INVALID', skippedModel: true, session: plan.session, sessionCommentId: plan.sessionCommentId });
+    console.log(`Dismissal format invalid for comment ${sourceId}; posted guidance reply.`);
+    return plan.session;
   }
 
   const loadCurrentDurable = async () => {
@@ -77,7 +94,26 @@ export async function applyManualDismissal({
 
   const targetFinding = durable.findings.find((f) => f.id === decision.findingId);
   if (!targetFinding || !['OPEN', 'UNCERTAIN'].includes(targetFinding.status) || !isBlockingFinding(targetFinding)) {
-    throw new Error('dismissal finding must be an OPEN or UNCERTAIN material candidate');
+    const openIds = durable.findings
+      .filter((f) => ['OPEN', 'UNCERTAIN'].includes(f.status) && isBlockingFinding(f))
+      .map((f) => f.id);
+    const reason = !targetFinding
+      ? `Finding **${decision.findingId}** was not found in this review session.${openIds.length ? ` Open blocking findings: ${openIds.join(', ')}.` : ''}`
+      : !['OPEN', 'UNCERTAIN'].includes(targetFinding.status)
+        ? `Finding **${decision.findingId}** is already **${targetFinding.status}** and does not need dismissal.`
+        : `Finding **${decision.findingId}** is non-blocking (${targetFinding.severity}) and does not require dismissal.`;
+    await postInvalidDismissalReply({
+      repo,
+      prNumber,
+      sourceId,
+      heading: `**${decision.findingId} cannot be dismissed**`,
+      reason,
+      fetchImpl,
+      env,
+    });
+    writePublishedSession(contextRoot, { mode: 'dismiss', verdict: 'INVALID', skippedModel: true, session: durable, sessionCommentId: plan.sessionCommentId });
+    console.log(`Dismissal target ${decision.findingId} ineligible; posted guidance reply.`);
+    return durable;
   }
 
   const inputHash = createHash('sha256')
@@ -241,6 +277,30 @@ export async function applyManualDismissal({
   writePublishedSession(contextRoot, { mode: 'dismiss', verdict: verdict.verdict, session, sessionCommentId: savedId });
   console.log(`Dismissal ${verdict.verdict.toLowerCase()} for ${decision.findingId}; status ${session.status} remains blocking.`);
   return session;
+}
+
+const DISMISSAL_FORMAT_EXAMPLE = [
+  '```text',
+  '@gemini dismiss F001',
+  'Reason: <30-1200 characters explaining why this finding is a false positive or already addressed>',
+  'Evidence: <https://... or path/to/file.ext#L10>',
+  '```',
+].join('\n');
+
+async function postInvalidDismissalReply({ repo, prNumber, sourceId, heading, reason, env, fetchImpl }) {
+  const body = [
+    `<!-- jiaze-review-source-comment:${sourceId} -->`,
+    heading,
+    '',
+    reason,
+    '',
+    'Expected format:',
+    DISMISSAL_FORMAT_EXAMPLE,
+  ].join('\n');
+  await github(`https://api.github.com/repos/${repo}/issues/${prNumber}/comments`, env.GH_TOKEN, fetchImpl, {
+    method: 'POST',
+    body: JSON.stringify({ body }),
+  });
 }
 
 async function postDismissalOutcomeReply({

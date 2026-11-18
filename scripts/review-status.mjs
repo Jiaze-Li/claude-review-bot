@@ -164,6 +164,7 @@ export async function publishRunStatus({ env = process.env, fetchImpl = fetch, p
     hasSessionComment,
     sourceCommentId: env.SOURCE_COMMENT_ID,
     hasFailureReason: Boolean(failure),
+    reviewReason: env.REVIEW_REASON || resolvedPlan?.decision?.reason || '',
   });
 
   if (decision.action === NOTIFICATION_ACTIONS.SILENT) {

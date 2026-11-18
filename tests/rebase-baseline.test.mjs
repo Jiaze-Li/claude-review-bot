@@ -323,7 +323,7 @@ test('P2 the exits named for a stopped rewritten-history session are the ones th
     assert.fail(`unexpected URL ${url}`);
   };
   const plan = (requested) => planSession({ env: env(context(), { REQUESTED_MODE: requested, SOURCE_KIND: 'comment', EXPECTED_REVIEW_AUTHOR: author }), fetchImpl });
-  assert.equal((await plan('dismiss')).decision.mode, 'noop_waiting', 'dismiss is NOT available on the new HEAD');
+  assert.equal((await plan('dismiss')).decision.mode, 'dismiss', 'dismiss is available on the new HEAD when blocking findings remain');
   assert.equal((await plan('override')).decision.mode, 'override');
   assert.notEqual((await plan('reset')).decision.mode, 'noop_waiting');
 });
