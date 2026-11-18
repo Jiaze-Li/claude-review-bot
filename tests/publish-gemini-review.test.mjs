@@ -422,3 +422,24 @@ test('splitForParts cuts at line boundaries, never exceeds the size, and keeps e
   assert.ok(oneHuge.every((p) => Buffer.byteLength(p, 'utf8') <= 700));
   assert.equal(oneHuge.join(''), 'y'.repeat(5000));
 });
+
+test('a run refuses to close its stage when another run closed one while it was writing', async () => {
+  const { writeSessionRecords } = await import('../scripts/session-store.mjs');
+  const pr = createFakePr();
+  pr.seed(readyBaseline());
+  // the faster run lands right after this run's first look at the ledger (its first read is complete by then)
+  const real = pr.fetchImpl;
+  let looked = false;
+  const moving = async (url, init = {}) => {
+    const response = await real(url, init);
+    if (!looked && String(url).endsWith('/graphql') && JSON.parse(init.body ?? '{}').query?.includes('reviewThreads(')) {
+      looked = true;
+      pr.seed({ ...readyBaseline(), updatedAt: 'faster run' }, { stage: 'verification' });
+    }
+    return response;
+  };
+  await assert.rejects(() => writeSessionRecords({
+    target: 'acme/project', prNumber: 7, token: 't', fetchImpl: moving, botLogin: BOT,
+    session: { ...readyBaseline(), updatedAt: 'slower run' }, stage: 'verification', expectedSeq: 1,
+  }), /moved while this run was writing/);
+});

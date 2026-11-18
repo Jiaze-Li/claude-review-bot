@@ -312,3 +312,15 @@ test('edit and collapse information survives the read so the ledger can refuse t
   assert.equal(records[0].lastEditedAt, '2026-11-18T12:00:00Z');
   assert.equal(buildLedger({ records: records.map((r) => ({ ...r, login: BOT })), botLogin: BOT, reads }).code, LEDGER_CODES.INTEGRITY_FAILED);
 });
+
+test('two handoffs that both closed the same Seq never stop the review: the first stands, the later one is set aside', () => {
+  const s1 = session([bug('One')]);
+  const first = post(handoff(s1));
+  const later = post(handoff({ ...session([bug('One')]), lastSummary: 'written by the slower run' }));
+  const ledger = build([...first, ...later]);
+  assert.equal(ledger.state, 'ok', ledger.message);
+  assert.equal(ledger.handoff.seq, 1);
+  assert.equal(ledger.handoff.commentId, first.at(-1).id);
+  assert.equal(ledger.conflictingHandoffs.length, 1);
+  assert.deepEqual(ledger.conflictingHandoffs[0].ignored, [later.at(-1).id]);
+});

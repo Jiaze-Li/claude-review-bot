@@ -51,7 +51,7 @@ const MAX_REVIEWED_KEYS = 400;
 const CLOSED_FINDING_STATUSES = new Set(['FIXED', 'DISMISSED', 'WAIVED', 'DEFERRED']);
 const MAX_CARRIED_CLOSED_FINDINGS = 32;
 // The ledger has no 24 KB state block any more; this only bounds how many findings one render carries.
-const MAX_SESSION_FINDINGS = 400;
+export const MAX_SESSION_FINDINGS = 400;
 
 function pruneFindingsToCap(findings, max = MAX_SESSION_FINDINGS) {
   const next = [...findings];

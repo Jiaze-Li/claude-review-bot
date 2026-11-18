@@ -446,8 +446,17 @@ export function buildLedger({ records, botLogin, reads = { complete: true }, hea
     bySeq.get(part.seq).push(part);
   }
   const incomplete = [];
-  for (const [seq, parts] of [...bySeq].sort((a, b) => a[0] - b[0])) {
-    const finals = parts.filter((p) => p.complete);
+  const setAsideHandoffs = [];
+  for (let [seq, parts] of [...bySeq].sort((a, b) => a[0] - b[0])) {
+    let finals = parts.filter((p) => p.complete);
+    // Two writers that both passed the Seq check close the same Seq: the first COMPLETE handoff stands, everything
+    // the later one wrote for that Seq is set aside (and named) instead of stopping the review for good.
+    if (finals.length > 1) {
+      const first = finals.reduce((a, b) => (b.order < a.order ? b : a));
+      setAsideHandoffs.push({ seq, kept: first.recordId, ignored: finals.filter((f) => f !== first).map((f) => f.recordId) });
+      parts = parts.filter((p) => p.order <= first.order);
+      finals = [first];
+    }
     if (finals.length !== 1) { incomplete.push(seq); continue; }
     const final = finals[0];
     const wanted = Array.from({ length: final.total }, (_, i) => i + 1);
@@ -591,7 +600,7 @@ export function buildLedger({ records, botLogin, reads = { complete: true }, hea
       coverage: latest.coverage, next: latest.next, forCurrentHead: !stale,
     },
     handoffs: handoffs.map((h) => ({ commentId: h.commentId, seq: h.seq, stage: h.stage, reviewedHead: h.reviewedHead })),
-    attempts, receipts, runs, verdicts: uniqueVerdicts, conflictingVerdicts: setAside,
+    attempts, receipts, runs, verdicts: uniqueVerdicts, conflictingVerdicts: setAside, conflictingHandoffs: setAsideHandoffs,
     findingRecords: findingRecords.map((r) => ({ id: r.id, recordId: r.recordId, source: r.source })),
     events: events.map((e) => ({ findingId: e.findingId, attempt: e.attempt, key: e.key })),
     legacyCommentId: latestLegacy?.id ?? null,

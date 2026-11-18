@@ -147,6 +147,13 @@ export async function writeSessionRecords({
     });
     return { ids: [...ids, id], handoffCommentId: null, seq: currentSeq, projectionId: ledger.projection?.id ?? null };
   }
+  // GitHub comments have no compare-and-swap, so this can only narrow the race (the per-PR workflow queue is what
+  // serialises runs; a reader sets aside a doubled Seq deterministically). Look once more right before closing.
+  const { ledger: latest } = await loadLedger({ target, prNumber, token, fetchImpl, botLogin, closingStage: true });
+  if (latest.state === 'stopped') throw new LedgerStopped(latest);
+  if ((latest.handoff?.seq ?? 0) !== currentSeq) {
+    throw new Error(`The review ledger moved while this run was writing (handoff Seq ${currentSeq} -> ${latest.handoff?.seq ?? 0}); not closing the stage, plan again`);
+  }
   const seq = currentSeq + 1;
   const attempts = repairAttempts(session.findings ?? [], [...(ledger.verdicts ?? []), ...written]);
   const bodies = renderHandoffParts({

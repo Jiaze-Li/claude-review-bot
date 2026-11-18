@@ -211,7 +211,8 @@ export async function applyManualDismissal({
           await saveSessionComment({
             target: repo, prNumber, token: env.GH_TOKEN, fetchImpl,
             existingId: plan.sessionCommentId, previous: latestForSpend, session: charged, body: chargedBody,
-            ledger: ledgerOptions(env, { sourceCommentIds: [sourceId], stage: 'closing', expectedSeq: plan.ledgerSeq ?? null }),
+            // the ledger was just read again (that is why it moved); the plan's Seq is already out of date
+            ledger: ledgerOptions(env, { sourceCommentIds: [sourceId], stage: 'closing' }),
           });
         }
       } catch {

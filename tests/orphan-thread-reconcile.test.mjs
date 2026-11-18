@@ -269,9 +269,9 @@ test('AC6: 20 orphans adopts 8 (P0-P2 first, P3 after), reports 12 remaining, an
   assert.equal(round2.orphanReconcile.adopted, 8);
   assert.equal(round2.orphanReconcile.deferred, 4);
 
-  // 64-finding session cap
+  // session cap (400 findings: the same limit the session itself is validated against)
   const fullSession = baseSession('REWORK');
-  fullSession.findings = Array.from({ length: 60 }, (_, i) => ({
+  fullSession.findings = Array.from({ length: 396 }, (_, i) => ({
     id: `F${String(i + 1).padStart(3, '0')}`,
     severity: 'P3',
     title: `Existing ${i}`,
@@ -285,7 +285,7 @@ test('AC6: 20 orphans adopts 8 (P0-P2 first, P3 after), reports 12 remaining, an
     lastCheckedHead: HEAD_OLD,
     resolutionReason: 'Fixed',
   }));
-  fullSession.nextFindingNumber = 61;
+  fullSession.nextFindingNumber = 397;
   const capped = adoptOrphanFindings({
     session: fullSession,
     orphans: findOrphanBotThreads({ session: fullSession, threads, botLogin: BOT_LOGIN }).orphans,
@@ -294,7 +294,7 @@ test('AC6: 20 orphans adopts 8 (P0-P2 first, P3 after), reports 12 remaining, an
     maxAdopt: 8,
   });
   assert.equal(capped.adoptedCount, 4);
-  assert.equal(capped.session.findings.length, 64);
+  assert.equal(capped.session.findings.length, 400);
   assert.equal(capped.deferredCount, 16);
 });
 

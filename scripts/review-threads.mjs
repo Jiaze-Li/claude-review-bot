@@ -1,7 +1,7 @@
 // The bot's review threads, read and changed through GitHub's GraphQL API, and how they map to findings.
 import { appendFileSync } from 'node:fs';
 import { findingKey, markerKey } from './review-anchors.mjs';
-import { isBlockingFinding } from './review-session-core.mjs';
+import { MAX_SESSION_FINDINGS, isBlockingFinding } from './review-session-core.mjs';
 
 const THREADS_QUERY = `query($owner:String!,$repo:String!,$number:Int!,$after:String){
   repository(owner:$owner,name:$repo){pullRequest(number:$number){
@@ -130,7 +130,6 @@ export function reportThreadProblem({ env, log, heading, counts, errors = [], pe
   }
 }
 
-const MAX_SESSION_FINDINGS = 64;
 const MAX_OPEN_VERIFICATIONS = 16;
 
 function compactOrphanText(value, max) {
