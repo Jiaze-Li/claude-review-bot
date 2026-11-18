@@ -477,13 +477,14 @@ export function buildLedger({ records, botLogin, reads = { complete: true }, hea
   const runs = ledger.filter((r) => r.type === 'run');
 
   const verdictByKey = new Map();
+  const setAside = [];
   for (const v of verdicts) {
     const key = `${v.findingId}@${v.head}/${v.kind}`;
     const prior = verdictByKey.get(key);
     if (!prior) verdictByKey.set(key, v);
-    else if (prior.verdict !== v.verdict) {
-      return stopped(LEDGER_CODES.INTEGRITY_FAILED, `Two conflicting verdicts exist for ${key}.`, [prior.recordId, v.recordId]);
-    }
+    // Two runs that raced to the same finding, HEAD and kind: the first verdict written stands and the later one is
+    // set aside (and named), instead of stopping the whole review for good over a record nobody can edit away.
+    else if (prior.verdict !== v.verdict) setAside.push({ key, kept: prior.recordId, ignored: v.recordId });
   }
   const uniqueVerdicts = [...verdictByKey.values()].sort((a, b) => a.order - b.order);
   const attemptsOf = (findings) => repairAttempts(findings, uniqueVerdicts);
@@ -590,7 +591,7 @@ export function buildLedger({ records, botLogin, reads = { complete: true }, hea
       coverage: latest.coverage, next: latest.next, forCurrentHead: !stale,
     },
     handoffs: handoffs.map((h) => ({ commentId: h.commentId, seq: h.seq, stage: h.stage, reviewedHead: h.reviewedHead })),
-    attempts, receipts, runs, verdicts: uniqueVerdicts,
+    attempts, receipts, runs, verdicts: uniqueVerdicts, conflictingVerdicts: setAside,
     findingRecords: findingRecords.map((r) => ({ id: r.id, recordId: r.recordId, source: r.source })),
     events: events.map((e) => ({ findingId: e.findingId, attempt: e.attempt, key: e.key })),
     legacyCommentId: latestLegacy?.id ?? null,

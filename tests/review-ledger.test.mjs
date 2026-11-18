@@ -169,13 +169,18 @@ test('repair attempts count distinct HEADs, dismissals do not count, and the eve
     rec(renderVerdictRecord({ finding: f, verdict: 'STILL_OPEN', head: C, kind: 'repair', attempt: 2, reason: 'again, same head' })),
   ];
   const event = rec(renderEventRecord({ findingId: f.id, attempt: 3 }));
+  const raced = rec(renderVerdictRecord({ finding: f, verdict: 'FIXED', head: C, kind: 'repair', attempt: 2, reason: 'x' }));
   const closing = post(renderHandoffParts({ session: s0, stage: 'verification', seq: 1, attempts: { F001: 2 } }));
   const ledger = build([...verdicts, event, ...closing]);
   assert.equal(ledger.state, 'ok', ledger.message);
   assert.equal(ledger.attempts.F001, 2);
   assert.deepEqual(ledger.events, [{ findingId: 'F001', attempt: 3, key: 'F001#repeated-rework' }]);
-  const conflicting = build([...verdicts, rec(renderVerdictRecord({ finding: f, verdict: 'FIXED', head: C, kind: 'repair', attempt: 2, reason: 'x' })), ...closing]);
-  assert.equal(conflicting.code, LEDGER_CODES.INTEGRITY_FAILED);
+  const conflicting = build([...verdicts, raced, ...closing]);
+  // a raced, conflicting verdict for the same finding/HEAD/kind never stops the review: the first one stands
+  assert.equal(conflicting.state, 'ok', conflicting.message);
+  assert.equal(conflicting.verdicts.length, ledger.verdicts.length); // nothing was added to the unique verdicts
+  assert.equal(conflicting.conflictingVerdicts.length, 1);
+  assert.equal(conflicting.attempts.F001, 2);
 });
 
 test('receipts and run starts are read for idempotency and spend', () => {
