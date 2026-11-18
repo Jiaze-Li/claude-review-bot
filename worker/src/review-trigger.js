@@ -83,6 +83,7 @@ export function automaticSourceId(deliveryId) {
 
 
 const REPO_RELATIVE_EVIDENCE_RE = /^([^:#]+)(?::(\d+)(?:-(\d+))?|#L(\d+)(?:-L(\d+))?)?$/;
+const URL_SCHEME_RE = /^(?:https?|ftp|file|javascript|data|vbscript|mailto):/i;
 
 /**
  * Validates a single dismissal evidence item: either a credential-free HTTPS URL
@@ -95,7 +96,7 @@ export function validateDismissalEvidence(raw) {
   if (/[\s\x00-\x1f\x7f]/.test(raw) || raw.includes('\\')) {
     throw new Error('Evidence must not contain whitespace, backslashes, or control characters');
   }
-  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(raw) || raw.includes('://')) {
+  if (raw.includes('://') || URL_SCHEME_RE.test(raw)) {
     let url;
     try { url = new URL(raw); } catch { throw new Error('Evidence must be a valid HTTPS URL or repo-relative path'); }
     if (url.protocol !== 'https:' || !url.hostname || url.username || url.password) {

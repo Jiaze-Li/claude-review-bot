@@ -483,8 +483,8 @@ test('V2: parseDismissalRequest allows 30-1200 char Reason and repo-relative Evi
   const r1201 = 'z'.repeat(1201);
   assert.equal(parseDismissalRequest(`@gemini dismiss F001\nReason: ${r600}\nEvidence: Sources/App.swift:42`).reason.length, 600);
   assert.deepEqual(
-    parseDismissalRequest(`@gemini dismiss F001\nReason: ${r1200}\nEvidence: docs/Design.md#L10-L20\nEvidence: README.md`).evidence,
-    ['docs/Design.md#L10-L20', 'README.md'],
+    parseDismissalRequest(`@gemini dismiss F001\nReason: ${r1200}\nEvidence: docs/Design.md#L10-L20\nEvidence: README.md:5\nEvidence: Makefile:10`).evidence,
+    ['docs/Design.md#L10-L20', 'README.md:5', 'Makefile:10'],
   );
   assert.throws(() => parseDismissalRequest(`@gemini dismiss F001\nReason: ${r1201}\nEvidence: README.md`), /30-1200/);
   assert.throws(() => parseDismissalRequest(`@gemini dismiss F001\nReason: ${reason}\nEvidence: ../secret.txt`), /traversal|inside/);
@@ -498,11 +498,12 @@ test('V3: extractSameRepoEvidence reads bounded excerpts for repo-relative paths
   fs.mkdirSync(path.join(root, 'src'), { recursive: true });
   const lines = Array.from({ length: 40 }, (_, i) => `line-${i + 1}`).join('\n');
   fs.writeFileSync(path.join(root, 'src', 'app.js'), lines, 'utf8');
+  fs.writeFileSync(path.join(root, 'README.md'), lines, 'utf8');
   fs.writeFileSync(path.join(outside, 'secret.txt'), 'TOP_SECRET', 'utf8');
   fs.symlinkSync(path.join(outside, 'secret.txt'), path.join(root, 'src', 'leak.txt'));
 
   const excerpt = extractSameRepoEvidence({
-    evidence: ['src/app.js:20', 'src/app.js#L5-L8', '../outside/secret.txt', 'src/leak.txt', 'https://example.com/docs'],
+    evidence: ['src/app.js:20', 'src/app.js#L5-L8', 'README.md:5', '../outside/secret.txt', 'src/leak.txt', 'https://example.com/docs'],
     repo: 'acme/project',
     headSha: A,
     repoRoot: root,
@@ -510,6 +511,7 @@ test('V3: extractSameRepoEvidence reads bounded excerpts for repo-relative paths
   assert.match(excerpt, /Cited repository evidence \(src\/app\.js:5-40\)/);
   assert.match(excerpt, /20: line-20/);
   assert.match(excerpt, /Cited repository evidence \(src\/app\.js:1-23\)/);
+  assert.match(excerpt, /Cited repository evidence \(README\.md:1-30\)/);
   assert.doesNotMatch(excerpt, /TOP_SECRET/);
 });
 

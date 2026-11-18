@@ -268,7 +268,7 @@ export function extractSameRepoEvidence({ evidence = [], repo = '', headSha = ''
       }
       lineStart = blobMatch[2] ? Number(blobMatch[2]) : null;
       lineEnd = blobMatch[3] ? Number(blobMatch[3]) : null;
-    } else if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(raw) && !raw.includes('://')) {
+    } else if (!raw.includes('://') && !/^(?:https?|ftp|file|javascript|data|vbscript|mailto):/i.test(raw)) {
       const relMatch = raw.match(relPattern);
       if (!relMatch) continue;
       relPath = relMatch[1];
