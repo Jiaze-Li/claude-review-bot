@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { syncReviewThreads } from '../scripts/sync-review-threads.mjs';
 import { findingMarker } from '../scripts/review-anchors.mjs';
-import { applyDiscoveryResult, renderSessionComment } from '../scripts/review-session-core.mjs';
+import { createFakePr } from './helpers/fake-pr.mjs';
+import { applyDiscoveryResult } from '../scripts/review-session-core.mjs';
 
 const BASE = 'b'.repeat(40);
 const HEAD = 'a'.repeat(40);
@@ -26,10 +27,9 @@ function fakeGitHub(sess, threads, { failResolve = [] } = {}) {
   const resolved = [];
   const reopened = [];
   const replies = [];
-  const fetchImpl = async (url, init = {}) => {
-    if (url.includes('/issues/7/comments')) {
-      return Response.json(sess ? [{ id: 5, user: { login: `${BOT}[bot]` }, body: renderSessionComment(sess) }] : []);
-    }
+  const pr = createFakePr({ author: `${BOT}[bot]` });
+  if (sess) pr.seed(sess);
+  const own = async (url, init = {}) => {
     if (url === 'https://api.github.com/graphql') {
       const { query, variables } = JSON.parse(init.body);
       if (query.includes('unresolveReviewThread')) { reopened.push(variables.id); return Response.json({ data: {} }); }
@@ -43,7 +43,8 @@ function fakeGitHub(sess, threads, { failResolve = [] } = {}) {
     if (/\/comments\/\d+\/replies$/.test(url)) { replies.push(JSON.parse(init.body).body); return Response.json({ id: 1 }); }
     assert.fail('unexpected URL ' + url);
   };
-  return { fetchImpl, resolved, reopened, replies };
+  const fetchImpl = pr.layer(own);
+  return { fetchImpl, resolved, reopened, replies, pr };
 }
 const quiet = { log() {}, warn() {} };
 
@@ -72,7 +73,7 @@ test('nothing is queried or resolved when no finding is closed, or there is no s
   for (const sess of [session({ 'Open bug': 'OPEN' }), null]) {
     const gh = fakeGitHub(sess, [thread('T1', 'Open bug')]);
     let graphqlCalls = 0;
-    const out = await syncReviewThreads({ env, fetchImpl: async (url, init) => { if (url.endsWith('/graphql')) graphqlCalls += 1; return gh.fetchImpl(url, init); }, log: quiet });
+    const out = await syncReviewThreads({ env, fetchImpl: async (url, init) => { if (url.endsWith('/graphql') && !/lastEditedAt/.test(init.body)) graphqlCalls += 1; return gh.fetchImpl(url, init); }, log: quiet });
     assert.equal(graphqlCalls, 0);
     assert.equal(out.resolved, 0);
   }
@@ -224,16 +225,17 @@ test('a reply-only failure still makes the CLI step exit non-zero, like any othe
   const byPerson = { ...thread('T1', 'Open bug', { resolved: true }), resolvedBy: { login: 'jiaze-li' } };
   const gh = fakeGitHub(sess, [byPerson]);
   writeFileSync(`${dir}/stub.mjs`, `
-    const sessionBody = ${JSON.stringify(renderSessionComment(sess))};
+    import { createFakePr } from ${JSON.stringify(new URL('./helpers/fake-pr.mjs', import.meta.url).href)};
+    const pr = createFakePr({ author: '${BOT}[bot]' });
+    pr.seed(${JSON.stringify(sess)});
     const thread = ${JSON.stringify(byPerson)};
-    globalThis.fetch = async (url, init = {}) => {
-      if (url.includes('/issues/7/comments')) return Response.json([{ id: 5, user: { login: '${BOT}[bot]' }, body: sessionBody }]);
+    globalThis.fetch = pr.layer(async (url, init = {}) => {
       if (url.endsWith('/graphql')) {
         if (/unresolveReviewThread/.test(init.body)) return Response.json({ data: {} });
         return Response.json({ data: { repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage: false }, nodes: [thread] } } } } });
       }
       return new Response('no', { status: 500 }); // the reply
-    };`);
+    });`);
   void gh;
   const run = spawnSync(process.execPath, ['--import', `${dir}/stub.mjs`, new URL('../scripts/sync-review-threads.mjs', import.meta.url).pathname], {
     env: { ...process.env, ...env, REVIEW_MODE: 'verification', GITHUB_STEP_SUMMARY: `${dir}/summary.md` }, encoding: 'utf8',

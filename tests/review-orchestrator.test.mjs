@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { createFakePr } from './helpers/fake-pr.mjs';
 import {
   DeadlineTracker,
   CircuitBreaker,
@@ -553,10 +554,13 @@ test('Golden Test M: Existing Session and output schemas are unchanged via apply
   assert.equal(session.findings[0].id, 'F001');
   assert.equal(session.findings[0].status, 'OPEN');
 
-  // Verify Render/Parse Round-trip
+  // Verify the visible summary and the round trip through the PR's own records
   const comment = renderSessionComment(session);
   assert.match(comment, /<!-- jiaze-review-session:v1/);
-  const parsed = parseSessionComment(comment);
+  assert.doesNotMatch(comment, /jiaze-review-state/); // no hidden state any more
+  const pr = createFakePr();
+  pr.seed(session);
+  const parsed = pr.session();
   assert.equal(parsed.sessionId, session.sessionId);
   assert.equal(parsed.status, 'REWORK');
   assert.equal(parsed.findings.length, 1);

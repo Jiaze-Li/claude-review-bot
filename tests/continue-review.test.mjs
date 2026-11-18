@@ -4,11 +4,17 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { chainIndex, continuationMode, continuationSourceKind, continueReview, decideContinuation, nextChainId, MAX_CONTINUATIONS } from '../scripts/continue-review.mjs';
-import { applyDiscoveryResult, renderSessionComment } from '../scripts/review-session-core.mjs';
+import { createFakePr } from './helpers/fake-pr.mjs';
+import { applyDiscoveryResult } from '../scripts/review-session-core.mjs';
 
 const BASE = 'b'.repeat(40), HEAD = 'a'.repeat(40);
 const awaiting = applyDiscoveryResult({ result: { summary: 'clean', findings: [] }, baseSha: BASE, headSha: HEAD, sourceCommentId: '1' });
 const rework = applyDiscoveryResult({ result: { summary: 'bug', findings: [{ severity: 'P1', title: 'Bug', body: 'Trigger X causes Y; expected Z.', path: 'a.js', line: 1, riskClass: 'state' }] }, baseSha: BASE, headSha: HEAD, sourceCommentId: '1' });
+function ledgerFetch(session, own) {
+  const pr = createFakePr({ author: 'bot[bot]' });
+  if (session) pr.seed(session);
+  return pr.layer(own);
+}
 const partial = { ...awaiting, status: 'PARTIAL', coverage: { complete: false, head: HEAD, unreviewedCount: 4, unreviewedPaths: ['x'], reviewedKeys: [] } };
 
 test('chain ids: a real comment id is index 0, each continuation adds one, and ids stay 13 digits', () => {
@@ -48,11 +54,10 @@ test('the next run is dispatched with the same inputs and a new trigger id; noth
   const run = (session) => continueReview({
     env: { TARGET_REPO: 'acme/project', PR_NUMBER: '7', BASE_SHA: BASE, HEAD_SHA: HEAD, SOURCE_COMMENT_ID: '6492010062', SOURCE_KIND: 'comment', REQUESTED_MODE: 'auto', TRIGGER_USER: 'jiaze', REVIEW_MODE: 'verification', GH_TOKEN: 't', DISPATCH_TOKEN: 'd', GITHUB_REPOSITORY: 'ctl/repo', GITHUB_RUN_ID: '40844152995', CONTROL_REF: 'main', EXPECTED_REVIEW_AUTHOR: 'bot[bot]', REVIEW_CONTEXT_DIR: dir },
     log: { log() {} },
-    fetchImpl: async (url, init = {}) => {
-      if (url.includes('/issues/7/comments')) return Response.json(session ? [{ id: 5, user: { login: 'bot[bot]' }, body: renderSessionComment(session) }] : []);
+    fetchImpl: ledgerFetch(session, async (url, init = {}) => {
       if (url.endsWith('/actions/workflows/review-v2.yml/dispatches')) { dispatched.push(JSON.parse(init.body)); return new Response(null, { status: 204 }); }
       assert.fail('unexpected URL ' + url);
-    },
+    }),
   });
   assert.equal((await run({ ...awaiting })).continue, true);
   assert.equal(dispatched.length, 1);
@@ -71,11 +76,10 @@ test('continuation run propagates review_providers and provider_budgets dispatch
       PROVIDER_BUDGETS: 'mock-runner-provider=5.00',
     },
     log: { log() {} },
-    fetchImpl: async (url, init = {}) => {
-      if (url.includes('/issues/7/comments')) return Response.json(session ? [{ id: 5, user: { login: 'bot[bot]' }, body: renderSessionComment(session) }] : []);
+    fetchImpl: ledgerFetch(session, async (url, init = {}) => {
       if (url.endsWith('/actions/workflows/review-v2.yml/dispatches')) { dispatched.push(JSON.parse(init.body)); return new Response(null, { status: 204 }); }
       assert.fail('unexpected URL ' + url);
-    },
+    }),
   });
   assert.equal((await runWithProviders({ ...awaiting })).continue, true);
   assert.equal(dispatched.length, 1);

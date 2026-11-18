@@ -7,6 +7,7 @@ import { findingMarker } from '../scripts/review-anchors.mjs';
 import { adoptOrphanFindings, findOrphanBotThreads, parseBotThreadBody } from '../scripts/review-threads.mjs';
 import { reconcileOrphanThreads } from '../scripts/plan-review-session.mjs';
 import { applyDiscoveryResult, applyVerificationResult, renderSessionComment } from '../scripts/review-session-core.mjs';
+import { createFakePr } from './helpers/fake-pr.mjs';
 import { syncReviewThreads } from '../scripts/sync-review-threads.mjs';
 import { SINGLE_REQUEST_MAX_BYTES } from '../scripts/review-shards.mjs';
 
@@ -164,12 +165,9 @@ test('AC2: verification resolves FIXED orphans and keeps STILL_OPEN/omitted orph
   assert.match(comment, /Old bot threads reconciled: found \*\*3\*\* — verified \*\*1\*\* fixed \(closed\), \*\*2\*\* still open/);
 
   const mutations = [];
-  const syncFetch = async (url, init) => {
-    if (url.includes('/issues/42/comments')) {
-      return Response.json([{ id: 7, user: { login: BOT_AUTHOR }, body: comment }]);
-    }
-    return graphqlFetch(threads, mutations)(url, init);
-  };
+  const pr = createFakePr({ author: BOT_AUTHOR, number: 42 });
+  pr.seed(verified);
+  const syncFetch = pr.layer(graphqlFetch(threads, mutations));
   const syncResult = await syncReviewThreads({ env: makeEnv(dir, { REVIEW_MODE: 'verification' }), fetchImpl: syncFetch, log: { log() {}, warn() {} } });
   assert.equal(syncResult.resolved, 1);
   assert.deepEqual(mutations.filter((m) => m.type === 'resolve'), [{ type: 'resolve', id: 'T1' }]);
@@ -203,12 +201,9 @@ test('AC3: human-resolved orphan still open is reopened with reply; bot-resolved
   });
 
   const mutations = [];
-  const syncFetch = async (url, init) => {
-    if (url.includes('/issues/42/comments')) {
-      return Response.json([{ id: 7, user: { login: BOT_AUTHOR }, body: renderSessionComment(verified, { orphanReconcile: plan.orphanReconcile }) }]);
-    }
-    return graphqlFetch(threads, mutations)(url, init);
-  };
+  const pr = createFakePr({ author: BOT_AUTHOR, number: 42 });
+  pr.seed(verified);
+  const syncFetch = pr.layer(graphqlFetch(threads, mutations));
   const syncResult = await syncReviewThreads({ env: makeEnv(dir, { REVIEW_MODE: 'verification' }), fetchImpl: syncFetch, log: { log() {}, warn() {} } });
   assert.equal(syncResult.reopened, 1);
   assert.equal(mutations[0].type, 'unresolve');

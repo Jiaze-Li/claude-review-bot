@@ -4,6 +4,7 @@ import { pathToFileURL } from 'node:url';
 import { appendFileSync } from 'node:fs';
 import { fetchReviewThreads, isWriter, replyToThread, reportThreadProblem, threadsByFinding, unresolveThread, blockingClaims } from './review-threads.mjs';
 import { saveSessionComment } from './session-comment.mjs';
+import { ledgerOptions } from './session-store.mjs';
 import { applyThreadDecisions, renderSessionComment } from './review-session-core.mjs';
 
 // A person resolving or reopening the bot's review threads. No model call here (when a review of the changes is
@@ -109,7 +110,8 @@ export async function applyThreadResolutions({ env = process.env, fetchImpl = fe
   const next = applyThreadDecisions({ session, headSha, closed, reopened });
   if (next !== session) {
     const body = renderSessionComment(next, { sourceCommentIds: [sourceCommentId] });
-    await saveSessionComment({ target, prNumber, token, fetchImpl, existingId: plan.sessionCommentId, previous: session, session: next, body });
+    await saveSessionComment({ target, prNumber, token, fetchImpl, existingId: plan.sessionCommentId, previous: session, session: next, body,
+      ledger: ledgerOptions(env, { sourceCommentIds: [sourceCommentId], expectedSeq: plan.ledgerSeq, stage: 'closing' }) });
   }
   log.log?.(`Review-thread decisions: ${closed.length} non-blocking finding(s) closed, ${reopened.length} reopened, ${bounced} thread(s) put back (nothing to verify)${problems ? `, ${problems} thread operation(s) did not complete` : ''}.`);
   return { session: next, closed, reopened, bounced, bounceFailed, bounceSkipped, replyFailed, problems };

@@ -25,6 +25,27 @@ export function foldedDetails(label, text) {
   return body ? '<details><summary>' + label + '</summary>\n\n' + body + '\n\n</details>' : '';
 }
 
+// A report too long for one comment is cut at line boundaries into parts that each stand alone (their own folded
+// block), so nothing is lost and no part is a half-open tag. -> [text, ...] each at most maxBytes
+export function splitForParts(text, maxBytes) {
+  const parts = []; let current = '';
+  const flush = () => { if (current) parts.push(current); current = ''; };
+  for (const line of String(text ?? '').split('\n')) {
+    for (let piece = line; ; ) {
+      const fit = Buffer.byteLength(current + piece + '\n', 'utf8') <= maxBytes;
+      if (fit) { current += piece + '\n'; break; }
+      if (current) { flush(); continue; }
+      // one line longer than a whole part: cut it by characters
+      let cut = Math.min(piece.length, maxBytes >> 1);
+      while (cut > 1 && Buffer.byteLength(piece.slice(0, cut) + '\n', 'utf8') > maxBytes) cut = Math.floor(cut / 2);
+      parts.push(piece.slice(0, cut) + '\n'); piece = piece.slice(cut);
+      if (!piece) break;
+    }
+  }
+  flush();
+  return parts.map((part) => part.replace(/\n+$/, ''));
+}
+
 export function escapeHtml(value) {
   return String(value)
     .replaceAll('&', '&amp;')

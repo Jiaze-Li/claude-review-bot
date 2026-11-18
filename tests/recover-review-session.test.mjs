@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { recoverReviewSession } from '../scripts/recover-review-session.mjs';
 import { applyDiscoveryResult } from '../scripts/review-session-core.mjs';
+import { createFakePr, BOT } from './helpers/fake-pr.mjs';
 
 const HEAD='a'.repeat(40), BASE='b'.repeat(40);
 
@@ -18,21 +19,21 @@ test('recovery persists pending session with both original and retry source mark
     pendingReviewId:'101',
     sessionCommentId:null,
   }));
-  const calls=[];
+  const pr=createFakePr();
   const out=await recoverReviewSession({
-    env:{GH_TOKEN:'token',TARGET_REPO:'acme/project',PR_NUMBER:'7',HEAD_SHA:HEAD,SOURCE_COMMENT_ID:'22',REVIEW_CONTEXT_DIR:dir},
-    fetchImpl:async(url,init={})=>{
-      calls.push({url,method:init.method||'GET',body:init.body?JSON.parse(init.body):null});
+    env:{GH_TOKEN:'token',TARGET_REPO:'acme/project',PR_NUMBER:'7',HEAD_SHA:HEAD,SOURCE_COMMENT_ID:'22',REVIEW_CONTEXT_DIR:dir,EXPECTED_REVIEW_AUTHOR:BOT},
+    fetchImpl:pr.layer(async(url)=>{
       if(url.endsWith('/pulls/7')) return Response.json({head:{sha:HEAD}});
-      if(url.endsWith('/issues/7/comments')) return Response.json({id:303});
       assert.fail('unexpected URL '+url);
-    },
+    }),
   });
-  assert.equal(out.sessionCommentId,'303');
-  const write=calls.find(c=>c.method==='POST');
-  assert.match(write.body.body,/jiaze-review-source-comment:11/);
-  assert.match(write.body.body,/jiaze-review-source-comment:22/);
-  assert.match(write.body.body,/Status: \*\*AUDIT_PENDING\*\*/);
+  // both the original and the retry command are receipted, the closing handoff carries the session, and the summary follows
+  const all=pr.issue.map(c=>c.body).join('\n');
+  assert.match(all,/Handled: comment 11 \(version created\)/);
+  assert.match(all,/Handled: comment 22 \(version created\)/);
+  assert.ok(pr.issue.some(c=>/Handoff: COMPLETE/.test(c.body)&&/session\.status: "AUDIT_PENDING"/.test(c.body)));
+  assert.equal(out.sessionCommentId,pr.issue.at(-1).id);
+  assert.match(pr.issue.at(-1).body,/Status: \*\*AUDIT_PENDING\*\*/);
 });
 
 test('recovery fails closed if PR HEAD moved and writes no session', async () => {

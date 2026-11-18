@@ -54,9 +54,6 @@ export function classifyIncrementalDelta({ session, numstat, nameStatus, patch }
   if ((session.incrementalReviewCount ?? 0) >= MAX_INCREMENTAL_REVIEWS) {
     return full('periodic full audit is due');
   }
-  if (session.findings.length > 48 || Buffer.byteLength(JSON.stringify(session), 'utf8') > 16_000) {
-    return full('durable finding ledger is nearing its size limit');
-  }
   if (typeof patch !== 'string' || Buffer.byteLength(patch, 'utf8') > MAX_INCREMENTAL_PATCH_BYTES) {
     return full('delta patch exceeds its safe context limit');
   }

@@ -1,7 +1,8 @@
 import { saveSessionComment } from './session-comment.mjs';
+import { ledgerOptions, loadLedger } from './session-store.mjs';
 import { pathToFileURL } from 'node:url';
 import {
-  DEEP_REVIEW_RUN_BUDGET_USD, failDeepReview, isDeepReviewStale, parseSessionComment, renderSessionComment,
+  DEEP_REVIEW_RUN_BUDGET_USD, failDeepReview, isDeepReviewStale, renderSessionComment,
 } from './review-session-core.mjs';
 import { postCommitStatus } from './sync-commit-status.mjs';
 
@@ -25,8 +26,7 @@ export async function findStaleDeepReviews({ env = process.env, fetchImpl = fetc
     if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) continue;
     const prs = (await github(`https://api.github.com/repos/${repo}/pulls?state=open&per_page=${MAX_PRS_PER_REPO}`, env.GH_TOKEN, fetchImpl)).slice(0, MAX_PRS_PER_REPO);
     for (const pr of prs) {
-      const latest = await latestSessionComment(repo, pr.number, author, env.GH_TOKEN, fetchImpl);
-      const session = latest ? parseSessionComment(latest.body) : null;
+      const session = await readSessionOrNull({ repo, prNumber: pr.number, author, env, fetchImpl });
       if (session && isDeepReviewStale(session, now) && session.lastReviewedHead === pr.head?.sha) {
         candidates.push({ repo, pr: pr.number });
         if (candidates.length >= MAX_CANDIDATES) return candidates;
@@ -46,8 +46,7 @@ export async function closeStaleDeepReview({ repo, prNumber, env = process.env, 
   if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(String(repo))) throw new Error('Invalid repository');
   if (!/^[1-9]\d*$/.test(String(prNumber))) throw new Error('Invalid PR number');
   const pr = await github(`https://api.github.com/repos/${repo}/pulls/${prNumber}`, env.GH_TOKEN, fetchImpl);
-  const latest = await latestSessionComment(repo, prNumber, author, env.GH_TOKEN, fetchImpl);
-  const session = latest ? parseSessionComment(latest.body) : null;
+  const session = await readSessionOrNull({ repo, prNumber, author, env, fetchImpl, importLegacy: true });
   if (!session || !isDeepReviewStale(session, now) || session.lastReviewedHead !== pr.head?.sha) {
     console.log(`${repo}#${prNumber}: no longer a stale deep review; leaving it alone.`);
     return false;
@@ -57,8 +56,9 @@ export async function closeStaleDeepReview({ repo, prNumber, env = process.env, 
     spentUsd: session.deepReview?.reservedUsd ?? DEEP_REVIEW_RUN_BUDGET_USD, now: new Date(now).toISOString(),
   });
   await saveSessionComment({
-    target: repo, prNumber, token: env.GH_TOKEN, fetchImpl, existingId: String(latest.id), previous: session, session: closed,
+    target: repo, prNumber, token: env.GH_TOKEN, fetchImpl, existingId: null, previous: session, session: closed,
     body: renderSessionComment(closed),
+    ledger: ledgerOptions(env, { stage: 'closing', next: 'Maintainer: comment @claude review to retry the interrupted review.' }),
   });
   await postCommitStatus({
     env, fetchImpl, target: repo, headSha: session.lastReviewedHead,
@@ -78,6 +78,20 @@ async function installationRepos(token, fetchImpl) {
     if (batch.length < 100) break;
   }
   return out;
+}
+
+// The newest session on the PR, from the ledger; null when there is none or the ledger cannot be trusted (a
+// scheduled sweep must never act on a state it could not read in full).
+async function readSessionOrNull({ repo, prNumber, author, env, fetchImpl, importLegacy = false }) {
+  try {
+    const { ledger } = await loadLedger({ target: repo, prNumber, token: env.GH_TOKEN, fetchImpl, botLogin: author, importLegacy });
+    if (ledger.state === 'ok') return ledger.session;
+    if (ledger.state === 'needs_import') return ledger.legacy.session;
+    return null;
+  } catch (error) {
+    console.warn(`::warning::${repo}#${prNumber}: could not read the review ledger (${String(error.message).slice(0, 160)}); leaving it alone.`);
+    return null;
+  }
 }
 
 async function latestSessionComment(repo, prNumber, author, token, fetchImpl) {

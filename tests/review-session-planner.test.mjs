@@ -5,7 +5,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { fullReviewDecision, planSession, runSessionPlanner } from '../scripts/plan-review-session.mjs';
 import { findingMarker } from '../scripts/review-anchors.mjs';
-import { applyDiscoveryResult, beginDeepReview, completeDeepReview, failDeepReview, pendingSessionMarker, renderSessionComment } from '../scripts/review-session-core.mjs';
+import { applyDiscoveryResult, beginDeepReview, completeDeepReview, failDeepReview } from '../scripts/review-session-core.mjs';
+import { createFakePr } from './helpers/fake-pr.mjs';
+import { renderPendingHandoff } from '../scripts/review-ledger.mjs';
+import { renderSessionComment } from '../scripts/review-session-core.mjs';
 
 const BASE='b'.repeat(40), A='a'.repeat(40), C='c'.repeat(40);
 const author='jiaze-claude-review-bot[bot]';
@@ -16,14 +19,21 @@ function env(extra={}) {
     REQUESTED_MODE:'auto',EXPECTED_REVIEW_AUTHOR:author,...extra,
   };
 }
+// A comment is either a session (stored as the bot's own records, with its visible summary at the given id) or raw text.
 function comment(id,body,user=author){return {id,user:{login:user},body};}
-function fetchState({comments=[],reviews=[]}={}){
-  return async(url)=>{
-    if(/issues\/7\/comments/.test(url)) return Response.json(comments);
-    if(/pulls\/7\/reviews/.test(url)) return Response.json(reviews);
-    assert.fail('unexpected URL '+url);
-  };
+const pendingBody=(session,sourceCommentId)=>renderPendingHandoff({session,sourceCommentId});
+function worldOf({comments=[],reviews=[]}={}){
+  const pr=createFakePr({author,number:7});
+  for(const c of comments){
+    const trusted=c.user.login===author;
+    if(typeof c.body==='string'){pr.addIssue(c.body,{id:c.id,user:c.user.login,type:trusted?'Bot':'User'});continue;}
+    if(trusted) pr.seed(c.body);
+    pr.addIssue(renderSessionComment(c.body),{id:c.id,user:c.user.login,type:trusted?'Bot':'User'});
+  }
+  for(const r of reviews) pr.addReview(r.body,{id:r.id,user:r.user.login,type:r.user.login===author?'Bot':'User'});
+  return pr;
 }
+function fetchState(state={}){return worldOf(state).fetchImpl;}
 
 test('planner starts discovery when no durable bot session exists',async()=>{
   const plan=await planSession({env:env(),fetchImpl:fetchState()});
@@ -41,8 +51,8 @@ test('planner trusts only the exact bot author and recovers latest durable sessi
   const plan=await planSession({
     env:env({HEAD_SHA:C}),
     fetchImpl:fetchState({comments:[
-      comment(5,renderSessionComment(session),'attacker'),
-      comment(6,renderSessionComment(session)),
+      comment(5,session,'attacker'),
+      comment(6,session),
     ]}),
   });
   assert.equal(plan.decision.mode,'verification');
@@ -51,18 +61,21 @@ test('planner trusts only the exact bot author and recovers latest durable sessi
   assert.equal(plan.session.findings[0].id,'F001');
 });
 
-test('planner refuses corrupt latest bot-authored session instead of silently restarting',async()=>{
-  await assert.rejects(()=>planSession({
+test('planner stops safely on a damaged bot handoff instead of silently restarting',async()=>{
+  const plan=await planSession({
     env:env(),
-    fetchImpl:fetchState({comments:[comment(9,'<!-- jiaze-review-session:v1 -->\ncorrupt')]}),
-  }),/unreadable/);
+    fetchImpl:fetchState({comments:[comment(9,'### Review Handoff · Seq 1 · first\nHandoff: COMPLETE\nSeq: 1')]}),
+  });
+  assert.equal(plan.decision.mode,'human_required');
+  assert.ok(plan.ledgerStopped);
+  assert.equal(plan.session,null);
 });
 
 test('explicit reset starts a fresh discovery while preserving session comment location',async()=>{
   const session=applyDiscoveryResult({result:{summary:'clean',findings:[]},baseSha:BASE,headSha:A,sourceCommentId:'1'});
   const plan=await planSession({
     env:env({REQUESTED_MODE:'reset'}),
-    fetchImpl:fetchState({comments:[comment(7,renderSessionComment(session))]}),
+    fetchImpl:fetchState({comments:[comment(7,session)]}),
   });
   assert.equal(plan.decision.mode,'claude');
   assert.equal(plan.sessionCommentId,'7');
@@ -75,7 +88,7 @@ test('@claude review plans exactly like @gemini review for the same session; onl
   };
   const plan=async(mode,session,sourceKind='comment')=>planSession({
     env:env({REQUESTED_MODE:mode,SOURCE_KIND:sourceKind}),
-    fetchImpl:fetchState({comments:session?[comment(7,renderSessionComment(session))]:[]}),
+    fetchImpl:fetchState({comments:session?[comment(7,session)]:[]}),
   });
   // same HEAD, discovery done, audit pending
   const claude=await plan('claude',sessions.awaitingAudit);
@@ -101,11 +114,11 @@ test('@claude review plans exactly like @gemini review for the same session; onl
 test('@claude review waits for a deep review already running on this HEAD, and a PARTIAL review continues',async()=>{
   const running={...applyDiscoveryResult({result:{summary:'clean',findings:[]},baseSha:BASE,headSha:A,sourceCommentId:'1'}),status:'REVIEW_IN_PROGRESS',
     deepReview:{head:A,startedAt:new Date().toISOString(),state:'IN_PROGRESS',resumeStatus:'AUDIT_PENDING'}};
-  const waiting=await planSession({env:env({REQUESTED_MODE:'claude',SOURCE_KIND:'comment'}),fetchImpl:fetchState({comments:[comment(7,renderSessionComment(running))]})});
+  const waiting=await planSession({env:env({REQUESTED_MODE:'claude',SOURCE_KIND:'comment'}),fetchImpl:fetchState({comments:[comment(7,running)]})});
   assert.equal(waiting.decision.mode,'noop_waiting');
   const partial={...applyDiscoveryResult({result:{summary:'clean',findings:[]},baseSha:BASE,headSha:A,sourceCommentId:'1'}),status:'PARTIAL',
     coverage:{complete:false,head:A,reviewedKeys:[],unreviewedPaths:['x'],unreviewedCount:1}};
-  const resumed=await planSession({env:env({REQUESTED_MODE:'claude',SOURCE_KIND:'comment'}),fetchImpl:fetchState({comments:[comment(7,renderSessionComment(partial))]})});
+  const resumed=await planSession({env:env({REQUESTED_MODE:'claude',SOURCE_KIND:'comment'}),fetchImpl:fetchState({comments:[comment(7,partial)]})});
   assert.equal(resumed.decision.mode,'claude');
   assert.match(resumed.decision.reason,/partial review/);
 });
@@ -117,7 +130,7 @@ test('manual review retries a FAILED deep review on the exact HEAD without reset
   assert.equal(failed.status,'HUMAN_REQUIRED');
   assert.equal(failed.deepReview.state,'FAILED');
   assert.equal(failed.reviewFailure,undefined);
-  const saved=fetchState({comments:[comment(7,renderSessionComment(failed))]});
+  const saved=fetchState({comments:[comment(7,failed)]});
 
   // Only a deliberate comment retries; routine webhook events do not loop.
   const automated=await planSession({env:env({SOURCE_KIND:'pull_request'}),fetchImpl:saved});
@@ -146,7 +159,7 @@ test('a failed deep review with real findings remains HUMAN_REQUIRED after a man
   }]},baseSha:BASE,headSha:A,sourceCommentId:'1'});
   const failed=failDeepReview({session:beginDeepReview({session:rework,baseSha:BASE,headSha:A}),headSha:A,reason:'provider quota'});
   const plan=await planSession({env:env({SOURCE_KIND:'comment',REQUESTED_MODE:'auto'}),
-    fetchImpl:fetchState({comments:[comment(7,renderSessionComment(failed))]})});
+    fetchImpl:fetchState({comments:[comment(7,failed)]})});
   assert.equal(plan.decision.mode,'human_required');
 });
 
@@ -160,7 +173,7 @@ test('planner recovers a trusted pending current-HEAD review instead of rerunnin
   const plan=await planSession({
     env:env(),
     fetchImpl:fetchState({reviews:[{
-      id:50,user:{login:author},body:'review body\n'+pendingSessionMarker(pending,'11'),
+      id:50,user:{login:author},body:'review body\n'+pendingBody(pending,'11'),
     }]}),
   });
   assert.equal(plan.decision.mode,'recover');
@@ -174,7 +187,7 @@ test('planner ignores pending state from another author',async()=>{
   const plan=await planSession({
     env:env(),
     fetchImpl:fetchState({reviews:[{
-      id:50,user:{login:'attacker'},body:pendingSessionMarker(pending,'11'),
+      id:50,user:{login:'attacker'},body:pendingBody(pending,'11'),
     }]}),
   });
   assert.equal(plan.decision.mode,'claude');
@@ -186,7 +199,7 @@ test('explicit reset ignores a recoverable pending review and starts fresh disco
   const plan=await planSession({
     env:env({REQUESTED_MODE:'reset'}),
     fetchImpl:fetchState({reviews:[{
-      id:50,user:{login:author},body:'review body\n'+pendingSessionMarker(pending,'11'),
+      id:50,user:{login:author},body:'review body\n'+pendingBody(pending,'11'),
     }]}),
   });
   assert.equal(plan.decision.mode,'claude');
@@ -201,8 +214,8 @@ test('explicit Claude request recovers a newer published-but-unpersisted session
   const plan=await planSession({
     env:env({REQUESTED_MODE:'claude'}),
     fetchImpl:fetchState({
-      comments:[comment(7,renderSessionComment(durable))],
-      reviews:[{id:11,user:{login:author},body:'review\n'+pendingSessionMarker(newer,'2')}],
+      comments:[comment(7,durable)],
+      reviews:[{id:11,user:{login:author},body:'review\n'+pendingBody(newer,'2')}],
     }),
   });
   assert.equal(plan.decision.mode,'recover');
@@ -223,7 +236,7 @@ test('every fresh full review goes through the sharded engine, whatever its size
 
 test('a resolved or reopened review thread is reconciled with the session without any model call',async()=>{
   const rework=applyDiscoveryResult({result:{summary:'bug',findings:[{severity:'P1',title:'Bug',body:'Trigger X causes Y; expected Z.',path:'a.js',line:1,riskClass:'state'}]},baseSha:BASE,headSha:A,sourceCommentId:'1'});
-  const plan=(session)=>planSession({env:env({REQUESTED_MODE:'threads',SOURCE_KIND:'pull_request'}),fetchImpl:fetchState({comments:session?[comment(7,renderSessionComment(session))]:[]})});
+  const plan=(session)=>planSession({env:env({REQUESTED_MODE:'threads',SOURCE_KIND:'pull_request'}),fetchImpl:fetchState({comments:session?[comment(7,session)]:[]})});
   const withSession=await plan(rework);
   assert.equal(withSession.decision.mode,'threads');
   assert.equal(withSession.sessionCommentId,'7');
@@ -240,7 +253,7 @@ test('a thread decision does not bypass recovery of a review that was published 
   newer.updatedAt=new Date(Date.now()+60_000).toISOString();
   const plan=await planSession({
     env:env({REQUESTED_MODE:'threads',SOURCE_KIND:'pull_request'}),
-    fetchImpl:fetchState({comments:[comment(7,renderSessionComment(stale))],reviews:[{id:101,user:{login:author},body:'review body\n'+pendingSessionMarker(newer,'11')}]}),
+    fetchImpl:fetchState({comments:[comment(7,stale)],reviews:[{id:101,user:{login:author},body:'review body\n'+pendingBody(newer,'11')}]}),
   });
   assert.equal(plan.decision.mode,'recover');
   assert.match(plan.decision.reason,/review-thread decision was NOT applied yet/);
@@ -248,9 +261,8 @@ test('a thread decision does not bypass recovery of a review that was published 
 });
 
 function threadFetch({session,findings,resolvedBy='jiaze-li',permission='write'}){
-  return async(url,init={})=>{
-    if(/issues\/7\/comments/.test(url)) return Response.json([comment(7,renderSessionComment(session))]);
-    if(/pulls\/7\/reviews/.test(url)) return Response.json([]);
+  const pr=worldOf({comments:[comment(7,session)]});
+  return pr.layer(async(url,init={})=>{
     if(url.endsWith('/graphql')) return Response.json({data:{repository:{pullRequest:{reviewThreads:{pageInfo:{hasNextPage:false},nodes:findings.map((f,i)=>({
       id:'T'+i,isResolved:resolvedBy!==null,resolvedBy:resolvedBy?{login:resolvedBy}:null,
       comments:{nodes:[{databaseId:i+1,author:{login:author.replace('[bot]','')},body:'x\n\n'+findingMarker(f.path,f.title)}]},
@@ -261,7 +273,7 @@ function threadFetch({session,findings,resolvedBy='jiaze-li',permission='write'}
       return Response.json({permission});
     }
     assert.fail('unexpected URL '+url);
-  };
+  });
 }
 const bug={severity:'P1',title:'Bug',body:'Trigger X causes Y; expected Z.',path:'a.js',line:1,riskClass:'state'};
 
@@ -291,7 +303,7 @@ test('V1: resolving original P3 after new commits triggers verification, and unr
   assert.equal(allResolved.decision.mode,'verification');
 
   const p1OnlyFetch=async(url,init={})=>{
-    if(url.endsWith('/graphql')) return Response.json({data:{repository:{pullRequest:{reviewThreads:{pageInfo:{hasNextPage:false},nodes:[
+    if(url.endsWith('/graphql')&&!/lastEditedAt/.test(init.body)) return Response.json({data:{repository:{pullRequest:{reviewThreads:{pageInfo:{hasNextPage:false},nodes:[
       {id:'T0',isResolved:true,resolvedBy:{login:'jiaze-li'},comments:{nodes:[{databaseId:1,author:{login:author.replace('[bot]','')},body:'x\n\n'+findingMarker(bug.path,bug.title)}]}},
       {id:'T1',isResolved:false,resolvedBy:null,comments:{nodes:[{databaseId:2,author:{login:author.replace('[bot]','')},body:'x\n\n'+findingMarker(p3.path,p3.title)}]}},
     ]}}}}});
@@ -309,7 +321,7 @@ test('V6: runSessionPlanner orchestrates planning and non-reset new-HEAD full re
   };
   const planned=await runSessionPlanner({
     env:env({HEAD_SHA:C,REQUESTED_MODE:'auto',SOURCE_KIND:'comment'}),
-    fetchImpl:fetchState({comments:[comment(7,renderSessionComment(partialWithOpen))]}),
+    fetchImpl:fetchState({comments:[comment(7,partialWithOpen)]}),
   });
   assert.equal(planned.decision.mode,'claude');
   assert.equal(planned.decision.carryOpen,true);
@@ -324,7 +336,7 @@ test('V6: runSessionPlanner orchestrates planning and non-reset new-HEAD full re
   };
   const blocked=await runSessionPlanner({
     env:env({HEAD_SHA:C,REQUESTED_MODE:'auto',SOURCE_KIND:'comment'}),
-    fetchImpl:fetchState({comments:[comment(7,renderSessionComment(manyOpen))]}),
+    fetchImpl:fetchState({comments:[comment(7,manyOpen)]}),
   });
   assert.equal(blocked.decision.mode,'human_required');
 });
@@ -334,7 +346,7 @@ test('the final review of a PR is a full review in the engine, whatever the size
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'plan-audit-'));
   fs.writeFileSync(path.join(dir,'pr.json'),'{}');
   const file=(i,bytes)=>`diff --git a/src/f${i}.js b/src/f${i}.js\n--- a/src/f${i}.js\n+++ b/src/f${i}.js\n@@ -1 +1 @@\n+${'x'.repeat(bytes)}\n`;
-  const plan=(mode='auto')=>planSession({env:env({REVIEW_CONTEXT_DIR:dir,REQUESTED_MODE:mode,SOURCE_KIND:'comment'}),fetchImpl:fetchState({comments:[comment(7,renderSessionComment(awaiting))]})});
+  const plan=(mode='auto')=>planSession({env:env({REVIEW_CONTEXT_DIR:dir,REQUESTED_MODE:mode,SOURCE_KIND:'comment'}),fetchImpl:fetchState({comments:[comment(7,awaiting)]})});
   for(const diff of [file(0,100),Array.from({length:30},(_,i)=>file(i,90_000)).join('')]){
     fs.writeFileSync(path.join(dir,'pr.diff'),diff);
     const planned=await plan();
@@ -356,7 +368,7 @@ test('a delta that needs a full look becomes a full review in the engine, with t
 test('a PARTIAL review continues for a person\'s command or for the run that continues it, not for an unrelated automatic event',async()=>{
   const partial={...applyDiscoveryResult({result:{summary:'clean',findings:[]},baseSha:BASE,headSha:A,sourceCommentId:'1'}),status:'PARTIAL',
     coverage:{complete:false,head:A,reviewedKeys:[],unreviewedPaths:['x'],unreviewedCount:1}};
-  const plan=(extra)=>planSession({env:env(extra),fetchImpl:fetchState({comments:[comment(7,renderSessionComment(partial))]})});
+  const plan=(extra)=>planSession({env:env(extra),fetchImpl:fetchState({comments:[comment(7,partial)]})});
   assert.equal((await plan({SOURCE_KIND:'comment'})).decision.mode,'claude');
   assert.equal((await plan({SOURCE_KIND:'pull_request',SOURCE_COMMENT_ID:'8140844152995'})).decision.mode,'claude'); // the continuation run
   assert.equal((await plan({SOURCE_KIND:'pull_request',SOURCE_COMMENT_ID:'263171400319958021003132'})).decision.mode,'noop_waiting'); // a reopened PR

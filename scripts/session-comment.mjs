@@ -1,11 +1,16 @@
-// The ONE place the durable review-session comment is written.
+// The ONE place a review session is written.
 //
-// The comment is the PR's visible review status, so when the result changes (a different status, or a different
-// HEAD reviewed) it is posted as a NEW comment at the bottom of the conversation, where it is seen, and the old
-// one is removed; the planner and the commit-status mirror always read the newest session comment. When nothing
-// visible changed it is edited in place, so a review that only refines findings does not notify anyone again.
-// REVIEW_IN_PROGRESS is a passing state: it is edited in place, and the finished result is compared with what the
-// PR looked like before the run started.
+// The durable state is the bot's own readable records on the PR (a Receipt per handled command, then a closing
+// Handoff, or a Run Start while a review runs); they are written FIRST. The "Independent Review Session" comment is
+// only the PR's visible status summary built from that state: planners and the commit-status mirror rebuild the
+// session from the records, never from this comment.
+//
+// The summary is posted as a NEW comment at the bottom of the conversation when the result changes (a different
+// status, or a different HEAD reviewed) and the old one is removed. When nothing visible changed it is edited in
+// place, so a review that only refines findings does not notify anyone again. REVIEW_IN_PROGRESS is a passing
+// state: it is edited in place, and the finished result is compared with what the PR looked like before the run.
+
+import { writeSessionRecords } from './session-store.mjs';
 
 export function isMarkedStale(session) {
   return Boolean(session?.staleFor) && session.staleFor === session.lastReviewedHead;
@@ -22,8 +27,19 @@ export function visibleResultChanged(previous, next) {
   return !running && isMarkedStale(previous) !== isMarkedStale(next);
 }
 
-// -> the id of the comment that now holds the session (as a string)
-export async function saveSessionComment({ target, prNumber, token, fetchImpl = fetch, existingId = null, previous = null, session, body }) {
+// The durable record of the session is the bot's own append-only records on the PR (see session-store.mjs); they
+// are written FIRST, and only then is the editable summary comment refreshed. That summary is a projection for
+// people: nothing reads it back to learn the session, so replacing it can never lose a fact.
+//
+// `ledger`: { botLogin, stage?, sourceCommentIds?, spendThisRun?, recordIds?, expectedSeq?, ... } — required, unless
+// the caller says `projectionOnly` (only the summary changes and no review fact does).
+// -> the id of the comment that now holds the summary (as a string)
+export async function saveSessionComment({ target, prNumber, token, fetchImpl = fetch, existingId = null, previous = null, session, body, ledger = null, projectionOnly = false }) {
+  if (!ledger && !projectionOnly) throw new Error('Saving a review session needs ledger options: the PR records are the durable state');
+  if (ledger) {
+    const written = await writeSessionRecords({ target, prNumber, token, fetchImpl, session, ...ledger });
+    existingId = existingId ?? written.projectionId ?? null;
+  }
   const root = `https://api.github.com/repos/${target}`;
   const post = () => request(`${root}/issues/${prNumber}/comments`, token, fetchImpl, { method: 'POST', body: JSON.stringify({ body }) });
   if (!existingId) return String((await post()).id);

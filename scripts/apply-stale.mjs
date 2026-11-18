@@ -3,6 +3,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { renderSessionComment } from './review-session-core.mjs';
 import { saveSessionComment } from './session-comment.mjs';
+import { ledgerOptions } from './session-store.mjs';
 
 // A new commit was pushed after the last review. Pushes never start a review, so the session comment would keep
 // saying READY about an older commit. This records that the result is out of date: the commit it covers, the
@@ -39,7 +40,8 @@ export async function applyStale({ env = process.env, fetchImpl = fetch, log = c
   }
   const next = { ...session, staleFor: session.lastReviewedHead, staleHead: headSha, staleCommits: commits };
   const body = renderSessionComment(next, { sourceCommentIds: [sourceCommentId] });
-  await saveSessionComment({ target, prNumber, token, fetchImpl, existingId: plan.sessionCommentId, previous: session, session: next, body });
+  await saveSessionComment({ target, prNumber, token, fetchImpl, existingId: plan.sessionCommentId, previous: session, session: next, body,
+    ledger: ledgerOptions(env, { sourceCommentIds: [sourceCommentId], expectedSeq: plan.ledgerSeq, stage: 'closing', next: 'Comment @gemini review or @claude review to review the newer commit(s).' }) });
   log.log?.(`Marked the review result for ${session.lastReviewedHead.slice(0, 12)} as out of date (${commits ?? 'unknown number of'} newer commit(s)).`);
   return { session: next, marked: true };
 }

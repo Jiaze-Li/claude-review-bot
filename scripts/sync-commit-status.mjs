@@ -1,5 +1,6 @@
 import { pathToFileURL } from 'node:url';
-import { parseSessionComment, sessionCommitStatus } from './review-session-core.mjs';
+import { sessionCommitStatus } from './review-session-core.mjs';
+import { loadLedger } from './session-store.mjs';
 
 // Mirrors the durable review session onto the exact HEAD as a GitHub commit
 // status, so a Required Status Check agrees with what the PR comment says.
@@ -62,23 +63,13 @@ export async function postCommitStatus({ env = process.env, fetchImpl = fetch, t
   return null;
 }
 
+// The newest session, read from the PR's own records. A ledger that cannot be trusted throws: a green or red check
+// must never be derived from state that was not read in full.
 export async function latestSession({ target, prNumber, author, token, fetchImpl }) {
-  let latest = null;
-  for (let page = 1; page <= 100; page += 1) {
-    const response = await fetchImpl(`https://api.github.com/repos/${target}/issues/${prNumber}/comments?per_page=100&page=${page}`, {
-      headers: { Accept: 'application/vnd.github+json', Authorization: `Bearer ${token}`, 'X-GitHub-Api-Version': '2022-11-28', 'User-Agent': 'jiaze-review-bot' },
-      signal: AbortSignal.timeout(15000),
-    });
-    if (!response.ok) throw new Error(`GitHub session lookup failed (HTTP ${response.status})`);
-    const batch = await response.json();
-    for (const comment of batch) {
-      if (comment?.user?.login === author && typeof comment.body === 'string' && comment.body.includes('<!-- jiaze-review-session:v1 -->')) {
-        if (!latest || Number(comment.id) > Number(latest.id)) latest = comment;
-      }
-    }
-    if (batch.length < 100) break;
-  }
-  return latest ? parseSessionComment(latest.body) : null;
+  const { ledger } = await loadLedger({ target, prNumber, token, fetchImpl, botLogin: author, importLegacy: false });
+  if (ledger.state === 'stopped') throw new Error(`Review ledger cannot be trusted: ${ledger.message}`);
+  if (ledger.state === 'needs_import') return ledger.legacy.session;
+  return ledger.session ?? null;
 }
 
 function required(env, key) {

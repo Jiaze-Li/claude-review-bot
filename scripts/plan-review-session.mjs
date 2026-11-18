@@ -1,7 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { isBlockingFinding, isDeepReviewStale, openMaterialFindings, parsePendingSessionReview, parseSessionComment, planReviewSession, unresolvedMaterialFindings } from './review-session-core.mjs';
+import { isBlockingFinding, isDeepReviewStale, openMaterialFindings, planReviewSession, unresolvedMaterialFindings } from './review-session-core.mjs';
+import { LEDGER_CODES, loadLedger, pendingFromRecords } from './session-store.mjs';
 import { dropIgnoredFiles, splitDiffByFile, stagedFixedBytes, stagedReviewCapacity } from './review-shards.mjs';
 import { adoptOrphanFindings, blockingClaims, fetchReviewThreads, findOrphanBotThreads, isWriter, threadsByFinding } from './review-threads.mjs';
 import { prepareIncrementalDelta } from './select-incremental-review.mjs';
@@ -23,28 +24,28 @@ export async function planSession({ env=process.env, fetchImpl=fetch }={}) {
   if(!['auto','claude','reset','override','dismiss','threads','stale'].includes(requested)) throw new Error('Invalid REQUESTED_MODE');
 
   const expectedAuthor=required(env,'EXPECTED_REVIEW_AUTHOR');
-  const comments=await loadComments(target,pr,env.GH_TOKEN,fetchImpl);
-  const reviews=await loadReviews(target,pr,env.GH_TOKEN,fetchImpl);
-  const candidates=comments
-    .filter(c=>c?.user?.login===expectedAuthor && typeof c.body==='string' && c.body.includes('<!-- jiaze-review-session:v1 -->'))
-    .sort((a,b)=>Number(b.id)-Number(a.id));
-
+  // The review session is rebuilt from the bot's own readable records on the PR (see review-ledger.mjs). An old
+  // hidden-state session is imported first. Anything unreadable, edited, incomplete or inconsistent stops here.
+  const {ledger,records}=await loadLedger({target,prNumber:pr,token:env.GH_TOKEN,fetchImpl,botLogin:expectedAuthor,headSha});
+  const ledgerSeq=ledger.handoff?.seq??0;
+  const pending=pendingFromRecords(records,expectedAuthor);
   let session=null;
   let sessionCommentId=null;
-  if(candidates.length){
-    sessionCommentId=String(candidates[0].id);
-    session=parseSessionComment(candidates[0].body);
-    if(!session) throw new Error('Latest bot-authored review session comment is unreadable; refusing to discard durable state');
+  if(ledger.state==='stopped'){
+    // A run that posted its review but died before closing the stage left a complete copy of its session inside
+    // that review: finish the handoff from it, without another model call.
+    if(ledger.code===LEDGER_CODES.STAGE_NOT_CLOSED && requested!=='reset' && pending && pending.session.lastReviewedHead===headSha){
+      return {ledgerSeq,requestedMode:requested,decision:{mode:'recover',previousHead:null,reason:'the previous review stage never closed; completing its handoff from the review it already published (no model call)'},
+        session:null,sessionCommentId:null,pendingSession:pending.session,pendingSourceCommentId:pending.sourceCommentId,pendingReviewId:pending.reviewId};
+    }
+    return {ledgerSeq,requestedMode:requested,decision:{mode:'human_required',previousHead:null,reason:ledger.message},
+      session:null,sessionCommentId:null,pendingSession:null,pendingSourceCommentId:null,pendingReviewId:null,ledgerStopped:{code:ledger.code}};
   }
-
-  const pendingCandidates=reviews
-    .filter(r=>r?.user?.login===expectedAuthor && typeof r.body==='string')
-    .map(r=>({reviewId:String(r.id),pending:parsePendingSessionReview(r.body)}))
-    .filter(r=>r.pending && r.pending.session.lastReviewedHead===headSha)
-    .sort((a,b)=>Number(b.reviewId)-Number(a.reviewId));
-  const pending=pendingCandidates[0]??null;
-  if(requested!=='reset' && pending && isPendingNewer(session,pending.pending.session)){
+  session=ledger.session??null;
+  sessionCommentId=ledger.projection?.id??null;
+  if(requested!=='reset' && pending && pending.session.lastReviewedHead===headSha && isPendingNewer(session,pending.session)){
     return {
+      ledgerSeq,
       requestedMode:requested,
       decision:{mode:'recover',previousHead:null,reason:requested==='claude'
         ?'recover published review session without another model call. Your @claude review request was NOT run; send it again after this recovery.'
@@ -53,8 +54,8 @@ export async function planSession({ env=process.env, fetchImpl=fetch }={}) {
           :'recover published review session without another model call'},
       session,
       sessionCommentId,
-      pendingSession:pending.pending.session,
-      pendingSourceCommentId:pending.pending.sourceCommentId,
+      pendingSession:pending.session,
+      pendingSourceCommentId:pending.sourceCommentId,
       pendingReviewId:pending.reviewId,
     };
   }
@@ -85,7 +86,7 @@ export async function planSession({ env=process.env, fetchImpl=fetch }={}) {
         }
       }
     }
-    return {requestedMode:requested,decision,session,sessionCommentId,pendingSession:null,pendingSourceCommentId:null,pendingReviewId:null};
+    return {ledgerSeq,requestedMode:requested,decision,session,sessionCommentId,pendingSession:null,pendingSourceCommentId:null,pendingReviewId:null};
   }
 
   // A push. Never reviews and never spends: it only marks a result for an older commit as out of date, once.
@@ -101,7 +102,7 @@ export async function planSession({ env=process.env, fetchImpl=fetch }={}) {
           :already
             ?{mode:'noop_waiting',previousHead:session.lastReviewedHead,reason:'the review result is already marked out of date for this commit'}
             :{mode:'stale',previousHead:session.lastReviewedHead,reason:'a new commit was pushed after the last review; marking that result as out of date (no model call)'};
-    return {requestedMode:requested,decision,session,sessionCommentId,pendingSession:null,pendingSourceCommentId:null,pendingReviewId:null};
+    return {ledgerSeq,requestedMode:requested,decision,session,sessionCommentId,pendingSession:null,pendingSourceCommentId:null,pendingReviewId:null};
   }
 
   // `@claude review` plans exactly like `@gemini review` (first review, incremental, verification or final
@@ -109,7 +110,7 @@ export async function planSession({ env=process.env, fetchImpl=fetch }={}) {
   // A run still in progress for this exact HEAD is the one thing to wait for rather than start again.
   if(['claude','reset'].includes(requested) && session && session.lastReviewedHead===headSha && session.status==='REVIEW_IN_PROGRESS' && !isDeepReviewStale(session)){
     const decision={mode:'noop_waiting',previousHead:headSha,reason:'a deep review is already in progress for this HEAD'};
-    return {requestedMode:requested,decision,session,sessionCommentId,pendingSession:null,pendingSourceCommentId:null,pendingReviewId:null};
+    return {ledgerSeq,requestedMode:requested,decision,session,sessionCommentId,pendingSession:null,pendingSourceCommentId:null,pendingReviewId:null};
   }
 
   if(requested==='dismiss'){
@@ -126,7 +127,7 @@ export async function planSession({ env=process.env, fetchImpl=fetch }={}) {
           : !['REWORK','HUMAN_REQUIRED'].includes(session.status)
             ? `review session is ${session.status}, not REWORK or HUMAN_REQUIRED`
             : 'no OPEN or UNCERTAIN blocking finding remains to dismiss'};
-    return {requestedMode:requested,decision,session,sessionCommentId,pendingSession:null,pendingSourceCommentId:null,pendingReviewId:null};
+    return {ledgerSeq,requestedMode:requested,decision,session,sessionCommentId,pendingSession:null,pendingSourceCommentId:null,pendingReviewId:null};
   }
 
   if(requested==='override'){
@@ -134,7 +135,7 @@ export async function planSession({ env=process.env, fetchImpl=fetch }={}) {
     const decision=overridable
       ?{mode:'override',previousHead:null,reason:'manual override by a repository writer'}
       :{mode:'noop_waiting',previousHead:null,reason:'nothing to override: no unfinished review session for this PR'};
-    return {requestedMode:requested,decision,session,sessionCommentId,pendingSession:null,pendingSourceCommentId:null,pendingReviewId:null};
+    return {ledgerSeq,requestedMode:requested,decision,session,sessionCommentId,pendingSession:null,pendingSourceCommentId:null,pendingReviewId:null};
   }
 
   let decision=planReviewSession({session,baseSha,headSha,reset:requested==='reset',
@@ -161,7 +162,7 @@ export async function planSession({ env=process.env, fetchImpl=fetch }={}) {
       decision=fullReviewDecision(env,requested,decision.reason);
     }
   }
-  return {requestedMode:requested,decision,session,sessionCommentId,pendingSession:null,pendingSourceCommentId:null,pendingReviewId:null};
+  return {ledgerSeq,requestedMode:requested,decision,session,sessionCommentId,pendingSession:null,pendingSourceCommentId:null,pendingReviewId:null};
 }
 
 
@@ -262,41 +263,6 @@ function isPendingNewer(durable,pending){
   const pendingTime=Date.parse(pending.updatedAt??'');
   if(Number.isFinite(durableTime)&&Number.isFinite(pendingTime))return pendingTime>durableTime;
   return JSON.stringify(durable)!==JSON.stringify(pending);
-}
-
-async function loadComments(repo,pr,token,fetchImpl){
-  if(!token) throw new Error('Missing GH_TOKEN');
-  const out=[];
-  for(let page=1;page<=100;page+=1){
-    const response=await fetchImpl(`https://api.github.com/repos/${repo}/issues/${pr}/comments?per_page=100&page=${page}`,{
-      headers:{Accept:'application/vnd.github+json',Authorization:`Bearer ${token}`,'X-GitHub-Api-Version':'2022-11-28','User-Agent':'jiaze-review-bot'},
-      signal:AbortSignal.timeout(15000),
-    });
-    if(!response.ok) throw new Error(`GitHub session lookup failed (HTTP ${response.status})`);
-    const batch=await response.json();
-    if(!Array.isArray(batch)) throw new Error('GitHub comments response was not an array');
-    out.push(...batch);
-    if(batch.length<100) return out;
-  }
-  throw new Error('Issue comment pagination exceeded safety limit');
-}
-
-
-async function loadReviews(repo,pr,token,fetchImpl){
-  if(!token) throw new Error('Missing GH_TOKEN');
-  const out=[];
-  for(let page=1;page<=100;page+=1){
-    const response=await fetchImpl(`https://api.github.com/repos/${repo}/pulls/${pr}/reviews?per_page=100&page=${page}`,{
-      headers:{Accept:'application/vnd.github+json',Authorization:`Bearer ${token}`,'X-GitHub-Api-Version':'2022-11-28','User-Agent':'jiaze-review-bot'},
-      signal:AbortSignal.timeout(15000),
-    });
-    if(!response.ok) throw new Error(`GitHub pending-review lookup failed (HTTP ${response.status})`);
-    const batch=await response.json();
-    if(!Array.isArray(batch)) throw new Error('GitHub reviews response was not an array');
-    out.push(...batch);
-    if(batch.length<100) return out;
-  }
-  throw new Error('Pull request review pagination exceeded safety limit');
 }
 
 function required(env,key){const v=env[key];if(!v)throw new Error(`Missing required environment variable: ${key}`);return String(v);}
