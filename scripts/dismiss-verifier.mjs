@@ -233,39 +233,67 @@ export async function verifyDismissalWithModel({
 }
 
 /**
- * Resolves same-repo GitHub blob URLs pointing to the exact reviewed HEAD
+ * Resolves same-repo GitHub blob URLs pointing to the exact reviewed HEAD,
+ * or safe repo-relative paths (with optional :line / :start-end / #Lline / #Lstart-Lend),
  * into bounded local file excerpts from safe-target. Never fetches remote URLs.
  */
 export function extractSameRepoEvidence({ evidence = [], repo = '', headSha = '', repoRoot } = {}) {
-  if (!Array.isArray(evidence) || !repo || !headSha || !repoRoot) return '';
+  if (!Array.isArray(evidence) || !repoRoot) return '';
+  let repoRootReal;
+  try {
+    repoRootReal = fs.realpathSync(repoRoot);
+  } catch {
+    return '';
+  }
   const chunks = [];
   let totalBytes = 0;
-  const escapedRepo = repo.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const blobPattern = new RegExp(`^https://github\\.com/${escapedRepo}/blob/${headSha}/([^#?]+)(?:#L(\\d+)(?:-L(\\d+))?)?$`, 'i');
+  const blobPattern = repo && headSha
+    ? new RegExp(`^https://github\\.com/${repo.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/blob/${headSha}/([^#?]+)(?:#L(\\d+)(?:-L(\\d+))?)?$`, 'i')
+    : null;
+  const relPattern = /^([^:#]+)(?::(\d+)(?:-(\d+))?|#L(\d+)(?:-L(\d+))?)?$/;
 
-  for (const rawUrl of evidence) {
+  for (const rawItem of evidence) {
     if (totalBytes >= MAX_TOTAL_EVIDENCE_BYTES) break;
-    const match = String(rawUrl || '').match(blobPattern);
-    if (!match) continue;
-    let relPath;
-    try {
-      relPath = decodeURIComponent(match[1]);
-    } catch {
+    const raw = String(rawItem || '');
+    let relPath = null;
+    let lineStart = null;
+    let lineEnd = null;
+
+    const blobMatch = blobPattern ? raw.match(blobPattern) : null;
+    if (blobMatch) {
+      try {
+        relPath = decodeURIComponent(blobMatch[1]);
+      } catch {
+        continue;
+      }
+      lineStart = blobMatch[2] ? Number(blobMatch[2]) : null;
+      lineEnd = blobMatch[3] ? Number(blobMatch[3]) : null;
+    } else if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(raw) && !raw.includes('://')) {
+      const relMatch = raw.match(relPattern);
+      if (!relMatch) continue;
+      relPath = relMatch[1];
+      lineStart = relMatch[2] ? Number(relMatch[2]) : relMatch[4] ? Number(relMatch[4]) : null;
+      lineEnd = relMatch[3] ? Number(relMatch[3]) : relMatch[5] ? Number(relMatch[5]) : null;
+    } else {
+      continue;
+    }
+
+    if (!relPath || relPath.includes('\\') || relPath.includes('\0') || path.posix.isAbsolute(relPath)) {
       continue;
     }
     const normalized = path.posix.normalize(relPath);
-    if (!normalized || normalized.startsWith('../') || path.posix.isAbsolute(normalized) || normalized.includes('\\') || normalized.includes('\0')) {
+    if (!normalized || normalized === '.' || normalized === '..' || normalized.startsWith('../')) {
       continue;
     }
     try {
-      const targetReal = fs.realpathSync(path.resolve(repoRoot, normalized));
-      if (!targetReal.startsWith(repoRoot + path.sep) || !fs.statSync(targetReal).isFile()) continue;
+      const targetReal = fs.realpathSync(path.resolve(repoRootReal, normalized));
+      if (!targetReal.startsWith(repoRootReal + path.sep) || !fs.statSync(targetReal).isFile()) continue;
       const lines = fs.readFileSync(targetReal, 'utf8').split('\n');
-      const startLine = match[2] ? Math.max(1, Number(match[2]) - 15) : 1;
-      const endLine = match[3]
-        ? Math.min(lines.length, Number(match[3]) + 15)
-        : match[2]
-          ? Math.min(lines.length, Number(match[2]) + 25)
+      const startLine = lineStart ? Math.max(1, lineStart - 15) : 1;
+      const endLine = lineEnd
+        ? Math.min(lines.length, lineEnd + 15)
+        : lineStart
+          ? Math.min(lines.length, lineStart + 25)
           : Math.min(lines.length, 120);
       const excerpt = lines
         .slice(startLine - 1, endLine)

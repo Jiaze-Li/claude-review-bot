@@ -116,12 +116,16 @@ export async function planSession({ env=process.env, fetchImpl=fetch }={}) {
     const alreadyHandled=Boolean(env.SOURCE_COMMENT_ID) && Array.isArray(session?.dismissLedger)
       && session.dismissLedger.some(entry=>String(entry?.commentId??'')===String(env.SOURCE_COMMENT_ID));
     const eligible=!alreadyHandled && session && ['REWORK','HUMAN_REQUIRED'].includes(session.status)
-      && session.lastReviewedHead===headSha && session.findings.some(f=>['OPEN','UNCERTAIN'].includes(f.status) && isBlockingFinding(f));
+      && session.findings.some(f=>['OPEN','UNCERTAIN'].includes(f.status) && isBlockingFinding(f));
     const decision=alreadyHandled
       ?{mode:'noop_waiting',previousHead:null,reason:'this dismissal comment was already adjudicated'}
       :eligible
         ?{mode:'dismiss',previousHead:null,reason:'adjudicate one evidenced finding without bypassing final audit'}
-        :{mode:'noop_waiting',previousHead:null,reason:'no OPEN or UNCERTAIN finding on the last-reviewed HEAD; review the current HEAD first'};
+        :{mode:'noop_waiting',previousHead:null,reason: !session
+          ? 'there is no review session for this PR yet'
+          : !['REWORK','HUMAN_REQUIRED'].includes(session.status)
+            ? `review session is ${session.status}, not REWORK or HUMAN_REQUIRED`
+            : 'no OPEN or UNCERTAIN blocking finding remains to dismiss'};
     return {requestedMode:requested,decision,session,sessionCommentId,pendingSession:null,pendingSourceCommentId:null,pendingReviewId:null};
   }
 

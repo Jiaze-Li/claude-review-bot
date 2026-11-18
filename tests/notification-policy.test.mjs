@@ -105,6 +105,26 @@ test('noop_waiting on manual override/dismiss without prior session produces inf
     sourceCommentId: '304',
   });
   assert.equal(dismissNoSession.action, NOTIFICATION_ACTIONS.POST_HUMAN_PROMPT);
+
+  const dismissWithSession = decideNotificationAction({
+    stage: 'finished',
+    mode: 'noop_waiting',
+    requestedMode: 'dismiss',
+    hasSessionComment: true,
+    sourceCommentId: '305',
+    reviewReason: 'review session is READY, not REWORK or HUMAN_REQUIRED',
+  });
+  assert.equal(dismissWithSession.action, NOTIFICATION_ACTIONS.POST_HUMAN_PROMPT);
+
+  const duplicateDismiss = decideNotificationAction({
+    stage: 'finished',
+    mode: 'noop_waiting',
+    requestedMode: 'dismiss',
+    hasSessionComment: true,
+    sourceCommentId: '306',
+    reviewReason: 'this dismissal comment was already adjudicated',
+  });
+  assert.equal(duplicateDismiss.action, NOTIFICATION_ACTIONS.RECORD_SESSION_MARKER);
 });
 
 test('successful review publication is silent because PR review and session comment speak for themselves', () => {

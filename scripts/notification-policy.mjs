@@ -23,6 +23,8 @@ export function decideNotificationAction({
   hasSessionComment = false,
   sourceCommentId = null,
   hasFailureReason = false,
+  reviewReason = '',
+  alreadyHandled = false,
 } = {}) {
   // 1. Started stage: all ephemeral start announcements in PR conversation are suppressed.
   // Progress is tracked via GitHub commit status checks and session REVIEW_IN_PROGRESS state.
@@ -69,6 +71,14 @@ export function decideNotificationAction({
   // 4. No-op modes: noop_ready, noop_waiting, deep_review_stale
   // (Note: recover is handled separately as a successful session recovery)
   if (['noop_ready', 'noop_waiting', 'deep_review_stale'].includes(mode)) {
+    const isDuplicateDismissal = alreadyHandled || /already adjudicated/i.test(String(reviewReason || ''));
+    if (mode === 'noop_waiting' && requestedMode === 'dismiss' && sourceCommentId && !isDuplicateDismissal) {
+      return {
+        action: NOTIFICATION_ACTIONS.POST_HUMAN_PROMPT,
+        reason: 'Informative human prompt explaining why dismissal command could not be applied',
+      };
+    }
+
     // If a durable session comment exists and we have a sourceCommentId to dedupe:
     // silently record the marker into the session comment without conversational noise.
     if (hasSessionComment && sourceCommentId) {
