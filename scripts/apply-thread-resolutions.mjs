@@ -84,7 +84,7 @@ export async function applyThreadResolutions({ env = process.env, fetchImpl = fe
         if (!thread.commentId) continue;
         try {
           await replyToThread({ target, prNumber, commentId: thread.commentId, token, fetchImpl,
-            body: `Reopened: nothing has been pushed since I reported this, so there is no change for me to check.\n\nPush a fix and resolve the thread again, or, if it is not a bug, comment \`@gemini dismiss ${finding.id}\` with a Reason and Evidence link.` });
+            body: `Reopened: nothing has been pushed since I reported this, so there is no change for me to check.\n\nPush a fix and resolve the thread again, or, if it is not a bug, comment \`@gemini dismiss ${finding.id}\` and say in your own words why.` });
         } catch (error) {
           replyFailed += 1;
           log.warn?.(`Reopened a thread but could not explain why: ${String(error.message).slice(0, 200)}`);

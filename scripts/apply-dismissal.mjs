@@ -159,7 +159,7 @@ export async function applyManualDismissal({
     const savedId = await saveSessionComment({
       target: repo, prNumber, token: env.GH_TOKEN, fetchImpl,
       existingId: plan.sessionCommentId, previous: durable, session: recorded, body,
-      ledger: ledgerOptions(env, { sourceCommentIds: [sourceId], stage: 'closing' }),
+      ledger: ledgerOptions(env, { sourceCommentIds: [sourceId], stage: 'closing', expectedSeq: plan.ledgerSeq ?? null }),
     });
     await postDismissalOutcomeReply({
       repo, prNumber, expectedAuthor, session: recorded, findingId: decision.findingId,
@@ -211,7 +211,7 @@ export async function applyManualDismissal({
           await saveSessionComment({
             target: repo, prNumber, token: env.GH_TOKEN, fetchImpl,
             existingId: plan.sessionCommentId, previous: latestForSpend, session: charged, body: chargedBody,
-            ledger: ledgerOptions(env, { sourceCommentIds: [sourceId], stage: 'closing' }),
+            ledger: ledgerOptions(env, { sourceCommentIds: [sourceId], stage: 'closing', expectedSeq: plan.ledgerSeq ?? null }),
           });
         }
       } catch {
@@ -240,7 +240,7 @@ export async function applyManualDismissal({
     const savedId = await saveSessionComment({
       target: repo, prNumber, token: env.GH_TOKEN, fetchImpl,
       existingId: plan.sessionCommentId, previous: durable, session, body,
-      ledger: ledgerOptions(env, { sourceCommentIds: [sourceId], stage: 'closing' }),
+      ledger: ledgerOptions(env, { sourceCommentIds: [sourceId], stage: 'closing', expectedSeq: plan.ledgerSeq ?? null }),
     });
     writePublishedSession(contextRoot, { mode: 'dismiss', verdict: 'DISMISSED', session, sessionCommentId: savedId });
     console.log(`Verified dismissal recorded (${verdict.provider}): ${decision.findingId}; status ${session.status}.`);
@@ -265,7 +265,7 @@ export async function applyManualDismissal({
   const savedId = await saveSessionComment({
     target: repo, prNumber, token: env.GH_TOKEN, fetchImpl,
     existingId: plan.sessionCommentId, previous: durable, session, body,
-    ledger: ledgerOptions(env, { sourceCommentIds: [sourceId], stage: 'closing' }),
+    ledger: ledgerOptions(env, { sourceCommentIds: [sourceId], stage: 'closing', expectedSeq: plan.ledgerSeq ?? null }),
   });
 
   const isRejected = verdict.verdict === 'REJECTED';

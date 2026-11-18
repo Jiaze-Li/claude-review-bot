@@ -16,7 +16,14 @@ export async function syncCommitStatus({ env = process.env, fetchImpl = fetch } 
   const headSha = required(env, 'HEAD_SHA');
   if (!/^[0-9a-f]{40}$/i.test(headSha)) throw new Error('Invalid HEAD_SHA');
   if (!env.STATUS_TOKEN) return postCommitStatus({ env, fetchImpl, target, headSha, status: null }); // warns, or throws in strict mode
-  const session = await latestSession({ target, prNumber, author: required(env, 'EXPECTED_REVIEW_AUTHOR'), token: required(env, 'GH_TOKEN'), fetchImpl });
+  let session;
+  try {
+    session = await latestSession({ target, prNumber, author: required(env, 'EXPECTED_REVIEW_AUTHOR'), token: required(env, 'GH_TOKEN'), fetchImpl });
+  } catch (error) {
+    // A record that cannot be trusted must not leave an old green or a forever-pending check behind: say so, red.
+    console.warn(`::warning::${String(error.message).slice(0, 200)}`);
+    return postCommitStatus({ env, fetchImpl, target, headSha, status: { state: 'error', description: 'Review records could not be read in full: human judgment required' } });
+  }
   let status = sessionCommitStatus(session, headSha, { finalReviewStarted: { true: true, false: false }[env.FINAL_REVIEW_DISPATCHED] });
   if (env.JOB_FAILED === 'true' && status.state === 'pending' && (!session || session.lastReviewedHead !== headSha)) {
     status = { state: 'error', description: 'Review run failed for this commit; comment @gemini review to retry' };

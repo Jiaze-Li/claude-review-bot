@@ -359,6 +359,42 @@ test('READY on this HEAD posts success; a different HEAD stays pending', async (
   assert.equal(other[0].body.state, 'pending');
 });
 
+test('a ledger that cannot be trusted turns the check red instead of leaving an old green or a pending one', async () => {
+  const pr = createFakePr({ author: 'bot[bot]', number: 7 });
+  pr.seed(readySession(A));
+  pr.issue.at(-1).lastEditedAt = '2026-11-18T12:00:00Z'; // somebody edited a bot record
+  const posted = [];
+  const fetchImpl = pr.layer(async (url, init = {}) => {
+    if (/statuses\//.test(url)) { posted.push({ url, body: JSON.parse(init.body) }); return Response.json({}); }
+    assert.fail('unexpected ' + url);
+  });
+  await syncCommitStatus({ env: senv(), fetchImpl });
+  assert.equal(posted.length, 1);
+  assert.equal(posted[0].body.state, 'error');
+  assert.match(posted[0].body.description, /could not be read in full/);
+});
+
+test('the stale sweep refuses to write when the review moved after it read the PR (no lost update)', async () => {
+  const stale = beginDeepReview({ session: readySession(), baseSha: BASE, headSha: A, reserveUsd: 2, now: '2020-01-01T00:00:00.000Z' });
+  const pr = createFakePr({ author: 'bot[bot]', number: 7 });
+  pr.seed(stale);
+  const fetchImpl = pr.layer(async (url) => {
+    if (/\/pulls\/7$/.test(url)) return Response.json({ number: 7, head: { sha: A }, base: { sha: BASE } });
+    if (/statuses\//.test(url)) return Response.json({});
+    assert.fail('unexpected ' + url);
+  });
+  let reads = 0;
+  const racing = async (url, init = {}) => {
+    const response = await fetchImpl(url, init);
+    // after the ledger has been read once (the sweep's snapshot), a newer handoff lands before the sweep writes
+    if (String(url).endsWith('/graphql') && JSON.parse(init.body ?? '{}').query?.includes('reviewThreads(') && ++reads === 1) {
+      pr.seed({ ...readySession(A), updatedAt: 'newer' }, { stage: 'verification' });
+    }
+    return response;
+  };
+  await assert.rejects(() => closeStaleDeepReview({ repo: 'acme/project', prNumber: 7, env: { EXPECTED_REVIEW_AUTHOR: 'bot[bot]', GH_TOKEN: 't', STATUS_TOKEN: 's' }, fetchImpl: racing }), /moved while this run was working/);
+});
+
 test('a failed run with no session for the HEAD reports error instead of pending forever', async () => {
   const posted = [];
   await syncCommitStatus({ env: senv({ JOB_FAILED: 'true' }), fetchImpl: statusFetch(null, posted) });

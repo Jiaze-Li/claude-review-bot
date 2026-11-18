@@ -46,7 +46,8 @@ export async function closeStaleDeepReview({ repo, prNumber, env = process.env, 
   if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(String(repo))) throw new Error('Invalid repository');
   if (!/^[1-9]\d*$/.test(String(prNumber))) throw new Error('Invalid PR number');
   const pr = await github(`https://api.github.com/repos/${repo}/pulls/${prNumber}`, env.GH_TOKEN, fetchImpl);
-  const session = await readSessionOrNull({ repo, prNumber, author, env, fetchImpl, importLegacy: true });
+  const read = {};
+  const session = await readSessionOrNull({ repo, prNumber, author, env, fetchImpl, importLegacy: true, seen: read });
   if (!session || !isDeepReviewStale(session, now) || session.lastReviewedHead !== pr.head?.sha) {
     console.log(`${repo}#${prNumber}: no longer a stale deep review; leaving it alone.`);
     return false;
@@ -58,7 +59,7 @@ export async function closeStaleDeepReview({ repo, prNumber, env = process.env, 
   await saveSessionComment({
     target: repo, prNumber, token: env.GH_TOKEN, fetchImpl, existingId: null, previous: session, session: closed,
     body: renderSessionComment(closed),
-    ledger: ledgerOptions(env, { stage: 'closing', next: 'Maintainer: comment @claude review to retry the interrupted review.' }),
+    ledger: ledgerOptions(env, { stage: 'closing', expectedSeq: read.seq ?? null, next: 'Maintainer: comment @claude review to retry the interrupted review.' }),
   });
   await postCommitStatus({
     env, fetchImpl, target: repo, headSha: session.lastReviewedHead,
@@ -82,10 +83,10 @@ async function installationRepos(token, fetchImpl) {
 
 // The newest session on the PR, from the ledger; null when there is none or the ledger cannot be trusted (a
 // scheduled sweep must never act on a state it could not read in full).
-async function readSessionOrNull({ repo, prNumber, author, env, fetchImpl, importLegacy = false }) {
+async function readSessionOrNull({ repo, prNumber, author, env, fetchImpl, importLegacy = false, seen = {} }) {
   try {
     const { ledger } = await loadLedger({ target: repo, prNumber, token: env.GH_TOKEN, fetchImpl, botLogin: author, importLegacy });
-    if (ledger.state === 'ok') return ledger.session;
+    if (ledger.state === 'ok') { seen.seq = ledger.handoff?.seq ?? 0; return ledger.session; }
     if (ledger.state === 'needs_import') return ledger.legacy.session;
     return null;
   } catch (error) {

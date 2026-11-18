@@ -1106,7 +1106,7 @@ export function renderSessionComment(session, { sourceCommentIds = [], finalRevi
     : session.reviewFailure?.code === 'REVIEWER_UNAVAILABLE'
     ? 'Provider review did not complete. Comment `@gemini review` to retry the latest HEAD, or `@claude review` for an existing exact-HEAD session. A manual request bypasses the automatic $6 cap but not provider quota or the $5 per-call ceiling.'
     : unresolved.length > 0
-    ? 'Inconclusive material candidate(s): inspect the cited code. If disproven, use `@gemini dismiss F001` with Reason and Evidence links; otherwise fix and push for a fresh review. Manual override explicitly accepts risk.'
+    ? 'Inconclusive material candidate(s): inspect the cited code. If disproven, use `@gemini dismiss F001` and say in your own words why; otherwise fix and push for a fresh review. Manual override explicitly accepts risk.'
     : session.status === 'PARTIAL'
     ? 'Some changed files were NOT reviewed (listed above), so this HEAD is not READY. Comment `@claude review` to cover them, or split the PR.'
     : session.status === 'READY'
@@ -1120,7 +1120,7 @@ export function renderSessionComment(session, { sourceCommentIds = [], finalRevi
           ? `The final full review is NOT running right now: ${cleanInline(finalReview.reason || 'it did not start')}. Comment \`@gemini review\` to start it.`
           : 'The final full review is the next step, but it may not be running right now. If no new run appears on this PR, comment `@gemini review` to start it.')
       : session.status === 'REWORK'
-        ? 'Push a repair for real bugs; for a disproven finding post `@gemini dismiss F001` with Reason and Evidence lines. Dismissal does not change product code.'
+        ? 'Push a repair for real bugs; for a disproven finding post `@gemini dismiss F001` and say in your own words why. Dismissal does not change product code.'
         : 'Automatic review budget is exhausted. Use human judgment or a targeted Codex/Claude review; do not restart full discovery automatically.';
   const dismissed = session.findings.filter((finding) => finding.status === 'DISMISSED').slice(-4);
   const hasVerifiedDismissal = dismissed.some((finding) => Boolean(finding.dismissal?.verifiedBy));

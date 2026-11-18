@@ -198,7 +198,7 @@ function upsertSession(ctx, session, sourceCommentIds, fetchImpl, existingId, pr
   return saveSessionComment({
     target: ctx.target, prNumber: ctx.prNumber, token: ctx.token, fetchImpl, existingId, previous, session,
     body: renderSessionComment(session, { sourceCommentIds, orphanReconcile: ctx.plan?.orphanReconcile }),
-    ledger: ledgerOptions({ EXPECTED_REVIEW_AUTHOR: ctx.botLogin }, { sourceCommentIds, runId: session.deepReview?.runId ?? null }),
+    ledger: ledgerOptions({ EXPECTED_REVIEW_AUTHOR: ctx.botLogin }, { sourceCommentIds, runId: session.deepReview?.runId ?? null, expectedSeq: ctx.plan?.ledgerSeq ?? null }),
   });
 }
 
