@@ -1,5 +1,6 @@
 import { saveSessionComment } from './session-comment.mjs';
 import { ledgerOptions } from './session-store.mjs';
+import { runSpendFromCharges } from './review-ledger.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -29,7 +30,7 @@ export async function applyManualOverride({ env = process.env, fetchImpl = fetch
   const body = renderSessionComment(session, { sourceCommentIds: [sourceCommentId] });
   await saveSessionComment({
     target, prNumber, token: env.GH_TOKEN, fetchImpl, existingId: plan.sessionCommentId, previous: plan.session, session, body,
-    ledger: ledgerOptions(env, { sourceCommentIds: [sourceCommentId], expectedSeq: plan.ledgerSeq, stage: 'closing', readyReason: `Risk accepted by @${by}` }),
+    ledger: ledgerOptions(env, { sourceCommentIds: [sourceCommentId], expectedSeq: plan.ledgerSeq, stage: 'closing', runSpend: runSpendFromCharges([], { modelCalled: false }), readyReason: `Risk accepted by @${by}` }),
   });
   console.log(`Manual override applied by @${by}; waived ${session.override.waived.length} finding(s); status READY.`);
   return session;

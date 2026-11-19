@@ -1,6 +1,7 @@
 import { defaultProviderRegistry, parseReviewProviders } from './provider-adapter.mjs';
 import { saveSessionComment } from './session-comment.mjs';
 import { ledgerOptions } from './session-store.mjs';
+import { runSpendFromCharges } from './review-ledger.mjs';
 import { staleMarkerIfMoved } from './github-review-api.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -99,7 +100,7 @@ export async function runDeepReviewCommand(command, { env = process.env, fetchIm
       session = { ...session, ...stale };
       console.log('PR moved during the review; recording the result for the reviewed commit, marked out of date.');
     }
-    const savedId = await upsertSession(ctx, session, [ctx.sourceCommentId], fetchImpl, state.sessionCommentId, state.session);
+    const savedId = await upsertSession(ctx, session, [ctx.sourceCommentId], fetchImpl, state.sessionCommentId, state.session, runSpendOf(usage));
     fs.writeFileSync(stateFile, JSON.stringify({ session, sessionCommentId: savedId }) + '\n', { mode: 0o600 });
     console.log(`Full review merged into session; status ${session.status}.`);
     return session;
@@ -138,7 +139,7 @@ export async function runDeepReviewCommand(command, { env = process.env, fetchIm
     const failed = failDeepReview({
       session, headSha: ctx.headSha, reason: env.DEEP_REVIEW_FAILURE_REASON || 'full review did not complete', spentUsd: usage.cost, costSource: usage.source, now,
     });
-    await upsertSession(ctx, failed, [ctx.sourceCommentId], fetchImpl, commentId, session);
+    await upsertSession(ctx, failed, [ctx.sourceCommentId], fetchImpl, commentId, session, runSpendOf(usage));
     console.log(`Full review failed closed: ${failed.deepReview.reason}`);
     return failed;
   }
@@ -196,12 +197,18 @@ async function assertHeadUnmoved(ctx, fetchImpl) {
   if (!(await headUnmoved(ctx, fetchImpl))) throw new Error('PR moved; refusing to change durable review state for a stale HEAD');
 }
 
-function upsertSession(ctx, session, sourceCommentIds, fetchImpl, existingId, previous) {
+function upsertSession(ctx, session, sourceCommentIds, fetchImpl, existingId, previous, runSpend) {
   return saveSessionComment({
     target: ctx.target, prNumber: ctx.prNumber, token: ctx.token, fetchImpl, existingId, previous, session,
     body: renderSessionComment(session, { sourceCommentIds, orphanReconcile: ctx.plan?.orphanReconcile }),
-    ledger: ledgerOptions({ EXPECTED_REVIEW_AUTHOR: ctx.botLogin }, { sourceCommentIds, runId: session.deepReview?.runId ?? null, expectedSeq: ctx.plan?.ledgerSeq ?? null }),
+    ledger: ledgerOptions({ EXPECTED_REVIEW_AUTHOR: ctx.botLogin }, { sourceCommentIds, runId: session.deepReview?.runId ?? null, expectedSeq: ctx.plan?.ledgerSeq ?? null, runSpend }),
   });
+}
+
+// What this run cost, described from the same usage that was just charged to the session (display only).
+function runSpendOf(usage) {
+  if (usage.source === 'sdk' && usage.cost === 0) return runSpendFromCharges([], { note: 'SDK reported $0.00' });
+  return runSpendFromCharges([{ amount: usage.cost, source: usage.source }]);
 }
 
 async function github(url, token, fetchImpl, init = {}) {

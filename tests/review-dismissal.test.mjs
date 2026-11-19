@@ -333,6 +333,20 @@ test('ungrounded DISMISSED verdict is downgraded to INCONCLUSIVE and fails close
   assert.equal(handoff.verdict, 'INCONCLUSIVE');
 });
 
+test('a repeated identical rebuttal is skipped without a model call, and the Handoff says no model ran', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'finding-dismiss-'));
+  const s = recordDismissAttempt({ session: initial(), findingId: 'F001', headSha: A, sourceCommentId: '51', inputHash: '00048b283566bc6b', verdict: 'REJECTED', reason: 'r1' });
+  writePlan(root, s);
+  const mock = mockGitHub(s, { threads: [] });
+  await applyManualDismissal({
+    env: env(root), fetchImpl: mock.fetchImpl,
+    modelFetchImpl: async () => { throw new Error('must not call model'); },
+    queryImpl: () => { throw new Error('must not call claude'); },
+  });
+  const handoff = mock.pr.issue.findLast((c) => /Handoff: COMPLETE/.test(c.body)).body;
+  assert.match(handoff, /^Spend: this run \$0\.00 \(no model call\) \/ cumulative/m);
+});
+
 test('Gemini 429 falls back to Claude within automatic budget; exhausted budget fails closed', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'finding-dismiss-'));
   const session = initial(); writePlan(root, session);
@@ -353,6 +367,8 @@ test('Gemini 429 falls back to Claude within automatic budget; exhausted budget 
   const out = await applyManualDismissal({ env: env(root), fetchImpl: mock.fetchImpl, modelFetchImpl, queryImpl });
   assert.equal(out.status, 'REWORK');
   assert.equal(out.deepSpendUsd, 0.25);
+  // the Handoff reports the charge the session just took, with its source
+  assert.match(mock.pr.issue.findLast((c) => /Handoff: COMPLETE/.test(c.body)).body, /^Spend: this run \$0\.2500 \(SDK-reported\) \/ cumulative \$0\.25 \(Claude charged ledger\)/m);
 
   // Exhausted Claude budget must fail closed with 0 Claude calls
   const root2 = fs.mkdtempSync(path.join(os.tmpdir(), 'finding-dismiss-'));
@@ -433,6 +449,8 @@ test('limit-rejected comment is recorded in dismissLedger and Claude spend is pr
     modelFetchImpl: async () => { throw new Error('must not call model'); },
   });
   assert.ok(out.dismissLedger.some((entry) => entry.commentId === '99'));
+  // the model call failed closed without any Claude charge: a known zero, never a bare default
+  assert.match(mock.pr.issue.findLast((c) => /Handoff: COMPLETE/.test(c.body)).body, /^Spend: this run \$0\.00 \(no Claude charge\) \/ cumulative/m);
 
   // Claude spend preserved when PR HEAD moves during Claude fallback
   const root2 = fs.mkdtempSync(path.join(os.tmpdir(), 'finding-dismiss-'));
@@ -455,6 +473,7 @@ test('limit-rejected comment is recorded in dismissLedger and Claude spend is pr
   );
   // the spend is kept: the stage still closes with a handoff that carries it
   assert.equal(mock2.pr.session().deepSpendUsd, 0.31);
+  assert.match(mock2.pr.issue.findLast((c) => /Handoff: COMPLETE/.test(c.body)).body, /^Spend: this run \$0\.3100 \(SDK-reported\) \/ cumulative \$0\.31/m);
 });
 
 test('planner selects dismissal only for a blocking OPEN/UNCERTAIN finding on the same reviewed HEAD', async () => {
@@ -670,6 +689,8 @@ test('accept: the owner accepts a P3 after one model check; record, reply and ha
   assert.match(posted, /F001 risk accepted by @maintainer/);
   assert.equal(handoff.verdict, 'DISMISSED');
   assert.equal(handoff.mode, 'dismiss');
+  // Gemini answered: nothing was charged to the Claude ledger, and the line says so instead of claiming the run was free
+  assert.match(mock.pr.issue.findLast((c) => /Handoff: COMPLETE/.test(c.body)).body, /^Spend: this run \$0\.00 \(Gemini only, no Claude charge\) \/ cumulative/m);
 });
 
 test('accept: a repository writer who is not the owner changes nothing and costs no model call', async () => {

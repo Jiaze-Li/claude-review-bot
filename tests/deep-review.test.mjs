@@ -477,7 +477,7 @@ test('final mirror turns a stale READY into error when the attempted deep review
   assert.equal(ok[0].body.state, 'success');
 });
 
-function sweepFetch({ repos, prs, comments, onWrite, liveHead = {} }) {
+function sweepFetch({ repos, prs, comments, onWrite, onRecord = () => {}, liveHead = {} }) {
   // each PR's conversation is a fake PR holding the bot's own records (the session) plus its readable summary comment
   const fakes = new Map();
   for (const [key, list] of Object.entries(comments)) {
@@ -493,6 +493,7 @@ function sweepFetch({ repos, prs, comments, onWrite, liveHead = {} }) {
   const notify = (url, method, init) => {
     const body = init.body ? JSON.parse(init.body) : null;
     if (!(body && isRecord(body.body))) onWrite({ url, method, body });
+    else onRecord(body.body);
   };
   return async (url, init = {}) => {
     const method = init.method || 'GET';
@@ -559,10 +560,11 @@ test('a PR with only an old-format comment is not a stale review: nothing is clo
 test('close fails a stale review closed and posts an error status', async () => {
   const stale = beginDeepReview({ session: readySession(), baseSha: BASE, headSha: A, reserveUsd: 2, now: '2020-01-01T00:00:00.000Z' });
   const writes = [];
+  const records = [];
   const fetchImpl = sweepFetch({
     repos: [], prs: { 'acme/project': [{ number: 7, head: { sha: A } }] },
     comments: { 'acme/project#7': [{ id: 70, session: stale }] },
-    onWrite: (w) => writes.push(w),
+    onWrite: (w) => writes.push(w), onRecord: (b) => records.push(b),
   });
   const ok = await closeStaleDeepReview({ repo: 'acme/project', prNumber: 7, env: { EXPECTED_REVIEW_AUTHOR: 'bot[bot]', GH_TOKEN: 't', STATUS_TOKEN: 's' }, fetchImpl });
   assert.equal(ok, true);
@@ -572,6 +574,9 @@ test('close fails a stale review closed and posts an error status', async () => 
   assert.equal(writes[1].method, 'DELETE');
   assert.match(writes[1].url, /issues\/comments\/70$/);
   assert.equal(writes[2].body.state, 'error');
+  // the swept run never reported its usage: the Handoff says its $2 reserve was charged, not that the run was free
+  const handoff = records.find((body) => /^### Review Handoff/.test(body));
+  assert.match(handoff, /^Spend: this run \$2\.0000 \(reserved: usage not reported\) \/ cumulative \$2\.00 \(Claude charged ledger\)$/m);
 });
 
 test('close inside the lock leaves alone a review that was restarted or moved since the scan', async () => {

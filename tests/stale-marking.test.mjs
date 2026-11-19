@@ -79,6 +79,8 @@ test('apply-stale changes only the mark: status, findings, spend and reviewed co
   // the summary comment was replaced by a new one at the bottom and says it is not current
   assert.equal(pr.issue.some((c) => c.id === projectionId), false);
   assert.match(pr.issue.at(-1).body, /NOT current/);
+  // no model ran: a known zero with its reason, never a bare default
+  assert.match(pr.issue.findLast((c) => /Handoff: COMPLETE/.test(c.body)).body, /^Spend: this run \$0\.00 \(no model call\) \/ cumulative/m);
 });
 
 test('apply-stale does nothing if the PR already moved on', async () => {

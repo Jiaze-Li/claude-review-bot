@@ -3,6 +3,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { renderSessionComment, stopUnavailableReviewSession } from './review-session-core.mjs';
 import { saveSessionComment } from './session-comment.mjs';
+import { runSpendFromCharges, runSpendUnrecorded } from './review-ledger.mjs';
 import { ledgerOptions } from './session-store.mjs';
 
 const SHA = /^[0-9a-f]{40}$/i;
@@ -72,6 +73,10 @@ export async function stopUnavailableReview({ env = process.env, fetchImpl = fet
     target: repo, prNumber: pr, token, fetchImpl, existingId, previous, session, body,
     ledger: ledgerOptions(env, {
       sourceCommentIds: [sourceCommentId], expectedSeq: plan.ledgerSeq,
+      // the same charges the session was just charged with; a repeat of an already recorded stop charged nothing now
+      runSpend: duplicate
+        ? runSpendUnrecorded('stop already recorded by an earlier attempt')
+        : runSpendFromCharges(costCharges ?? [{ amount: spentUsd, source: 'reserve' }]),
       ...(pausedForCost
         ? {
           intro: [`**Paused for cost:** spent $${spentUsd.toFixed(2)} so far; stopped at the ${marker.mode} step for ${headSha.slice(0, 12)}. This is a stop, not a pass and not a failure of the code.`],

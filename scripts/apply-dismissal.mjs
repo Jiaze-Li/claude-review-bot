@@ -4,6 +4,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { saveSessionComment } from './session-comment.mjs';
 import { ledgerOptions, loadSession } from './session-store.mjs';
+import { runSpendFromCharges } from './review-ledger.mjs';
 import { finalReviewOutlook } from './continue-review.mjs';
 import {
   applyFindingAcceptance,
@@ -194,7 +195,7 @@ export async function applyManualDismissal({
     const savedId = await saveSessionComment({
       target: repo, prNumber, token: env.GH_TOKEN, fetchImpl,
       existingId: plan.sessionCommentId, previous: durable, session: recorded, body,
-      ledger: ledgerOptions(env, { sourceCommentIds: [sourceId], stage: 'closing', expectedSeq: plan.ledgerSeq ?? null }),
+      ledger: ledgerOptions(env, { sourceCommentIds: [sourceId], stage: 'closing', expectedSeq: plan.ledgerSeq ?? null, runSpend: runSpendFromCharges([], { modelCalled: false }) }),
     });
     await postDismissalOutcomeReply({
       repo, prNumber, expectedAuthor, session: recorded, findingId: decision.findingId,
@@ -255,7 +256,7 @@ export async function applyManualDismissal({
             target: repo, prNumber, token: env.GH_TOKEN, fetchImpl,
             existingId: plan.sessionCommentId, previous: latestForSpend, session: charged, body: chargedBody,
             // the ledger was just read again (that is why it moved); the plan's Seq is already out of date
-            ledger: ledgerOptions(env, { sourceCommentIds: [sourceId], stage: 'closing' }),
+            ledger: ledgerOptions(env, { sourceCommentIds: [sourceId], stage: 'closing', runSpend: runSpendOfVerdict(verdict) }),
           });
         }
       } catch {
@@ -273,7 +274,7 @@ export async function applyManualDismissal({
     const savedId = await saveSessionComment({
       target: repo, prNumber, token: env.GH_TOKEN, fetchImpl,
       existingId: plan.sessionCommentId, previous: durable, session, body,
-      ledger: ledgerOptions(env, { sourceCommentIds: [sourceId], stage: 'closing', expectedSeq: plan.ledgerSeq ?? null }),
+      ledger: ledgerOptions(env, { sourceCommentIds: [sourceId], stage: 'closing', expectedSeq: plan.ledgerSeq ?? null, runSpend: runSpendOfVerdict(verdict) }),
     });
     if (afterSave) await afterSave(session);
     writePublishedSession(contextRoot, { mode: 'dismiss', verdict: publishedVerdict, session, sessionCommentId: savedId });
@@ -461,4 +462,13 @@ function required(env, key) {
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   try { await applyManualDismissal(); }
   catch (error) { console.error(error.message); process.exitCode = 1; }
+}
+
+// What the verification cost the Claude charged ledger, described from the charge the verifier already reported
+// (the same value the session is charged with). Claude answering without any reported cost is unknown, not zero.
+function runSpendOfVerdict(verdict) {
+  const charge = verdict?.claudeCharge;
+  if (charge && Number.isFinite(charge.amount) && charge.amount > 0) return runSpendFromCharges([charge]);
+  if (verdict?.provider === 'claude') return runSpendFromCharges([], { unknownCalls: 1 });
+  return runSpendFromCharges([], { note: verdict?.provider === 'gemini' ? 'Gemini only, no Claude charge' : 'no Claude charge' });
 }

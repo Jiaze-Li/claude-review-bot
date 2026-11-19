@@ -112,6 +112,27 @@ test('unavailable review persists a fail-closed state without fabricating a revi
   const handoff=api.pr.issue.findLast(c=>/Handoff: COMPLETE/.test(c.body)).body;
   assert.match(handoff,/\*\*Paused for cost:\*\* spent \$0\.00 so far; stopped at the incremental step/);
   assert.match(handoff,/decide whether to spend more/);
+  assert.match(handoff,/^Spend: this run \$0\.00 \(no Claude charge\) \/ cumulative/m);
+});
+
+test('a stop reports the mixed SDK and reserve charges it just took, and a repeat of the same stop reports none',async()=>{
+  const dir=folder();
+  fs.writeFileSync(path.join(dir,'fallback-unavailable.json'),JSON.stringify({
+    mode:'incremental',headSha:HEAD,reason:'Gemini HTTP 503; Claude failed',spentUsd:1.1,
+    costCharges:[{amount:0.2,source:'sdk'},{amount:0.9,source:'reserve'}],
+  }));
+  const api=prAPI([]);
+  const first=await stopUnavailableReview({env:stopEnv(dir),fetchImpl:api});
+  assert.equal(first.session.deepSpendUsd,1.1);
+  const line=api.pr.issue.findLast(c=>/Handoff: COMPLETE/.test(c.body)).body.match(/^Spend: .*$/m)[0];
+  assert.match(line,/^Spend: this run \$1\.1000 \(SDK-reported \$0\.2000 \+ reserved \$0\.9000 — usage not reported\) \/ cumulative \$1\.10 \(Claude charged ledger\)$/);
+  // the same stop recorded again (retry): the session is not charged twice, so the line must not claim a second charge
+  fs.writeFileSync(path.join(dir,'session-plan.json'),JSON.stringify({requestedMode:'auto',decision:{mode:'incremental'},
+    session:first.session,sessionCommentId:first.sessionCommentId}));
+  const again=await stopUnavailableReview({env:stopEnv(dir),fetchImpl:prAPI([],{session:first.session,pr:api.pr})});
+  assert.equal(again.session.deepSpendUsd,1.1);
+  const second=api.pr.issue.findLast(c=>/Handoff: COMPLETE/.test(c.body)).body.match(/^Spend: .*$/m)[0];
+  assert.match(second,/^Spend: this run not recorded \(stop already recorded by an earlier attempt\) \/ cumulative \$1\.10/);
 });
 
 test('a provider outage is not described as a pause for cost',async()=>{

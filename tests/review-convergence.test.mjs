@@ -228,6 +228,7 @@ test('apply-override posts the new session comment with the processed-source mar
   // the decision is a closed handoff on the PR, with a visible receipt for the command
   assert.equal(pr.session().status, 'READY');
   assert.match(pr.issue.map((c) => c.body).join('\n'), /Handled: comment 77 \(version created\)/);
+  assert.match(pr.issue.findLast((c) => /Handoff: COMPLETE/.test(c.body)).body, /^Spend: this run \$0\.00 \(no model call\) \/ cumulative/m);
   // READY is a new result for the PR: the summary is posted as the newest comment, and the old one removed
   assert.equal(pr.issue.some((c) => c.id === '5'), false);
   assert.match(pr.issue.at(-1).body, /Status: \*\*READY\*\*/);

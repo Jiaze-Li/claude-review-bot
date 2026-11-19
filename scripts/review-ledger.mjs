@@ -115,6 +115,49 @@ function fieldPairs(lines, prefix) {
 
 const clean = (value, max = 200) => String(value ?? '').replace(/[\r\n]+/g, ' ').replace(/<!--|-->/g, '').trim().slice(0, max);
 const usd = (value) => (Number.isFinite(value) ? value : 0).toFixed(2);
+const usd4 = (value) => (Number.isFinite(value) ? value : 0).toFixed(4);
+const roundUsd4 = (value) => Math.round(value * 10000) / 10000;
+
+// What this run cost the Claude charged ledger, as the step that writes the Handoff knows it. It describes the
+// charge that step just applied (never a second source of money) and is only ever displayed.
+//   charged    Claude spend was charged: `sdkUsd` reported by the SDK, `reserveUsd` charged at a conservative reserve
+//              because usage was not reported; `unknownCalls` calls had no usage at all and were not charged
+//   none       a known zero, with the reason in `note` (e.g. no model call, Gemini only)
+//   unknown    Claude ran but reported no usage and nothing was charged
+//   unrecorded this step does not say (the default: a missing value must never read as $0.00)
+export function runSpendFromCharges(charges = [], { modelCalled = true, unknownCalls = 0, note = '' } = {}) {
+  let sdkUsd = 0; let reserveUsd = 0;
+  for (const charge of Array.isArray(charges) ? charges : []) {
+    if (!(Number.isFinite(charge?.amount) && charge.amount > 0)) continue;
+    if (charge.source === 'reserve') reserveUsd += charge.amount; else sdkUsd += charge.amount;
+  }
+  sdkUsd = roundUsd4(sdkUsd); reserveUsd = roundUsd4(reserveUsd);
+  const unknown = Number.isInteger(unknownCalls) && unknownCalls > 0 ? unknownCalls : 0;
+  if (sdkUsd + reserveUsd > 0) return { state: 'charged', sdkUsd, reserveUsd, unknownCalls: unknown };
+  if (unknown > 0) return { state: 'unknown', unknownCalls: unknown };
+  return { state: 'none', note: note || (modelCalled ? 'no Claude charge' : 'no model call') };
+}
+
+export const runSpendUnrecorded = (note = '') => ({ state: 'unrecorded', note });
+
+function renderSpendThisRun(runSpend) {
+  if (runSpend === undefined || runSpend === null) return 'this run not recorded (not provided by this step)';
+  if (typeof runSpend !== 'object') throw new Error('runSpend must be a run-spend description; a bare number cannot say whether it is reported, reserved or unknown');
+  switch (runSpend.state) {
+    case 'charged': {
+      const sdk = Number(runSpend.sdkUsd) || 0; const reserve = Number(runSpend.reserveUsd) || 0;
+      const basis = reserve === 0 ? 'SDK-reported'
+        : sdk === 0 ? 'reserved: usage not reported'
+          : `SDK-reported $${usd4(sdk)} + reserved $${usd4(reserve)} — usage not reported`;
+      const extra = runSpend.unknownCalls > 0 ? ` + ${runSpend.unknownCalls} call(s) with unknown usage, not charged` : '';
+      return `this run $${usd4(roundUsd4(sdk + reserve))} (${basis})${extra}`;
+    }
+    case 'none': return `this run $0.00 (${clean(runSpend.note || 'no Claude charge', 80)})`;
+    case 'unknown': return 'this run unknown (Claude usage not reported; nothing charged)';
+    case 'unrecorded': return `this run not recorded (${clean(runSpend.note || 'not provided by this step', 120)})`;
+    default: throw new Error(`unknown runSpend state "${runSpend.state}"`);
+  }
+}
 
 function keyValue(lines, key) {
   const prefix = `${key}: `;
@@ -146,9 +189,10 @@ export function repairAttempts(findings, verdicts = []) {
 
 // -> array of comment bodies (Part 1..n). Only the last one carries `Handoff: COMPLETE`.
 export function renderHandoffParts({
-  session, stage, seq, prev = null, recordIds = {}, attempts = {}, spendThisRun = 0, next = '', readyReason = '',
+  session, stage, seq, prev = null, recordIds = {}, attempts = {}, runSpend, spendThisRun, next = '', readyReason = '',
   intro = [], maxPartBytes = LEDGER_LIMITS.maxPartBytes,
 } = {}) {
+  if (spendThisRun !== undefined) throw new Error('spendThisRun is retired: pass runSpend (see runSpendFromCharges)');
   if (!STAGES.includes(stage)) throw new Error(`unknown handoff stage "${stage}"`);
   if (!Number.isInteger(seq) || seq < 1) throw new Error('handoff Seq must be a positive integer');
   const coverage = session.coverage && !session.coverage.complete
@@ -175,7 +219,7 @@ export function renderHandoffParts({
     `Prev: ${prev ?? 'none'}`,
     `Reviewed HEAD: ${session.lastReviewedHead}`,
     `Coverage: ${coverage}`,
-    `Spend: this run $${usd(spendThisRun)} / cumulative $${usd(session.deepSpendUsd ?? 0)}`,
+    `Spend: ${renderSpendThisRun(runSpend)} / cumulative $${usd(session.deepSpendUsd ?? 0)} (Claude charged ledger)`,
     `Ready: ${ready ? 'yes' : 'no'}${readyReason ? ` — ${clean(readyReason, 300)}` : ''}`,
     `Next: ${clean(next, 400) || 'none'}`,
     '',
