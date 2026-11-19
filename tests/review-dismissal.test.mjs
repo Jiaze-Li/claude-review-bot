@@ -6,12 +6,12 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
-  applyDiscoveryResult, applyFindingDismissal,
-  checkDismissEligibility,
+  applyDiscoveryResult, applyFindingAcceptance, applyFindingDismissal,
+  checkDismissEligibility, knownIssues,
   matchesKnownDismissal, openMaterialFindings,
   planReviewSession, recordDismissAttempt, renderSessionComment,
 } from '../scripts/review-session-core.mjs';
-import { parseDismissalRequest, parseReviewTrigger } from '../worker/src/review-trigger.js';
+import { dismissalCommandKind, parseDismissalRequest, parseReviewTrigger } from '../worker/src/review-trigger.js';
 import { planSession } from '../scripts/plan-review-session.mjs';
 import { applyManualDismissal } from '../scripts/apply-dismissal.mjs';
 import { extractSameRepoEvidence } from '../scripts/dismiss-verifier.mjs';
@@ -546,4 +546,215 @@ test('V4: applyManualDismissal posts clear guidance reply on malformed format or
     const handoff = JSON.parse(fs.readFileSync(path.join(root, 'published-session.json'), 'utf8'));
     assert.equal(handoff.verdict, 'INVALID');
   }
+});
+
+
+// ---- Owner risk acceptance (`@gemini accept F### <statement>`) --------------------------------------------------
+const STATEMENT = 'The retry can double-send one notification if two pushes land together; the cost is one duplicate message.';
+const acceptCommand = `@gemini accept F001 ${STATEMENT}`;
+const p3Session = (extra = {}) => ({
+  ...applyDiscoveryResult({
+    result: { summary: 'candidate', findings: [{ ...issue('Duplicate notification'), severity: 'P3' }] },
+    baseSha: BASE, headSha: A, sourceCommentId: '9',
+  }),
+  ...extra,
+});
+const accepted = (session, extras = {}) => applyFindingAcceptance({
+  session, findingId: 'F001', headSha: A, by: 'jiaze', statement: STATEMENT, sourceCommentId: '99',
+  verification: { provider: 'gemini', reason: 'Same risk and a stated consequence.' },
+  now: '2026-11-19T00:00:00Z', ...extras,
+});
+const acceptVerdict = (verdict, reasonText = 'The statement matches the reported duplicate-send risk.') =>
+  async () => geminiJsonResponse({ verdict, reason: reasonText, nextStep: '' });
+const runAccept = async ({ session = p3Session(), body = acceptCommand, permission = 'admin', model, mockOpts = {}, extraEnv = {} } = {}) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'finding-accept-'));
+  writePlan(root, session);
+  const mock = mockGitHub(session, { sourceBody: body, permission, ...mockOpts });
+  let modelCalls = 0;
+  const modelFetchImpl = async (...args) => { modelCalls += 1; return (model ?? acceptVerdict('ACCEPTED'))(...args); };
+  const out = await applyManualDismissal({ env: env(root, extraEnv), fetchImpl: mock.fetchImpl, modelFetchImpl });
+  const posted = mock.calls.filter((c) => c.method === 'POST').map((c) => JSON.parse(c.body ?? '{}').body ?? '').join('\n');
+  const handoffPath = path.join(root, 'published-session.json');
+  const handoff = fs.existsSync(handoffPath) ? JSON.parse(fs.readFileSync(handoffPath, 'utf8')) : null;
+  return { out, mock, modelCalls: () => modelCalls, posted, handoff };
+};
+
+test('accept: only a first-line command counts, routes as dismiss, and dismiss keeps its old shape', () => {
+  assert.deepEqual(parseReviewTrigger(acceptCommand), { requestedMode: 'dismiss' });
+  assert.deepEqual(parseReviewTrigger(acceptCommand.replace('@gemini', '@jiaze-claude-review-bot')), { requestedMode: 'dismiss' });
+  for (const body of [`> ${acceptCommand}`, '```\n' + acceptCommand + '\n```', 'please\n' + acceptCommand,
+    `    ${acceptCommand}`, '@gemini accept F1 x', '@gemini accept everything', 'I will @gemini accept F001 later']) {
+    assert.equal(parseReviewTrigger(body), null, body);
+  }
+  const parsed = parseDismissalRequest(acceptCommand);
+  assert.deepEqual(parsed, { findingId: 'F001', reason: STATEMENT, evidence: [], kind: 'accepted' });
+  assert.equal(dismissalCommandKind(acceptCommand), 'accepted');
+  // dismiss is unchanged: same visible shape, and the kind is still readable
+  const dismissed = parseDismissalRequest('@gemini dismiss F001 please');
+  assert.deepEqual(dismissed, { findingId: 'F001', reason: 'please', evidence: [] });
+  assert.equal(dismissed.kind, 'dismissed');
+  assert.equal(dismissalCommandKind('@gemini dismiss F001'), 'dismissed');
+  // statement may continue on following lines; an empty statement is refused
+  assert.equal(parseDismissalRequest('@gemini accept F001\n' + STATEMENT).reason, STATEMENT);
+  assert.throws(() => parseDismissalRequest('@gemini accept F001'), /your own words/);
+  assert.throws(() => parseDismissalRequest('@gemini accept F001\n\n  '), /your own words/);
+});
+
+test('accept: closes only a blocking P3, records who/words/when, and never skips the final audit', () => {
+  const closed = accepted(p3Session());
+  const f = closed.findings[0];
+  assert.equal(f.status, 'DISMISSED');
+  assert.equal(f.dismissal.kind, 'accepted');
+  assert.deepEqual([f.dismissal.by, f.dismissal.reason, f.dismissal.head, f.dismissal.sourceCommentId, f.dismissal.at],
+    ['jiaze', STATEMENT, A, '99', '2026-11-19T00:00:00Z']);
+  assert.equal(closed.status, 'AUDIT_PENDING');                        // audit not done: not READY by itself
+  assert.equal(closed.dismissLedger[0].kind, 'accepted');
+  // audit already completed on this exact HEAD: the existing rule gives READY
+  assert.equal(accepted(p3Session({ auditCompleted: true, lastReviewedHead: A })).status, 'READY');
+  // another blocker remains: stays REWORK
+  const two = applyDiscoveryResult({
+    result: { summary: 'c', findings: [{ ...issue('Duplicate notification'), severity: 'P3' }, issue('Unrelated bug')] },
+    baseSha: BASE, headSha: A, sourceCommentId: '9',
+  });
+  assert.equal(accepted(two).status, 'REWORK');
+  assert.equal(accepted(two).findings[1].status, 'OPEN');
+  // P2 can never be accepted, whatever the caller did
+  assert.throws(() => accepted(initial()), /blocking P3/);
+  assert.throws(() => accepted(p3Session(), { statement: '  ' }), /own words/);
+  assert.throws(() => accepted(p3Session(), { by: 'bad name!' }), /actor/);
+});
+
+test('accept: the record shows in the summary and in what later reviewers are told is settled', () => {
+  const closed = accepted(p3Session());
+  const body = renderSessionComment(closed);
+  assert.match(body, /Dismissed findings and accepted risks:/);
+  assert.match(body, /F001 \[risk accepted\] by @jiaze on aaaaaaa — The retry can double-send/);
+  assert.ok(knownIssues(closed).some((item) => /Risk accepted by @jiaze/.test(item.reason)));
+  // a dismissed finding renders exactly as before
+  const dismissedBody = renderSessionComment(dismiss(initial(), { verification: { provider: 'gemini', reason: 'x' } }));
+  assert.match(dismissedBody, /Dismissed findings \(bot-verified\):/);
+  assert.doesNotMatch(dismissedBody, /risk accepted/);
+  // the hint tells the owner about the new command
+  assert.match(renderSessionComment(p3Session()), /@gemini accept F001/);
+});
+
+test('accept: survives a later push only for the same finding; a different one blocks as new', () => {
+  const closed = accepted(p3Session());
+  const same = { path: 'scripts/ref.mjs', title: 'Duplicate notification', failurePath: issue().failurePath };
+  assert.equal(matchesKnownDismissal(same, closed), true);
+  assert.equal(matchesKnownDismissal({ ...same, title: 'Notification is lost on retry' }, closed), false);
+  assert.equal(matchesKnownDismissal({ ...same, failurePath: 'a different failure path' }, closed), false);
+  assert.equal(matchesKnownDismissal({ ...same, path: 'scripts/other.mjs' }, closed), false);
+});
+
+test('accept: the owner accepts a P3 after one model check; record, reply and handoff are written', async () => {
+  const { out, mock, modelCalls, posted, handoff } = await runAccept();
+  assert.equal(modelCalls(), 1);
+  assert.equal(out.status, 'AUDIT_PENDING');
+  assert.equal(out.findings[0].dismissal.kind, 'accepted');
+  assert.equal(mock.pr.session().findings[0].status, 'DISMISSED');
+  const summary = mock.pr.issue.filter((c) => /Independent Review Session/.test(c.body)).at(-1).body;
+  assert.match(summary, /\[risk accepted\] by @maintainer/);
+  assert.match(posted, /F001 risk accepted by @maintainer/);
+  assert.equal(handoff.verdict, 'DISMISSED');
+  assert.equal(handoff.mode, 'dismiss');
+});
+
+test('accept: a repository writer who is not the owner changes nothing and costs no model call', async () => {
+  for (const permission of ['write', 'maintain']) {
+    const { out, mock, modelCalls, posted, handoff } = await runAccept({ permission });
+    assert.equal(modelCalls(), 0, permission);
+    assert.equal(out.findings[0].status, 'OPEN');
+    assert.equal(mock.calls.filter((c) => ['PATCH', 'DELETE'].includes(c.method)).length, 0);
+    assert.match(posted, /Only the repository owner can accept/);
+    assert.equal(handoff.verdict, 'INVALID');
+  }
+  // someone without write access is still refused before anything happens
+  await assert.rejects(runAccept({ permission: 'read' }), /write permission/);
+});
+
+test('accept: P0-P2 are refused plainly with no model call; a non-blocking P3 needs nothing', async () => {
+  const { out, modelCalls, posted } = await runAccept({ session: initial() });
+  assert.equal(modelCalls(), 0);
+  assert.equal(out.findings[0].status, 'OPEN');
+  assert.match(posted, /Only minor \(P3\) findings can be accepted, and this one is P2/);
+  const demoted = p3Session();
+  demoted.findings[0] = { ...demoted.findings[0], downgradedFrom: 'P2', status: 'DEFERRED' };
+  const second = await runAccept({ session: demoted });
+  assert.equal(second.modelCalls(), 0);
+  assert.match(second.posted, /already \*\*DEFERRED\*\* and does not need acceptance/);
+});
+
+test('accept: a wrong-risk or too-vague statement is refused with the reason and the finding stays blocking', async () => {
+  const mismatch = await runAccept({ model: acceptVerdict('MISMATCH', 'It describes a timeout problem, not the duplicate notification.') });
+  assert.equal(mismatch.modelCalls(), 1);
+  assert.equal(mismatch.out.findings[0].status, 'OPEN');
+  assert.equal(mismatch.out.status, 'REWORK');
+  assert.match(mismatch.posted, /acceptance does not match the finding \(kept blocking\)/);
+  assert.match(mismatch.posted, /timeout problem/);
+  assert.equal(mismatch.out.dismissLedger[0].verdict, 'REJECTED');
+  assert.equal(mismatch.out.dismissLedger[0].kind, 'accepted');
+  assert.equal(mismatch.handoff.verdict, 'REJECTED');
+
+  const vague = await runAccept({ model: acceptVerdict('TOO_VAGUE', 'It says what the risk is but not what happens if it occurs.') });
+  assert.equal(vague.out.findings[0].status, 'OPEN');
+  assert.match(vague.posted, /acceptance too vague \(kept blocking\)/);
+  assert.match(vague.posted, /not what happens if it occurs/);
+});
+
+test('accept: a model that fails or answers badly never closes the finding', async () => {
+  const unavailable = await runAccept({
+    model: async () => new Response('quota exceeded', { status: 429 }),
+    session: p3Session({ deepSpendUsd: 5.8 }),                          // no Claude fallback budget left
+  });
+  assert.equal(unavailable.out.findings[0].status, 'OPEN');
+  assert.equal(unavailable.out.dismissLedger[0].verdict, 'INCONCLUSIVE');
+  assert.match(unavailable.posted, /acceptance inconclusive \(kept blocking\)/);
+  assert.equal(unavailable.handoff.verdict, 'INCONCLUSIVE');
+
+  const garbage = await runAccept({ model: async () => geminiJsonResponse({ verdict: 'DISMISSED', reason: 'a dismissal verdict is not valid here', nextStep: '' }) });
+  assert.equal(garbage.out.findings[0].status, 'OPEN');
+  assert.equal(garbage.out.dismissLedger[0].verdict, 'INCONCLUSIVE');
+  // the model may not slip a dismissal-style verdict through the acceptance door
+  const wrongDoor = await runAccept({ model: acceptVerdict('INCONCLUSIVE', 'Cannot decide from the text given.') });
+  assert.equal(wrongDoor.out.findings[0].status, 'OPEN');
+});
+
+test('accept: an empty statement gets format guidance with an accept example and no model call', async () => {
+  const { out, modelCalls, posted, handoff } = await runAccept({ body: '@gemini accept F001' });
+  assert.equal(modelCalls(), 0);
+  assert.equal(out.findings[0].status, 'OPEN');
+  assert.match(posted, /Acceptance command format invalid/);
+  assert.match(posted, /@gemini accept F001 <what the risk is, and what happens if it occurs>/);
+  assert.equal(handoff.verdict, 'INVALID');
+});
+
+test('accept: a replayed comment is skipped, and a moved head or changed session aborts without writing', async () => {
+  const replay = p3Session({ dismissLedger: [{ findingId: 'F001', head: A, commentId: '99', inputHash: 'x', verdict: 'REJECTED', at: '2026-11-19T00:00:00Z' }] });
+  const skipped = await runAccept({ session: replay });
+  assert.equal(skipped.modelCalls(), 0);
+  assert.equal(skipped.out.findings[0].status, 'OPEN');
+
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'finding-accept-'));
+  const s = p3Session(); writePlan(root, s);
+  const mock = mockGitHub(s, { sourceBody: acceptCommand, permission: 'admin', mutateHeadAfterReads: 2 });
+  await assert.rejects(applyManualDismissal({ env: env(root), fetchImpl: mock.fetchImpl, modelFetchImpl: acceptVerdict('ACCEPTED') }), /PR moved/);
+  assert.equal(mock.pr.session().findings[0].status, 'OPEN');
+  assert.equal(mock.calls.filter((c) => ['PATCH', 'DELETE'].includes(c.method)).length, 0);
+});
+
+test('accept: dismiss on the same PR still works exactly as before (kind dismissed, no accepted marks)', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'finding-accept-'));
+  const session = initial(); writePlan(root, session);
+  const mock = mockGitHub(session);
+  const out = await applyManualDismissal({
+    env: env(root), fetchImpl: mock.fetchImpl,
+    modelFetchImpl: async () => geminiJsonResponse({
+      verdict: 'DISMISSED', reason: 'Line 3 calls the exact-ref endpoint, which returns a single object.', nextStep: '',
+      sourceAnchors: [{ path: 'scripts/ref.mjs', line: 3, quote: 'return fetchJson(`/repos/${target}/git/ref/${ref}`);' }],
+    }),
+  });
+  assert.equal(out.findings[0].dismissal.kind, undefined);
+  assert.equal(out.dismissLedger[0].kind, undefined);
+  assert.equal(out.findings[0].dismissal.verifiedBy, 'gemini');
 });

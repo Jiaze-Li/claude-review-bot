@@ -78,6 +78,7 @@ A full review is used for: a PR's first review, the review after a big or risky 
 @jiaze-claude-review-bot reset review   # discard the session and review from scratch
 @jiaze-claude-review-bot override review  # a writer accepts the risk: waives open findings, READY (marked as manual)
 @gemini dismiss F001                    # + Reason:/Evidence: lines, see below
+@gemini accept F001 <risk and consequence>  # the owner accepts a real minor (P3) finding, see below
 ```
 
 `@gemini review` / `@claude review` are the same review; only the model differs. On a HEAD that is already READY
@@ -151,6 +152,22 @@ Evidence: https://docs.github.com/en/rest/git/refs
 `Reason:` 30-400 characters and 1-3 credential-free HTTPS `Evidence:` lines. The evidence is attributed to the
 person, not certified by the bot. The other findings stay blocking; when none is left the session goes to
 AUDIT_PENDING and the final full review runs by itself. Resolving a thread alone is not a dismissal.
+
+### Accept a real minor finding as a known risk
+
+When a P3 finding is real but the owner decides to live with it, `dismiss` cannot help (it needs proof the finding is
+wrong). The repository owner (GitHub permission `admin`) can accept it instead:
+
+```text
+@gemini accept F001 The retry can double-send one notification if two pushes land together; the cost is one duplicate message.
+```
+
+The statement must say what the risk is and what happens if it occurs. The bot checks once, with a model, that it
+describes the same risk the finding reports; it does not judge whether the risk is worth accepting. Anyone but the
+owner changes nothing, P0-P2 findings are refused, and a wrong, vague or unverifiable statement leaves the finding
+blocking with a reply saying why. An acceptance is shown in the review summary as `[risk accepted]` with who, the
+owner's words and the commit, and later reviewers are told it is settled. It stays accepted on later pushes only
+while the same finding comes back (same file, title and failure path). The final full review still runs.
 
 ## Security and execution model
 

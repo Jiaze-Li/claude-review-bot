@@ -832,7 +832,7 @@ export function checkDismissEligibility({ session, findingId, headSha, sourceCom
 
 export function recordDismissAttempt({
   session, findingId, headSha, sourceCommentId, inputHash = '', verdict,
-  reason = '', unavailable = false, claudeCharge = null, now = new Date().toISOString(),
+  reason = '', unavailable = false, claudeCharge = null, kind = 'dismissed', now = new Date().toISOString(),
 } = {}) {
   validateSession(session);
   checkedSha(headSha, 'headSha');
@@ -854,6 +854,7 @@ export function recordDismissAttempt({
     commentId: commentKey,
     inputHash: String(inputHash ?? '').slice(0, 16),
     verdict,
+    ...(kind === 'accepted' ? { kind: 'accepted' } : {}),
     ...(unavailable ? { unavailable: true } : {}),
     ...(reason ? { reason: compactText(reason, 120) } : {}),
     at: now,
@@ -989,6 +990,65 @@ export function applyFindingDismissal({
       + findingId + ' by @' + by + '; remaining material findings: ' + remaining + '.',
       800,
     ),
+    updatedAt: now,
+  };
+}
+
+// The owner states a blocking P3 finding is real and accepts the risk. Same closure as a verified dismissal
+// (status DISMISSED, so status recomputation, carry-forward and suppression are the existing ones), but the
+// record says what happened: dismissal.kind 'accepted', the owner's own words, and who/when/HEAD/comment.
+// Callers check owner and severity first; this re-checks severity so a P0-P2 can never be closed this way.
+export function applyFindingAcceptance({
+  session, findingId, headSha, by, statement, sourceCommentId,
+  verification = null, inputHash = '', now = new Date().toISOString(),
+} = {}) {
+  validateSession(session);
+  checkedSha(headSha, 'headSha');
+  if (!['REWORK', 'HUMAN_REQUIRED'].includes(session.status)) {
+    throw new Error('acceptance requires REWORK or HUMAN_REQUIRED');
+  }
+  if (!/^F[0-9]{3,}$/.test(String(findingId ?? ''))) throw new Error('invalid acceptance finding id');
+  if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})(?:\[bot\])?$/.test(String(by ?? ''))) {
+    throw new Error('invalid acceptance actor');
+  }
+  if (!/^[1-9]\d*$/.test(String(sourceCommentId ?? ''))) throw new Error('invalid acceptance source comment id');
+  const words = compactText(String(statement ?? '').trim(), 1200);
+  if (!words) throw new Error('acceptance needs the owner\'s own words');
+  const item = session.findings.find((finding) => finding.id === findingId);
+  if (!item || !['OPEN', 'UNCERTAIN'].includes(item.status) || !isBlocking(item) || item.severity !== 'P3') {
+    throw new Error('acceptance finding must be an OPEN or UNCERTAIN blocking P3');
+  }
+  const verifiedBy = compactText(verification?.provider || 'gemini', 24);
+  const verdictReason = verification?.reason ? compactText(verification.reason, 300) : '';
+  const findings = session.findings.map((finding) => finding.id === findingId
+    ? {
+      ...finding, status: 'DISMISSED', lastCheckedHead: headSha,
+      resolutionReason: compactText(`Risk accepted by @${by}: ${words}`, 300),
+      dismissal: {
+        kind: 'accepted', by, at: now, head: headSha, sourceCommentId: String(sourceCommentId),
+        reason: words, evidence: [], verifiedBy,
+        ...(verification?.model ? { model: compactText(verification.model, 80) } : {}),
+        ...(verdictReason ? { verdictReason } : {}),
+      },
+    }
+    : { ...finding });
+  const remaining = findings.filter((finding) =>
+    ['OPEN', 'UNCERTAIN'].includes(finding.status) && isBlocking(finding)).length;
+  const status = remaining
+    ? findings.some((f) => f.status === 'OPEN') ? 'REWORK' : 'HUMAN_REQUIRED'
+    : session.auditCompleted === true && session.lastReviewedHead === headSha ? 'READY' : 'AUDIT_PENDING';
+  let next = session;
+  if (verification?.claudeCharge && Number.isFinite(verification.claudeCharge.amount) && verification.claudeCharge.amount > 0) {
+    next = chargeClaudeFallback(next, verification.claudeCharge.amount, verification.claudeCharge.source || 'sdk');
+  }
+  next = recordDismissAttempt({
+    session: next, findingId, headSha, sourceCommentId, inputHash,
+    verdict: 'DISMISSED', reason: verdictReason || words, kind: 'accepted', now,
+  });
+  const base = remaining === 0 ? stripTransientState(next, headSha) : next;
+  return {
+    ...base, findings, status,
+    lastSummary: compactText(`Risk accepted by @${by} for ${findingId}; remaining material findings: ${remaining}.`, 800),
     updatedAt: now,
   };
 }
@@ -1145,15 +1205,21 @@ export function renderSessionComment(session, { sourceCommentIds = [], finalRevi
           ? `The final full review is NOT running right now: ${cleanInline(finalReview.reason || 'it did not start')}. Comment \`@gemini review\` to start it.`
           : 'The final full review is the next step, but it may not be running right now. If no new run appears on this PR, comment `@gemini review` to start it.')
       : session.status === 'REWORK'
-        ? 'Push a repair for real bugs; for a disproven finding post `@gemini dismiss F001` and say in your own words why. Dismissal does not change product code.'
+        ? 'Push a repair for real bugs; for a disproven finding post `@gemini dismiss F001` and say in your own words why. Dismissal does not change product code. For a real minor (P3) finding the owner can accept instead: `@gemini accept F001 <the risk, and what happens if it occurs>`.'
         : 'Automatic review budget is exhausted. Use human judgment or a targeted Codex/Claude review; do not restart full discovery automatically.';
   const dismissed = session.findings.filter((finding) => finding.status === 'DISMISSED').slice(-4);
   const hasVerifiedDismissal = dismissed.some((finding) => Boolean(finding.dismissal?.verifiedBy));
   const dismissalLines = dismissed.flatMap((finding) => [
+    ...(finding.dismissal?.kind === 'accepted' ? [
+      '- ' + finding.id + ' [risk accepted] by @' + cleanInline(finding.dismissal?.by ?? 'unknown')
+        + ' on ' + cleanInline(String(finding.dismissal?.head ?? '').slice(0, 7))
+        + ' — ' + cleanInline(finding.dismissal?.reason || ''),
+    ] : [
     '- ' + finding.id + (finding.dismissal?.verifiedBy ? ` [verified by ${cleanInline(finding.dismissal.verifiedBy)}]` : '')
       + ' dismissed by @' + cleanInline(finding.dismissal?.by ?? 'unknown')
       + ' — ' + cleanInline(finding.dismissal?.verdictReason || finding.dismissal?.reason || ''),
     '  - Evidence: ' + (finding.dismissal?.evidence ?? []).map(cleanInline).join(' · '),
+    ]),
   ]);
   const threadLines = session.findings
     .filter((finding) => finding.status === 'WAIVED' && finding.resolvedVia === 'thread')
@@ -1198,7 +1264,7 @@ export function renderSessionComment(session, { sourceCommentIds = [], finalRevi
     ] : []),
     '',
     ...findingLines,
-    ...(dismissalLines.length ? ['', hasVerifiedDismissal ? 'Dismissed findings (bot-verified):' : 'Human-dismissed findings (cited, not machine-verified):', ...dismissalLines] : []),
+    ...(dismissalLines.length ? ['', dismissed.some((finding) => finding.dismissal?.kind === 'accepted') ? 'Dismissed findings and accepted risks:' : hasVerifiedDismissal ? 'Dismissed findings (bot-verified):' : 'Human-dismissed findings (cited, not machine-verified):', ...dismissalLines] : []),
     ...(threadLines.length ? ['', 'Closed by people (review thread resolved):', ...threadLines] : []),
     ...(orphanLine ? ['', orphanLine] : []),
     '',

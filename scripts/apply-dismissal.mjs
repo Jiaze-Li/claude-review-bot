@@ -6,6 +6,7 @@ import { saveSessionComment } from './session-comment.mjs';
 import { ledgerOptions, loadSession } from './session-store.mjs';
 import { finalReviewOutlook } from './continue-review.mjs';
 import {
+  applyFindingAcceptance,
   applyFindingDismissal,
   chargeClaudeFallback,
   checkDismissEligibility,
@@ -14,8 +15,8 @@ import {
   renderSessionComment,
 } from './review-session-core.mjs';
 import { fetchReviewThreads, replyToThread, threadsByFinding } from './review-threads.mjs';
-import { verifyDismissalWithModel } from './dismiss-verifier.mjs';
-import { parseDismissalRequest } from '../worker/src/review-trigger.js';
+import { verifyAcceptanceWithModel, verifyDismissalWithModel } from './dismiss-verifier.mjs';
+import { dismissalCommandKind, parseDismissalRequest } from '../worker/src/review-trigger.js';
 
 // Independent model verification for @gemini dismiss F001. All user-origin
 // facts are re-fetched from GitHub rather than trusted from workflow_dispatch.
@@ -78,8 +79,9 @@ export async function applyManualDismissal({
       repo,
       prNumber,
       sourceId,
-      heading: '**Dismissal command format invalid**',
+      heading: dismissalCommandKind(source.body) === 'accepted' ? '**Acceptance command format invalid**' : '**Dismissal command format invalid**',
       reason: String(parseError?.message || parseError),
+      kind: dismissalCommandKind(source.body) ?? 'dismissed',
       fetchImpl,
       env,
     });
@@ -97,6 +99,22 @@ export async function applyManualDismissal({
     throw new Error('Durable review session changed since planning; refusing stale dismissal');
   }
 
+  const isAcceptance = decision.kind === 'accepted';
+  const noun = isAcceptance ? 'acceptance' : 'dismissal';
+  // Only the repository admin (the owner) can accept a risk. Anyone else changes nothing and costs no model call.
+  if (isAcceptance && permission.permission !== 'admin') {
+    await postInvalidDismissalReply({
+      repo, prNumber, sourceId,
+      heading: `**${decision.findingId} cannot be accepted by @${by}**`,
+      reason: 'Only the repository owner can accept a risk. A repository writer can still dismiss a finding with `@gemini dismiss`, or fix it and push.',
+      kind: 'accepted',
+      fetchImpl, env,
+    });
+    writePublishedSession(contextRoot, { mode: 'dismiss', verdict: 'INVALID', skippedModel: true, session: durable, sessionCommentId: plan.sessionCommentId });
+    console.log(`Acceptance of ${decision.findingId} refused: @${by} is not the repository owner.`);
+    return durable;
+  }
+
   const targetFinding = durable.findings.find((f) => f.id === decision.findingId);
   if (!targetFinding || !['OPEN', 'UNCERTAIN'].includes(targetFinding.status) || !isBlockingFinding(targetFinding)) {
     const openIds = durable.findings
@@ -105,14 +123,15 @@ export async function applyManualDismissal({
     const reason = !targetFinding
       ? `Finding **${decision.findingId}** was not found in this review session.${openIds.length ? ` Open blocking findings: ${openIds.join(', ')}.` : ''}`
       : !['OPEN', 'UNCERTAIN'].includes(targetFinding.status)
-        ? `Finding **${decision.findingId}** is already **${targetFinding.status}** and does not need dismissal.`
-        : `Finding **${decision.findingId}** is non-blocking (${targetFinding.severity}) and does not require dismissal.`;
+        ? `Finding **${decision.findingId}** is already **${targetFinding.status}** and does not need ${noun}.`
+        : `Finding **${decision.findingId}** is non-blocking (${targetFinding.severity}) and does not require ${noun}.`;
     await postInvalidDismissalReply({
       repo,
       prNumber,
       sourceId,
-      heading: `**${decision.findingId} cannot be dismissed**`,
+      heading: `**${decision.findingId} cannot be ${isAcceptance ? 'accepted' : 'dismissed'}**`,
       reason,
+      kind: decision.kind ?? 'dismissed',
       fetchImpl,
       env,
     });
@@ -121,8 +140,23 @@ export async function applyManualDismissal({
     return durable;
   }
 
+  // Only minor findings can be accepted; anything more serious is refused plainly, with no model call.
+  if (isAcceptance && targetFinding.severity !== 'P3') {
+    await postInvalidDismissalReply({
+      repo, prNumber, sourceId,
+      heading: `**${decision.findingId} cannot be accepted**`,
+      reason: `Only minor (P3) findings can be accepted, and this one is ${targetFinding.severity}. Fix it, or dismiss it with proof that it is not a real problem.`,
+      kind: 'accepted',
+      fetchImpl, env,
+    });
+    writePublishedSession(contextRoot, { mode: 'dismiss', verdict: 'INVALID', skippedModel: true, session: durable, sessionCommentId: plan.sessionCommentId });
+    console.log(`Acceptance target ${decision.findingId} is ${targetFinding.severity}; refused without a model call.`);
+    return durable;
+  }
+
+  // An acceptance and a dismissal that use the same words are different claims.
   const inputHash = createHash('sha256')
-    .update(decision.reason.trim() + '\n' + decision.evidence.join('\n'))
+    .update((isAcceptance ? 'accepted\n' : '') + decision.reason.trim() + '\n' + decision.evidence.join('\n'))
     .digest('hex')
     .slice(0, 16);
 
@@ -141,8 +175,8 @@ export async function applyManualDismissal({
     }
     const priorReason = eligibility.entry?.reason || 'Previous dismissal rebuttal on this HEAD was already rejected.';
     const message = eligibility.kind === 'duplicate_rebuttal'
-      ? `Repeated identical rebuttal for **${decision.findingId}** on this commit was not re-run. ${priorReason}`
-      : `Per-commit dismissal verification limit reached for **${decision.findingId}** on this commit without new code changes.`;
+      ? `Repeated identical ${isAcceptance ? 'statement' : 'rebuttal'} for **${decision.findingId}** on this commit was not re-run. ${priorReason}`
+      : `Per-commit ${noun} verification limit reached for **${decision.findingId}** on this commit without new code changes.`;
     const recorded = recordDismissAttempt({
       session: durable,
       findingId: decision.findingId,
@@ -151,6 +185,7 @@ export async function applyManualDismissal({
       inputHash,
       verdict: 'REJECTED',
       reason: message,
+      kind: decision.kind ?? 'dismissed',
     });
     const body = renderSessionComment(recorded, {
       sourceCommentIds: [sourceId],
@@ -163,9 +198,11 @@ export async function applyManualDismissal({
     });
     await postDismissalOutcomeReply({
       repo, prNumber, expectedAuthor, session: recorded, findingId: decision.findingId,
-      heading: `**${decision.findingId} dismissal not re-run**`,
+      heading: `**${decision.findingId} ${noun} not re-run**`,
       reason: message,
-      nextStep: 'Push a code/test fix, or have a repository maintainer use `override review` if accepting risk.',
+      nextStep: isAcceptance
+        ? 'Reword the statement (what the risk is, and what happens if it occurs), or push a fix.'
+        : 'Push a code/test fix, or have a repository maintainer use `override review` if accepting risk.',
       env, fetchImpl,
     });
     writePublishedSession(contextRoot, { mode: 'dismiss', verdict: 'REJECTED', skippedModel: true, session: recorded, sessionCommentId: savedId });
@@ -176,7 +213,13 @@ export async function applyManualDismissal({
   const diffPath = path.join(contextRoot, 'pr.diff');
   const prDiff = fs.existsSync(diffPath) ? fs.readFileSync(diffPath, 'utf8') : '';
 
-  const verdict = await verifyDismissalWithModel({
+  const verdict = isAcceptance
+    ? await verifyAcceptanceWithModel({
+      repo, prNumber, headSha, finding: targetFinding, statement: decision.reason, session: durable,
+      env, fetchImpl: modelFetchImpl,
+      queryImpl,
+    })
+    : await verifyDismissalWithModel({
     repo,
     prNumber,
     headSha,
@@ -222,7 +265,41 @@ export async function applyManualDismissal({
     throw staleError;
   }
 
-  if (verdict.verdict === 'DISMISSED') {
+  if (isAcceptance && verdict.verdict === 'ACCEPTED') {
+    const session = applyFindingAcceptance({
+      session: durable,
+      findingId: decision.findingId,
+      headSha,
+      by,
+      statement: decision.reason,
+      sourceCommentId: sourceId,
+      verification: verdict,
+      inputHash,
+    });
+    const body = renderSessionComment(session, {
+      sourceCommentIds: [sourceId],
+      finalReview: finalReviewOutlook({ session, headSha, sourceCommentId: env.SOURCE_COMMENT_ID, planMode: 'dismiss' }),
+    });
+    const savedId = await saveSessionComment({
+      target: repo, prNumber, token: env.GH_TOKEN, fetchImpl,
+      existingId: plan.sessionCommentId, previous: durable, session, body,
+      ledger: ledgerOptions(env, { sourceCommentIds: [sourceId], stage: 'closing', expectedSeq: plan.ledgerSeq ?? null }),
+    });
+    await postDismissalOutcomeReply({
+      repo, prNumber, expectedAuthor, session, findingId: decision.findingId,
+      heading: `**${decision.findingId} risk accepted by @${by}**`,
+      reason: `Recorded in the review summary with your own words. ${verdict.reason}`,
+      nextStep: session.status === 'AUDIT_PENDING'
+        ? 'No other blocking findings remain; the final audit is the next step.'
+        : session.status === 'READY' ? '' : 'Other blocking findings remain.',
+      env, fetchImpl,
+    });
+    writePublishedSession(contextRoot, { mode: 'dismiss', verdict: 'DISMISSED', session, sessionCommentId: savedId });
+    console.log(`Risk acceptance recorded (${verdict.provider}): ${decision.findingId}; status ${session.status}.`);
+    return session;
+  }
+
+  if (!isAcceptance && verdict.verdict === 'DISMISSED') {
     const session = applyFindingDismissal({
       session: durable,
       findingId: decision.findingId,
@@ -254,10 +331,12 @@ export async function applyManualDismissal({
     headSha,
     sourceCommentId: sourceId,
     inputHash,
-    verdict: verdict.verdict,
+    // an acceptance that was not ACCEPTED is ledgered as REJECTED (wrong or vague) or INCONCLUSIVE, never DISMISSED
+    verdict: isAcceptance ? (verdict.verdict === 'INCONCLUSIVE' ? 'INCONCLUSIVE' : 'REJECTED') : verdict.verdict,
     reason: verdict.reason,
     unavailable: Boolean(verdict.unavailable),
     claudeCharge: verdict.claudeCharge,
+    kind: decision.kind ?? 'dismissed',
   });
   const body = renderSessionComment(session, {
     sourceCommentIds: [sourceId],
@@ -270,22 +349,33 @@ export async function applyManualDismissal({
   });
 
   const isRejected = verdict.verdict === 'REJECTED';
+  const acceptanceHeading = verdict.verdict === 'MISMATCH'
+    ? `**${decision.findingId} acceptance does not match the finding (kept blocking)**`
+    : verdict.verdict === 'TOO_VAGUE'
+      ? `**${decision.findingId} acceptance too vague (kept blocking)**`
+      : `**${decision.findingId} acceptance inconclusive (kept blocking)**`;
   await postDismissalOutcomeReply({
     repo,
     prNumber,
     expectedAuthor,
     session,
     findingId: decision.findingId,
-    heading: isRejected
-      ? `**${decision.findingId} dismissal rejected**`
-      : `**${decision.findingId} dismissal inconclusive (kept blocking)**`,
+    heading: isAcceptance
+      ? acceptanceHeading
+      : isRejected
+        ? `**${decision.findingId} dismissal rejected**`
+        : `**${decision.findingId} dismissal inconclusive (kept blocking)**`,
     reason: verdict.reason,
     nextStep: verdict.nextStep,
     env,
     fetchImpl,
   });
-  writePublishedSession(contextRoot, { mode: 'dismiss', verdict: verdict.verdict, session, sessionCommentId: savedId });
-  console.log(`Dismissal ${verdict.verdict.toLowerCase()} for ${decision.findingId}; status ${session.status} remains blocking.`);
+  writePublishedSession(contextRoot, {
+    mode: 'dismiss',
+    verdict: isAcceptance ? (verdict.verdict === 'INCONCLUSIVE' ? 'INCONCLUSIVE' : 'REJECTED') : verdict.verdict,
+    session, sessionCommentId: savedId,
+  });
+  console.log(`${isAcceptance ? 'Acceptance' : 'Dismissal'} ${verdict.verdict.toLowerCase()} for ${decision.findingId}; status ${session.status} remains blocking.`);
   return session;
 }
 
@@ -294,8 +384,13 @@ const DISMISSAL_FORMAT_EXAMPLE = [
   '@gemini dismiss F001 <say in your own words why this is not a problem; mention the file or line if it helps>',
   '```',
 ].join('\n');
+const ACCEPTANCE_FORMAT_EXAMPLE = [
+  '```text',
+  '@gemini accept F001 <what the risk is, and what happens if it occurs>',
+  '```',
+].join('\n');
 
-async function postInvalidDismissalReply({ repo, prNumber, sourceId, heading, reason, env, fetchImpl }) {
+async function postInvalidDismissalReply({ repo, prNumber, sourceId, heading, reason, kind = 'dismissed', env, fetchImpl }) {
   const body = [
     `Handled: comment ${sourceId} (version created) → guidance posted, no review was run`,
     heading,
@@ -303,7 +398,7 @@ async function postInvalidDismissalReply({ repo, prNumber, sourceId, heading, re
     reason,
     '',
     'How to ask:',
-    DISMISSAL_FORMAT_EXAMPLE,
+    kind === 'accepted' ? ACCEPTANCE_FORMAT_EXAMPLE : DISMISSAL_FORMAT_EXAMPLE,
   ].join('\n');
   await github(`https://api.github.com/repos/${repo}/issues/${prNumber}/comments`, env.GH_TOKEN, fetchImpl, {
     method: 'POST',
