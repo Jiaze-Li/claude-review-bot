@@ -25,7 +25,7 @@ F9 对外调用契约：`review.yml:5` 的 `inputs`（含 `requested_mode`）经
 ## 3. Options
 
 - **A 全量改名**：把 `deepReview`、`deep_review_stale`、预算常量一并改名并迁移持久化记录。否决：触碰 #97 冻结的持久化格式，需要迁移与回滚方案，收益只是内部命名；与 Plan“不重新设计历史记录持久化”冲突。
-- **B（选定）在规划输出上显式拆成 `scope` 与 `providerPolicy` 两个字段；完整审查的路由名由 `claude` 改为 `full`；四处提供方判断收敛到一个解析函数；用户可见文案去掉 “deep”；持久化字段与预算常量原样保留并标注为历史存储名。**
+- **B（选定）在规划输出上显式拆成 `reviewScope` 与 `providerPolicy` 两个字段；完整审查的路由名由 `claude` 改为 `full`；四处提供方判断收敛到一个解析函数；用户可见文案去掉 “deep”；持久化字段与预算常量原样保留并标注为历史存储名。**
 - **C 仅改文案**：不改代码路径，只替换字符串。否决：不满足“只允许一处权威范围决策”和“提供方解耦可被测试证明”，四处 `requestedMode==='claude'` 继续各自为政。
 
 ## 4. Assumptions（大白话）
@@ -40,13 +40,13 @@ F9 对外调用契约：`review.yml:5` 的 `inputs`（含 `requested_mode`）经
 ## 5. 设计
 
 **5.1 规划输出**：`planSession` 的 `decision` 增加两个字段，其余字段不变：
-- `scope`：`'full'`（`full_review` 终态路由与 F2 的三处 `claude`）、`'targeted'`（`verification`、`incremental`）、`null`（`noop_*`/`human_required`/`recover` 等不审查的决定）。
+- `reviewScope`（不叫 `scope`：规划器早已用 `decision.scope = 'current-pr'` 标记“整个当前 PR 的核验”，同名会覆盖它）：`'full'`（`full_review` 终态路由与 F2 的三处 `claude`）、`'targeted'`（`verification`、`incremental`）、`null`（`noop_*`/`human_required`/`recover` 等不审查的决定）。
 - 路由名：F2 三处返回值由 `mode:'claude'` 改为 `mode:'full'`；读取方额外接受 `'claude'`（别名）。
 - `plan.providerPolicy`：`requestedMode==='claude'` → `'claude_only'`，否则 `'default'`（Gemini 优先、Claude 后备）；由规划器写入一次。
 
 **5.2 提供方解耦**：新增 `providerPolicyOf(plan)`（放在 `review-session-core.mjs`，与 `isManualBudgetExemptReview` 同处）。F4 四处改为调用它；`isManualBudgetExemptReview` 的判定与数值不变。`continue-review` 的续审仍沿用 `requested_mode` 输入（F9），行为不变。范围规划函数不得读取 `providerPolicy`。
 
-**5.3 范围权威**：执行/发布/状态模块只读 `decision.scope` 与 `decision.mode`，不得再由 `requestedMode` 重推阶段。`@claude review` 与 `@gemini review` 唯一差别 = `providerPolicy`。F3 的 `plan-review-session.mjs:111`（同 HEAD 运行中则等待）**保持不变**：`auto` 在同样状态下已由 `review-session-core.mjs:98-104` 返回 `noop_waiting`（`REVIEW_IN_PROGRESS` 且同 HEAD），因此 `auto` 与 `claude` 的等待结果相同，`:111` 只是为 `reset` 与 `claude` 在规划前提前返回；本任务不改它，也不改变同 HEAD 去重行为（Plan AC 8），仅用测试证明二者一致。
+**5.3 范围权威**：执行/发布/状态模块只读 `decision.reviewScope` 与 `decision.mode`，不得再由 `requestedMode` 重推阶段。`@claude review` 与 `@gemini review` 唯一差别 = `providerPolicy`。F3 的 `plan-review-session.mjs:111`（同 HEAD 运行中则等待）**保持不变**：`auto` 在同样状态下已由 `review-session-core.mjs:98-104` 返回 `noop_waiting`（`REVIEW_IN_PROGRESS` 且同 HEAD），因此 `auto` 与 `claude` 的等待结果相同，`:111` 只是为 `reset` 与 `claude` 在规划前提前返回；本任务不改它，也不改变同 HEAD 去重行为（Plan AC 8），仅用测试证明二者一致。
 
 **5.4 用户可见语言**：提交状态与报告文案改为“Full review in progress / did not complete”“Stale review cleanup…”（Assumption 2 成立时）；报告详情可写“分片/所用模型/覆盖”，并明确不是额外阶段；README 与 `review-v2.yml` 步骤名同步。`sweep-stale-deep-reviews.yml` 文件名不改（避免触发器与引用失效），仅改显示名。
 
@@ -54,7 +54,7 @@ F9 对外调用契约：`review.yml:5` 的 `inputs`（含 `requested_mode`）经
 
 ## 6. 不变量
 
-I1 同一 `(session, baseSha, headSha, 触发类型)`，`auto` 与 `claude` 的 `decision.scope` 与 `decision.mode` 逐一相同（含同 HEAD 运行中的 `noop_waiting`，无例外）。
+I1 同一 `(session, baseSha, headSha, 触发类型)`，`auto` 与 `claude` 的 `decision.reviewScope` 与 `decision.mode` 逐一相同（含同 HEAD 运行中的 `noop_waiting`，无例外）。
 I2 READY 判定、覆盖、终审、dismiss 与 #97 行为不变；指定 Claude 不降低任何检查。
 I3 预算数值与 manual/自动规则（F5）逐字不变。
 I4 仅 `providerPolicyOf` 读取 `requestedMode==='claude'`（除 F3 触发解析与 F9 输入透传）。
@@ -77,7 +77,7 @@ I6 所有用户可见文案不含 “deep review”；日常无需选择范围�
 ## 8. 实现顺序
 
 1. 核实 Assumption 2；加矩阵测试、预算快照测试（先在现有代码上应当通过，证明基线）。
-2. 规划器加 `scope`/`providerPolicy`，路由名改 `full`（读取方兼容 `claude`），`providerPolicyOf` 并收敛四处。
+2. 规划器加 `reviewScope`/`providerPolicy`，路由名改 `full`（读取方兼容 `claude`），`providerPolicyOf` 并收敛四处。
 3. 用户可见文案、`review-v2.yml` 条件与步骤名、README；补文案/工作流静态测试。
 4. 跑全量 `npm test`；真实 PR 端到端仅在获授权后执行，未执行则如实标“未执行”。
 
@@ -91,7 +91,7 @@ I6 所有用户可见文案不含 “deep review”；日常无需选择范围�
 ## Work Contract（Code 阶段直接使用）
 
 **可观察结果**
-1. 规划决定带 `scope`（full/targeted/null）；完整审查路由名为 `full`；`@gemini review` 与 `@claude review` 在同一状态下 scope/mode 一致，仅 `providerPolicy` 不同。
+1. 规划决定带 `reviewScope`（full/targeted/null）；完整审查路由名为 `full`；`@gemini review` 与 `@claude review` 在同一状态下 scope/mode 一致，仅 `providerPolicy` 不同。
 2. 提供方判断只在 `providerPolicyOf`；其余模块不读 `requestedMode==='claude'` 决定范围或阶段。
 3. 用户可见文案、提交状态、README、工作流显示名不再出现 “deep review”；真实执行细节（分片/模型/覆盖）可保留且不暗示额外阶段。
 

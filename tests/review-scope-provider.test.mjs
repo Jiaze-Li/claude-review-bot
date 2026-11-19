@@ -50,8 +50,8 @@ test('I1: auto and claude get the same scope and route for every session state; 
       const [auto, claude] = [await run('auto'), await run('claude')];
       const label = `${name}/${sourceKind}`;
       assert.equal(claude.decision.mode, auto.decision.mode, label);
-      assert.equal(claude.decision.scope, auto.decision.scope, label);
-      assert.equal(claude.decision.scope, scopeOfMode(claude.decision.mode), label);
+      assert.equal(claude.decision.reviewScope, auto.decision.reviewScope, label);
+      assert.equal(claude.decision.reviewScope, scopeOfMode(claude.decision.mode), label);
       assert.equal(auto.providerPolicy, 'default', label);
       assert.equal(claude.providerPolicy, 'claude_only', label);
     }
@@ -146,7 +146,7 @@ test('the final plan from runSessionPlanner always carries a scope that matches 
   const e = env({ REVIEW_CONTEXT_DIR: fs.mkdtempSync(path.join(process.env.TMPDIR || '/tmp', 'scope-')), REQUESTED_MODE: 'claude' });
   const plan = await runSessionPlanner({ env: e, fetchImpl: fetchWith(null), log: { log() {}, warn() {} } });
   assert.equal(plan.decision.mode, 'full');
-  assert.equal(plan.decision.scope, 'full');
+  assert.equal(plan.decision.reviewScope, 'full');
   assert.equal(plan.providerPolicy, 'claude_only');
 });
 
@@ -192,4 +192,11 @@ test('Assumption 2: the required status check name is a constant that no wording
   assert.equal(STATUS_CONTEXT, 'claude-review-bot/review');
   const source = fs.readFileSync(path.join(root, 'scripts/sync-commit-status.mjs'), 'utf8');
   assert.match(source, /context: STATUS_CONTEXT, description: status\.description/);
+});
+
+test('adding the review scope keeps the existing whole-PR marker on a rewritten-history verification', async () => {
+  const { withScopeAndPolicy } = await import('../scripts/plan-review-session.mjs');
+  const plan = withScopeAndPolicy({ requestedMode: 'auto', decision: { mode: 'verification', scope: 'current-pr' } });
+  assert.equal(plan.decision.scope, 'current-pr');
+  assert.equal(plan.decision.reviewScope, 'targeted');
 });

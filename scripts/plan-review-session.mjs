@@ -13,8 +13,8 @@ const shaPattern=/^[0-9a-f]{40}$/i;
 export const MAX_CARRIED_FINDINGS=8;
 
 // The plan carries the scope of this review and, separately, which model policy applies (see review-session-core).
-function withScopeAndPolicy(plan){
-  return {...plan,providerPolicy:providerPolicyFor(plan.requestedMode),decision:{...plan.decision,scope:scopeOfMode(plan.decision?.mode)}};
+export function withScopeAndPolicy(plan){
+  return {...plan,providerPolicy:providerPolicyFor(plan.requestedMode),decision:{...plan.decision,reviewScope:scopeOfMode(plan.decision?.mode)}};
 }
 
 export async function planSession(args={}) {
