@@ -95,6 +95,7 @@ test('a writer resolving a P3 thread writes it into the session comment, with no
   assert.match(patches[0], /findings\[2\]\.status: "WAIVED"/);
   assert.match(pr.issue.map((c) => c.body).join('\n'), /Handled: comment 99 \(version created\)/);
   assert.equal(pr.session().findings[2].status, 'WAIVED');
+  assert.match(pr.issue.findLast((c) => /Handoff: COMPLETE/.test(c.body)).body, /^Spend: this run \$0\.00 \(no model call\) \/ cumulative/m);
 });
 
 test('only writers\' resolves count; the bot\'s own resolves, marker-less threads and other authors\' threads do not', async () => {

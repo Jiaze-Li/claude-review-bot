@@ -34,6 +34,8 @@ test('recovery persists pending session with both original and retry source mark
   assert.ok(pr.issue.some(c=>/Handoff: COMPLETE/.test(c.body)&&/session\.status: "AUDIT_PENDING"/.test(c.body)));
   assert.equal(out.sessionCommentId,pr.issue.at(-1).id);
   assert.match(pr.issue.at(-1).body,/Status: \*\*AUDIT_PENDING\*\*/);
+  // the spend in the session came from an earlier run: say so instead of claiming this run was free
+  assert.match(pr.issue.findLast(c=>/Handoff: COMPLETE/.test(c.body)).body,/^Spend: this run not recorded \(recovered from a review published by an earlier run\) \/ cumulative/m);
 });
 
 test('recovery fails closed if PR HEAD moved and writes no session', async () => {

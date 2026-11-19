@@ -91,8 +91,9 @@ export function deriveStage(session) {
 // -> { ids: [...], handoffCommentId, seq, projectionId }
 export async function writeSessionRecords({
   target, prNumber, token, fetchImpl = fetch, botLogin, session, stage = null, sourceCommentIds = [], commentVersion = 'created',
-  spendThisRun = 0, next = '', readyReason = '', recordIds = {}, expectedSeq = null, runId = null, intro = [], verdicts = [],
+  runSpend, spendThisRun, next = '', readyReason = '', recordIds = {}, expectedSeq = null, runId = null, intro = [], verdicts = [],
 }) {
+  if (spendThisRun !== undefined) throw new Error('spendThisRun is retired: pass runSpend (see runSpendFromCharges)');
   if (!botLogin) throw new Error('Missing EXPECTED_REVIEW_AUTHOR: cannot read or write the review ledger');
   const { ledger } = await loadLedger({ target, prNumber, token, fetchImpl, botLogin, closingStage: true });
   if (ledger.state === 'stopped') throw new LedgerStopped(ledger);
@@ -144,7 +145,7 @@ export async function writeSessionRecords({
   const attempts = repairAttempts(session.findings ?? [], [...(ledger.verdicts ?? []), ...written]);
   const bodies = renderHandoffParts({
     session, stage: stage ?? deriveStage(session), seq, prev: ledger.handoff?.commentId ?? null,
-    attempts, recordIds, spendThisRun, next: next || nextStepFor(session), readyReason: readyReason || readyReasonFor(session), intro,
+    attempts, recordIds, runSpend, next: next || nextStepFor(session), readyReason: readyReason || readyReasonFor(session), intro,
   });
   let handoffCommentId = null;
   for (const body of bodies) {

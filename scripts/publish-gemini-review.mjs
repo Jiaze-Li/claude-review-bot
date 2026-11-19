@@ -1,4 +1,4 @@
-import { renderFindingRecord } from './review-ledger.mjs';
+import { renderFindingRecord, runSpendFromCharges } from './review-ledger.mjs';
 import { saveSessionComment } from './session-comment.mjs';
 import { ledgerOptions } from './session-store.mjs';
 import { renderPendingHandoff } from './review-ledger.mjs';
@@ -66,10 +66,20 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
 
   // Charge every completed Claude call separately, preserving reported versus
   // conservatively reserved spend. Never label a legacy amount as SDK-reported.
+  // The charges applied here are also what the Handoff reports as this run's spend (display only).
+  const appliedCharges = [];
+  let claudeCalls = 0; let unknownCalls = 0;
   for (const meta of [raw._meta, raw._validation?._meta]) {
-    if (meta?.provider === 'claude' && Number.isFinite(meta.total_cost_usd) && meta.total_cost_usd > 0)
-      session = chargeClaudeFallback(session, meta.total_cost_usd, meta.cost_source === 'reserve' ? 'reserve' : 'sdk');
+    if (meta?.provider !== 'claude') continue;
+    claudeCalls += 1;
+    if (!Number.isFinite(meta.total_cost_usd) || meta.cost_source === 'unknown') unknownCalls += 1;
+    if (Number.isFinite(meta.total_cost_usd) && meta.total_cost_usd > 0) {
+      const source = meta.cost_source === 'reserve' ? 'reserve' : 'sdk';
+      session = chargeClaudeFallback(session, meta.total_cost_usd, source);
+      appliedCharges.push({ amount: meta.total_cost_usd, source });
+    }
   }
+  const runSpend = runSpendFromCharges(appliedCharges, { unknownCalls, note: claudeCalls === 0 ? 'Gemini only, no Claude charge' : '' });
 
   // Every verification answer becomes a readable Verdict record on the PR, written before the handoff that closes the stage.
   const verdictRecords = mode === 'verification'
@@ -201,7 +211,7 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
 
   const sessionCommentId = await saveSessionComment({
     target: owner + '/' + repo, prNumber, existingId: plan.sessionCommentId, previous: plan.session, session, body: sessionBody, token: env.GH_TOKEN, fetchImpl,
-    ledger: ledgerOptions(env, { sourceCommentIds: [sourceCommentId], expectedSeq: plan.ledgerSeq, spendThisRun: spentThisRun(raw), verdicts: verdictRecords }),
+    ledger: ledgerOptions(env, { sourceCommentIds: [sourceCommentId], expectedSeq: plan.ledgerSeq, runSpend, verdicts: verdictRecords }),
   });
   const publishedStatePath = path.join(contextRoot, 'published-session.json');
   fs.writeFileSync(publishedStatePath, JSON.stringify({
@@ -210,11 +220,6 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
   console.log('Published Gemini ' + mode + ' review ' + (review.html_url || review.id)
     + '; session comment ' + sessionCommentId + '; status ' + session.status + '.');
   return { session, sessionCommentId, reviewId: review.id };
-}
-
-// What this run cost, from the usage the provider reported (zero for a provider that reports none).
-function spentThisRun(raw) {
-  return [raw?._meta, raw?._validation?._meta].reduce((sum, meta) => sum + (meta?.provider === 'claude' && Number.isFinite(meta.total_cost_usd) ? meta.total_cost_usd : 0), 0);
 }
 
 // Findings the session filter removed. Identity is path + title: two findings

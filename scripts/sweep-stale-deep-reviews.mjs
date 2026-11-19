@@ -1,5 +1,6 @@
 import { saveSessionComment } from './session-comment.mjs';
 import { ledgerOptions, loadLedger } from './session-store.mjs';
+import { runSpendFromCharges } from './review-ledger.mjs';
 import { pathToFileURL } from 'node:url';
 import {
   DEEP_REVIEW_RUN_BUDGET_USD, failDeepReview, isDeepReviewStale, renderSessionComment,
@@ -52,14 +53,15 @@ export async function closeStaleDeepReview({ repo, prNumber, env = process.env, 
     console.log(`${repo}#${prNumber}: no longer a stale full review; leaving it alone.`);
     return false;
   }
+  const spentUsd = session.deepReview?.reservedUsd ?? DEEP_REVIEW_RUN_BUDGET_USD;
   const closed = failDeepReview({
     session, headSha: session.lastReviewedHead, reason: 'full review never reported back (swept after timeout)',
-    spentUsd: session.deepReview?.reservedUsd ?? DEEP_REVIEW_RUN_BUDGET_USD, now: new Date(now).toISOString(),
+    spentUsd, now: new Date(now).toISOString(),
   });
   await saveSessionComment({
     target: repo, prNumber, token: env.GH_TOKEN, fetchImpl, existingId: null, previous: session, session: closed,
     body: renderSessionComment(closed),
-    ledger: ledgerOptions(env, { stage: 'closing', expectedSeq: read.seq ?? null, next: 'Maintainer: comment @claude review to retry the interrupted review.' }),
+    ledger: ledgerOptions(env, { stage: 'closing', expectedSeq: read.seq ?? null, runSpend: runSpendFromCharges([{ amount: spentUsd, source: 'reserve' }]), next: 'Maintainer: comment @claude review to retry the interrupted review.' }),
   });
   await postCommitStatus({
     env, fetchImpl, target: repo, headSha: session.lastReviewedHead,

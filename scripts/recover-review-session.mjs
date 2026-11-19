@@ -1,5 +1,6 @@
 import { saveSessionComment } from './session-comment.mjs';
 import { ledgerOptions } from './session-store.mjs';
+import { runSpendUnrecorded } from './review-ledger.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -37,7 +38,7 @@ export async function recoverReviewSession({ env = process.env, fetchImpl = fetc
   const savedId = await saveSessionComment({
     target: owner + '/' + repo, prNumber, token: env.GH_TOKEN, fetchImpl, existingId: plan.sessionCommentId,
     previous: plan.session, session: plan.pendingSession, body,
-    ledger: ledgerOptions(env, { sourceCommentIds: sourceIds, expectedSeq: plan.ledgerSeq, readyReason: 'completed from the review that was already published' }),
+    ledger: ledgerOptions(env, { sourceCommentIds: sourceIds, expectedSeq: plan.ledgerSeq, runSpend: runSpendUnrecorded('recovered from a review published by an earlier run'), readyReason: 'completed from the review that was already published' }),
   });
   console.log('Recovered durable review session ' + savedId + ' from pending review ' + (plan.pendingReviewId || 'unknown') + '.');
   return { session: plan.pendingSession, sessionCommentId: savedId };
