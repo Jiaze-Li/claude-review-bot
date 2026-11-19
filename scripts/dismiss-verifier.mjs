@@ -7,7 +7,7 @@ import { CLAUDE_FALLBACK_EFFORT, CLAUDE_FALLBACK_MODEL, claudeToolOptions, FALLB
 import { GEMINI_MODEL, resolveGeminiTimeoutMs } from './run-gemini-review.mjs';
 import { buildValidationContextForFinding, VALIDATOR_THINKING } from './validate-gemini-findings.mjs';
 import { defaultProviderRegistry, getProviderAdapter, OUTCOME_KINDS, parseReviewProviders, PROVIDER_KINDS } from './provider-adapter.mjs';
-import { BudgetManager, createReviewToolGateway, executeWorkUnit, resolveProviderBudgetManagers } from './review-orchestrator.mjs';
+import { BudgetManager, createReviewToolGateway, executeWorkUnit, resolveProviderBudgetManagers, resolveSafeRoot } from './review-orchestrator.mjs';
 import { readOnlyToolGuidance } from './review-prompts.mjs';
 
 const VERIFIER_MAX_TURNS = 6;
@@ -462,8 +462,7 @@ export async function verifyAcceptanceWithModel({
   repo, prNumber, headSha, finding, statement, session, repoRoot = null,
   env = process.env, fetchImpl = fetch, queryImpl = null,
 } = {}) {
-  const safeCandidate = repoRoot || env?.SAFE_REPO_DIR || null;
-  const safeRoot = safeCandidate && fs.existsSync(safeCandidate) ? fs.realpathSync(safeCandidate) : null;
+  const safeRoot = repoRoot && fs.existsSync(repoRoot) ? fs.realpathSync(repoRoot) : resolveSafeRoot(env);
   const prompt = buildAcceptancePrompt({ repo, prNumber, headSha, finding, statement, hasTools: Boolean(safeRoot) });
   const chain = await runVerifierChain({
     prompt, schema: acceptanceVerdictSchema, normalize: normalizeAcceptancePayload, label: 'acceptance',

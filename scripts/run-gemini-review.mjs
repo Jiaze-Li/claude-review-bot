@@ -7,7 +7,7 @@ import {geminiBaseUrl} from './gemini-config.mjs';
 import {SINGLE_REQUEST_MAX_BYTES,dropIgnoredFiles,stagedFixedBytes,stagedReviewCapacity} from './review-shards.mjs';
 import {defaultProviderRegistry, getProviderAdapter, parseReviewProviders, PROVIDER_KINDS, OUTCOME_KINDS} from './provider-adapter.mjs';
 import { readOnlyToolGuidance } from './review-prompts.mjs';
-import {BudgetManager, CircuitBreaker, DeadlineTracker, runBoundedPool, executeWorkUnit, resolveProviderBudgetManagers, createReviewToolGateway} from './review-orchestrator.mjs';
+import {BudgetManager, CircuitBreaker, DeadlineTracker, runBoundedPool, executeWorkUnit, resolveProviderBudgetManagers, createReviewToolGateway, resolveSafeRoot} from './review-orchestrator.mjs';
 
 // Moving alias: always resolves to Google's current Flash model. Override with GEMINI_MODEL to pin.
 export const GEMINI_MODEL='gemini-flash-latest';
@@ -631,18 +631,6 @@ export function toGeminiJsonSchema(value,key=null){
     out[childKey]=toGeminiJsonSchema(childValue,childKey);
   }
   return out;
-}
-
-function resolveSafeRoot(env) {
-  const candidate = env.SAFE_REPO_DIR || 'safe-target';
-  const target = path.resolve(candidate);
-  if (!fs.existsSync(target)) return null;
-  try {
-    const resolved = fs.realpathSync.native ? fs.realpathSync.native(target) : fs.realpathSync(target);
-    return fs.statSync(resolved).isDirectory() ? resolved : null;
-  } catch {
-    return null;
-  }
 }
 
 function nonnegative(v){return typeof v==='number'&&Number.isFinite(v)&&v>=0?v:null;}

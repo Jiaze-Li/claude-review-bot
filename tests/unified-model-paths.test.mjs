@@ -354,6 +354,7 @@ test('validate-gemini-findings uses ReadOnlyToolGateway (maxTurns=6) on Gemini a
       PR_NUMBER: '104',
       HEAD_SHA,
       TARGET_REPO_DIR: safeRepo,
+      SAFE_REPO_DIR: safeRepo,
       REVIEW_CONTEXT_DIR: ctxDir,
     },
     fetchImpl: async () => {
@@ -402,6 +403,7 @@ test('validate-gemini-findings uses ReadOnlyToolGateway (maxTurns=6) on Gemini a
       PR_NUMBER: '104',
       HEAD_SHA,
       TARGET_REPO_DIR: safeRepo,
+      SAFE_REPO_DIR: safeRepo,
       REVIEW_CONTEXT_DIR: ctxDir,
     },
     fetchImpl: async () => new Response('quota exceeded', { status: 402 }),
@@ -429,6 +431,42 @@ test('validate-gemini-findings uses ReadOnlyToolGateway (maxTurns=6) on Gemini a
   assert.equal(claudeCalls[0].options.maxTurns, 6);
   assert.ok(claudeCalls[0].options.mcpServers?.gateway);
   assert.deepEqual(claudeCalls[0].options.allowedTools, ['mcp__gateway__Read', 'mcp__gateway__Glob', 'mcp__gateway__Grep']);
+
+  // 3. When SAFE_REPO_DIR is unset (and no safe-target exists), validator must NOT mount tools on TARGET_REPO_DIR
+  const noSafeCalls = [];
+  await validateMaterialFindings({
+    env: {
+      GEMINI_API_KEY: 'k',
+      CLAUDE_CODE_OAUTH_TOKEN: 't',
+      TARGET_REPO: 'o/r',
+      PR_NUMBER: '104',
+      HEAD_SHA,
+      TARGET_REPO_DIR: safeRepo,
+      REVIEW_CONTEXT_DIR: ctxDir,
+    },
+    fetchImpl: async () => new Response('quota exceeded', { status: 402 }),
+    queryImpl: async function* (args) {
+      noSafeCalls.push(args);
+      yield { type: 'system', subtype: 'init', model: 'claude-sonnet-x' };
+      yield {
+        type: 'result',
+        subtype: 'success',
+        structured_output: {
+          summary: 'Validated without tools',
+          validations: [{
+            candidateId: 'D001',
+            verdict: 'CONFIRMED',
+            reason: 'Confirmed from inline context.',
+            evidence: ['src/handler.mjs'],
+            sourceAnchors: [{ path: 'src/handler.mjs', line: 3, quote: 'return sanitizeInput(raw);' }],
+          }],
+        },
+      };
+    },
+  });
+  assert.equal(noSafeCalls.length, 1);
+  assert.equal(noSafeCalls[0].options.mcpServers?.gateway, undefined);
+  assert.doesNotMatch(noSafeCalls[0].prompt, /READ-ONLY REPOSITORY TOOLS/);
 });
 
 test('claudeToolOptions(null) denies all tools when safeRoot is absent, and verifyAcceptanceWithModel mounts gateway when repoRoot is present', async () => {

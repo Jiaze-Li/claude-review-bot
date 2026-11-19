@@ -7,7 +7,7 @@ import { requireGroundedSourceEvidence } from './local-source-evidence.mjs';
 import { CLAUDE_FALLBACK_EFFORT, CLAUDE_FALLBACK_MODEL, claudeToolOptions, FALLBACK_UNKNOWN_COST_USD, formatClaudeFailureError, isGeminiUnavailableStatus } from './claude-fallback.mjs';
 import { GEMINI_MODEL, resolveGeminiTimeoutMs } from './run-gemini-review.mjs';
 import { defaultProviderRegistry, getProviderAdapter, OUTCOME_KINDS, parseReviewProviders, PROVIDER_KINDS } from './provider-adapter.mjs';
-import { BudgetManager, createReviewToolGateway, executeWorkUnit, resolveProviderBudgetManagers } from './review-orchestrator.mjs';
+import { BudgetManager, createReviewToolGateway, executeWorkUnit, resolveProviderBudgetManagers, resolveSafeRoot } from './review-orchestrator.mjs';
 import { readOnlyToolGuidance } from './review-prompts.mjs';
 
 export const VALIDATOR_THINKING = 'medium';
@@ -126,7 +126,7 @@ export async function validateMaterialFindings({ env = process.env, fetchImpl = 
     if (totalBytes >= MAX_TOTAL_CONTEXT_BYTES) break;
   }
 
-  const safeRoot = env.SAFE_REPO_DIR && fs.existsSync(env.SAFE_REPO_DIR) ? realDir(env.SAFE_REPO_DIR) : repoRoot;
+  const safeRoot = resolveSafeRoot(env);
   const includedIds = new Set(contexts.map((entry) => entry.candidateId));
   const contextById = new Map(contexts.map((entry) => [entry.candidateId, entry.context]));
   const prompt = buildValidationPrompt({ repo, prNumber, headSha, contexts, hasTools: Boolean(safeRoot) });
@@ -207,6 +207,7 @@ export async function validateMaterialFindings({ env = process.env, fetchImpl = 
         });
         let lastRes = null;
         for (let attempt = 1; attempt <= 2; attempt += 1) {
+          structuredAttempts = attempt;
           const res = await adapter.execute({
             prompt,
             schema: validationSchema,
@@ -217,11 +218,10 @@ export async function validateMaterialFindings({ env = process.env, fetchImpl = 
             timeoutMs: callTimeout,
             env,
             fetchImpl,
-            maxAttempts: 2,
+            maxAttempts: 1,
             toolGateway: makeToolGateway(),
           });
           lastRes = res;
-          structuredAttempts += (res.meta?.attempts ?? res.meta?.num_turns ?? 1);
           resolvedGeminiModel = res.meta?.resolved_model || model;
           if (res.meta?.usage) {
             usage.promptTokenCount += nonnegative(res.meta.usage.input_tokens) ?? 0;
@@ -230,6 +230,13 @@ export async function validateMaterialFindings({ env = process.env, fetchImpl = 
             usage.totalTokenCount += nonnegative(res.meta.usage.total_tokens) ?? 0;
           }
           if (!res.ok) {
+            const isUnavailable = res.kind === OUTCOME_KINDS.UNAVAILABLE
+              || (res.kind === OUTCOME_KINDS.CONFIG && !res.status)
+              || isGeminiUnavailableStatus(res.status);
+            if (!isUnavailable && attempt === 1 && /JSON|structured/i.test(res.error || '')) {
+              console.warn(`Gemini finding validator returned malformed structured output; retrying once: ${res.error}`);
+              continue;
+            }
             break;
           }
           try {
