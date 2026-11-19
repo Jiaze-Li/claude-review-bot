@@ -1,5 +1,6 @@
 import { defaultProviderRegistry, parseReviewProviders } from './provider-adapter.mjs';
 import { saveSessionComment } from './session-comment.mjs';
+import { ledgerOptions } from './session-store.mjs';
 import { staleMarkerIfMoved } from './github-review-api.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -155,6 +156,7 @@ function readContext(env) {
     headSha: required(env, 'HEAD_SHA'),
     sourceCommentId: required(env, 'SOURCE_COMMENT_ID'),
     token: required(env, 'GH_TOKEN'),
+    botLogin: required(env, 'EXPECTED_REVIEW_AUTHOR'),
     plan: JSON.parse(fs.readFileSync(path.join(contextRoot, 'session-plan.json'), 'utf8')),
   };
 }
@@ -196,6 +198,7 @@ function upsertSession(ctx, session, sourceCommentIds, fetchImpl, existingId, pr
   return saveSessionComment({
     target: ctx.target, prNumber: ctx.prNumber, token: ctx.token, fetchImpl, existingId, previous, session,
     body: renderSessionComment(session, { sourceCommentIds, orphanReconcile: ctx.plan?.orphanReconcile }),
+    ledger: ledgerOptions({ EXPECTED_REVIEW_AUTHOR: ctx.botLogin }, { sourceCommentIds, runId: session.deepReview?.runId ?? null, expectedSeq: ctx.plan?.ledgerSeq ?? null }),
   });
 }
 

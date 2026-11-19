@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { createFakePr } from './helpers/fake-pr.mjs';
 import {
   applyDiscoveryResult, applyIncrementalResult, beginDeepReview, completeDeepReview,
   applyVerificationResult, parseSessionComment, planReviewSession,
@@ -59,7 +60,10 @@ test('READY changes are candidates; successful delta advances exact HEAD without
   assert.equal(planReviewSession({ session: next, baseSha: BASE, headSha: C }).previousHead, B);
   assert.equal(sessionCommitStatus(next, C).state, 'pending');
   assert.equal(sessionCommitStatus(next, B).state, 'success');
-  assert.deepEqual(parseSessionComment(renderSessionComment(next)), next);
+  // the session survives the round trip through the PR's own visible records
+  const pr = createFakePr();
+  pr.seed(next);
+  assert.deepEqual(pr.session(), next);
 });
 
 test('incremental finding remains blocking with stable prior ledger and a fresh repair budget', () => {

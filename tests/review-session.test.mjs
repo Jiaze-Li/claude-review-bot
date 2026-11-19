@@ -1,8 +1,8 @@
 import { applyFullReview } from './helpers/full-review.mjs';
 import test from 'node:test';
+import { createFakePr } from './helpers/fake-pr.mjs';
 import assert from 'node:assert/strict';
 import {
-  MAX_VERIFICATION_ROUNDS,
     applyDiscoveryResult,
   applyOverride,
   applyVerificationResult,
@@ -50,15 +50,16 @@ test('verification fixes stable finding and proceeds to the one-time final audit
   assert.equal(v.findings[0].status,'FIXED');
 });
 
-test('missing verification verdict fails closed and bounded rounds end HUMAN_REQUIRED',()=>{
+test('missing verification verdict fails closed, and there is no fixed number of verification rounds',()=>{
   let s=applyDiscoveryResult({result:{summary:'bug',findings:[finding('P1')]},baseSha:BASE,headSha:A,sourceCommentId:'9'});
-  s=applyVerificationResult({session:s,headSha:B,result:{summary:'unclear',verifications:[],findings:[]}});
-  assert.equal(s.status,'REWORK');
-  assert.equal(s.verificationRound,1);
-  s=applyVerificationResult({session:s,headSha:C,result:{summary:'still unclear',verifications:[],findings:[]}});
-  assert.equal(s.status,'HUMAN_REQUIRED');
-  assert.equal(s.verificationRound,MAX_VERIFICATION_ROUNDS);
-  assert.equal(planReviewSession({session:s,baseSha:BASE,headSha:C}).mode,'human_required');
+  const heads=['b','c','d','e','f'].map((c)=>c.repeat(40));
+  heads.forEach((head,i)=>{
+    s=applyVerificationResult({session:s,headSha:head,result:{summary:'unclear',verifications:[],findings:[]}});
+    assert.equal(s.status,'REWORK'); // never silently ends, never gives up on a count
+    assert.equal(s.verificationRound,i+1);
+    assert.equal(s.findings[0].status,'OPEN'); // an omitted verdict keeps the finding open
+    assert.equal(planReviewSession({session:s,baseSha:BASE,headSha:'9'.repeat(40)}).mode,'verification');
+  });
 });
 
 test('verification may add only modeled repair regressions and a new P3 is open too',()=>{
@@ -96,12 +97,15 @@ test('findings of the one final full review are verified without a second full r
   assert.equal(planReviewSession({session:s,baseSha:BASE,headSha:B}).mode,'noop_ready');
 });
 
-test('session comment round-trips durable hidden state',()=>{
+test('the session summary is readable and the durable state round-trips through the PR records',()=>{
   const s=applyDiscoveryResult({result:{summary:'bug',findings:[finding()]},baseSha:BASE,headSha:A,sourceCommentId:'9'});
   const body=renderSessionComment(s);
   assert.match(body,/Independent Review Session/);
   assert.match(body,/REWORK/);
-  assert.deepEqual(parseSessionComment(body),s);
+  assert.doesNotMatch(body,/jiaze-review-state/);
+  const pr=createFakePr();
+  pr.seed(s);
+  assert.deepEqual(pr.session(),s);
   assert.equal(parseSessionComment('ordinary comment'),null);
 });
 
@@ -127,7 +131,7 @@ test('target base-tip movement alone never spends another discovery call',()=>{
   assert.equal(planReviewSession({session:rework,baseSha:NEW_BASE,headSha:B}).mode,'verification');
 });
 
-test('maximum accepted bounded session remains renderable through two verification rounds',()=>{
+test('maximum accepted bounded session remains renderable through repeated verification rounds',()=>{
   const text=(ch,n)=>ch.repeat(n);
   const maxFinding=(i)=>({
     severity:'P1',
@@ -155,7 +159,7 @@ test('maximum accepted bounded session remains renderable through two verificati
   });
   s=applyVerificationResult(verify(B,10));
   s=applyVerificationResult(verify(C,20));
-  assert.equal(s.status,'HUMAN_REQUIRED');
+  assert.equal(s.status,'REWORK'); // there is no round limit that stops the review
   assert.equal(s.findings.length,12);
   const body=renderSessionComment(s,{sourceCommentIds:['1','2']});
   assert.ok(Buffer.byteLength(body,'utf8')<65536);

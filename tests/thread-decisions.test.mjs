@@ -6,11 +6,13 @@ import path from 'node:path';
 import { applyThreadDecisions, planReviewSession, parseSessionComment, renderSessionComment, sessionCommitStatus, applyDiscoveryResult } from '../scripts/review-session-core.mjs';
 import { applyThreadResolutions } from '../scripts/apply-thread-resolutions.mjs';
 import { findingMarker } from '../scripts/review-anchors.mjs';
+import { createFakePr } from './helpers/fake-pr.mjs';
 
 const BASE = 'b'.repeat(40);
 const OLD = 'c'.repeat(40);
 const HEAD = 'a'.repeat(40);
 const BOT = 'jiaze-claude-review-bot';
+const BOT_LOGIN = `${BOT}[bot]`;
 const f = (title, severity = 'P2') => ({ severity, title, body: 'Trigger X causes wrong result Y.', path: `${title.replace(/\W+/g, '-')}.swift`, line: 3 });
 
 function reworkSession(extra = {}, head = HEAD) {
@@ -55,32 +57,44 @@ function threadNode(id, finding, { resolvedBy = null, author = BOT } = {}) {
 
 function setup(session, threads, { permission = {}, head = HEAD } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'thread-apply-'));
-  fs.writeFileSync(path.join(dir, 'session-plan.json'), JSON.stringify({ decision: { mode: 'threads' }, session, sessionCommentId: '55' }));
+  // The session lives on the PR as the bot's own records; `patches` lists the closing handoffs written by the run.
+  const pr = createFakePr({ author: BOT_LOGIN });
+  pr.seed(session);
+  const projection = pr.seedProjection(session);
+  fs.writeFileSync(path.join(dir, 'session-plan.json'), JSON.stringify({ decision: { mode: 'threads' }, session, sessionCommentId: projection.id, ledgerSeq: 1 }));
   const patches = [];
-  const fetchImpl = async (url, init = {}) => {
+  const before = pr.issue.length;
+  const own = async (url, init = {}) => {
     if (url.endsWith('/graphql')) return Response.json({ data: { repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage: false }, nodes: threads } } } } });
     if (url.endsWith('/pulls/7')) return Response.json({ base: { sha: BASE }, head: { sha: head } });
     if (url.includes('/collaborators/')) {
       const login = decodeURIComponent(url.split('/collaborators/')[1].split('/')[0]);
       return Response.json({ permission: permission[login] ?? 'write' });
     }
-    if (url.includes('/issues/comments/55') && init.method === 'PATCH') { patches.push(JSON.parse(init.body).body); return Response.json({ id: 55 }); }
     assert.fail('unexpected URL ' + url);
   };
-  const env = { GH_TOKEN: 't', TARGET_REPO: 'acme/project', PR_NUMBER: '7', BASE_SHA: BASE, HEAD_SHA: HEAD, SOURCE_COMMENT_ID: '99', EXPECTED_REVIEW_AUTHOR: `${BOT}[bot]`, REVIEW_CONTEXT_DIR: dir };
-  return { env, fetchImpl, patches };
+  const fetchImpl = async (url, init = {}) => {
+    const response = await pr.layer(own)(url, init);
+    patches.length = 0;
+    patches.push(...pr.issue.slice(before).filter((c) => /Handoff: COMPLETE/.test(c.body)).map((c) => c.body));
+    return response;
+  };
+  const env = { GH_TOKEN: 't', TARGET_REPO: 'acme/project', PR_NUMBER: '7', BASE_SHA: BASE, HEAD_SHA: HEAD, SOURCE_COMMENT_ID: '99', EXPECTED_REVIEW_AUTHOR: BOT_LOGIN, REVIEW_CONTEXT_DIR: dir };
+  return { env, fetchImpl, patches, pr };
 }
 const quiet = { log() {}, warn() {} };
 
 test('a writer resolving a P3 thread writes it into the session comment, with no model involved', async () => {
   const session = reworkSession();
   const [, , nit] = session.findings;
-  const { env, fetchImpl, patches } = setup(session, [threadNode('T3', nit, { resolvedBy: 'jiaze-li' }), threadNode('T1', session.findings[0])]);
+  const { env, fetchImpl, patches, pr } = setup(session, [threadNode('T3', nit, { resolvedBy: 'jiaze-li' }), threadNode('T1', session.findings[0])]);
   const out = await applyThreadResolutions({ env, fetchImpl, log: quiet });
   assert.deepEqual(out.closed, [{ id: 'F003', by: 'jiaze-li' }]);
   assert.equal(out.session.status, 'REWORK');
   assert.equal(patches.length, 1);
-  assert.match(patches[0], /jiaze-review-source-comment:99/);
+  assert.match(patches[0], /findings\[2\]\.status: "WAIVED"/);
+  assert.match(pr.issue.map((c) => c.body).join('\n'), /Handled: comment 99 \(version created\)/);
+  assert.equal(pr.session().findings[2].status, 'WAIVED');
 });
 
 test('only writers\' resolves count; the bot\'s own resolves, marker-less threads and other authors\' threads do not', async () => {

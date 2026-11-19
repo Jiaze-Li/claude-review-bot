@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { continueReview, decideContinuation, finalReviewOutlook, nextChainId, MAX_CONTINUATIONS } from '../scripts/continue-review.mjs';
 import { applyDiscoveryResult, currentCoverage, renderSessionComment, sessionCommitStatus } from '../scripts/review-session-core.mjs';
+import { createFakePr } from './helpers/fake-pr.mjs';
 import { syncCommitStatus } from '../scripts/sync-commit-status.mjs';
 
 const BASE = 'b'.repeat(40), HEAD = 'a'.repeat(40), OLD = 'c'.repeat(40);
@@ -85,12 +86,13 @@ test('AC5: the final review is yellow only when it really was handed on, red oth
 const SYNC_ENV = { TARGET_REPO: 'acme/p', PR_NUMBER: '7', HEAD_SHA: HEAD, STATUS_TOKEN: 's', GH_TOKEN: 't', EXPECTED_REVIEW_AUTHOR: 'bot[bot]' };
 async function mirror(extra) {
   const posted = [];
+  const pr = createFakePr({ author: 'bot[bot]' });
+  pr.seed(awaiting);
   await syncCommitStatus({
     env: { ...SYNC_ENV, ...extra },
-    fetchImpl: async (url, init = {}) => {
-      if (url.includes('/issues/7/comments')) return Response.json([{ id: 5, user: { login: 'bot[bot]' }, body: renderSessionComment(awaiting) }]);
+    fetchImpl: pr.layer(async (url, init = {}) => {
       posted.push(JSON.parse(init.body)); return new Response(null, { status: 201 });
-    },
+    }),
   });
   return posted[0];
 }
@@ -103,14 +105,17 @@ test('AC5: the mirror step turns the dispatch result into the commit status', as
 });
 
 const RUN_ENV = { TARGET_REPO: 'acme/p', PR_NUMBER: '7', BASE_SHA: BASE, HEAD_SHA: HEAD, SOURCE_COMMENT_ID: '6492010062', SOURCE_KIND: 'comment', REQUESTED_MODE: 'auto', TRIGGER_USER: 'j', REVIEW_MODE: 'verification', GH_TOKEN: 't', DISPATCH_TOKEN: 'd', GITHUB_REPOSITORY: 'ctl/repo', GITHUB_RUN_ID: '40844152995', EXPECTED_REVIEW_AUTHOR: 'bot[bot]' };
-const runWith = (session, dispatchStatus, logs = []) => continueReview({
-  env: RUN_ENV, log: { log: (m) => logs.push(m) },
-  fetchImpl: async (url) => {
-    if (url.includes('/issues/7/comments')) return Response.json([{ id: 5, user: { login: 'bot[bot]' }, body: renderSessionComment(session) }]);
-    if (dispatchStatus === 'throw') throw new Error('socket hang up');
-    return new Response(null, { status: dispatchStatus });
-  },
-});
+const runWith = (session, dispatchStatus, logs = []) => {
+  const pr = createFakePr({ author: 'bot[bot]' });
+  pr.seed(session);
+  return continueReview({
+    env: RUN_ENV, log: { log: (m) => logs.push(m) },
+    fetchImpl: pr.layer(async () => {
+      if (dispatchStatus === 'throw') throw new Error('socket hang up');
+      return new Response(null, { status: dispatchStatus });
+    }),
+  });
+};
 
 test('AC1/AC4: an old-commit leftover dispatches once; a failed dispatch is reported, not thrown, not silent', async () => {
   assert.equal((await runWith(stale, 204)).dispatched, true);

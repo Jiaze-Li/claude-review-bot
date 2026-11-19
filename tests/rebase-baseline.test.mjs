@@ -8,11 +8,20 @@ import { SINGLE_REQUEST_MAX_BYTES, planShards, splitDiffByFile, stagedFixedBytes
 import { SINGLE_REQUEST_MAX_BYTES as RUNNER_LIMIT } from '../scripts/run-gemini-review.mjs';
 import { findingMarker } from '../scripts/review-anchors.mjs';
 import { runDeepReviewCommand } from '../scripts/deep-review.mjs';
-import { applyDiscoveryResult, applyVerificationResult, beginDeepReview, completeDeepReview, parseSessionComment, renderSessionComment } from '../scripts/review-session-core.mjs';
+import { applyDiscoveryResult, applyVerificationResult, beginDeepReview, completeDeepReview } from '../scripts/review-session-core.mjs';
+import { renderSessionComment } from '../scripts/review-session-core.mjs';
+import { createFakePr } from './helpers/fake-pr.mjs';
 
 const BASE = 'b'.repeat(40), OLD = 'a'.repeat(40), NEW = 'c'.repeat(40);
 const MB_OLD = '1'.repeat(40), MB_NEW = '2'.repeat(40);
 const author = 'jiaze-claude-review-bot[bot]';
+// the session lives on the PR as the bot's own records; `own` answers everything else
+function withSession(session, own, { projectionId = null } = {}) {
+  const pr = createFakePr({ author, number: 7 });
+  if (session) pr.seed(session);
+  if (projectionId) pr.addIssue(renderSessionComment(session), { id: projectionId });
+  return pr.layer(own);
+}
 
 const fileDiff = (name, padBytes = 0) => `diff --git a/${name} b/${name}\n--- a/${name}\n+++ b/${name}\n@@ -1 +1 @@\n-x\n+${'y'.repeat(padBytes)}\n`;
 const smallPrDiff = (n = 11) => Array.from({ length: n }, (_, i) => fileDiff(`src/f${i}.js`)).join('');
@@ -146,7 +155,9 @@ test('T7 a PR too large to verify goes to a sharded review that carries the old 
   assert.notEqual(done.status, 'READY');
   assert.ok(done.findings.some((f) => f.carriedFromId === 'F001' && f.status === 'UNCERTAIN'));
   // The carried entry survives the durable session comment round trip.
-  const reread = parseSessionComment(renderSessionComment(done));
+  const pr = createFakePr({ author });
+  pr.seed(done);
+  const reread = pr.session();
   assert.ok(reread.findings.some((f) => f.carriedFromId === 'F001' && f.origin === 'CARRIED_OPEN' && f.status === 'UNCERTAIN'));
 });
 
@@ -199,14 +210,11 @@ test('T8 planner and staged runner share one capacity rule at the exact boundary
 test('T9 non-main base, auto planning and the CLI wiring all reach the same decision', async () => {
   const otherBase = 'd'.repeat(40);
   const dir = context();
-  const comments = [{ id: 1, user: { login: author }, body: renderSessionComment(reworkSession()) }];
-  const fetchImpl = async (url) => {
-    if (/issues\/7\/comments/.test(url)) return Response.json(comments);
-    if (/pulls\/7\/reviews/.test(url)) return Response.json([]);
+  const fetchImpl = withSession(reworkSession(), async (url) => {
     if (url.includes(`/compare/${OLD}...${NEW}`)) return Response.json({ status: 'ahead' });
     if (url.includes(`/compare/${otherBase}...${OLD}`)) return Response.json({ merge_base_commit: { sha: MB_OLD } });
     assert.fail(`unexpected URL ${url}`);
-  };
+  });
   const e = env(dir, { BASE_SHA: otherBase, REQUESTED_MODE: 'auto', EXPECTED_REVIEW_AUTHOR: author });
   const plan = await planSession({ env: e, fetchImpl });
   assert.equal(plan.decision.mode, 'verification');
@@ -222,9 +230,7 @@ test('T9 non-main base, auto planning and the CLI wiring all reach the same deci
 });
 
 function threadFetch({ session, resolvedBy = 'jiaze-li' }) {
-  return async (url) => {
-    if (/issues\/7\/comments/.test(url)) return Response.json([{ id: 7, user: { login: author }, body: renderSessionComment(session) }]);
-    if (/pulls\/7\/reviews/.test(url)) return Response.json([]);
+  return withSession(session, async (url) => {
     if (url.endsWith('/graphql')) {
       return Response.json({ data: { repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage: false }, nodes: session.findings.map((f, i) => ({
         id: `T${i}`, isResolved: true, resolvedBy: { login: resolvedBy },
@@ -234,7 +240,7 @@ function threadFetch({ session, resolvedBy = 'jiaze-li' }) {
     if (url.includes('/collaborators/')) return Response.json({ permission: 'write' });
     if (url.includes(`/compare/${OLD}...${NEW}`)) return Response.json({ status: 'diverged' });
     assert.fail(`unexpected URL ${url}`);
-  };
+  });
 }
 
 test('T9 the threads path (a person resolved every blocking thread) also verifies the whole current PR after a rebase', async () => {
@@ -258,13 +264,10 @@ test('T9 a manual retry of a provider-unavailable verification also uses the who
     ...reworkSession(), status: 'HUMAN_REQUIRED',
     reviewFailure: { code: 'REVIEWER_UNAVAILABLE', mode: 'verification', head: OLD, previousHead: OLD, reason: 'provider down' },
   };
-  const comments = [{ id: 7, user: { login: author }, body: renderSessionComment(stopped) }];
-  const fetchImpl = async (url) => {
-    if (/issues\/7\/comments/.test(url)) return Response.json(comments);
-    if (/pulls\/7\/reviews/.test(url)) return Response.json([]);
+  const fetchImpl = withSession(stopped, async (url) => {
     if (url.includes(`/compare/${OLD}...${NEW}`)) return Response.json({ status: 'diverged' });
     assert.fail(`unexpected URL ${url}`);
-  };
+  });
   const e = env(dir, { REQUESTED_MODE: 'auto', SOURCE_KIND: 'comment', EXPECTED_REVIEW_AUTHOR: author });
   const plan = await planSession({ env: e, fetchImpl });
   assert.equal(plan.decision.mode, 'verification');
@@ -274,12 +277,12 @@ test('T9 a manual retry of a provider-unavailable verification also uses the who
 });
 
 test('the deep-review begin step hands the planner\'s carryOpen to the new session (and defaults to off)', async () => {
-  const github = async (url, init = {}) => {
+  const makeGithub = () => withSession(reworkSession(), async (url, init = {}) => {
     if (/\/pulls\/7$/.test(url)) return Response.json({ base: { sha: BASE }, head: { sha: NEW } });
     if (init.method === 'POST' || init.method === 'PATCH') return Response.json({ id: 901 });
     if (/\/statuses\//.test(url)) return Response.json({});
     assert.fail(`unexpected ${url}`);
-  };
+  }, { projectionId: '300' });
   for (const [carryOpen, expected] of [[true, 1], [undefined, 0]]) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'deep-carry-'));
     fs.writeFileSync(path.join(dir, 'session-plan.json'), JSON.stringify({
@@ -287,8 +290,8 @@ test('the deep-review begin step hands the planner\'s carryOpen to the new sessi
       decision: { mode: 'claude', previousHead: null, reason: 'x', ...(carryOpen ? { carryOpen } : {}) },
     }));
     const begun = await runDeepReviewCommand('begin', {
-      env: { TARGET_REPO: 'acme/project', PR_NUMBER: '7', BASE_SHA: BASE, HEAD_SHA: NEW, SOURCE_COMMENT_ID: '55', GH_TOKEN: 't', REVIEW_CONTEXT_DIR: dir, GITHUB_OUTPUT: path.join(dir, 'out') },
-      fetchImpl: github, now: '2026-11-17T00:00:00.000Z',
+      env: { TARGET_REPO: 'acme/project', PR_NUMBER: '7', BASE_SHA: BASE, HEAD_SHA: NEW, SOURCE_COMMENT_ID: '55', GH_TOKEN: 't', EXPECTED_REVIEW_AUTHOR: author, REVIEW_CONTEXT_DIR: dir, GITHUB_OUTPUT: path.join(dir, 'out') },
+      fetchImpl: makeGithub(), now: '2026-11-17T00:00:00.000Z',
     });
     assert.equal(begun.findings.filter((f) => f.carriedFromId === 'F001' && f.status === 'UNCERTAIN').length, expected);
   }
@@ -317,11 +320,9 @@ test('F001 a carried needs-confirmation finding suppresses a re-report of the sa
 
 test('P2 the exits named for a stopped rewritten-history session are the ones that actually work on the new HEAD', async () => {
   const session = reworkSession(9);
-  const fetchImpl = async (url) => {
-    if (/issues\/7\/comments/.test(url)) return Response.json([{ id: 7, user: { login: author }, body: renderSessionComment(session) }]);
-    if (/pulls\/7\/reviews/.test(url)) return Response.json([]);
+  const fetchImpl = withSession(session, async (url) => {
     assert.fail(`unexpected URL ${url}`);
-  };
+  });
   const plan = (requested) => planSession({ env: env(context(), { REQUESTED_MODE: requested, SOURCE_KIND: 'comment', EXPECTED_REVIEW_AUTHOR: author }), fetchImpl });
   assert.equal((await plan('dismiss')).decision.mode, 'dismiss', 'dismiss is available on the new HEAD when blocking findings remain');
   assert.equal((await plan('override')).decision.mode, 'override');

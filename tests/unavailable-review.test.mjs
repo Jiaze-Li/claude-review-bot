@@ -7,6 +7,7 @@ import path from 'node:path';
 import { runGeminiReview } from '../scripts/run-gemini-review.mjs';
 import { stopUnavailableReview } from '../scripts/stop-unavailable-review.mjs';
 import { planSession } from '../scripts/plan-review-session.mjs';
+import { createFakePr, BOT } from './helpers/fake-pr.mjs';
 import {
   CLAUDE_AUTO_MIN_BUDGET_USD, DEEP_REVIEW_PR_BUDGET_USD,
   chargeClaudeFallback, claudeFallbackBudgetLeft, claudeFallbackCallBudget, isManualBudgetExemptReview,
@@ -15,7 +16,7 @@ import {
 } from '../scripts/review-session-core.mjs';
 
 const BASE = 'b'.repeat(40), HEAD = 'a'.repeat(40), PRIOR = 'c'.repeat(40);
-const AUTHOR = 'jiaze-claude-review-bot[bot]';
+const AUTHOR = BOT;
 function folder(mode='incremental',session=null){
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'unavailable-review-'));
   fs.writeFileSync(path.join(dir,'repair.diff'),'diff --git a/a b/a\n');
@@ -28,7 +29,7 @@ function folder(mode='incremental',session=null){
 function runnerEnv(dir,more={}){return {GEMINI_API_KEY:'gemini',CLAUDE_CODE_OAUTH_TOKEN:'claude',
   TARGET_REPO:'owner/repo',PR_NUMBER:'5',HEAD_SHA:HEAD,REVIEW_CONTEXT_DIR:dir,...more};}
 function stopEnv(dir,more={}){return {...runnerEnv(dir),BASE_SHA:BASE,SOURCE_COMMENT_ID:'200',
-  GH_TOKEN:'token',...more};}
+  GH_TOKEN:'token',EXPECTED_REVIEW_AUTHOR:AUTHOR,...more};}
 function unavailable(status=402){return async()=>new Response('no credits',{status});}
 function fakeClaude(calls){
   return async function* (input){
@@ -38,16 +39,16 @@ function fakeClaude(calls){
       total_cost_usd:0.2,usage:{input_tokens:1,output_tokens:2}};
   };
 }
-function prAPI(calls,{head=HEAD,commentId=123}={}){
-  return async(url,init={})=>{
-    calls.push({url,init});
+function prAPI(calls,{head=HEAD,session=null,pr=createFakePr({number:5})}={}){
+  if(session&&!pr.issue.length){pr.seed(session);pr.addIssue(renderSessionComment(session),{id:123});}
+  const own=async(url)=>{
     if(url.endsWith('/pulls/5')) return Response.json({head:{sha:head},base:{sha:BASE}});
-    if(url.endsWith('/issues/5/comments') || url.endsWith('/issues/comments/123')){
-      assert.match(JSON.parse(init.body).body,/HUMAN_REQUIRED/);
-      return Response.json({id:commentId});
-    }
     throw Error('Unexpected GitHub request: '+url);
   };
+  const layered=pr.layer(own);
+  const fn=async(url,init={})=>{calls.push({url,init});return layered(url,init);};
+  fn.pr=pr;
+  return fn;
 }
 
 test('automatic fallback shares the full $6 ledger; manual requests have a $5 per-call ceiling',()=>{
@@ -94,15 +95,35 @@ test('unavailable review persists a fail-closed state without fabricating a revi
     mode:'incremental',headSha:HEAD,reason:'Gemini HTTP 402; Claude fallback budget exhausted',spentUsd:0,
   }));
   const calls=[];
-  const result=await stopUnavailableReview({env:stopEnv(dir),fetchImpl:prAPI(calls)});
+  const api=prAPI(calls);
+  const result=await stopUnavailableReview({env:stopEnv(dir),fetchImpl:api});
   assert.equal(result.handled,true);
   assert.equal(result.session.status,'HUMAN_REQUIRED');
   assert.equal(result.session.lastReviewedHead,HEAD);
   assert.equal(result.session.reviewFailure.mode,'incremental');
   assert.equal(result.session.auditCompleted,false);
   assert.match(renderSessionComment(result.session),/Comment `@gemini review`/);
-  assert.equal(calls.filter(c=>c.init.method==='POST').length,1);
+  // the stop is a closed handoff on the PR (plus the visible summary); a fresh run rebuilds it from the PR alone
+  assert.equal(api.pr.session().status,'HUMAN_REQUIRED');
+  assert.ok(api.pr.issue.some(c=>/Handoff: COMPLETE/.test(c.body)));
+  assert.match(api.pr.issue.at(-1).body,/HUMAN_REQUIRED/);
   assert.deepEqual(planReviewSession({session:result.session,baseSha:BASE,headSha:HEAD}).mode,'human_required');
+  // a stop for cost says so, in words, on the closing handoff: spent so far, where it stopped, who decides
+  const handoff=api.pr.issue.findLast(c=>/Handoff: COMPLETE/.test(c.body)).body;
+  assert.match(handoff,/\*\*Paused for cost:\*\* spent \$0\.00 so far; stopped at the incremental step/);
+  assert.match(handoff,/decide whether to spend more/);
+});
+
+test('a provider outage is not described as a pause for cost',async()=>{
+  const dir=folder();
+  fs.writeFileSync(path.join(dir,'fallback-unavailable.json'),JSON.stringify({
+    mode:'incremental',headSha:HEAD,reason:'Gemini HTTP 503; Claude fallback disabled',spentUsd:0,
+  }));
+  const api=prAPI([]);
+  await stopUnavailableReview({env:stopEnv(dir),fetchImpl:api});
+  const handoff=api.pr.issue.findLast(c=>/Handoff: COMPLETE/.test(c.body)).body;
+  assert.doesNotMatch(handoff,/Paused for cost/);
+  assert.match(handoff,/once the provider is available/);
 });
 
 test('a failed delta review keeps the reviewed state, the spend and the retry stage',()=>{
@@ -125,9 +146,9 @@ test('manual @gemini review resumes ONLY a provider-unavailable stop',async()=>{
   const stopped=stopUnavailableReviewSession({baseSha:BASE,headSha:HEAD,sourceCommentId:'100',
     mode:'incremental',reason:'Gemini HTTP 429; fallback disabled'});
   const session={...stopped,reviewFailure:{...stopped.reviewFailure,mode:'discovery'}};
-  const fetchImpl=async(url)=>url.includes('/issues/5/comments')
-    ? Response.json([{id:123,user:{login:AUTHOR},body:renderSessionComment(session)}])
-    : Response.json([]);
+  const pr=createFakePr({number:5});
+  pr.seed(session);
+  const fetchImpl=pr.fetchImpl;
   const env=stopEnv(folder(),{EXPECTED_REVIEW_AUTHOR:AUTHOR,REQUESTED_MODE:'auto',SOURCE_KIND:'comment'});
   // The retried first review goes through the sharded engine (Gemini first, Claude if it is still down).
   assert.equal((await planSession({env,fetchImpl})).decision.mode,'claude');
@@ -164,7 +185,7 @@ test('replaying a source comment cannot double-charge a persisted fallback failu
     mode:'incremental',headSha:HEAD,reason:'Gemini unavailable',spentUsd:1,
   }));
   const calls=[];
-  const s=(await stopUnavailableReview({env:stopEnv(dir),fetchImpl:prAPI(calls)})).session;
+  const s=(await stopUnavailableReview({env:stopEnv(dir),fetchImpl:prAPI(calls,{session:previous})})).session;
   assert.equal(s.deepSpendUsd,1);
   assert.equal(s.fallbackSpendUsd,1);
 });
@@ -178,7 +199,7 @@ test('moved HEAD and non-provider errors never advance the durable status',async
     mode:'incremental',headSha:HEAD,reason:'Gemini down',spentUsd:0,
   }));
   await assert.rejects(stopUnavailableReview({env:stopEnv(dir),fetchImpl:prAPI(calls,{head:PRIOR})}),/PR moved/);
-  assert.equal(calls.filter(c=>c.init.method==='PATCH'||c.init.method==='POST').length,0);
+  assert.equal(calls.filter(c=>(c.init.method==='PATCH'||c.init.method==='POST')&&!c.url.endsWith('/graphql')).length,0);
 });
 
 test('low automatic allowance avoids a doomed Claude call, but a manual comment can exceed $6',async()=>{

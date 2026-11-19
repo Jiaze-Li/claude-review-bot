@@ -3,6 +3,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { renderSessionComment, stopUnavailableReviewSession } from './review-session-core.mjs';
 import { saveSessionComment } from './session-comment.mjs';
+import { ledgerOptions } from './session-store.mjs';
 
 const SHA = /^[0-9a-f]{40}$/i;
 const REPO = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
@@ -52,6 +53,7 @@ export async function stopUnavailableReview({ env = process.env, fetchImpl = fet
   const reason = String(marker.reason || 'Both model providers unavailable').slice(0, 240);
   const spentUsd = Number.isFinite(marker.spentUsd) && marker.spentUsd > 0 ? marker.spentUsd : 0;
   const costCharges = Array.isArray(marker.costCharges) ? marker.costCharges : null;
+  const pausedForCost = /budget|allowance|spend|cost/i.test(reason);
   const endpoint = 'https://api.github.com/repos/' + repo;
   const current = await githubJson(endpoint + '/pulls/' + pr, token, fetchImpl);
   if (current.head?.sha !== headSha || current.base?.sha !== baseSha) {
@@ -68,6 +70,15 @@ export async function stopUnavailableReview({ env = process.env, fetchImpl = fet
   const existingId = plan.sessionCommentId ? required({ id: String(plan.sessionCommentId) }, 'id', NUMBER) : null;
   const updated = { id: await saveSessionComment({
     target: repo, prNumber: pr, token, fetchImpl, existingId, previous, session, body,
+    ledger: ledgerOptions(env, {
+      sourceCommentIds: [sourceCommentId], expectedSeq: plan.ledgerSeq,
+      ...(pausedForCost
+        ? {
+          intro: [`**Paused for cost:** spent $${spentUsd.toFixed(2)} so far; stopped at the ${marker.mode} step for ${headSha.slice(0, 12)}. This is a stop, not a pass and not a failure of the code.`],
+          next: 'Maintainer: decide whether to spend more, then comment @gemini review to continue.',
+        }
+        : { next: 'Maintainer: comment @gemini review to retry once the provider is available.' }),
+    }),
   }) };
   if (!NUMBER.test(String(updated.id))) throw new Error('Invalid durable session comment ID');
   // Keep the exact-HEAD status authoritative even if publication races a push.
