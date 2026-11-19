@@ -24,6 +24,11 @@ export function parseReviewTrigger(body) {
   if (/^ {0,3}@(gemini|jiaze-claude-review-bot)[ \t]+dismiss[ \t]+F[0-9]{3,}(?:[ \t]+\S.*)?[ \t]*$/i.test(firstLine)) {
     return { requestedMode: 'dismiss' };
   }
+  // `accept F001 <risk and consequence>` rides the same route as `dismiss`: the owner says the finding is real
+  // and accepts the risk. The apply step tells the two apart (see parseDismissalRequest `kind`).
+  if (/^ {0,3}@(gemini|jiaze-claude-review-bot)[ \t]+accept[ \t]+F[0-9]{3,}(?:[ \t]+\S.*)?[ \t]*$/i.test(firstLine)) {
+    return { requestedMode: 'dismiss' };
+  }
   // Short forms: `@gemini review` (same as the bare bot command) and `@claude review`.
   if (/^ {0,3}@gemini[ \t]+review[ \t]*$/i.test(firstLine)) {
     return { requestedMode: 'auto' };
@@ -147,16 +152,34 @@ export function extractEvidenceFromText(text) {
   return seen;
 }
 
+// 'accepted' for `accept F001 ...`, 'dismissed' for `dismiss F001 ...`, null when the first line is neither.
+export function dismissalCommandKind(body) {
+  if (typeof body !== 'string') return null;
+  const firstLine = body.split(/\r\n|\n|\r/).find((line) => line.trim() !== '');
+  if (typeof firstLine !== 'string' || parseReviewTrigger(body)?.requestedMode !== 'dismiss') return null;
+  return /^ {0,3}@(?:gemini|jiaze-claude-review-bot)[ \t]+accept[ \t]/i.test(firstLine) ? 'accepted' : 'dismissed';
+}
+
 export function parseDismissalRequest(body) {
   if (typeof body !== 'string' || body.length > 3000) throw new Error('Invalid dismissal comment length');
   const lines = body.split(/\r\n|\n|\r/);
   const index = lines.findIndex((line) => line.trim() !== '');
-  if (index < 0 || parseReviewTrigger(body)?.requestedMode !== 'dismiss') {
-    throw new Error('Expected a standalone @gemini dismiss F001 command');
+  const kind = dismissalCommandKind(body);
+  if (index < 0 || !kind) {
+    throw new Error('Expected a standalone @gemini dismiss F001 or @gemini accept F001 command');
   }
-  const match = lines[index].match(/^ {0,3}@(gemini|jiaze-claude-review-bot)[ \t]+dismiss[ \t]+(F[0-9]{3,})(?:[ \t]+(\S.*?))?[ \t]*$/i);
-  if (!match) throw new Error('Invalid finding dismissal command');
+  const verb = kind === 'accepted' ? 'accept' : 'dismiss';
+  const match = lines[index].match(new RegExp(`^ {0,3}@(gemini|jiaze-claude-review-bot)[ \\t]+${verb}[ \\t]+(F[0-9]{3,})(?:[ \\t]+(\\S.*?))?[ \\t]*$`, 'i'));
+  if (!match) throw new Error('Invalid finding ' + (kind === 'accepted' ? 'acceptance' : 'dismissal') + ' command');
   const claim = [match[3] ?? '', ...lines.slice(index + 1)].join('\n').trim();
   const reason = claim.replace(/^(?:Reason|Evidence):[ \t]*/gim, '').slice(0, 1200).trim();
-  return { findingId: match[2].toUpperCase(), reason, evidence: extractEvidenceFromText(claim) };
+  if (kind === 'accepted' && !reason) {
+    throw new Error('An acceptance needs your own words: what the risk is and what happens if it occurs.');
+  }
+  const request = { findingId: match[2].toUpperCase(), reason, evidence: extractEvidenceFromText(claim) };
+  // `kind` is a plain field for an acceptance. For a dismissal it stays readable (`kind === 'dismissed'`) but is
+  // not enumerable, so the shape every existing dismissal consumer and test sees is exactly what it was before.
+  if (kind === 'accepted') request.kind = kind;
+  else Object.defineProperty(request, 'kind', { value: kind, enumerable: false });
+  return request;
 }
