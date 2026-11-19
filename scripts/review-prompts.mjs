@@ -26,3 +26,23 @@ Required procedure:
 Deterministic signals: ${JSON.stringify(riskProfile.signals || {})}
 `;
 }
+
+export function readOnlyToolGuidance({ hasTools = false, mode = 'review' } = {}) {
+  if (!hasTools) return '';
+  const lines = [
+    '',
+    'READ-ONLY REPOSITORY TOOLS:',
+    'You have read-only tools (`Read`, `Glob`, `Grep`) to inspect the checked-out safe repository snapshot.',
+    'Do NOT guess or claim insufficient context when the answer can be verified in the repository.',
+  ];
+  if (mode === 'verification') {
+    lines.push(
+      'MANDATORY REUSED-FUNCTION CHECK: When a fix calls or reuses an existing function, helper, or constant whose implementation is not fully shown in the repair diff, you MUST use `Read` or `Grep` to inspect the actual implementation and boundary checks of that reused function BEFORE returning `FIXED`, `STILL_OPEN`, or `UNCERTAIN`. Do NOT return `UNCERTAIN` merely because the diff does not inline the called helper.',
+    );
+  } else if (mode === 'dismissal' || mode === 'acceptance' || mode === 'validation') {
+    lines.push(
+      'MANDATORY REUSED-FUNCTION CHECK: When the finding, rebuttal, or code under check references or calls an existing function, helper, or constant not fully shown in the prompt context, use `Read` or `Grep` to inspect its actual implementation in the repository before reaching your verdict.',
+    );
+  }
+  return `${lines.join('\n')}\n`;
+}

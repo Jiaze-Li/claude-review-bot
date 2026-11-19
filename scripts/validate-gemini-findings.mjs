@@ -4,10 +4,14 @@ import { pathToFileURL } from 'node:url';
 import { CLAUDE_AUTO_MIN_BUDGET_USD, claudeFallbackCallBudget, isManualBudgetExemptReview } from './review-session-core.mjs';
 import { assessExternalPremise, applyExternalEvidence } from './external-fact-evidence.mjs';
 import { requireGroundedSourceEvidence } from './local-source-evidence.mjs';
-import { GeminiUnavailableError, isGeminiUnavailableStatus, runClaudeStructured } from './claude-fallback.mjs';
-import { GEMINI_MODEL, resolveGeminiTimeoutMs, toGeminiJsonSchema } from './run-gemini-review.mjs';
+import { CLAUDE_FALLBACK_EFFORT, CLAUDE_FALLBACK_MODEL, claudeToolOptions, FALLBACK_UNKNOWN_COST_USD, formatClaudeFailureError, isGeminiUnavailableStatus } from './claude-fallback.mjs';
+import { GEMINI_MODEL, resolveGeminiTimeoutMs } from './run-gemini-review.mjs';
+import { defaultProviderRegistry, getProviderAdapter, OUTCOME_KINDS, parseReviewProviders, PROVIDER_KINDS } from './provider-adapter.mjs';
+import { BudgetManager, createReviewToolGateway, executeWorkUnit, resolveProviderBudgetManagers, resolveSafeRoot } from './review-orchestrator.mjs';
+import { readOnlyToolGuidance } from './review-prompts.mjs';
 
 export const VALIDATOR_THINKING = 'medium';
+const VALIDATOR_MAX_TURNS = 6;
 const MATERIAL = new Set(['P0', 'P1', 'P2']);
 const MAX_FILE_BYTES = 1024 * 1024;
 const MAX_FILES = 3000;
@@ -122,20 +126,59 @@ export async function validateMaterialFindings({ env = process.env, fetchImpl = 
     if (totalBytes >= MAX_TOTAL_CONTEXT_BYTES) break;
   }
 
+  const safeRoot = resolveSafeRoot(env);
   const includedIds = new Set(contexts.map((entry) => entry.candidateId));
   const contextById = new Map(contexts.map((entry) => [entry.candidateId, entry.context]));
-  const prompt = buildValidationPrompt({ repo, prNumber, headSha, contexts });
+  const prompt = buildValidationPrompt({ repo, prNumber, headSha, contexts, hasTools: Boolean(safeRoot) });
   const model = env.GEMINI_MODEL || GEMINI_MODEL;
   const stateIntegrityRisk = raw?._meta?.risk_profile?.stateIntegrity === true;
   const maxOutputTokens = stateIntegrityRisk ? 32768 : 8192;
   const timeoutMs = resolveGeminiTimeoutMs({ env });
-  let returned = null;
-  let payload = null;
-  let structuredAttempts = 0;
-  let lastStructuredError = null;
-  // A review that already fell back to Claude means Gemini is down; do not spend another failing request.
-  let unavailable = raw?._meta?.provider === 'claude' ? new GeminiUnavailableError('review already fell back to Claude', 0) : null;
+  const providers = parseReviewProviders(env?.REVIEW_PROVIDERS, { defaultProviders: ['gemini', 'claude'] });
+  const alreadyFellBackToClaude = raw?._meta?.provider === 'claude';
+
+  const planPath = path.join(contextRoot, 'session-plan.json');
+  const plan = fs.existsSync(planPath) ? JSON.parse(fs.readFileSync(planPath, 'utf8')) : null;
+  const manual = isManualBudgetExemptReview({ sourceKind: env.SOURCE_KIND, requestedMode: plan?.requestedMode });
+  // The discovery/audit fallback has already consumed part of this run's
+  // allowance, even though the publisher has not yet persisted it.
+  const primaryCharge = raw?._meta?.provider === 'claude' && Number.isFinite(raw._meta.total_cost_usd)
+    ? [{ amount: raw._meta.total_cost_usd, source: raw._meta.cost_source === 'reserve' ? 'reserve' : 'sdk' }]
+    : [];
+  const priorUsd = primaryCharge.reduce((sum, c) => sum + c.amount, 0);
+  const recordStop = (reason, extraCharges = []) => {
+    const costCharges = [...primaryCharge, ...extraCharges];
+    fs.writeFileSync(path.join(contextRoot, 'fallback-unavailable.json'),
+      JSON.stringify({ mode: raw?._meta?.mode, headSha, reason, costCharges,
+        spentUsd: costCharges.reduce((sum, c) => sum + c.amount, 0) }) + '\n', { mode: 0o600 });
+  };
+
+  const claudeBudgetManager = new BudgetManager({
+    minStartingAllowanceUsd: manual ? 0 : CLAUDE_AUTO_MIN_BUDGET_USD,
+    getAvailableBudget: (pendingUsd) => claudeFallbackCallBudget(plan?.session, { manual, pendingUsd: priorUsd + pendingUsd }),
+  });
+  const providerBudgetManagers = resolveProviderBudgetManagers({
+    providers,
+    env,
+    claudeBudgetManager,
+    registry: defaultProviderRegistry,
+  });
+
+  const makeToolGateway = () => createReviewToolGateway({
+    safeRoot,
+    contextRoot,
+    cwd: safeRoot || process.cwd(),
+    allowedContextFiles: ['pr.diff', 'changed-files.txt', 'diff-stat.txt', 'pr.json', 'skipped-files.txt'],
+    maxTurns: VALIDATOR_MAX_TURNS,
+  });
+
+  let geminiFailure = { isUnavailable: false, error: null };
+  let geminiReasonText = alreadyFellBackToClaude ? 'Gemini unavailable for this review' : 'Gemini unavailable';
+  let lastClaudeCharge = null;
   let claudeMeta = null;
+  let returned = null;
+  let structuredAttempts = 0;
+  let resolvedGeminiModel = model;
   const usage = {
     promptTokenCount: 0,
     candidatesTokenCount: 0,
@@ -143,105 +186,184 @@ export async function validateMaterialFindings({ env = process.env, fetchImpl = 
     totalTokenCount: 0,
   };
 
-  for (let attempt = 1; !unavailable && attempt <= 2; attempt += 1) {
-    structuredAttempts = attempt;
-    const response = await fetchImpl(
-      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
-        body: JSON.stringify({
-          contents: [{ role: 'user', parts: [{ text: prompt }] }],
-          generationConfig: {
-            thinkingConfig: { thinkingLevel: VALIDATOR_THINKING },
-            responseFormat: {
-              text: {
-                mimeType: 'APPLICATION_JSON',
-                schema: toGeminiJsonSchema(validationSchema),
-              },
-            },
+  const outcome = await executeWorkUnit({
+    unit: { headSha },
+    providers,
+    budgetManager: claudeBudgetManager,
+    budgetManagers: providerBudgetManagers,
+    defaultTimeoutMs: timeoutMs,
+    throwClaudeErrors: true,
+    canExecute: {
+      gemini: () => (alreadyFellBackToClaude ? 'review already fell back to Claude' : true),
+      claude: () => (!alreadyFellBackToClaude && providers.includes('gemini') && geminiFailure.error && !geminiFailure.isUnavailable)
+        ? geminiFailure.error
+        : true,
+    },
+    executors: {
+      gemini: async ({ timeoutMs: callTimeout }) => {
+        const adapter = getProviderAdapter(PROVIDER_KINDS.GEMINI, {
+          defaultModel: model,
+          defaultEffort: VALIDATOR_THINKING,
+        });
+        let lastRes = null;
+        for (let attempt = 1; attempt <= 2; attempt += 1) {
+          structuredAttempts = attempt;
+          const res = await adapter.execute({
+            prompt,
+            schema: validationSchema,
+            model,
+            effort: VALIDATOR_THINKING,
+            maxTurns: VALIDATOR_MAX_TURNS,
             maxOutputTokens,
-          },
-        }),
-        signal: AbortSignal.timeout(timeoutMs),
+            timeoutMs: callTimeout,
+            env,
+            fetchImpl,
+            maxAttempts: 1,
+            toolGateway: makeToolGateway(),
+          });
+          lastRes = res;
+          resolvedGeminiModel = res.meta?.resolved_model || model;
+          if (res.meta?.usage) {
+            usage.promptTokenCount += nonnegative(res.meta.usage.input_tokens) ?? 0;
+            usage.candidatesTokenCount += nonnegative(res.meta.usage.output_tokens) ?? 0;
+            usage.thoughtsTokenCount += nonnegative(res.meta.usage.thoughts_tokens) ?? 0;
+            usage.totalTokenCount += nonnegative(res.meta.usage.total_tokens) ?? 0;
+          }
+          if (!res.ok) {
+            const isUnavailable = res.kind === OUTCOME_KINDS.UNAVAILABLE
+              || (res.kind === OUTCOME_KINDS.CONFIG && !res.status)
+              || isGeminiUnavailableStatus(res.status);
+            if (!isUnavailable && attempt === 1 && /JSON|structured/i.test(res.error || '')) {
+              console.warn(`Gemini finding validator returned malformed structured output; retrying once: ${res.error}`);
+              continue;
+            }
+            break;
+          }
+          try {
+            returned = normalizeValidationResult(res.structured, includedIds);
+            return {
+              ok: true,
+              structured: returned,
+              meta: {
+                provider: 'gemini',
+                resolved_model: resolvedGeminiModel,
+              },
+            };
+          } catch (error) {
+            geminiFailure = {
+              isUnavailable: false,
+              error: attempt === 1
+                ? error.message
+                : `Gemini finding validator returned invalid structured output after one retry: ${error.message}`,
+            };
+            if (attempt === 1) {
+              console.warn(`Gemini finding validator returned malformed structured output; retrying once: ${error.message}`);
+              continue;
+            }
+            return { ok: false, kind: OUTCOME_KINDS.FAILED, error: geminiFailure.error, status: 0 };
+          }
+        }
+        const isUnavailable = lastRes?.kind === OUTCOME_KINDS.UNAVAILABLE
+          || (lastRes?.kind === OUTCOME_KINDS.CONFIG && !lastRes?.status)
+          || isGeminiUnavailableStatus(lastRes?.status);
+        geminiFailure = { isUnavailable, error: lastRes?.error || 'Gemini finding validator failed' };
+        geminiReasonText = lastRes?.status ? `HTTP ${lastRes.status}` : 'Gemini unavailable for this review';
+        if (isUnavailable) {
+          console.log(`Gemini unavailable (${lastRes?.status ? `HTTP ${lastRes.status}` : geminiFailure.error}); validating findings with Claude instead`);
+        }
+        return {
+          ok: false,
+          kind: isUnavailable ? OUTCOME_KINDS.UNAVAILABLE : OUTCOME_KINDS.FAILED,
+          error: geminiFailure.error,
+          status: lastRes?.status || 0,
+        };
       },
-    );
-
-    if (!response.ok) {
-      const body = await response.text();
-      const message = `Gemini finding validator failed (HTTP ${response.status}): ${body.slice(0, 500)}`;
-      if (isGeminiUnavailableStatus(response.status)) {
-        unavailable = new GeminiUnavailableError(message, response.status);
-        break;
-      }
-      throw new Error(message);
-    }
-
-    payload = await response.json();
-    for (const key of Object.keys(usage)) {
-      const value = payload.usageMetadata?.[key];
-      if (typeof value === 'number' && Number.isFinite(value) && value >= 0) usage[key] += value;
-    }
-
-    const text = (payload.candidates?.[0]?.content?.parts || [])
-      .map((part) => typeof part.text === 'string' ? part.text : '')
-      .join('');
-
-    try {
-      if (!text) throw new Error('returned no structured text');
-      returned = normalizeValidationResult(JSON.parse(text), includedIds);
-      break;
-    } catch (error) {
-      lastStructuredError = error;
-      if (attempt === 1) {
-        console.warn(`Gemini finding validator returned malformed structured output; retrying once: ${error.message}`);
-      }
-    }
-  }
-
-  if (unavailable) {
-    console.log(`Gemini unavailable (HTTP ${unavailable.status}); validating findings with Claude instead`);
-    const planPath = path.join(contextRoot, 'session-plan.json');
-    const plan = fs.existsSync(planPath) ? JSON.parse(fs.readFileSync(planPath, 'utf8')) : null;
-    const manual = isManualBudgetExemptReview({ sourceKind: env.SOURCE_KIND, requestedMode: plan?.requestedMode });
-    // The discovery/audit fallback has already consumed part of this run's
-    // allowance, even though the publisher has not yet persisted it.
-    const primaryCharge = raw?._meta?.provider === 'claude' && Number.isFinite(raw._meta.total_cost_usd)
-      ? [{ amount: raw._meta.total_cost_usd, source: raw._meta.cost_source === 'reserve' ? 'reserve' : 'sdk' }]
-      : [];
-    const priorUsd = primaryCharge.reduce((sum, c) => sum + c.amount, 0);
-    const budget = claudeFallbackCallBudget(plan?.session, { manual, pendingUsd: priorUsd });
-    const recordStop = (reason, extraCharges = []) => {
-      const costCharges = [...primaryCharge, ...extraCharges];
-      fs.writeFileSync(path.join(contextRoot, 'fallback-unavailable.json'),
-        JSON.stringify({ mode: raw?._meta?.mode, headSha, reason, costCharges,
-          spentUsd: costCharges.reduce((sum, c) => sum + c.amount, 0) }) + '\n', { mode: 0o600 });
-    };
-    if (!manual && budget < CLAUDE_AUTO_MIN_BUDGET_USD) {
+      claude: async ({ timeoutMs: callTimeout, maxBudgetUsd, reservation }) => {
+        if (!env.CLAUDE_CODE_OAUTH_TOKEN) {
+          claudeBudgetManager.cancelReservation(reservation);
+          const err = new Error('Claude fallback unavailable: CLAUDE_CODE_OAUTH_TOKEN is not set');
+          recordStop('Claude finding validator failed: ' + err.message.slice(0, 170),
+            [{ amount: maxBudgetUsd, source: 'reserve' }]);
+          err.alreadyRecorded = true;
+          throw err;
+        }
+        const adapter = getProviderAdapter(PROVIDER_KINDS.CLAUDE, {
+          defaultModel: CLAUDE_FALLBACK_MODEL,
+          defaultEffort: CLAUDE_FALLBACK_EFFORT,
+        });
+        let res = null;
+        try {
+          res = await adapter.execute({
+            prompt,
+            schema: validationSchema,
+            model: CLAUDE_FALLBACK_MODEL,
+            effort: CLAUDE_FALLBACK_EFFORT,
+            maxTurns: VALIDATOR_MAX_TURNS,
+            maxBudgetUsd,
+            timeoutMs: callTimeout,
+            env,
+            queryImpl,
+            ...claudeToolOptions(makeToolGateway()),
+            allowZeroCost: false,
+            fallbackUnknownCostUsd: FALLBACK_UNKNOWN_COST_USD,
+            isolateEnv: true,
+            requireAuthToken: true,
+          });
+        } finally {
+          if (res?.meta) {
+            lastClaudeCharge = {
+              amount: res.meta.total_cost_usd ?? maxBudgetUsd,
+              source: res.meta.cost_source ?? 'reserve',
+            };
+          }
+          if (res?.meta && claudeBudgetManager && reservation && !reservation.settled) {
+            claudeBudgetManager.settleReservation(reservation, {
+              actualCostUsd: res.meta.total_cost_usd,
+              costSource: res.meta.cost_source ?? 'reserve',
+              fallbackCostUsd: maxBudgetUsd,
+            });
+          }
+        }
+        if (!res.ok) {
+          throw formatClaudeFailureError(res, callTimeout);
+        }
+        returned = normalizeValidationResult(res.structured, includedIds);
+        claudeMeta = {
+          provider: 'claude',
+          requested_model: CLAUDE_FALLBACK_MODEL,
+          resolved_model: res.meta?.resolved_model || CLAUDE_FALLBACK_MODEL,
+          effort: CLAUDE_FALLBACK_EFFORT,
+          total_cost_usd: res.meta?.total_cost_usd,
+          cost_source: res.meta?.cost_source,
+          usage: {
+            input_tokens: res.meta?.usage?.input_tokens ?? null,
+            output_tokens: res.meta?.usage?.output_tokens ?? null,
+            thoughts_tokens: null,
+            total_tokens: null,
+          },
+          fallback_from: 'gemini',
+          fallback_reason: geminiReasonText,
+        };
+        return {
+          ok: true,
+          structured: returned,
+          meta: claudeMeta,
+        };
+      },
+    },
+    onClaudeBudgetBlocked: () => {
       recordStop('Claude validation budget exhausted or below minimum starting allowance');
       throw new Error('Claude finding validator blocked: automatic budget is exhausted or insufficient for a full validation');
-    }
-    let fallback = null;
-    try {
-      fallback = await runClaudeStructured({ prompt, schema: validationSchema, timeoutMs,
-        maxBudgetUsd: budget, env, queryImpl });
-      returned = normalizeValidationResult(fallback.structured, includedIds);
-    } catch (error) {
-      recordStop('Claude finding validator failed: ' + String(error.message || error).slice(0, 170),
-        [{ amount: fallback?.meta?.total_cost_usd ?? budget,
-          source: fallback?.meta?.cost_source ?? 'reserve' }]);
-      throw error;
-    }
-    claudeMeta = {
-      ...fallback.meta,
-      fallback_from: 'gemini',
-      fallback_reason: unavailable.status ? `HTTP ${unavailable.status}` : 'Gemini unavailable for this review',
-    };
-  }
-  if (!returned) {
-    throw new Error(
-      `Gemini finding validator returned invalid structured output after one retry: ${lastStructuredError?.message || 'unknown error'}`,
-    );
+    },
+    onClaudeError: ({ error, reservation }) => {
+      if (error?.alreadyRecorded) return;
+      const charge = lastClaudeCharge || { amount: reservation?.amount ?? 0, source: reservation?.source ?? 'reserve' };
+      recordStop('Claude finding validator failed: ' + String(error?.message || error).slice(0, 170), [charge]);
+    },
+  });
+
+  if (!outcome.ok || !returned) {
+    throw new Error(geminiFailure.error || outcome.error || 'Gemini finding validator returned invalid structured output');
   }
   const byId = new Map(returned.validations.map((entry) => [entry.candidateId, entry]));
   const validations = candidates.map((candidate) => {
@@ -331,7 +453,8 @@ export async function validateMaterialFindings({ env = process.env, fetchImpl = 
   return output;
 }
 
-export function buildValidationPrompt({ repo, prNumber, headSha, contexts }) {
+export function buildValidationPrompt({ repo, prNumber, headSha, contexts, hasTools = false }) {
+  const toolGuidance = readOnlyToolGuidance({ hasTools, mode: 'validation' });
   const candidates = contexts.map((entry) => [
     `### ${entry.candidateId}`,
     'CANDIDATE FINDING:',
@@ -362,7 +485,7 @@ Verdicts:
 - UNCERTAIN: the supplied targeted context is insufficient to prove or disprove it.
 
 Do not introduce new findings. Do not redesign architecture. Keep reasons concise and cite concrete functions/guards/tests in the evidence strings.
-
+${toolGuidance}
 ${candidates}`;
 }
 

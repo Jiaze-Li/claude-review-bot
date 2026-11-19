@@ -8,7 +8,25 @@ import { getProviderAdapter, PROVIDER_KINDS, ERROR_KINDS } from './provider-adap
 export const FALLBACK_UNKNOWN_COST_USD = 0.5;
 export const CLAUDE_FALLBACK_MODEL = 'sonnet';
 export const CLAUDE_FALLBACK_EFFORT = 'medium';
-const CLAUDE_FALLBACK_MAX_TURNS = 3;
+const CLAUDE_FALLBACK_DEFAULT_MAX_TURNS = 8;
+
+/**
+ * Returns Claude adapter tool options: mounts ReadOnlyToolGateway when available,
+ * or explicitly denies all tools when no safe repository snapshot exists.
+ */
+export function claudeToolOptions(toolGateway = null) {
+  if (toolGateway) {
+    return { toolGateway, tools: [] };
+  }
+  return {
+    toolGateway: null,
+    tools: [],
+    canUseTool: async () => ({
+      behavior: 'deny',
+      message: 'No tools are available without a safe repository snapshot.',
+    }),
+  };
+}
 
 export class GeminiUnavailableError extends Error {
   constructor(message, status) {
@@ -16,6 +34,22 @@ export class GeminiUnavailableError extends Error {
     this.name = 'GeminiUnavailableError';
     this.status = status;
   }
+}
+
+export function formatClaudeFailureError(outcome, timeoutMs) {
+  if (outcome.errorKind === ERROR_KINDS.TIMEOUT) {
+    return new Error(`Claude fallback timed out after ${timeoutMs}ms`);
+  }
+  if (outcome.error === 'Claude produced no result') {
+    return new Error('Claude fallback produced no result');
+  }
+  if (outcome.error === 'Claude completed without structured output') {
+    return new Error('Claude fallback completed without structured output');
+  }
+  if (outcome.subtype && outcome.subtype !== 'success') {
+    return new Error(`Claude fallback failed with result subtype: ${outcome.subtype}`);
+  }
+  return new Error(`Claude fallback failed: ${outcome.error}`);
 }
 
 // 402 = credits depleted, 429 = rate/quota limit, 5xx = provider outage.
@@ -29,6 +63,8 @@ export async function runClaudeStructured({
   schema,
   timeoutMs,
   maxBudgetUsd,
+  maxTurns = CLAUDE_FALLBACK_DEFAULT_MAX_TURNS,
+  toolGateway = null,
   env = process.env,
   queryImpl = null,
   logImpl = console.log,
@@ -50,29 +86,16 @@ export async function runClaudeStructured({
     logImpl,
     model: CLAUDE_FALLBACK_MODEL,
     effort: CLAUDE_FALLBACK_EFFORT,
-    maxTurns: CLAUDE_FALLBACK_MAX_TURNS,
+    maxTurns,
+    ...claudeToolOptions(toolGateway),
     allowZeroCost: false,
     fallbackUnknownCostUsd: FALLBACK_UNKNOWN_COST_USD,
     isolateEnv: true,
     requireAuthToken: true,
-    tools: [],
-    canUseTool: async () => ({ behavior: 'deny', message: 'No tools are available in fallback review.' }),
   });
 
   if (!outcome.ok) {
-    if (outcome.errorKind === ERROR_KINDS.TIMEOUT) {
-      throw new Error(`Claude fallback timed out after ${timeoutMs}ms`);
-    }
-    if (outcome.error === 'Claude produced no result') {
-      throw new Error('Claude fallback produced no result');
-    }
-    if (outcome.error === 'Claude completed without structured output') {
-      throw new Error('Claude fallback completed without structured output');
-    }
-    if (outcome.subtype && outcome.subtype !== 'success') {
-      throw new Error(`Claude fallback failed with result subtype: ${outcome.subtype}`);
-    }
-    throw new Error(`Claude fallback failed: ${outcome.error}`);
+    throw formatClaudeFailureError(outcome, timeoutMs);
   }
 
   logImpl(`Claude fallback complete: model=${outcome.meta.resolved_model || CLAUDE_FALLBACK_MODEL} effort=${CLAUDE_FALLBACK_EFFORT}`);

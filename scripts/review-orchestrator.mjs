@@ -7,9 +7,43 @@
 // - Diagnostic logging and failure provenance tracking
 // - Normalized provider outcome contract
 
+import fs from 'node:fs';
+import path from 'node:path';
 import { defaultProviderRegistry, PROVIDER_KINDS, parseProviderBudgets } from './provider-adapter.mjs';
+import { ReadOnlyToolGateway } from './tool-gateway.mjs';
 
 export { parseProviderBudgets };
+
+export function resolveSafeRoot(env = process.env) {
+  const candidate = env?.SAFE_REPO_DIR || 'safe-target';
+  const target = path.resolve(candidate);
+  if (!fs.existsSync(target)) return null;
+  try {
+    const resolved = fs.realpathSync.native ? fs.realpathSync.native(target) : fs.realpathSync(target);
+    return fs.statSync(resolved).isDirectory() ? resolved : null;
+  } catch {
+    return null;
+  }
+}
+
+export function createReviewToolGateway({
+  safeRoot,
+  contextRoot = null,
+  cwd = process.cwd(),
+  allowedContextFiles = [],
+  maxTurns = 8,
+  ignorePatterns = [],
+} = {}) {
+  if (!safeRoot) return null;
+  return new ReadOnlyToolGateway({
+    safeRoot,
+    contextRoot,
+    cwd,
+    ignorePatterns,
+    allowedContextFiles,
+    maxCalls: maxTurns * 4,
+  });
+}
 
 export class DeadlineTracker {
   constructor({ totalMs, minBufferMs = 60_000, nowFn = Date.now } = {}) {

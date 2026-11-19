@@ -216,7 +216,7 @@ export async function applyManualDismissal({
   const verdict = isAcceptance
     ? await verifyAcceptanceWithModel({
       repo, prNumber, headSha, finding: targetFinding, statement: decision.reason, session: durable,
-      env, fetchImpl: modelFetchImpl,
+      repoRoot, env, fetchImpl: modelFetchImpl,
       queryImpl,
     })
     : await verifyDismissalWithModel({
