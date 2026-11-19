@@ -14,6 +14,7 @@ import {
   classifyIncrementalDelta, prepareIncrementalDelta,
 } from '../scripts/select-incremental-review.mjs';
 import { buildGeminiRequest } from '../scripts/run-gemini-review.mjs';
+import { fullReviewDecision } from '../scripts/plan-review-session.mjs';
 
 const A = 'a'.repeat(40), B = 'b'.repeat(40), C = 'c'.repeat(40), BASE = 'd'.repeat(40);
 const empty = { summary: 'No confirmed defects in this delta', findings: [] };
@@ -154,4 +155,20 @@ test('exact Git tree delta is materialized without sending old cumulative PR com
   const actual = fs.readFileSync(path.join(context, 'repair.diff'), 'utf8');
   assert.match(actual, /const label = 2;/);
   assert.doesNotMatch(actual, /old commits are re-reviewed/);
+});
+
+test('escalation to a full review is the same whichever model was asked for: shared-state, permission, size and history changes', () => {
+  const sharedState = (extra) => classifyIncrementalDelta(changed(extra));
+  // a small edit that touches shared state / transactions / permissions / tokens widens to a full review
+  for (const line of ['+db.transaction(run)', '+await rollback()', '+if (!permission) deny()', '+const token = readToken()', '+queue.race(a, b)']) {
+    assert.equal(sharedState({ patch: patch + line + '\n' }).mode, 'full', line);
+  }
+  // more than 3 files or more than 50 changed lines widens too
+  assert.equal(sharedState({ numstat: ['1\t1\ta.js','1\t1\tb.js','1\t1\tc.js','1\t1\td.js'].join('\0') + '\0', nameStatus: 'M\0a.js\0M\0b.js\0M\0c.js\0M\0d.js\0' }).mode, 'full');
+  assert.equal(sharedState({ numstat: '30\t21\tsrc/ui.js\0' }).mode, 'full');
+  // and the scope that follows is the same full route for a person asking for Claude and for the default
+  for (const requested of ['auto', 'claude']) {
+    const decision = fullReviewDecision({ REVIEW_CONTEXT_DIR: os.tmpdir() }, requested, 'widened');
+    assert.equal(decision.mode, 'full');
+  }
 });

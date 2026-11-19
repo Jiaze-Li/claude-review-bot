@@ -6,7 +6,7 @@ import {
 } from './review-session-core.mjs';
 import { postCommitStatus } from './sync-commit-status.mjs';
 
-// Scheduled safety net: a deep review whose job died without cleanup would otherwise sit in
+// Scheduled safety net: a full review whose job died without cleanup would otherwise sit in
 // REVIEW_IN_PROGRESS until someone triggers another review. This closes it to HUMAN_REQUIRED
 // (and the required status to error) without any model call.
 // Hard bounds so a scheduled run can never become an unbounded API crawl.
@@ -14,7 +14,7 @@ export const MAX_REPOS = 100;
 export const MAX_PRS_PER_REPO = 100;
 export const MAX_CANDIDATES = 50;
 
-// Phase 1 (no writes): list PRs whose latest session looks like a dead deep review.
+// Phase 1 (no writes): list PRs whose latest session looks like a dead full review.
 export async function findStaleDeepReviews({ env = process.env, fetchImpl = fetch, now = Date.now() } = {}) {
   const author = env.EXPECTED_REVIEW_AUTHOR;
   if (!author) throw new Error('Missing required environment variable: EXPECTED_REVIEW_AUTHOR');
@@ -33,7 +33,7 @@ export async function findStaleDeepReviews({ env = process.env, fetchImpl = fetc
       }
     }
   }
-  console.log(candidates.length ? `Stale deep review candidates: ${candidates.map((c) => `${c.repo}#${c.pr}`).join(', ')}` : `No stale deep reviews (${repos.length} installed repositories checked).`);
+  console.log(candidates.length ? `Stale full review candidates: ${candidates.map((c) => `${c.repo}#${c.pr}`).join(', ')}` : `No stale full reviews (${repos.length} installed repositories checked).`);
   return candidates;
 }
 
@@ -49,11 +49,11 @@ export async function closeStaleDeepReview({ repo, prNumber, env = process.env, 
   const read = {};
   const session = await readSessionOrNull({ repo, prNumber, author, env, fetchImpl, importLegacy: true, seen: read });
   if (!session || !isDeepReviewStale(session, now) || session.lastReviewedHead !== pr.head?.sha) {
-    console.log(`${repo}#${prNumber}: no longer a stale deep review; leaving it alone.`);
+    console.log(`${repo}#${prNumber}: no longer a stale full review; leaving it alone.`);
     return false;
   }
   const closed = failDeepReview({
-    session, headSha: session.lastReviewedHead, reason: 'deep review never reported back (swept after timeout)',
+    session, headSha: session.lastReviewedHead, reason: 'full review never reported back (swept after timeout)',
     spentUsd: session.deepReview?.reservedUsd ?? DEEP_REVIEW_RUN_BUDGET_USD, now: new Date(now).toISOString(),
   });
   await saveSessionComment({
@@ -63,9 +63,9 @@ export async function closeStaleDeepReview({ repo, prNumber, env = process.env, 
   });
   await postCommitStatus({
     env, fetchImpl, target: repo, headSha: session.lastReviewedHead,
-    status: { state: 'error', description: 'Claude deep review timed out: human judgment required' },
+    status: { state: 'error', description: 'full review timed out: human judgment required' },
   });
-  console.log(`${repo}#${prNumber}: stale deep review closed to HUMAN_REQUIRED.`);
+  console.log(`${repo}#${prNumber}: stale full review closed to HUMAN_REQUIRED.`);
   return true;
 }
 

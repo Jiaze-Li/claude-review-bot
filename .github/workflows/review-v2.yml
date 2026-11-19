@@ -304,8 +304,8 @@ jobs:
           fi
           git -C target diff --no-ext-diff --no-textconv --unified=80 "$PREVIOUS_HEAD" "$HEAD_SHA" > .review-context/repair.diff
 
-      - name: Install Claude dependencies only for explicit deep review
-        if: steps.dedupe.outputs.duplicate != 'true' && steps.plan.outputs.mode == 'claude'
+      - name: Install Claude dependencies only for full reviews
+        if: steps.dedupe.outputs.duplicate != 'true' && steps.plan.outputs.mode == 'full'
         shell: bash
         run: |
           set -euo pipefail
@@ -314,7 +314,7 @@ jobs:
 
       - name: Materialize safe source snapshot
         id: snapshot
-        if: steps.dedupe.outputs.duplicate != 'true' && (steps.plan.outputs.mode == 'claude' || steps.plan.outputs.mode == 'incremental' || steps.plan.outputs.mode == 'verification' || steps.plan.outputs.mode == 'dismiss')
+        if: steps.dedupe.outputs.duplicate != 'true' && (steps.plan.outputs.mode == 'full' || steps.plan.outputs.mode == 'incremental' || steps.plan.outputs.mode == 'verification' || steps.plan.outputs.mode == 'dismiss')
         env:
           HEAD_SHA: ${{ inputs.head_sha }}
           SOURCE_REPO_DIR: target
@@ -344,9 +344,9 @@ jobs:
           REVIEW_REASON: ${{ steps.plan.outputs.reason }}
         run: node scripts/review-status.mjs
 
-      - name: Begin Claude deep review in the durable session
+      - name: Begin the full review in the durable session
         id: begin-deep
-        if: steps.dedupe.outputs.duplicate != 'true' && steps.plan.outputs.mode == 'claude'
+        if: steps.dedupe.outputs.duplicate != 'true' && steps.plan.outputs.mode == 'full'
         env:
           EXPECTED_REVIEW_AUTHOR: ${{ steps.app-token.outputs.app-slug }}[bot]
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
@@ -527,9 +527,9 @@ jobs:
           REVIEW_CONTEXT_DIR: .review-context
         run: node scripts/apply-dismissal.mjs
 
-      - name: Run Claude explicit deep review
+      - name: Run the full review
         timeout-minutes: 20
-        if: steps.dedupe.outputs.duplicate != 'true' && steps.plan.outputs.mode == 'claude' && steps.begin-deep.outputs.run == 'true'
+        if: steps.dedupe.outputs.duplicate != 'true' && steps.plan.outputs.mode == 'full' && steps.begin-deep.outputs.run == 'true'
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -544,9 +544,9 @@ jobs:
           REVIEW_OUTPUT_PATH: .review-context/review.json
         run: node scripts/run-review.mjs
 
-      - name: Publish Claude explicit deep review
+      - name: Publish the full review
         id: publish-claude
-        if: steps.dedupe.outputs.duplicate != 'true' && steps.plan.outputs.mode == 'claude' && steps.begin-deep.outputs.run == 'true'
+        if: steps.dedupe.outputs.duplicate != 'true' && steps.plan.outputs.mode == 'full' && steps.begin-deep.outputs.run == 'true'
         env:
           EXPECTED_REVIEW_AUTHOR: ${{ steps.app-token.outputs.app-slug }}[bot]
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
@@ -559,9 +559,9 @@ jobs:
           REVIEW_PATH: .review-context/review.json
         run: node scripts/publish-review.mjs
 
-      - name: Merge Claude deep review into the durable session
+      - name: Merge the full review into the durable session
         id: finalize-deep
-        if: steps.dedupe.outputs.duplicate != 'true' && steps.plan.outputs.mode == 'claude' && steps.begin-deep.outputs.run == 'true'
+        if: steps.dedupe.outputs.duplicate != 'true' && steps.plan.outputs.mode == 'full' && steps.begin-deep.outputs.run == 'true'
         env:
           EXPECTED_REVIEW_AUTHOR: ${{ steps.app-token.outputs.app-slug }}[bot]
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
@@ -574,7 +574,7 @@ jobs:
           REVIEW_PATH: .review-context/review.json
         run: node scripts/deep-review.mjs finalize
 
-      - name: Fail closed if the deep review did not complete
+      - name: Fail closed if the full review did not complete
         id: fail-deep
         if: always() && steps.dedupe.outputs.duplicate != 'true' && ((steps.begin-deep.outputs.began == 'true' && steps.begin-deep.outputs.run == 'true' && steps.finalize-deep.outcome != 'success') || steps.plan.outputs.mode == 'deep_review_stale')
         env:
@@ -587,7 +587,7 @@ jobs:
           SOURCE_COMMENT_ID: ${{ inputs.source_comment_id }}
           REVIEW_CONTEXT_DIR: .review-context
           DEEP_REVIEW_MAX_BUDGET_USD: ${{ steps.begin-deep.outputs.run_budget_usd }}
-          DEEP_REVIEW_FAILURE_REASON: deep review failed, timed out, hit its turn/budget limit, or never reported back (see the workflow run)
+          DEEP_REVIEW_FAILURE_REASON: full review failed, timed out, hit its turn/budget limit, or never reported back (see the workflow run)
         run: node scripts/deep-review.mjs fail
 
       - name: Resolve review threads for closed findings

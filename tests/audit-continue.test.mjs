@@ -66,7 +66,7 @@ test('AC6: other statuses read exactly as before', () => {
   const ready = { ...awaiting, status: 'READY', auditCompleted: true };
   assert.doesNotMatch(renderSessionComment(ready, { finalReview: { startsByItself: false, reason: 'x' } }), /NOT running/);
   assert.equal(sessionCommitStatus(ready, HEAD).state, 'success');
-  assert.equal(sessionCommitStatus({ ...awaiting, status: 'REVIEW_IN_PROGRESS' }, HEAD).description, 'Claude deep review in progress');
+  assert.equal(sessionCommitStatus({ ...awaiting, status: 'REVIEW_IN_PROGRESS' }, HEAD).description, 'Full review in progress');
   assert.equal(sessionCommitStatus({ ...awaiting, status: 'REWORK' }, HEAD).state, 'failure');
   assert.equal(sessionCommitStatus({ ...awaiting, status: 'PARTIAL' }, HEAD).state, 'error');
   assert.equal(sessionCommitStatus({ ...awaiting, status: 'HUMAN_REQUIRED' }, HEAD).state, 'error');

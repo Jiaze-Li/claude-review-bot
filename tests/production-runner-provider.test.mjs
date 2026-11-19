@@ -861,7 +861,7 @@ test('GitHub Actions workflow propagation: review-v2.yml propagates REVIEW_PROVI
   assert.match(yml, /jobs:\s*\n\s*review:\s*\n\s*runs-on: ubuntu-latest\s*\n\s*env:\s*\n\s*REVIEW_PROVIDERS:[\s\S]*?PROVIDER_BUDGETS:/);
 
   // Verify step level propagation to begin-deep, gemini-run, and claude-run
-  const beginDeepBlock = yml.slice(yml.indexOf('- name: Begin Claude deep review'), yml.indexOf('- name: Recover published session'));
+  const beginDeepBlock = yml.slice(yml.indexOf('- name: Begin the full review'), yml.indexOf('- name: Recover published session'));
   assert.match(beginDeepBlock, /REVIEW_PROVIDERS: \$\{\{ inputs\.review_providers \|\| vars\.REVIEW_PROVIDERS \|\| '' \}\}/);
   assert.match(beginDeepBlock, /PROVIDER_BUDGETS: \$\{\{ inputs\.provider_budgets \|\| vars\.PROVIDER_BUDGETS \|\| '' \}\}/);
 
@@ -869,7 +869,7 @@ test('GitHub Actions workflow propagation: review-v2.yml propagates REVIEW_PROVI
   assert.match(geminiRunBlock, /REVIEW_PROVIDERS: \$\{\{ inputs\.review_providers \|\| vars\.REVIEW_PROVIDERS \|\| '' \}\}/);
   assert.match(geminiRunBlock, /PROVIDER_BUDGETS: \$\{\{ inputs\.provider_budgets \|\| vars\.PROVIDER_BUDGETS \|\| '' \}\}/);
 
-  const claudeRunBlock = yml.slice(yml.indexOf('- name: Run Claude explicit deep review'), yml.indexOf('- name: Publish Claude explicit deep review'));
+  const claudeRunBlock = yml.slice(yml.indexOf('- name: Run the full review'), yml.indexOf('- name: Publish the full review'));
   assert.match(claudeRunBlock, /REVIEW_PROVIDERS: \$\{\{ steps\.begin-deep\.outputs\.providers \}\}/);
   assert.match(claudeRunBlock, /PROVIDER_BUDGETS: \$\{\{ inputs\.provider_budgets \|\| vars\.PROVIDER_BUDGETS \|\| '' \}\}/);
 });

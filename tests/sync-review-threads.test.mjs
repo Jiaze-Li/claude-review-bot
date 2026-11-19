@@ -95,7 +95,7 @@ test('the workflow runs the thread sync last and never lets it fail a review', a
   const { readFileSync } = await import('node:fs');
   const yml = readFileSync(new URL('../.github/workflows/review-v2.yml', import.meta.url), 'utf8');
   const start = yml.indexOf('- name: Resolve review threads for closed findings');
-  assert.ok(start > yml.indexOf('- name: Fail closed if the deep review did not complete'));
+  assert.ok(start > yml.indexOf('- name: Fail closed if the full review did not complete'));
   assert.ok(start < yml.indexOf('- name: Finalize workflow status'));
   const block = yml.slice(start, yml.indexOf('- name: Finalize workflow status'));
   assert.match(block, /continue-on-error: true/);

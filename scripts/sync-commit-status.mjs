@@ -28,11 +28,11 @@ export async function syncCommitStatus({ env = process.env, fetchImpl = fetch } 
   if (env.JOB_FAILED === 'true' && status.state === 'pending' && (!session || session.lastReviewedHead !== headSha)) {
     status = { state: 'error', description: 'Review run failed for this commit; comment @gemini review to retry' };
   }
-  // A deep review that was attempted but whose job failed must never leave an old green or a
+  // A full review that was attempted but whose job failed must never leave an old green or a
   // forever-pending status, even if persisting the failure to the session comment itself failed.
   if (env.DEEP_REVIEW_ATTEMPTED === 'true' && env.JOB_FAILED === 'true'
     && !(session && session.lastReviewedHead === headSha && ['REWORK', 'HUMAN_REQUIRED', 'PARTIAL'].includes(session.status))) {
-    status = { state: 'error', description: 'Claude deep review did not complete: human judgment required' };
+    status = { state: 'error', description: 'Full review did not complete: human judgment required' };
   }
   return postCommitStatus({ env, fetchImpl, target, headSha, status });
 }

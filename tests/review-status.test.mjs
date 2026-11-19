@@ -243,7 +243,7 @@ test('v2 workflow isolates provider credentials and serializes durable PR sessio
   const stopGemini = yml.indexOf('- name: Record provider-unavailable delta review');
   const validator = yml.indexOf('- name: Validate Gemini material findings');
   const publishGemini = yml.indexOf('- name: Publish Gemini review and durable session');
-  const claude = yml.indexOf('- name: Run Claude explicit deep review');
+  const claude = yml.indexOf('- name: Run the full review');
   const finished = yml.indexOf('- name: Finalize workflow status');
 
   assert.ok(context < plan && plan < started && started < recover && recover < gemini && gemini < validator && validator < publishGemini && publishGemini < claude && claude < finished);
@@ -265,7 +265,7 @@ test('v2 workflow isolates provider credentials and serializes durable PR sessio
   assert.match(validatorBlock, /GH_TOKEN: \$\{\{ steps\.app-token\.outputs\.token \}\}/);
   // Claude fallback validates when Gemini is out of credits; the fallback subprocess is tool-less and gets a scrubbed env (see claude-fallback tests).
   assert.match(validatorBlock, /CLAUDE_CODE_OAUTH_TOKEN/);
-  const publishClaude = yml.indexOf('- name: Publish Claude explicit deep review');
+  const publishClaude = yml.indexOf('- name: Publish the full review');
   const claudeBlock = yml.slice(claude, publishClaude);
   assert.doesNotMatch(claudeBlock, /GH_TOKEN|app-token\.outputs\.token/);
   assert.match(yml, /permission-issues: read/);
@@ -397,7 +397,7 @@ test("deep_review_stale finished status reports outcome: success records receipt
     fetchImpl: async (url, init = {}) => { sent.push(JSON.parse(init.body).body); return Response.json({ id: 5678 }); },
   });
   assert.equal(r2, "5678");
-  assert.match(sent.at(-1), /Stale deep review cleanup was not confirmed/);
+  assert.match(sent.at(-1), /Stale review cleanup was not confirmed/);
   assert.match(sent.at(-1), /actions\/runs\/1234\/attempts\/2/);
   assert.match(sent.at(-1), /<!-- jiaze-review-source-comment:99 -->/);
 });

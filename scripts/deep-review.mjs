@@ -15,7 +15,9 @@ import {
   completeDeepReview,
   failDeepReview,
   isDeepReviewStale,
+  isFullMode,
   isManualBudgetExemptReview,
+  providerPolicyOf,
   renderSessionComment,
 } from './review-session-core.mjs';
 
@@ -30,12 +32,12 @@ export async function runDeepReviewCommand(command, { env = process.env, fetchIm
   const stateFile = path.join(ctx.contextRoot, 'deep-review-state.json');
 
   if (command === 'begin') {
-    if (ctx.plan.decision?.mode !== 'claude') throw new Error('begin requires an explicit Claude deep review plan');
+    if (!isFullMode(ctx.plan.decision?.mode)) throw new Error('begin requires a full review plan');
     await assertHeadUnmoved(ctx, fetchImpl);
     // An explicit @claude review (or a manual @gemini review comment) deliberately authorizes a
     // bounded $5 call even when the cumulative automatic $6 cap is exhausted. The same mode is
     // also chosen automatically when a PR is too large for Gemini; that run obeys the cap.
-    const explicitClaude = ctx.plan.requestedMode === 'claude';
+    const explicitClaude = providerPolicyOf(ctx.plan) === 'claude_only';
     // Who asked decides the money rules (the same rule the staged pipeline uses): a person's review command is
     // manual; a dismissal, override or automatic event is not.
     const manual = explicitClaude || isManualBudgetExemptReview({ sourceKind: env.SOURCE_KIND, requestedMode: ctx.plan.requestedMode });
@@ -67,7 +69,7 @@ export async function runDeepReviewCommand(command, { env = process.env, fetchIm
     // Required status goes pending/error FIRST, so a failed durable write below can never leave an old green.
     await postCommitStatus({
       env, fetchImpl, target: ctx.target, headSha: ctx.headSha,
-      status: { state: 'pending', description: 'Claude deep review in progress' },
+      status: { state: 'pending', description: 'full review in progress' },
     });
     const commentId = await upsertSession(ctx, session, [], fetchImpl, ctx.plan.sessionCommentId, ctx.plan.session);
     fs.writeFileSync(stateFile, JSON.stringify({ session, sessionCommentId: commentId }) + '\n', { mode: 0o600 });
@@ -75,7 +77,7 @@ export async function runDeepReviewCommand(command, { env = process.env, fetchIm
     output(env, 'run', 'true');
     output(env, 'run_budget_usd', runBudget.toFixed(2));
     output(env, 'providers', providers);
-    console.log(`Deep review begun (providers: ${providers.replace(',', ' then ')}; Claude per-call budget ${runBudget.toFixed(2)}).`);
+    console.log(`Full review begun (providers: ${providers.replace(',', ' then ')}; Claude per-call budget ${runBudget.toFixed(2)}).`);
     return session;
   }
 
@@ -99,7 +101,7 @@ export async function runDeepReviewCommand(command, { env = process.env, fetchIm
     }
     const savedId = await upsertSession(ctx, session, [ctx.sourceCommentId], fetchImpl, state.sessionCommentId, state.session);
     fs.writeFileSync(stateFile, JSON.stringify({ session, sessionCommentId: savedId }) + '\n', { mode: 0o600 });
-    console.log(`Deep review merged into session; status ${session.status}.`);
+    console.log(`Full review merged into session; status ${session.status}.`);
     return session;
   }
 
@@ -115,12 +117,12 @@ export async function runDeepReviewCommand(command, { env = process.env, fetchIm
       session = ctx.plan.session; commentId = ctx.plan.sessionCommentId;
       fallbackCost = ctx.plan.session.deepReview?.reservedUsd ?? DEEP_REVIEW_RUN_BUDGET_USD;
     } else {
-      console.log('No deep review owned by this job and no stale marker; nothing to fail.');
+      console.log('No full review owned by this job and no stale marker; nothing to fail.');
       return null;
     }
     const usage = readUsage(ctx.contextRoot, fallbackCost);
     if (!session || session.status !== 'REVIEW_IN_PROGRESS' || session.lastReviewedHead !== ctx.headSha) {
-      console.log('No in-progress deep review for this HEAD to fail; nothing to do.');
+      console.log('No in-progress full review for this HEAD to fail; nothing to do.');
       return null;
     }
     // A newer commit replaces this marker when it is reviewed, and the new HEAD plans from the status this run
@@ -130,14 +132,14 @@ export async function runDeepReviewCommand(command, { env = process.env, fetchIm
     if (stale) {
       const marked = { ...session, ...stale };
       await upsertSession(ctx, marked, [ctx.sourceCommentId], fetchImpl, commentId, session);
-      console.log('PR moved; marked the interrupted deep review as out of date for the newer commit.');
+      console.log('PR moved; marked the interrupted full review as out of date for the newer commit.');
       return null;
     }
     const failed = failDeepReview({
-      session, headSha: ctx.headSha, reason: env.DEEP_REVIEW_FAILURE_REASON || 'deep review did not complete', spentUsd: usage.cost, costSource: usage.source, now,
+      session, headSha: ctx.headSha, reason: env.DEEP_REVIEW_FAILURE_REASON || 'full review did not complete', spentUsd: usage.cost, costSource: usage.source, now,
     });
     await upsertSession(ctx, failed, [ctx.sourceCommentId], fetchImpl, commentId, session);
-    console.log(`Deep review failed closed: ${failed.deepReview.reason}`);
+    console.log(`Full review failed closed: ${failed.deepReview.reason}`);
     return failed;
   }
 

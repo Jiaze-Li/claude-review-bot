@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { isBlockingFinding, isDeepReviewStale, openMaterialFindings, planReviewSession, unresolvedMaterialFindings } from './review-session-core.mjs';
+import { isBlockingFinding, isDeepReviewStale, isFullMode, openMaterialFindings, planReviewSession, providerPolicyFor, scopeOfMode, unresolvedMaterialFindings } from './review-session-core.mjs';
 import { LEDGER_CODES, loadLedger, pendingFromRecords } from './session-store.mjs';
 import { dropIgnoredFiles, splitDiffByFile, stagedFixedBytes, stagedReviewCapacity } from './review-shards.mjs';
 import { adoptOrphanFindings, blockingClaims, fetchReviewThreads, findOrphanBotThreads, isWriter, threadsByFinding } from './review-threads.mjs';
@@ -12,7 +12,16 @@ const repoPattern=/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const shaPattern=/^[0-9a-f]{40}$/i;
 export const MAX_CARRIED_FINDINGS=8;
 
-export async function planSession({ env=process.env, fetchImpl=fetch }={}) {
+// The plan carries the scope of this review and, separately, which model policy applies (see review-session-core).
+function withScopeAndPolicy(plan){
+  return {...plan,providerPolicy:providerPolicyFor(plan.requestedMode),decision:{...plan.decision,scope:scopeOfMode(plan.decision?.mode)}};
+}
+
+export async function planSession(args={}) {
+  return withScopeAndPolicy(await planSessionDecision(args));
+}
+
+async function planSessionDecision({ env=process.env, fetchImpl=fetch }={}) {
   const target=required(env,'TARGET_REPO');
   if(!repoPattern.test(target)) throw new Error('Invalid TARGET_REPO');
   const pr=required(env,'PR_NUMBER');
@@ -47,7 +56,7 @@ export async function planSession({ env=process.env, fetchImpl=fetch }={}) {
     return {
       ledgerSeq,
       requestedMode:requested,
-      decision:{mode:'recover',previousHead:null,reason:requested==='claude'
+      decision:{mode:'recover',previousHead:null,reason:providerPolicyFor(requested)==='claude_only'
         ?'recover published review session without another model call. Your @claude review request was NOT run; send it again after this recovery.'
         :requested==='threads'
           ?'recover published review session without another model call. Your review-thread decision was NOT applied yet; resolve the thread again (or comment @gemini review) after this recovery.'
@@ -109,7 +118,7 @@ export async function planSession({ env=process.env, fetchImpl=fetch }={}) {
   // audit, whatever the session calls for); only the model differs: Claude alone instead of Gemini first.
   // A run still in progress for this exact HEAD is the one thing to wait for rather than start again.
   if(['claude','reset'].includes(requested) && session && session.lastReviewedHead===headSha && session.status==='REVIEW_IN_PROGRESS' && !isDeepReviewStale(session)){
-    const decision={mode:'noop_waiting',previousHead:headSha,reason:'a deep review is already in progress for this HEAD'};
+    const decision={mode:'noop_waiting',previousHead:headSha,reason:'a full review is already in progress for this HEAD'};
     return {ledgerSeq,requestedMode:requested,decision,session,sessionCommentId,pendingSession:null,pendingSourceCommentId:null,pendingReviewId:null};
   }
 
@@ -248,8 +257,8 @@ export async function resolveVerificationScope({ plan, env = process.env, fetchI
 // The one decision for any review of the whole PR.
 export function fullReviewDecision(env,requested,why){
   const diffBytes=fileBytes(path.join(path.resolve(env.REVIEW_CONTEXT_DIR||'.review-context'),'pr.diff'));
-  return {mode:'claude',previousHead:null,
-    reason:`${why}: reviewing the ${Math.max(1,Math.round(diffBytes/1000))} KB diff in shards: ${requested==='claude'?'Claude only':'Gemini first, Claude continues if Gemini cannot'}`};
+  return {mode:'full',previousHead:null,
+    reason:`${why}: reviewing the ${Math.max(1,Math.round(diffBytes/1000))} KB diff in shards: ${providerPolicyFor(requested)==='claude_only'?'Claude only':'Gemini first, Claude continues if Gemini cannot'}`};
 }
 
 function fileBytes(file){
@@ -272,7 +281,7 @@ function appendOutput(name,value,env){
   fs.appendFileSync(env.GITHUB_OUTPUT,`${name}=${String(value??'')}\n`);
 }
 
-const ORPHAN_RECONCILE_MODES = new Set(['verification', 'incremental', 'claude', 'human_required']);
+const ORPHAN_RECONCILE_MODES = new Set(['verification', 'incremental', 'full', 'claude', 'human_required']);
 
 // Reconcile bot-authored review threads missing from the current session.
 // Only `auto` verification runs (or AUDIT_PENDING before final full review) adopt and verify orphans;
@@ -299,7 +308,7 @@ export async function reconcileOrphanThreads({ plan, env = process.env, fetchImp
   if (found.total === 0) return plan;
 
   const canAdopt = plan.requestedMode === 'auto'
-    && (plan.decision.mode === 'verification' || (plan.session.status === 'AUDIT_PENDING' && plan.decision.mode === 'claude'));
+    && (plan.decision.mode === 'verification' || (plan.session.status === 'AUDIT_PENDING' && isFullMode(plan.decision.mode)));
 
   if (!canAdopt) {
     return {
@@ -390,8 +399,9 @@ export async function runSessionPlanner({ env = process.env, fetchImpl = fetch, 
     log.log?.('Review scope: ' + scope.mode + ' — ' + scope.reason
       + (scope.changedLines == null ? '' : ' (' + scope.files + ' files, ' + scope.changedLines + ' lines)'));
   }
+  // Orphan reconciliation may replace the decision, so scope and policy are stamped on the final plan.
   plan = await reconcileOrphanThreads({ plan, env, fetchImpl, log });
-  return plan;
+  return withScopeAndPolicy(plan);
 }
 
 if(process.argv[1] && import.meta.url===pathToFileURL(process.argv[1]).href){

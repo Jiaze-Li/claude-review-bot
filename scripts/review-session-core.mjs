@@ -68,6 +68,8 @@ function pruneFindingsToCap(findings, max = MAX_SESSION_FINDINGS) {
 export function pathKey(path) {
   return createHash('sha1').update(String(path)).digest('hex').slice(0, 8);
 }
+// Note: `deepReview`, `deep_review_stale` and the DEEP_REVIEW_* names are historical storage/identifier names kept for
+// compatibility with saved records and the workflow inputs. They are not a product concept: there is one full review.
 export const CLAUDE_AUTO_MIN_BUDGET_USD = 0.5;
 // An IN_PROGRESS session older than this belongs to a run that died without
 // reporting; it must resolve instead of waiting forever.
@@ -88,7 +90,7 @@ export function planReviewSession({ session = null, baseSha, headSha, reset = fa
     return { mode: 'full_review', previousHead: null, reason: reset ? 'explicit reset' : 'new review session' };
   }
 
-  // A push during a deep review must not wipe the session: plan as if the deep review had
+  // A push during a full review must not wipe the session: plan as if the full review had
   // never started, from the status it interrupted (open findings and rounds are preserved).
   if (session.status === 'REVIEW_IN_PROGRESS' && session.lastReviewedHead !== headSha) {
     return planReviewSession({
@@ -99,9 +101,9 @@ export function planReviewSession({ session = null, baseSha, headSha, reset = fa
 
   if (session.status === 'REVIEW_IN_PROGRESS') {
     if (isDeepReviewStale(session, now)) {
-      return { mode: 'deep_review_stale', previousHead: session.lastReviewedHead, reason: 'deep review did not report back in time' };
+      return { mode: 'deep_review_stale', previousHead: session.lastReviewedHead, reason: 'the full review did not report back in time' };
     }
-    return { mode: 'noop_waiting', previousHead: session.lastReviewedHead, reason: 'deep review is still in progress for this HEAD' };
+    return { mode: 'noop_waiting', previousHead: session.lastReviewedHead, reason: 'a full review is still in progress for this HEAD' };
   }
 
   if (session.status === 'AUDIT_PENDING') {
@@ -143,7 +145,7 @@ export function planReviewSession({ session = null, baseSha, headSha, reset = fa
       return { mode: 'full_review', previousHead: null, reason: 'new HEAD after partial-coverage review; run a fresh bounded review' };
     }
     return retryUnavailable || continuation
-      ? { mode: 'claude', previousHead: null, reason: 'continue the partial review with the files not yet covered' }
+      ? { mode: 'full', previousHead: null, reason: 'continue the partial review with the files not yet covered' }
       : { mode: 'noop_waiting', previousHead: session.lastReviewedHead, reason: 'review coverage was partial; comment `@gemini review` to cover the remaining files' };
   }
 
@@ -182,8 +184,8 @@ export function planReviewSession({ session = null, baseSha, headSha, reset = fa
         && ['AUDIT_PENDING', 'PARTIAL', 'READY'].includes(session.deepReview.resumeStatus)
         && openMaterialFindings(session).length === 0
         && unresolvedMaterialFindings(session).length === 0) {
-      return { mode: 'claude', previousHead: null,
-        reason: 'manual retry of failed deep review on the same HEAD; keep prior evidence and spend' };
+      return { mode: 'full', previousHead: null,
+        reason: 'manual retry of failed review on the same HEAD; keep prior evidence and spend' };
     }
     return { mode: 'human_required', previousHead: session.lastReviewedHead ?? null, reason: 'session already requires human judgment' };
   }
@@ -370,6 +372,29 @@ export function isManualBudgetExemptReview({ sourceKind, requestedMode } = {}) {
   return (sourceKind === 'comment' && ['auto', 'reset', 'claude'].includes(requestedMode)) || requestedMode === 'threads';
 }
 
+// Review scope and model policy are two separate things. Scope (what gets reviewed) is decided once, by the
+// planner; provider policy (which model reviews it) only chooses the model and never changes the scope.
+// `full` is the whole-PR review route. The route used to be called `claude`; readers still accept that old value.
+export function isFullMode(mode) {
+  return mode === 'full' || mode === 'claude';
+}
+
+// 'full' | 'targeted' | null (null: nothing is reviewed by this decision)
+export function scopeOfMode(mode) {
+  if (isFullMode(mode)) return 'full';
+  return mode === 'verification' || mode === 'incremental' ? 'targeted' : null;
+}
+
+// 'claude_only' when a person asked for Claude by name, otherwise 'default' (Gemini first, Claude continues).
+export function providerPolicyFor(requestedMode) {
+  return requestedMode === 'claude' ? 'claude_only' : 'default';
+}
+
+// The one place that decides which model reviews. Older plan files carry no policy, so derive it from the request.
+export function providerPolicyOf(plan) {
+  return plan?.providerPolicy ?? providerPolicyFor(plan?.requestedMode);
+}
+
 export function claudeFallbackCallBudget(session, { manual = false, pendingUsd = 0 } = {}) {
   return manual ? DEEP_REVIEW_MANUAL_RUN_BUDGET_USD
     : Math.max(0, roundUsd(claudeFallbackBudgetLeft(session) - nonNegative(pendingUsd)));
@@ -482,7 +507,7 @@ export function beginDeepReview({
   // it is owed once, so findings it adds are verified and the PR then needs no second full review. A review that
   // starts a session of its own is not (a clean one is simply READY).
   if (session?.lastReviewedHead === headSha && session.status === 'REVIEW_IN_PROGRESS' && !isDeepReviewStale(session, Date.parse(now))) {
-    throw new Error('a deep review is already in progress for this HEAD');
+    throw new Error('a full review is already in progress for this HEAD');
   }
   const settledAndWaiting = Boolean(session) && !reset && session.lastReviewedHead === headSha && session.status === 'AUDIT_PENDING';
   // A full review of a HEAD that has no session yet (or an explicit reset) starts a seeded session; spend carries over.
@@ -490,7 +515,7 @@ export function beginDeepReview({
     session = seedSession({ previous: session, baseSha, headSha, now, carryOpen, reset });
   }
   // A stale in-progress marker is replaced; the status it interrupted is remembered.
-  // A deep review that failed closed is the only reason for that HUMAN_REQUIRED (no findings,
+  // A full review that failed closed is the only reason for that HUMAN_REQUIRED (no findings,
   // no provider failure), so a retry resumes the status the failed run interrupted instead
   // of making the stop permanent.
   const retryingFailedRun = session.status === 'HUMAN_REQUIRED' && session.deepReview?.state === 'FAILED'
@@ -524,10 +549,10 @@ export function completeDeepReview({
   validateSession(session);
   checkedSha(headSha, 'headSha');
   if (session.status !== 'REVIEW_IN_PROGRESS' || session.deepReview?.head !== headSha || session.lastReviewedHead !== headSha) {
-    throw new Error('deep review result does not match the in-progress session HEAD');
+    throw new Error('full review result does not match the in-progress session HEAD');
   }
   if (!result || typeof result !== 'object' || Array.isArray(result) || !Array.isArray(result.findings)) {
-    throw new Error('deep review result must be an object with a findings array');
+    throw new Error('full review result must be an object with a findings array');
   }
   // Material findings first so the 6-entry session limit never drops a blocker.
   const ordered = [...result.findings].sort((a, b) => (SEVERITY_ORDER[a?.severity] ?? 9) - (SEVERITY_ORDER[b?.severity] ?? 9));
@@ -537,7 +562,7 @@ export function completeDeepReview({
   });
   // Every severity counts: a reported P3 blocks too, so nothing past the sixth may be dropped silently.
   const omitted = ordered.slice(6).length;
-  if (omitted > 0) throw new Error(`deep review reported more than 6 findings (${omitted} omitted); refusing to drop blockers`);
+  if (omitted > 0) throw new Error(`full review reported more than 6 findings (${omitted} omitted); refusing to drop blockers`);
   const findings = session.findings.map((finding) => ({ ...finding }));
   let nextFindingNumber = Number.isInteger(session.nextFindingNumber) ? session.nextFindingNumber : findings.length + 1;
   // Deduplicate against all active OPEN/UNCERTAIN findings (same path+title) and known dismissals.
@@ -594,7 +619,7 @@ export function completeDeepReview({
 }
 
 // Absent coverage means a legacy result that predates the field and is treated as
-// complete; run-review.mjs always supplies it for new deep reviews.
+// complete; run-review.mjs always supplies it for new full reviews.
 function normalizeCoverage(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   const unreviewed = Array.isArray(value.unreviewedPaths)
@@ -618,14 +643,14 @@ export function failDeepReview({
   validateSession(session);
   checkedSha(headSha, 'headSha');
   if (session.status !== 'REVIEW_IN_PROGRESS' || session.lastReviewedHead !== headSha) {
-    throw new Error('failed deep review does not match the in-progress session HEAD');
+    throw new Error('failed full review does not match the in-progress session HEAD');
   }
   return {
     ...session,
     ...reconcileDeepSpend(session, spentUsd, costSource),
     status: 'HUMAN_REQUIRED',
-    deepReview: { ...session.deepReview, state: 'FAILED', failedAt: now, reason: compactText(reason || 'deep review did not complete', 300) },
-    lastSummary: compactText(`Deep review did not complete: ${reason || 'unknown reason'}`, 800),
+    deepReview: { ...session.deepReview, state: 'FAILED', failedAt: now, reason: compactText(reason || 'full review did not complete', 300) },
+    lastSummary: compactText(`Full review did not complete: ${reason || 'unknown reason'}`, 800),
     updatedAt: now,
   };
 }
@@ -652,7 +677,7 @@ export function sessionCommitStatus(session, headSha, { finalReviewStarted } = {
       || unresolvedMaterialFindings(session).length > 0
       ? { state: 'error', description: 'Review evidence incomplete or material candidates unresolved' }
       : { state: 'success', description: 'Independent review complete: READY' };
-    case 'REVIEW_IN_PROGRESS': return { state: 'pending', description: 'Claude deep review in progress' };
+    case 'REVIEW_IN_PROGRESS': return { state: 'pending', description: 'Full review in progress' };
     case 'AUDIT_PENDING':
       if (finalReviewStarted === true) return { state: 'pending', description: 'Final review starting automatically' };
       // Red only when this run tried to hand the final review on and said it could not. A run that never reached
@@ -1112,7 +1137,7 @@ export function renderSessionComment(session, { sourceCommentIds = [], finalRevi
     : session.status === 'READY'
     ? 'Review is clear on this HEAD; confirm separate CI checks and GitHub merge requirements before merging.'
     : session.status === 'REVIEW_IN_PROGRESS'
-      ? 'Claude deep review is running for this exact commit; the PR is not READY until it finishes. If it stops, comment `@claude review` to restart.'
+      ? 'A full review is running for this exact commit; the PR is not READY until it finishes. If it stops, comment `@claude review` to restart.'
     : session.status === 'AUDIT_PENDING'
       ? (finalReview?.startsByItself === true
         ? 'The final full review is starting automatically (Gemini first, Claude continues). If it does not appear, comment `@gemini review`.'

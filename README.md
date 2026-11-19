@@ -240,7 +240,7 @@ Repository secrets:
 
 - `APP_PRIVATE_KEY`: complete GitHub App private-key PEM
 - `GEMINI_API_KEY`: Google AI Studio / Gemini API key used by the default bounded reviewer
-- `CLAUDE_CODE_OAUTH_TOKEN`: Claude Code OAuth token used only by explicit Claude deep review
+- `CLAUDE_CODE_OAUTH_TOKEN`: Claude Code OAuth token used only by an explicit `@claude review`
 
 The OAuth token can be generated locally with Claude Code using `claude setup-token` if that authentication mode is available to your account.
 
