@@ -373,3 +373,120 @@ test('a PARTIAL review continues for a person\'s command or for the run that con
   assert.equal((await plan({SOURCE_KIND:'pull_request',SOURCE_COMMENT_ID:'8140844152995'})).decision.mode,'full'); // the continuation run
   assert.equal((await plan({SOURCE_KIND:'pull_request',SOURCE_COMMENT_ID:'263171400319958021003132'})).decision.mode,'noop_waiting'); // a reopened PR
 });
+
+test('AC-02: decision regression matrix across new PR, READY, REWORK, AUDIT_PENDING, PARTIAL, HUMAN_REQUIRED, REVIEW_IN_PROGRESS (reset guard), recover, and duplicate event', async () => {
+  // 1. New PR -> full
+  const newPr = await planSession({
+    env: env({ HEAD_SHA: A, REQUESTED_MODE: 'auto', SOURCE_KIND: 'pull_request' }),
+    fetchImpl: fetchState({ comments: [] }),
+  });
+  assert.equal(newPr.decision.mode, 'full');
+
+  // 2. READY same HEAD (auto -> noop_ready, reset -> full), new HEAD -> incremental
+  const ready = {
+    ...applyDiscoveryResult({ result: { summary: 'clean', findings: [] }, baseSha: BASE, headSha: A, sourceCommentId: '1' }),
+    status: 'READY',
+    auditCompleted: true,
+    handledCommentIds: ['50'],
+  };
+  assert.equal((await planSession({
+    env: env({ HEAD_SHA: A, REQUESTED_MODE: 'auto', SOURCE_KIND: 'comment', SOURCE_COMMENT_ID: '51' }),
+    fetchImpl: fetchState({ comments: [comment(7, ready)] }),
+  })).decision.mode, 'noop_ready');
+  assert.equal((await planSession({
+    env: env({ HEAD_SHA: A, REQUESTED_MODE: 'reset', SOURCE_KIND: 'comment', SOURCE_COMMENT_ID: '52' }),
+    fetchImpl: fetchState({ comments: [comment(7, ready)] }),
+  })).decision.mode, 'full');
+  assert.equal((await planSession({
+    env: env({ HEAD_SHA: C, REQUESTED_MODE: 'auto', SOURCE_KIND: 'pull_request', SOURCE_COMMENT_ID: '53' }),
+    fetchImpl: fetchState({ comments: [comment(7, ready)] }),
+  })).decision.mode, 'incremental_candidate');
+
+  // 3. Duplicate event -> noop_ready
+  assert.equal((await planSession({
+    env: env({ HEAD_SHA: A, REQUESTED_MODE: 'auto', SOURCE_KIND: 'comment', SOURCE_COMMENT_ID: '50' }),
+    fetchImpl: fetchState({ comments: [comment(7, ready)] }),
+  })).decision.mode, 'noop_ready');
+
+  // 4. REWORK same HEAD -> noop_waiting; new HEAD -> verification
+  const discovered = applyDiscoveryResult({
+    result: {
+      summary: 'issue',
+      findings: [{ path: 'src/a.js', line: 1, severity: 'P2', title: 'Bug', body: 'Details', failurePath: 'bad path' }],
+    },
+    baseSha: BASE,
+    headSha: A,
+    sourceCommentId: '10',
+  });
+  const rework = {
+    ...discovered,
+    status: 'REWORK',
+    findings: [{ ...discovered.findings[0], status: 'OPEN' }],
+  };
+  assert.equal((await planSession({
+    env: env({ HEAD_SHA: A, REQUESTED_MODE: 'auto', SOURCE_KIND: 'pull_request', SOURCE_COMMENT_ID: '11' }),
+    fetchImpl: fetchState({ comments: [comment(7, rework)] }),
+  })).decision.mode, 'noop_waiting');
+  assert.equal((await planSession({
+    env: env({ HEAD_SHA: C, REQUESTED_MODE: 'auto', SOURCE_KIND: 'pull_request', SOURCE_COMMENT_ID: '12' }),
+    fetchImpl: fetchState({ comments: [comment(7, rework)] }),
+  })).decision.mode, 'verification');
+
+  // 5. AUDIT_PENDING same HEAD -> full
+  const auditPending = applyDiscoveryResult({
+    result: { summary: 'clean', findings: [] },
+    baseSha: BASE,
+    headSha: A,
+    sourceCommentId: '20',
+  });
+  assert.equal((await planSession({
+    env: env({ HEAD_SHA: A, REQUESTED_MODE: 'auto', SOURCE_KIND: 'comment', SOURCE_COMMENT_ID: '21' }),
+    fetchImpl: fetchState({ comments: [comment(7, auditPending)] }),
+  })).decision.mode, 'full');
+
+  // 6. HUMAN_REQUIRED same HEAD (auto -> human_required; explicit @gemini after provider outage -> full)
+  const humanReq = {
+    ...auditPending,
+    status: 'HUMAN_REQUIRED',
+    reviewFailure: {
+      code: 'REVIEWER_UNAVAILABLE',
+      mode: 'audit',
+      reason: 'quota exceeded',
+      at: new Date().toISOString(),
+    },
+  };
+  assert.equal((await planSession({
+    env: env({ HEAD_SHA: A, REQUESTED_MODE: 'auto', SOURCE_KIND: 'pull_request', SOURCE_COMMENT_ID: '31' }),
+    fetchImpl: fetchState({ comments: [comment(7, humanReq)] }),
+  })).decision.mode, 'human_required');
+  assert.equal((await planSession({
+    env: env({ HEAD_SHA: A, REQUESTED_MODE: 'auto', SOURCE_KIND: 'comment', SOURCE_COMMENT_ID: '32' }),
+    fetchImpl: fetchState({ comments: [comment(7, humanReq)] }),
+  })).decision.mode, 'full');
+
+  // 7. REVIEW_IN_PROGRESS same HEAD (active) blocks even reset and claude (concurrent guard)
+  const inProgress = beginDeepReview({
+    session: auditPending,
+    headSha: A,
+    baseSha: BASE,
+    sourceCommentId: '40',
+    runId: 'run-1',
+    now: new Date().toISOString(),
+  });
+  for (const mode of ['auto', 'claude', 'reset']) {
+    assert.equal((await planSession({
+      env: env({ HEAD_SHA: A, REQUESTED_MODE: mode, SOURCE_KIND: 'comment', SOURCE_COMMENT_ID: '41' }),
+      fetchImpl: fetchState({ comments: [comment(7, inProgress)] }),
+    })).decision.mode, 'noop_waiting', mode);
+  }
+
+  // 8. recover mode (pending published review newer than durable session)
+  const newerPending = { ...auditPending, updatedAt: new Date(Date.now() + 60_000).toISOString() };
+  assert.equal((await planSession({
+    env: env({ HEAD_SHA: A, REQUESTED_MODE: 'auto', SOURCE_KIND: 'comment', SOURCE_COMMENT_ID: '61' }),
+    fetchImpl: fetchState({
+      comments: [comment(7, auditPending)],
+      reviews: [{ id: 8, user: { login: author }, body: pendingBody(newerPending, '60') }],
+    }),
+  })).decision.mode, 'recover');
+});

@@ -265,17 +265,7 @@ export async function applyManualDismissal({
     throw staleError;
   }
 
-  if (isAcceptance && verdict.verdict === 'ACCEPTED') {
-    const session = applyFindingAcceptance({
-      session: durable,
-      findingId: decision.findingId,
-      headSha,
-      by,
-      statement: decision.reason,
-      sourceCommentId: sourceId,
-      verification: verdict,
-      inputHash,
-    });
+  async function persistDismissalSession({ session, publishedVerdict, afterSave = null, logMessage }) {
     const body = renderSessionComment(session, {
       sourceCommentIds: [sourceId],
       finalReview: finalReviewOutlook({ session, headSha, sourceCommentId: env.SOURCE_COMMENT_ID, planMode: 'dismiss' }),
@@ -285,46 +275,56 @@ export async function applyManualDismissal({
       existingId: plan.sessionCommentId, previous: durable, session, body,
       ledger: ledgerOptions(env, { sourceCommentIds: [sourceId], stage: 'closing', expectedSeq: plan.ledgerSeq ?? null }),
     });
-    await postDismissalOutcomeReply({
-      repo, prNumber, expectedAuthor, session, findingId: decision.findingId,
-      heading: `**${decision.findingId} risk accepted by @${by}**`,
-      reason: `Recorded in the review summary with your own words. ${verdict.reason}`,
-      nextStep: session.status === 'AUDIT_PENDING'
-        ? 'No other blocking findings remain; the final audit is the next step.'
-        : session.status === 'READY' ? '' : 'Other blocking findings remain.',
-      env, fetchImpl,
-    });
-    writePublishedSession(contextRoot, { mode: 'dismiss', verdict: 'DISMISSED', session, sessionCommentId: savedId });
-    console.log(`Risk acceptance recorded (${verdict.provider}): ${decision.findingId}; status ${session.status}.`);
+    if (afterSave) await afterSave(session);
+    writePublishedSession(contextRoot, { mode: 'dismiss', verdict: publishedVerdict, session, sessionCommentId: savedId });
+    console.log(logMessage(session));
     return session;
   }
 
-  if (!isAcceptance && verdict.verdict === 'DISMISSED') {
-    const session = applyFindingDismissal({
-      session: durable,
-      findingId: decision.findingId,
-      headSha,
-      by,
-      reason: decision.reason,
-      evidence: decision.evidence,
-      sourceCommentId: sourceId,
-      verification: verdict,
-      inputHash,
+  if ((isAcceptance && verdict.verdict === 'ACCEPTED') || (!isAcceptance && verdict.verdict === 'DISMISSED')) {
+    const session = isAcceptance
+      ? applyFindingAcceptance({
+        session: durable,
+        findingId: decision.findingId,
+        headSha,
+        by,
+        statement: decision.reason,
+        sourceCommentId: sourceId,
+        verification: verdict,
+        inputHash,
+      })
+      : applyFindingDismissal({
+        session: durable,
+        findingId: decision.findingId,
+        headSha,
+        by,
+        reason: decision.reason,
+        evidence: decision.evidence,
+        sourceCommentId: sourceId,
+        verification: verdict,
+        inputHash,
+      });
+    return persistDismissalSession({
+      session,
+      publishedVerdict: 'DISMISSED',
+      afterSave: isAcceptance
+        ? (savedSession) => postDismissalOutcomeReply({
+          repo, prNumber, expectedAuthor, session: savedSession, findingId: decision.findingId,
+          heading: `**${decision.findingId} risk accepted by @${by}**`,
+          reason: `Recorded in the review summary with your own words. ${verdict.reason}`,
+          nextStep: savedSession.status === 'AUDIT_PENDING'
+            ? 'No other blocking findings remain; the final audit is the next step.'
+            : savedSession.status === 'READY' ? '' : 'Other blocking findings remain.',
+          env, fetchImpl,
+        })
+        : null,
+      logMessage: (savedSession) => isAcceptance
+        ? `Risk acceptance recorded (${verdict.provider}): ${decision.findingId}; status ${savedSession.status}.`
+        : `Verified dismissal recorded (${verdict.provider}): ${decision.findingId}; status ${savedSession.status}.`,
     });
-    const body = renderSessionComment(session, {
-      sourceCommentIds: [sourceId],
-      finalReview: finalReviewOutlook({ session, headSha, sourceCommentId: env.SOURCE_COMMENT_ID, planMode: 'dismiss' }),
-    });
-    const savedId = await saveSessionComment({
-      target: repo, prNumber, token: env.GH_TOKEN, fetchImpl,
-      existingId: plan.sessionCommentId, previous: durable, session, body,
-      ledger: ledgerOptions(env, { sourceCommentIds: [sourceId], stage: 'closing', expectedSeq: plan.ledgerSeq ?? null }),
-    });
-    writePublishedSession(contextRoot, { mode: 'dismiss', verdict: 'DISMISSED', session, sessionCommentId: savedId });
-    console.log(`Verified dismissal recorded (${verdict.provider}): ${decision.findingId}; status ${session.status}.`);
-    return session;
   }
 
+  const publishedVerdict = isAcceptance ? (verdict.verdict === 'INCONCLUSIVE' ? 'INCONCLUSIVE' : 'REJECTED') : verdict.verdict;
   const session = recordDismissAttempt({
     session: durable,
     findingId: decision.findingId,
@@ -332,51 +332,40 @@ export async function applyManualDismissal({
     sourceCommentId: sourceId,
     inputHash,
     // an acceptance that was not ACCEPTED is ledgered as REJECTED (wrong or vague) or INCONCLUSIVE, never DISMISSED
-    verdict: isAcceptance ? (verdict.verdict === 'INCONCLUSIVE' ? 'INCONCLUSIVE' : 'REJECTED') : verdict.verdict,
+    verdict: publishedVerdict,
     reason: verdict.reason,
     unavailable: Boolean(verdict.unavailable),
     claudeCharge: verdict.claudeCharge,
     kind: decision.kind ?? 'dismissed',
   });
-  const body = renderSessionComment(session, {
-    sourceCommentIds: [sourceId],
-    finalReview: finalReviewOutlook({ session, headSha, sourceCommentId: env.SOURCE_COMMENT_ID, planMode: 'dismiss' }),
-  });
-  const savedId = await saveSessionComment({
-    target: repo, prNumber, token: env.GH_TOKEN, fetchImpl,
-    existingId: plan.sessionCommentId, previous: durable, session, body,
-    ledger: ledgerOptions(env, { sourceCommentIds: [sourceId], stage: 'closing', expectedSeq: plan.ledgerSeq ?? null }),
-  });
-
   const isRejected = verdict.verdict === 'REJECTED';
   const acceptanceHeading = verdict.verdict === 'MISMATCH'
     ? `**${decision.findingId} acceptance does not match the finding (kept blocking)**`
     : verdict.verdict === 'TOO_VAGUE'
       ? `**${decision.findingId} acceptance too vague (kept blocking)**`
       : `**${decision.findingId} acceptance inconclusive (kept blocking)**`;
-  await postDismissalOutcomeReply({
-    repo,
-    prNumber,
-    expectedAuthor,
+  return persistDismissalSession({
     session,
-    findingId: decision.findingId,
-    heading: isAcceptance
-      ? acceptanceHeading
-      : isRejected
-        ? `**${decision.findingId} dismissal rejected**`
-        : `**${decision.findingId} dismissal inconclusive (kept blocking)**`,
-    reason: verdict.reason,
-    nextStep: verdict.nextStep,
-    env,
-    fetchImpl,
+    publishedVerdict,
+    afterSave: (savedSession) => postDismissalOutcomeReply({
+      repo,
+      prNumber,
+      expectedAuthor,
+      session: savedSession,
+      findingId: decision.findingId,
+      heading: isAcceptance
+        ? acceptanceHeading
+        : isRejected
+          ? `**${decision.findingId} dismissal rejected**`
+          : `**${decision.findingId} dismissal inconclusive (kept blocking)**`,
+      reason: verdict.reason,
+      nextStep: verdict.nextStep,
+      env,
+      fetchImpl,
+    }),
+    logMessage: (savedSession) =>
+      `${isAcceptance ? 'Acceptance' : 'Dismissal'} ${verdict.verdict.toLowerCase()} for ${decision.findingId}; status ${savedSession.status} remains blocking.`,
   });
-  writePublishedSession(contextRoot, {
-    mode: 'dismiss',
-    verdict: isAcceptance ? (verdict.verdict === 'INCONCLUSIVE' ? 'INCONCLUSIVE' : 'REJECTED') : verdict.verdict,
-    session, sessionCommentId: savedId,
-  });
-  console.log(`${isAcceptance ? 'Acceptance' : 'Dismissal'} ${verdict.verdict.toLowerCase()} for ${decision.findingId}; status ${session.status} remains blocking.`);
-  return session;
 }
 
 const DISMISSAL_FORMAT_EXAMPLE = [

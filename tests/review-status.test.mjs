@@ -413,3 +413,34 @@ test('a PR holding only old-format comments reads as "no session" for the commit
   assert.equal(session, null);
   assert.equal(pr.calls.filter((c) => c.method === 'POST' && !c.url.endsWith('/graphql')).length, 0);
 });
+
+test('AC-07: dismiss finished status never claims no model quota was spent', async () => {
+  const statusSrc = fs.readFileSync(new URL('../scripts/review-status.mjs', import.meta.url), 'utf8');
+  assert.doesNotMatch(statusSrc, /No model quota was spent by dismissal/);
+
+  const fakeSuccess = fakeFetch();
+  const res = await publishRunStatus({
+    env: {
+      ...baseEnv,
+      REVIEW_MODE: 'dismiss',
+      DISMISS_OUTCOME: 'success',
+      STATUS_STAGE: 'finished',
+    },
+    fetchImpl: fakeSuccess.fetchImpl,
+  });
+  assert.equal(res, null);
+  assert.equal(fakeSuccess.calls.length, 0);
+
+  const fakeFailure = fakeFetch();
+  const failRes = await publishRunStatus({
+    env: {
+      ...baseEnv,
+      REVIEW_MODE: 'dismiss',
+      DISMISS_OUTCOME: 'failure',
+      STATUS_STAGE: 'finished',
+    },
+    fetchImpl: fakeFailure.fetchImpl,
+  });
+  assert.equal(failRes, '5678');
+  assert.match(fakeFailure.calls[0].body, /Finding dismissal was not confirmed; durable session did not acknowledge it\./);
+});
