@@ -47,7 +47,7 @@ export async function closeStaleDeepReview({ repo, prNumber, env = process.env, 
   if (!/^[1-9]\d*$/.test(String(prNumber))) throw new Error('Invalid PR number');
   const pr = await github(`https://api.github.com/repos/${repo}/pulls/${prNumber}`, env.GH_TOKEN, fetchImpl);
   const read = {};
-  const session = await readSessionOrNull({ repo, prNumber, author, env, fetchImpl, importLegacy: true, seen: read });
+  const session = await readSessionOrNull({ repo, prNumber, author, env, fetchImpl, seen: read });
   if (!session || !isDeepReviewStale(session, now) || session.lastReviewedHead !== pr.head?.sha) {
     console.log(`${repo}#${prNumber}: no longer a stale full review; leaving it alone.`);
     return false;
@@ -83,11 +83,10 @@ async function installationRepos(token, fetchImpl) {
 
 // The newest session on the PR, from the ledger; null when there is none or the ledger cannot be trusted (a
 // scheduled sweep must never act on a state it could not read in full).
-async function readSessionOrNull({ repo, prNumber, author, env, fetchImpl, importLegacy = false, seen = {} }) {
+async function readSessionOrNull({ repo, prNumber, author, env, fetchImpl, seen = {} }) {
   try {
-    const { ledger } = await loadLedger({ target: repo, prNumber, token: env.GH_TOKEN, fetchImpl, botLogin: author, importLegacy });
+    const { ledger } = await loadLedger({ target: repo, prNumber, token: env.GH_TOKEN, fetchImpl, botLogin: author });
     if (ledger.state === 'ok') { seen.seq = ledger.handoff?.seq ?? 0; return ledger.session; }
-    if (ledger.state === 'needs_import') return ledger.legacy.session;
     return null;
   } catch (error) {
     console.warn(`::warning::${repo}#${prNumber}: could not read the review ledger (${String(error.message).slice(0, 160)}); leaving it alone.`);

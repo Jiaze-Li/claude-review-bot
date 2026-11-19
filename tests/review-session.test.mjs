@@ -7,7 +7,6 @@ import {
   applyOverride,
   applyVerificationResult,
   openMaterialFindings,
-  parseSessionComment,
   planReviewSession,
   renderSessionComment,
 } from '../scripts/review-session-core.mjs';
@@ -106,7 +105,6 @@ test('the session summary is readable and the durable state round-trips through 
   const pr=createFakePr();
   pr.seed(s);
   assert.deepEqual(pr.session(),s);
-  assert.equal(parseSessionComment('ordinary comment'),null);
 });
 
 

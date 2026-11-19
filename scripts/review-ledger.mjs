@@ -4,7 +4,6 @@
 // an HTML comment. The newest COMPLETE Handoff is a full snapshot of the review session; Finding / Verdict / Event
 // records are the per-problem history and are cross-checked against it. Anything that cannot be read in full, was
 // edited or collapsed after the bot wrote it, or does not add up, STOPS the ledger: "not read" is never "no problem".
-import { parseSessionComment } from './review-session-core.mjs';
 
 export const LEDGER_LIMITS = Object.freeze({
   maxIssueComments: 2000, maxReviews: 500, maxThreads: 2000, maxThreadComments: 250, pageSize: 100,
@@ -20,7 +19,7 @@ export const LEDGER_CODES = Object.freeze({
   RECORD_UNRECOVERABLE: 'RECORD_UNRECOVERABLE',
 });
 
-export const STAGES = Object.freeze(['first', 'verification', 'audit', 'closing', 'import']);
+export const STAGES = Object.freeze(['first', 'verification', 'audit', 'closing']);
 const VERDICTS = new Set(['FIXED', 'STILL_OPEN', 'UNCERTAIN', 'DISMISSED']);
 const KINDS = new Set(['repair', 'dismissal']);
 
@@ -309,6 +308,8 @@ export function parseRecord(body) {
   const lines = body.split(/\r?\n/);
   const head = lines.find((line) => line.trim() !== '')?.trim() ?? '';
   let match;
+  // Records from the removed import stage are old-format content: ignored like any other unknown comment.
+  if (/^### Review Handoff · Seq [1-9]\d* · import(?: · Part \d+\/\d+)?$/.test(head)) return null;
   if (/^### Review Handoff · /.test(head)) return parseHandoffPart(lines);
   if ((match = /^### Finding (F\d{3,}) · (P[0-3]) · /.exec(head))) return parseFinding(lines, match[1]);
   if ((match = /^### Review Verdict · (F\d{3,}) · /.exec(head))) return parseVerdict(lines, match[1]);
@@ -422,7 +423,7 @@ export function buildLedger({ records, botLogin, reads = { complete: true }, hea
   const mine = records.filter((r) => normalizeLogin(r.login) === bot && String(r.type ?? '').toLowerCase() === 'bot')
     .sort(order);
 
-  const ledger = []; const legacy = []; const edited = [];
+  const ledger = []; const summaries = []; const edited = [];
   for (const record of mine) {
     const body = String(record.body ?? '');
     const parsed = parseRecord(body);
@@ -431,7 +432,7 @@ export function buildLedger({ records, botLogin, reads = { complete: true }, hea
       if (parsed.error) return stopped(LEDGER_CODES.RECORD_UNRECOVERABLE, `A review record (${record.source} ${record.id}) is unreadable: ${parsed.error}.`, [record.id]);
       ledger.push({ ...parsed, recordId: record.id, createdAt: record.createdAt, source: record.source, order: ledger.length });
     } else if (body.includes('<!-- jiaze-review-session:v1 -->')) {
-      legacy.push({ id: record.id, body, createdAt: record.createdAt });
+      summaries.push({ id: record.id, body, createdAt: record.createdAt });
     }
   }
   if (edited.length) {
@@ -476,9 +477,6 @@ export function buildLedger({ records, botLogin, reads = { complete: true }, hea
     }
   }
 
-  const latestLegacy = legacy.at(-1) ?? null;
-  const legacyHasState = latestLegacy?.body.includes('<!-- jiaze-review-state:') ?? false;
-
   const findingRecords = ledger.filter((r) => r.type === 'finding');
   const verdicts = ledger.filter((r) => r.type === 'verdict');
   const events = ledger.filter((r) => r.type === 'event');
@@ -503,7 +501,7 @@ export function buildLedger({ records, botLogin, reads = { complete: true }, hea
     return parsed?.session ? { ...parsed.session, findings: parsed.findings ?? [] } : null;
   };
   const lastRunSnapshot = [...runs].reverse().find((r) => r.hasSnapshot) ?? null;
-  const projection = legacy.length ? { id: legacy.at(-1).id, body: legacy.at(-1).body } : null;
+  const projection = summaries.length ? { id: summaries.at(-1).id, body: summaries.at(-1).body } : null;
 
   if (handoffs.length === 0 && lastRunSnapshot) {
     const session = snapshotOf(lastRunSnapshot);
@@ -513,14 +511,6 @@ export function buildLedger({ records, botLogin, reads = { complete: true }, hea
   if (handoffs.length === 0) {
     if (!closingStage && (findingRecords.length || verdicts.length || events.length)) {
       return stopped(LEDGER_CODES.STAGE_NOT_CLOSED, 'Finding or verdict records exist but no review stage was ever closed with a COMPLETE handoff.', []);
-    }
-    if (latestLegacy) {
-      if (!legacyHasState) {
-        return stopped(LEDGER_CODES.RECORD_UNRECOVERABLE, 'The previous review session comment has no readable state; refusing to discard it.', [latestLegacy.id]);
-      }
-      const session = parseSessionComment(latestLegacy.body);
-      if (!session) return stopped(LEDGER_CODES.RECORD_UNRECOVERABLE, 'The previous review session comment is unreadable; refusing to discard it.', [latestLegacy.id]);
-      return { state: 'needs_import', legacy: { session, commentId: latestLegacy.id }, findingRecords: findingRecords.map((r) => ({ id: r.id, recordId: r.recordId, source: r.source })), receipts, runs, attempts: {}, events: [], verdicts: uniqueVerdicts, projection };
     }
     return { state: 'new', session: null, findingRecords: findingRecords.map((r) => ({ id: r.id, recordId: r.recordId, source: r.source })), receipts, runs, attempts: {}, events: [], verdicts: uniqueVerdicts, projection };
   }
@@ -603,7 +593,6 @@ export function buildLedger({ records, botLogin, reads = { complete: true }, hea
     attempts, receipts, runs, verdicts: uniqueVerdicts, conflictingVerdicts: setAside, conflictingHandoffs: setAsideHandoffs,
     findingRecords: findingRecords.map((r) => ({ id: r.id, recordId: r.recordId, source: r.source })),
     events: events.map((e) => ({ findingId: e.findingId, attempt: e.attempt, key: e.key })),
-    legacyCommentId: latestLegacy?.id ?? null,
   };
 }
 
@@ -615,23 +604,4 @@ export function ledgerIsReady(ledger, headSha) {
   if (session.coverage && !session.coverage.complete) return false;
   return !session.findings.some((f) => ['OPEN', 'UNCERTAIN'].includes(f.status)
     && (['P0', 'P1', 'P2'].includes(f.severity) || (f.severity === 'P3' && !f.downgradedFrom)));
-}
-
-// ---------------------------------------------------------------------------------------------------------------
-// Importing an old hidden-state session: a visible Import Report + a COMPLETE Handoff with Stage: import.
-
-export function renderImportParts({ legacySession, legacyCommentId, markerByFinding = {}, recordIds = {} }) {
-  const lines = [
-    '#### Import of an earlier review session',
-    `Imported from the earlier session comment ${legacyCommentId}. That comment is kept unchanged as history.`,
-    `Status: ${legacySession.status} · last reviewed ${legacySession.lastReviewedHead} · final audit ${legacySession.auditCompleted === true ? 'complete' : 'not complete'}`,
-    `Claude spend so far: $${usd(legacySession.deepSpendUsd ?? 0)}`,
-    '',
-    ...(legacySession.findings.length ? ['Findings carried over:'] : ['No findings were recorded.']),
-    ...legacySession.findings.map((f) => `- ${f.id} · ${f.severity} · ${f.status} · ${clean(f.title, 160)} · ${clean(f.path, 160)}${f.line ? `:${f.line}` : ''} · earlier thread marker ${markerByFinding[f.id] ?? 'none'}${f.resolutionReason ? ` · ${clean(f.resolutionReason, 200)}` : ''}`),
-  ];
-  return renderHandoffParts({
-    session: legacySession, stage: 'import', seq: 1, prev: null, recordIds, attempts: {},
-    next: 'Review continues from the imported state.', readyReason: 'imported state', intro: lines,
-  });
 }

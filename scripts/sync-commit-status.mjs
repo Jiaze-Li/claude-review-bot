@@ -73,9 +73,8 @@ export async function postCommitStatus({ env = process.env, fetchImpl = fetch, t
 // The newest session, read from the PR's own records. A ledger that cannot be trusted throws: a green or red check
 // must never be derived from state that was not read in full.
 export async function latestSession({ target, prNumber, author, token, fetchImpl }) {
-  const { ledger } = await loadLedger({ target, prNumber, token, fetchImpl, botLogin: author, importLegacy: false });
+  const { ledger } = await loadLedger({ target, prNumber, token, fetchImpl, botLogin: author });
   if (ledger.state === 'stopped') throw new Error(`Review ledger cannot be trusted: ${ledger.message}`);
-  if (ledger.state === 'needs_import') return ledger.legacy.session;
   return ledger.session ?? null;
 }
 

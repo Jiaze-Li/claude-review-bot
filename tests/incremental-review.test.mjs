@@ -7,7 +7,7 @@ import { execFileSync } from 'node:child_process';
 import { createFakePr } from './helpers/fake-pr.mjs';
 import {
   applyDiscoveryResult, applyIncrementalResult, beginDeepReview, completeDeepReview,
-  applyVerificationResult, parseSessionComment, planReviewSession,
+  applyVerificationResult, planReviewSession,
   renderSessionComment, sessionCommitStatus, stopUnavailableReviewSession,
 } from '../scripts/review-session-core.mjs';
 import {
