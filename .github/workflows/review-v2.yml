@@ -329,6 +329,7 @@ jobs:
         if: steps.dedupe.outputs.duplicate != 'true'
         continue-on-error: true
         env:
+          EXPECTED_REVIEW_AUTHOR: ${{ steps.app-token.outputs.app-slug }}[bot]
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           TARGET_REPO: ${{ inputs.target_repo }}
           PR_NUMBER: ${{ inputs.pr_number }}
@@ -347,6 +348,7 @@ jobs:
         id: begin-deep
         if: steps.dedupe.outputs.duplicate != 'true' && steps.plan.outputs.mode == 'claude'
         env:
+          EXPECTED_REVIEW_AUTHOR: ${{ steps.app-token.outputs.app-slug }}[bot]
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           STATUS_TOKEN: ${{ steps.status-token.outputs.token }}
           STATUS_STRICT: ${{ vars.REQUIRE_STATUS_CHECK }}
@@ -365,6 +367,7 @@ jobs:
         id: recover-session
         if: steps.dedupe.outputs.duplicate != 'true' && steps.plan.outputs.mode == 'recover'
         env:
+          EXPECTED_REVIEW_AUTHOR: ${{ steps.app-token.outputs.app-slug }}[bot]
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           TARGET_REPO: ${{ inputs.target_repo }}
           PR_NUMBER: ${{ inputs.pr_number }}
@@ -378,6 +381,7 @@ jobs:
         id: override
         if: steps.dedupe.outputs.duplicate != 'true' && steps.plan.outputs.mode == 'override'
         env:
+          EXPECTED_REVIEW_AUTHOR: ${{ steps.app-token.outputs.app-slug }}[bot]
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           TARGET_REPO: ${{ inputs.target_repo }}
           PR_NUMBER: ${{ inputs.pr_number }}
@@ -406,6 +410,7 @@ jobs:
         id: stale
         if: steps.dedupe.outputs.duplicate != 'true' && steps.plan.outputs.mode == 'stale'
         env:
+          EXPECTED_REVIEW_AUTHOR: ${{ steps.app-token.outputs.app-slug }}[bot]
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           TARGET_REPO: ${{ inputs.target_repo }}
           PR_NUMBER: ${{ inputs.pr_number }}
@@ -440,6 +445,7 @@ jobs:
       - name: Record provider-unavailable delta review
         if: failure() && steps.gemini-run.outcome == 'failure'
         env:
+          EXPECTED_REVIEW_AUTHOR: ${{ steps.app-token.outputs.app-slug }}[bot]
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           TARGET_REPO: ${{ inputs.target_repo }}
           PR_NUMBER: ${{ inputs.pr_number }}
@@ -469,6 +475,7 @@ jobs:
       - name: Record provider-unavailable material validation
         if: failure() && steps.validate-material.outcome == 'failure'
         env:
+          EXPECTED_REVIEW_AUTHOR: ${{ steps.app-token.outputs.app-slug }}[bot]
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           TARGET_REPO: ${{ inputs.target_repo }}
           PR_NUMBER: ${{ inputs.pr_number }}
@@ -487,6 +494,7 @@ jobs:
         id: publish-gemini
         if: steps.dedupe.outputs.duplicate != 'true' && (steps.plan.outputs.mode == 'incremental' || steps.plan.outputs.mode == 'verification')
         env:
+          EXPECTED_REVIEW_AUTHOR: ${{ steps.app-token.outputs.app-slug }}[bot]
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           TARGET_REPO: ${{ inputs.target_repo }}
           PR_NUMBER: ${{ inputs.pr_number }}
@@ -540,6 +548,7 @@ jobs:
         id: publish-claude
         if: steps.dedupe.outputs.duplicate != 'true' && steps.plan.outputs.mode == 'claude' && steps.begin-deep.outputs.run == 'true'
         env:
+          EXPECTED_REVIEW_AUTHOR: ${{ steps.app-token.outputs.app-slug }}[bot]
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           TARGET_REPO: ${{ inputs.target_repo }}
           PR_NUMBER: ${{ inputs.pr_number }}
@@ -554,6 +563,7 @@ jobs:
         id: finalize-deep
         if: steps.dedupe.outputs.duplicate != 'true' && steps.plan.outputs.mode == 'claude' && steps.begin-deep.outputs.run == 'true'
         env:
+          EXPECTED_REVIEW_AUTHOR: ${{ steps.app-token.outputs.app-slug }}[bot]
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           TARGET_REPO: ${{ inputs.target_repo }}
           PR_NUMBER: ${{ inputs.pr_number }}
@@ -568,6 +578,7 @@ jobs:
         id: fail-deep
         if: always() && steps.dedupe.outputs.duplicate != 'true' && ((steps.begin-deep.outputs.began == 'true' && steps.begin-deep.outputs.run == 'true' && steps.finalize-deep.outcome != 'success') || steps.plan.outputs.mode == 'deep_review_stale')
         env:
+          EXPECTED_REVIEW_AUTHOR: ${{ steps.app-token.outputs.app-slug }}[bot]
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           TARGET_REPO: ${{ inputs.target_repo }}
           PR_NUMBER: ${{ inputs.pr_number }}
@@ -618,6 +629,7 @@ jobs:
         if: always() && steps.dedupe.outputs.duplicate != 'true'
         continue-on-error: true
         env:
+          EXPECTED_REVIEW_AUTHOR: ${{ steps.app-token.outputs.app-slug }}[bot]
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           TARGET_REPO: ${{ inputs.target_repo }}
           PR_NUMBER: ${{ inputs.pr_number }}
