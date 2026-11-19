@@ -8,8 +8,28 @@
 // - Normalized provider outcome contract
 
 import { defaultProviderRegistry, PROVIDER_KINDS, parseProviderBudgets } from './provider-adapter.mjs';
+import { ReadOnlyToolGateway } from './tool-gateway.mjs';
 
 export { parseProviderBudgets };
+
+export function createReviewToolGateway({
+  safeRoot,
+  contextRoot = null,
+  cwd = process.cwd(),
+  allowedContextFiles = [],
+  maxTurns = 8,
+  ignorePatterns = [],
+} = {}) {
+  if (!safeRoot) return null;
+  return new ReadOnlyToolGateway({
+    safeRoot,
+    contextRoot,
+    cwd,
+    ignorePatterns,
+    allowedContextFiles,
+    maxCalls: maxTurns * 4,
+  });
+}
 
 export class DeadlineTracker {
   constructor({ totalMs, minBufferMs = 60_000, nowFn = Date.now } = {}) {
