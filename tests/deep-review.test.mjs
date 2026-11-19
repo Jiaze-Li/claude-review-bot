@@ -601,7 +601,7 @@ test('the sweeper close job shares the main review workflow PR lock, queues inst
 
 test('the Claude step is bounded below the whole job timeout so publish and cleanup still have time', () => {
   const main = fs.readFileSync(new URL('../.github/workflows/review-v2.yml', import.meta.url), 'utf8');
-  const step = main.slice(main.indexOf('- name: Run Claude explicit deep review'));
+  const step = main.slice(main.indexOf('- name: Run the full review'));
   const stepMinutes = Number(step.match(/timeout-minutes: (\d+)/)[1]);
   const jobMinutes = Number(main.match(/\n    timeout-minutes: (\d+)/)[1]);
   assert.equal(stepMinutes, 20);
@@ -653,8 +653,8 @@ test('partial coverage never reaches READY, names the unreviewed files, and a co
   assert.match(body, /Review coverage: \*\*PARTIAL\*\*/);
   assert.match(body, /ui\/Layout\.swift/);
   // The same HEAD continues with the files not yet covered (by a command or by the run that continues it); a new HEAD starts a fresh review.
-  assert.equal(planReviewSession({ session: partial, baseSha: BASE, headSha: A, retryUnavailable: true }).mode, 'claude');
-  assert.equal(planReviewSession({ session: partial, baseSha: BASE, headSha: A, continuation: true }).mode, 'claude');
+  assert.equal(planReviewSession({ session: partial, baseSha: BASE, headSha: A, retryUnavailable: true }).mode, 'full');
+  assert.equal(planReviewSession({ session: partial, baseSha: BASE, headSha: A, continuation: true }).mode, 'full');
   assert.equal(planReviewSession({ session: partial, baseSha: BASE, headSha: A }).mode, 'noop_waiting'); // an unrelated automatic event spends nothing
   assert.equal(planReviewSession({ session: partial, baseSha: BASE, headSha: C }).mode, 'full_review');
   const rerun = completeDeepReview({

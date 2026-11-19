@@ -151,7 +151,7 @@ test('manual @gemini review resumes ONLY a provider-unavailable stop',async()=>{
   const fetchImpl=pr.fetchImpl;
   const env=stopEnv(folder(),{EXPECTED_REVIEW_AUTHOR:AUTHOR,REQUESTED_MODE:'auto',SOURCE_KIND:'comment'});
   // The retried first review goes through the sharded engine (Gemini first, Claude if it is still down).
-  assert.equal((await planSession({env,fetchImpl})).decision.mode,'claude');
+  assert.equal((await planSession({env,fetchImpl})).decision.mode,'full');
   assert.equal((await planSession({env:{...env,SOURCE_KIND:'pull_request'},fetchImpl})).decision.mode,'human_required');
   const unrelated={...session,reviewFailure:undefined};
   assert.equal(planReviewSession({session:unrelated,baseSha:BASE,headSha:HEAD,retryUnavailable:true}).mode,'human_required');

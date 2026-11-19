@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import { pathToFileURL } from 'node:url';
-import { currentCoverage } from './review-session-core.mjs';
+import { currentCoverage, isFullMode, providerPolicyFor } from './review-session-core.mjs';
 import { latestSession } from './sync-commit-status.mjs';
 
 // A review that is not finished when a run ends continues by itself: the next run is started on the same HEAD,
@@ -9,13 +9,13 @@ import { latestSession } from './sync-commit-status.mjs';
 // - every finding is settled (fixed, dismissed) and only the final full review is left (AUDIT_PENDING).
 // The chain is capped and stops at the first run that did not leave exactly that kind of work behind.
 export const MAX_CONTINUATIONS = 3;
-const REVIEW_WORK = new Set(['verification', 'incremental', 'claude', 'dismiss', 'recover']);
+const REVIEW_WORK = new Set(['verification', 'incremental', 'full', 'claude', 'dismiss', 'recover']);
 const CHAIN_ID = /^8([0-9])\d{11}$/; // 13 digits: '8', continuation number, run id; real comment ids never look like this
 
 // A continuation resumes; it must never repeat a one-shot command (reset, override, dismiss, threads).
 // Only `claude` (Claude alone) is carried over, so the model choice holds for the whole chain.
 export function continuationMode(requestedMode) {
-  return requestedMode === 'claude' ? 'claude' : 'auto';
+  return providerPolicyFor(requestedMode) === 'claude_only' ? 'claude' : 'auto';
 }
 
 // Money rules follow who asked. A person's review command (and a resolved-threads verification) keeps its manual
@@ -53,7 +53,7 @@ function explainNoContinuation(reason) {
 export function decideContinuation({ session, headSha, sourceCommentId, planMode }) {
   if (!session || session.lastReviewedHead !== headSha) return { continue: false, reason: 'no review of this HEAD to continue' };
   if (chainIndex(sourceCommentId) >= MAX_CONTINUATIONS) return { continue: false, reason: 'continuation limit reached' };
-  if (session.status === 'PARTIAL' && session.coverage?.head === headSha && planMode === 'claude') {
+  if (session.status === 'PARTIAL' && session.coverage?.head === headSha && isFullMode(planMode)) {
     return { continue: true, reason: `${session.coverage.unreviewedCount ?? 'some'} file(s) are still unreviewed` };
   }
   // Only a run that did review work leads straight into the final review; a bookkeeping run (a closed P3 thread,

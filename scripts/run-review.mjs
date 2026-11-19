@@ -5,7 +5,7 @@ import { pathToFileURL } from 'node:url';
 import { defaultProviderRegistry, getProviderAdapter, parseReviewProviders, PROVIDER_KINDS } from './provider-adapter.mjs';
 import { ReadOnlyToolGateway } from './tool-gateway.mjs';
 import { stateIntegrityProcedure } from './review-prompts.mjs';
-import { knownIssuesPromptBlock, matchesKnownDismissal, pathKey } from './review-session-core.mjs';
+import { knownIssuesPromptBlock, matchesKnownDismissal, pathKey, providerPolicyOf } from './review-session-core.mjs';
 import { GEMINI_SHARD_MAX_BYTES, GEMINI_SHARD_TIMEOUT_MS, runGeminiShard } from './gemini-shard.mjs';
 import { DEFAULT_IGNORE, assertDiffCoverage, decodeGitPath, matchesIgnore, mergeShardResults, parseIgnorePatterns, planShards, reconcileCoverage, splitDiffByFile } from './review-shards.mjs';
 import { BudgetManager, CircuitBreaker, DeadlineTracker, runBoundedPool, executeWorkUnit, resolveProviderBudgetManagers } from './review-orchestrator.mjs';
@@ -180,7 +180,7 @@ export async function runReview({ env = process.env, cwd = process.cwd() } = {})
     }
   }
   const sessionPlan = readSessionPlan();
-  const claudeOnly = sessionPlan?.requestedMode === 'claude';
+  const claudeOnly = providerPolicyOf(sessionPlan) === 'claude_only';
   const PROVIDERS = parseReviewProviders(env.REVIEW_PROVIDERS, {
     registry: defaultProviderRegistry,
     claudeOnly,

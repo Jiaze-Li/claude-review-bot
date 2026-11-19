@@ -37,7 +37,7 @@ function fetchState(state={}){return worldOf(state).fetchImpl;}
 
 test('planner starts discovery when no durable bot session exists',async()=>{
   const plan=await planSession({env:env(),fetchImpl:fetchState()});
-  assert.equal(plan.decision.mode,'claude');
+  assert.equal(plan.decision.mode,'full');
   assert.equal(plan.session,null);
 });
 
@@ -77,7 +77,7 @@ test('explicit reset starts a fresh discovery while preserving session comment l
     env:env({REQUESTED_MODE:'reset'}),
     fetchImpl:fetchState({comments:[comment(7,session)]}),
   });
-  assert.equal(plan.decision.mode,'claude');
+  assert.equal(plan.decision.mode,'full');
   assert.equal(plan.sessionCommentId,'7');
   assert.match(plan.decision.reason,/^explicit reset: /);
 });
@@ -93,7 +93,7 @@ test('@claude review plans exactly like @gemini review for the same session; onl
   // same HEAD, discovery done, audit pending
   const claude=await plan('claude',sessions.awaitingAudit);
   const gemini=await plan('auto',sessions.awaitingAudit);
-  assert.equal(claude.decision.mode,'claude'); // the final review is a full review: the sharded engine
+  assert.equal(claude.decision.mode,'full'); // the final review is a full review: the sharded engine
   assert.match(claude.decision.reason,/Claude only/);
   assert.match(gemini.decision.reason,/Gemini first, Claude continues/);
   assert.equal(claude.decision.mode,gemini.decision.mode);
@@ -106,7 +106,7 @@ test('@claude review plans exactly like @gemini review for the same session; onl
   assert.equal((await plan('auto',rework)).decision.mode,'verification');
   // no session: the first review, in shards, by Claude only
   const none=await plan('claude',null);
-  assert.equal(none.decision.mode,'claude');
+  assert.equal(none.decision.mode,'full');
   assert.match(none.decision.reason,/Claude only/);
   assert.match((await plan('auto',null)).decision.reason,/Gemini first, Claude continues/);
 });
@@ -119,7 +119,7 @@ test('@claude review waits for a deep review already running on this HEAD, and a
   const partial={...applyDiscoveryResult({result:{summary:'clean',findings:[]},baseSha:BASE,headSha:A,sourceCommentId:'1'}),status:'PARTIAL',
     coverage:{complete:false,head:A,reviewedKeys:[],unreviewedPaths:['x'],unreviewedCount:1}};
   const resumed=await planSession({env:env({REQUESTED_MODE:'claude',SOURCE_KIND:'comment'}),fetchImpl:fetchState({comments:[comment(7,partial)]})});
-  assert.equal(resumed.decision.mode,'claude');
+  assert.equal(resumed.decision.mode,'full');
   assert.match(resumed.decision.reason,/partial review/);
 });
 
@@ -137,8 +137,8 @@ test('manual review retries a FAILED deep review on the exact HEAD without reset
   assert.equal(automated.decision.mode,'human_required');
   for(const command of ['auto','claude']){
     const plan=await planSession({env:env({SOURCE_KIND:'comment',REQUESTED_MODE:command}),fetchImpl:saved});
-    assert.equal(plan.decision.mode,'claude');
-    assert.match(plan.decision.reason,/manual retry of failed deep review/);
+    assert.equal(plan.decision.mode,'full');
+    assert.match(plan.decision.reason,/manual retry of failed review/);
     assert.equal(plan.sessionCommentId,'7');
     assert.equal(plan.session.deepSpendUsd,5);
     assert.equal(plan.session.deepReview.state,'FAILED');
@@ -190,7 +190,7 @@ test('planner ignores pending state from another author',async()=>{
       id:50,user:{login:'attacker'},body:pendingBody(pending,'11'),
     }]}),
   });
-  assert.equal(plan.decision.mode,'claude');
+  assert.equal(plan.decision.mode,'full');
 });
 
 
@@ -202,7 +202,7 @@ test('explicit reset ignores a recoverable pending review and starts fresh disco
       id:50,user:{login:author},body:'review body\n'+pendingBody(pending,'11'),
     }]}),
   });
-  assert.equal(plan.decision.mode,'claude');
+  assert.equal(plan.decision.mode,'full');
   assert.match(plan.decision.reason,/^explicit reset: /);
 });
 
@@ -229,7 +229,7 @@ test('every fresh full review goes through the sharded engine, whatever its size
   for(const bytes of [1_000,100_000,1_600_000]){
     fs.writeFileSync(path.join(dir,'pr.diff'),'x'.repeat(bytes));
     const plan=await planSession({env:env({REVIEW_CONTEXT_DIR:dir}),fetchImpl:fetchState()});
-    assert.equal(plan.decision.mode,'claude',`${bytes} bytes`);
+    assert.equal(plan.decision.mode,'full',`${bytes} bytes`);
     assert.match(plan.decision.reason,/in shards: Gemini first, Claude continues/);
   }
 });
@@ -323,7 +323,7 @@ test('V6: runSessionPlanner orchestrates planning and non-reset new-HEAD full re
     env:env({HEAD_SHA:C,REQUESTED_MODE:'auto',SOURCE_KIND:'comment'}),
     fetchImpl:fetchState({comments:[comment(7,partialWithOpen)]}),
   });
-  assert.equal(planned.decision.mode,'claude');
+  assert.equal(planned.decision.mode,'full');
   assert.equal(planned.decision.carryOpen,true);
 
   const manyOpen={
@@ -350,7 +350,7 @@ test('the final review of a PR is a full review in the engine, whatever the size
   for(const diff of [file(0,100),Array.from({length:30},(_,i)=>file(i,90_000)).join('')]){
     fs.writeFileSync(path.join(dir,'pr.diff'),diff);
     const planned=await plan();
-    assert.equal(planned.decision.mode,'claude');
+    assert.equal(planned.decision.mode,'full');
     assert.match(planned.decision.reason,/Gemini first/);
     assert.match((await plan('claude')).decision.reason,/Claude only/);
   }
@@ -360,7 +360,7 @@ test('a delta that needs a full look becomes a full review in the engine, with t
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'plan-full-'));
   fs.writeFileSync(path.join(dir,'pr.diff'),'x'.repeat(5000));
   const gemini=fullReviewDecision({REVIEW_CONTEXT_DIR:dir},'auto','Full review: high-risk path: .github/workflows/build.yml');
-  assert.equal(gemini.mode,'claude');
+  assert.equal(gemini.mode,'full');
   assert.match(gemini.reason,/high-risk path.*5 KB diff in shards: Gemini first, Claude continues/);
   assert.match(fullReviewDecision({REVIEW_CONTEXT_DIR:dir},'claude','x').reason,/Claude only/);
 });
@@ -369,7 +369,7 @@ test('a PARTIAL review continues for a person\'s command or for the run that con
   const partial={...applyDiscoveryResult({result:{summary:'clean',findings:[]},baseSha:BASE,headSha:A,sourceCommentId:'1'}),status:'PARTIAL',
     coverage:{complete:false,head:A,reviewedKeys:[],unreviewedPaths:['x'],unreviewedCount:1}};
   const plan=(extra)=>planSession({env:env(extra),fetchImpl:fetchState({comments:[comment(7,partial)]})});
-  assert.equal((await plan({SOURCE_KIND:'comment'})).decision.mode,'claude');
-  assert.equal((await plan({SOURCE_KIND:'pull_request',SOURCE_COMMENT_ID:'8140844152995'})).decision.mode,'claude'); // the continuation run
+  assert.equal((await plan({SOURCE_KIND:'comment'})).decision.mode,'full');
+  assert.equal((await plan({SOURCE_KIND:'pull_request',SOURCE_COMMENT_ID:'8140844152995'})).decision.mode,'full'); // the continuation run
   assert.equal((await plan({SOURCE_KIND:'pull_request',SOURCE_COMMENT_ID:'263171400319958021003132'})).decision.mode,'noop_waiting'); // a reopened PR
 });

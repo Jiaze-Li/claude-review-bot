@@ -1,4 +1,4 @@
-name: Sweep Stale Deep Reviews
+name: Sweep Stale Reviews
 
 on:
   schedule:
@@ -31,7 +31,7 @@ jobs:
           permission-pull-requests: read
           permission-issues: read
 
-      - name: List deep reviews that look dead (read-only)
+      - name: List full reviews that look dead (read-only)
         id: find
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
@@ -80,7 +80,7 @@ jobs:
           owner: ${{ github.repository_owner }}
           permission-statuses: write
 
-      - name: Close the stale deep review inside the PR lock
+      - name: Close the stale full review inside the PR lock
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           STATUS_TOKEN: ${{ steps.status-token.outputs.token }}

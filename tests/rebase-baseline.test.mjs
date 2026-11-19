@@ -137,7 +137,7 @@ test('T7 a PR too large to verify goes to a sharded review that carries the old 
   const dir = context({ prDiff: hugeDiff(25) });
   const plan = verificationPlan();
   const decision = await resolveVerificationScope({ plan, env: env(dir), fetchImpl: compareFetch({ forward: { status: 'diverged' } }) });
-  assert.equal(decision.mode, 'claude');
+  assert.equal(decision.mode, 'full');
   assert.equal(decision.carryOpen, true);
   assert.equal(decision.previousHead, null);
   assert.match(decision.reason, /needs confirmation/);
@@ -175,7 +175,7 @@ test('T7b more than 8 blocking findings stops for a person instead of truncating
   assert.equal(plan.session.findings.length, 9);
   // Exactly 8 still fits.
   const eight = await resolveVerificationScope({ plan: verificationPlan(reworkSession(8)), env: env(dir), fetchImpl: compareFetch({ forward: { status: 'diverged' } }) });
-  assert.equal(eight.mode, 'claude');
+  assert.equal(eight.mode, 'full');
   const begun = beginDeepReview({ session: reworkSession(8), baseSha: BASE, headSha: NEW, carryOpen: true });
   assert.equal(begun.findings.length, 8);
 });
@@ -272,7 +272,7 @@ test('T9 a manual retry of a provider-unavailable verification also uses the who
   const plan = await planSession({ env: e, fetchImpl });
   assert.equal(plan.decision.mode, 'verification');
   const decision = await resolveVerificationScope({ plan, env: e, fetchImpl });
-  assert.equal(decision.mode, 'claude');
+  assert.equal(decision.mode, 'full');
   assert.equal(decision.carryOpen, true);
 });
 

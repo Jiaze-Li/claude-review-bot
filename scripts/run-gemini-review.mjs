@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { CLAUDE_AUTO_MIN_BUDGET_USD, DEEP_REVIEW_MANUAL_RUN_BUDGET_USD, GEMINI_MAX_CONTEXT_BYTES, claudeFallbackCallBudget, isManualBudgetExemptReview, knownIssuesPromptBlock, normalizeReviewResult, normalizeVerificationResult, openMaterialFindings } from './review-session-core.mjs';
+import { CLAUDE_AUTO_MIN_BUDGET_USD, DEEP_REVIEW_MANUAL_RUN_BUDGET_USD, GEMINI_MAX_CONTEXT_BYTES, claudeFallbackCallBudget, isManualBudgetExemptReview, knownIssuesPromptBlock, normalizeReviewResult, normalizeVerificationResult, openMaterialFindings, providerPolicyOf } from './review-session-core.mjs';
 import {isGeminiUnavailableStatus,runClaudeStructured} from './claude-fallback.mjs';
 import {geminiBaseUrl} from './gemini-config.mjs';
 import {SINGLE_REQUEST_MAX_BYTES,dropIgnoredFiles,stagedFixedBytes,stagedReviewCapacity} from './review-shards.mjs';
@@ -137,7 +137,7 @@ export async function runGeminiReview({env=process.env,fetchImpl=fetch,logImpl=c
   const planPath=path.join(contextRoot,'session-plan.json');
   const plan=JSON.parse(fs.readFileSync(planPath,'utf8'));
   // `@claude review` asks for Claude alone: Gemini is neither needed nor called.
-  const claudeOnly=plan.requestedMode==='claude';
+  const claudeOnly=providerPolicyOf(plan)==='claude_only';
 
   const providers = parseReviewProviders(env.REVIEW_PROVIDERS, {
     registry: defaultProviderRegistry,

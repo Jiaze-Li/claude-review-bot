@@ -1,7 +1,7 @@
 version: 2
 updates:
   # Keeps the Claude Agent SDK current so the `sonnet` alias used by the
-  # explicit Claude deep review (scripts/run-review.mjs) resolves to the
+  # explicit Claude review (scripts/run-review.mjs) resolves to the
   # newest Sonnet without a manual edit. Review and merge the PR it opens.
   - package-ecosystem: npm
     directory: /

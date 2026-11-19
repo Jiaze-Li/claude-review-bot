@@ -479,7 +479,7 @@ test('the dismissal step uses safe-target and model credentials, and the final r
   assert.match(yml, /id: dismiss/);
   assert.match(yml, /run: node scripts\/apply-dismissal\.mjs/);
   const block = yml.slice(yml.indexOf('- name: Apply evidence-based finding dismissal'),
-    yml.indexOf('- name: Run Claude explicit deep review'));
+    yml.indexOf('- name: Run the full review'));
   assert.match(block, /GEMINI_API_KEY/);
   assert.match(block, /CLAUDE_CODE_OAUTH_TOKEN/);
   assert.match(block, /SAFE_REPO_DIR: safe-target/);

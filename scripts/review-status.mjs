@@ -11,7 +11,7 @@ import { recordReceipt } from './session-store.mjs';
 const repoPattern = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const positiveId = /^[1-9]\d*$/;
 const reviewModes = new Set([
-  'incremental', 'verification', 'recover', 'claude',
+  'incremental', 'verification', 'recover', 'full', 'claude',
   'noop_ready', 'noop_waiting', 'human_required', 'deep_review_stale',
   'override', 'dismiss', 'threads', 'stale',
 ]);
@@ -157,7 +157,7 @@ export async function publishRunStatus({ env = process.env, fetchImpl = fetch, p
     state = 'Session recovery was not confirmed. Check the workflow run; no successful recovery is being claimed.'
       + failure;
   } else if (mode === 'deep_review_stale') {
-    state = 'Stale deep review cleanup was not confirmed. Check the workflow run.'
+    state = 'Stale review cleanup was not confirmed. Check the workflow run.'
       + failure;
   } else {
     state = 'Review publication was not confirmed. Check the workflow run; no successful publication is being claimed.'

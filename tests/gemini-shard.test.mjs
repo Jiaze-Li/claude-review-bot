@@ -51,8 +51,8 @@ test('the API key only ever goes to the Gemini host or a local test server', () 
 
 test('the deep review step receives the provider list and the Gemini key, but never the GitHub token', () => {
   const yml = fs.readFileSync(new URL('../.github/workflows/review-v2.yml', import.meta.url), 'utf8');
-  const start = yml.indexOf('- name: Run Claude explicit deep review');
-  const block = yml.slice(start, yml.indexOf('- name: Publish Claude explicit deep review'));
+  const start = yml.indexOf('- name: Run the full review');
+  const block = yml.slice(start, yml.indexOf('- name: Publish the full review'));
   assert.match(block, /GEMINI_API_KEY: \$\{\{ secrets\.GEMINI_API_KEY \}\}/);
   assert.match(block, /REVIEW_PROVIDERS: \$\{\{ steps\.begin-deep\.outputs\.providers \}\}/);
   assert.doesNotMatch(block, /GH_TOKEN|app-token\.outputs\.token/);

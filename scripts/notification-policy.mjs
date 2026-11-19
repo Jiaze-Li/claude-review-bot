@@ -44,7 +44,7 @@ export function decideNotificationAction({
 
   // 2. Finished stage: check for real execution/publication failures first.
   const isFailure = hasFailureReason
-    || (mode === 'claude' && outcomes.claudePublish !== 'success')
+    || ((mode === 'full' || mode === 'claude') && outcomes.claudePublish !== 'success')
     || (['incremental', 'verification'].includes(mode) && outcomes.geminiPublish !== 'success')
     || (mode === 'override' && outcomes.override !== 'success')
     || (mode === 'dismiss' && outcomes.dismiss !== 'success')
