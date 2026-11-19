@@ -114,3 +114,7 @@ I7. `override review`, budgets, provider selection and finding grading are not m
 **Verification and evidence.** Run the repository's own test commands and report the real outputs; list the new tests by name against Plan acceptance 1-7. Item 8 (live PR after merge and Worker deployment) is reported as NOT RUN.
 
 **Stop conditions.** Stop and report to Jack if: owner cannot be determined as `admin` on the target repositories (Assumption 1 fails); a change to existing `dismiss` behaviour or its tests becomes necessary; the Worker cannot route `accept` without a new mode (Option A); or any merge/deploy action would be needed. Do not merge or deploy.
+
+
+## Amendment after PR review (F001, P2)
+Assumption 4 and the "Survival across pushes" section said an acceptance reuses the existing same-finding test. That test treats an empty failure path on either side as a match and ignores severity, so a worsened finding re-reported as P2+ (or without a failure path) could be wrongly suppressed. Amended rule, implemented in `matchesKnownDismissal`: a finding closed by acceptance suppresses a re-report only when path and title are equal, the failure path is equal (both empty counts as equal; one empty does not), and the re-reported severity is P3. Plain dismissals keep the old matching. Test: "accept: a worse severity or a missing failure path is a new finding".

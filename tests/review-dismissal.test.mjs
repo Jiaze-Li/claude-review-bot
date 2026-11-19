@@ -640,11 +640,23 @@ test('accept: the record shows in the summary and in what later reviewers are to
 
 test('accept: survives a later push only for the same finding; a different one blocks as new', () => {
   const closed = accepted(p3Session());
-  const same = { path: 'scripts/ref.mjs', title: 'Duplicate notification', failurePath: issue().failurePath };
+  const same = { path: 'scripts/ref.mjs', title: 'Duplicate notification', failurePath: issue().failurePath, severity: 'P3' };
   assert.equal(matchesKnownDismissal(same, closed), true);
   assert.equal(matchesKnownDismissal({ ...same, title: 'Notification is lost on retry' }, closed), false);
   assert.equal(matchesKnownDismissal({ ...same, failurePath: 'a different failure path' }, closed), false);
   assert.equal(matchesKnownDismissal({ ...same, path: 'scripts/other.mjs' }, closed), false);
+});
+
+test('accept: a worse severity or a missing failure path is a new finding, not covered by the acceptance', () => {
+  const closed = accepted(p3Session());
+  const same = { path: 'scripts/ref.mjs', title: 'Duplicate notification', failurePath: issue().failurePath, severity: 'P3' };
+  assert.equal(matchesKnownDismissal(same, closed), true);
+  for (const severity of ['P0', 'P1', 'P2']) assert.equal(matchesKnownDismissal({ ...same, severity }, closed), false, severity);
+  assert.equal(matchesKnownDismissal({ ...same, failurePath: '' }, closed), false);
+  assert.equal(matchesKnownDismissal({ ...same, failurePath: undefined }, closed), false);
+  // a plain dismissal keeps its old, looser matching (empty failure path still matches)
+  const dismissedClosed = dismiss(initial());
+  assert.equal(matchesKnownDismissal({ path: 'scripts/ref.mjs', title: 'Ref endpoint array', severity: 'P2' }, dismissedClosed), true);
 });
 
 test('accept: the owner accepts a P3 after one model check; record, reply and handoff are written', async () => {

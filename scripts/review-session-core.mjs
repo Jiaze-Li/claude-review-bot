@@ -787,6 +787,13 @@ export function matchesKnownDismissal(finding, session) {
     if (item.path !== finding.path) return false;
     // Human-dismissed claims require exact title + matching failure paths:
     // related but distinct real bugs must still reach the final auditor.
+    if (item.status === 'DISMISSED' && item.dismissal?.kind === 'accepted') {
+      // An accepted risk was a P3 with one specific failure path. A worse severity, a different path, or a missing
+      // path (which would match anything) is a materially different finding and must block again.
+      return item.title.trim().toLowerCase() === String(finding.title).trim().toLowerCase()
+        && finding.severity === 'P3'
+        && String(item.failurePath ?? '').trim() === String(finding.failurePath ?? '').trim();
+    }
     if (item.status === 'DISMISSED') {
       return item.title.trim().toLowerCase() === String(finding.title).trim().toLowerCase()
         && (!item.failurePath || !finding.failurePath || item.failurePath === finding.failurePath);

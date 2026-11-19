@@ -167,7 +167,7 @@ describes the same risk the finding reports; it does not judge whether the risk 
 owner changes nothing, P0-P2 findings are refused, and a wrong, vague or unverifiable statement leaves the finding
 blocking with a reply saying why. An acceptance is shown in the review summary as `[risk accepted]` with who, the
 owner's words and the commit, and later reviewers are told it is settled. It stays accepted on later pushes only
-while the same finding comes back (same file, title and failure path). The final full review still runs.
+while the same finding comes back (same file, title and failure path, and still P3). The final full review still runs.
 
 ## Security and execution model
 
