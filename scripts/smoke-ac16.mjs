@@ -2,7 +2,7 @@
 // Returns the last `count` items of a list.
 export function lastItems(list, count) {
   if (count <= 0) return [];
-  return list.slice(list.length - count);
+  return list.slice(Math.max(0, list.length - count));
 }
 
 // Returns a percentage string for done / total.
