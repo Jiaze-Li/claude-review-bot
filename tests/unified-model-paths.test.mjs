@@ -432,7 +432,7 @@ test('validate-gemini-findings uses ReadOnlyToolGateway (maxTurns=6) on Gemini a
   assert.ok(claudeCalls[0].options.mcpServers?.gateway);
   assert.deepEqual(claudeCalls[0].options.allowedTools, ['mcp__gateway__Read', 'mcp__gateway__Glob', 'mcp__gateway__Grep']);
 
-  // 3. When SAFE_REPO_DIR is unset (and no safe-target exists), validator must NOT mount tools on TARGET_REPO_DIR
+  // 3. When SAFE_REPO_DIR is missing/non-existent, validator must NOT mount tools on TARGET_REPO_DIR
   const noSafeCalls = [];
   await validateMaterialFindings({
     env: {
@@ -442,6 +442,7 @@ test('validate-gemini-findings uses ReadOnlyToolGateway (maxTurns=6) on Gemini a
       PR_NUMBER: '104',
       HEAD_SHA,
       TARGET_REPO_DIR: safeRepo,
+      SAFE_REPO_DIR: path.join(path.dirname(safeRepo), 'missing-safe-target'),
       REVIEW_CONTEXT_DIR: ctxDir,
     },
     fetchImpl: async () => new Response('quota exceeded', { status: 402 }),

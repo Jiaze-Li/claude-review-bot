@@ -297,11 +297,17 @@ async function runVerifierChain({
             timeoutMs: callTimeout,
             env,
             fetchImpl,
-            maxAttempts: 2,
+            maxAttempts: 1,
             toolGateway: makeToolGateway(),
           });
           lastRes = res;
           if (!res.ok) {
+            const isUnavailable = res.kind === OUTCOME_KINDS.UNAVAILABLE
+              || (res.kind === OUTCOME_KINDS.CONFIG && !res.status)
+              || isGeminiUnavailableStatus(res.status);
+            if (!isUnavailable && attempt === 1 && /JSON|structured/i.test(res.error || '')) {
+              continue;
+            }
             break;
           }
           try {
