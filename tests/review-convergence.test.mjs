@@ -1,4 +1,5 @@
 import { applyFullReview } from './helpers/full-review.mjs';
+import { createFakePr } from './helpers/fake-pr.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -147,7 +148,9 @@ test('similarity ignores case and short words', () => {
 
 test('dismissed ledger survives the session-comment round trip', () => {
   const s = recordDismissed(session(), [dismissal()], A);
-  assert.equal(parseSessionComment(renderSessionComment(s)).dismissed.length, 1);
+  const pr = createFakePr();
+  pr.seed(s);
+  assert.equal(pr.session().dismissed.length, 1);
 });
 
 // ---- manual override -----------------------------------------------------
@@ -187,20 +190,20 @@ const planEnv = (extra = {}) => ({
   GH_TOKEN: 't', TARGET_REPO: 'acme/p', PR_NUMBER: '7', BASE_SHA: BASE, HEAD_SHA: B,
   REQUESTED_MODE: 'override', EXPECTED_REVIEW_AUTHOR: author, ...extra,
 });
-const listFetch = (comments) => async (url) => {
-  if (/issues\/7\/comments/.test(url)) return Response.json(comments);
-  if (/pulls\/7\/reviews/.test(url)) return Response.json([]);
-  assert.fail('unexpected ' + url);
+// the session (if any) is stored as the bot's own records on a fake PR; `author` is that PR's bot login
+const listFetch = (sessions) => {
+  const pr = createFakePr({ author, number: 7 });
+  for (const session of sessions) pr.seed(session);
+  return pr.fetchImpl;
 };
 
 test('planner chooses override only for an unfinished session', async () => {
-  const body = renderSessionComment(session([finding()]));
-  const plan = await planSession({ env: planEnv(), fetchImpl: listFetch([{ id: 5, user: { login: author }, body }]) });
+  const plan = await planSession({ env: planEnv(), fetchImpl: listFetch([session([finding()])]) });
   assert.equal(plan.decision.mode, 'override');
   const none = await planSession({ env: planEnv(), fetchImpl: listFetch([]) });
   assert.equal(none.decision.mode, 'noop_waiting');
-  const ready = renderSessionComment(applyOverride({ session: session([finding()]), headSha: A, by: 'bob' }));
-  const done = await planSession({ env: planEnv(), fetchImpl: listFetch([{ id: 5, user: { login: author }, body: ready }]) });
+  const ready = applyOverride({ session: session([finding()]), headSha: A, by: 'bob' });
+  const done = await planSession({ env: planEnv(), fetchImpl: listFetch([ready]) });
   assert.equal(done.decision.mode, 'noop_waiting');
 });
 
@@ -210,26 +213,25 @@ test('apply-override posts the new session comment with the processed-source mar
   fs.writeFileSync(path.join(dir, 'session-plan.json'), JSON.stringify({
     decision: { mode: 'override' }, session: s, sessionCommentId: '5',
   }));
-  const calls = [];
-  const fetchImpl = async (url, init = {}) => {
-    calls.push({ url, method: init.method || 'GET', body: init.body });
-    if (!init.method) return Response.json({ base: { sha: BASE }, head: { sha: B } });
-    if (init.method === 'DELETE') return new Response(null, { status: 204 });
-    return Response.json({ id: 6 });
-  };
+  const pr = createFakePr({ author: 'acme-bot[bot]', number: 7 });
+  pr.seed(s);
+  pr.addIssue(renderSessionComment(s), { id: 5 });
+  const fetchImpl = pr.layer(async (url) => {
+    if (/\/pulls\/7$/.test(url)) return Response.json({ base: { sha: BASE }, head: { sha: B } });
+    assert.fail('unexpected ' + url);
+  });
   const out = await applyManualOverride({
     env: { GH_TOKEN: 't', TARGET_REPO: 'acme/p', PR_NUMBER: '7', BASE_SHA: BASE, HEAD_SHA: B,
-      TRIGGER_USER: 'alice', SOURCE_COMMENT_ID: '77', REVIEW_CONTEXT_DIR: dir },
+      TRIGGER_USER: 'alice', SOURCE_COMMENT_ID: '77', REVIEW_CONTEXT_DIR: dir, EXPECTED_REVIEW_AUTHOR: 'acme-bot[bot]' },
     fetchImpl,
   });
   assert.equal(out.status, 'READY');
-  // READY is a new result for the PR: posted as the newest comment, and the old session comment removed
-  const post = calls.find((c) => c.method === 'POST');
-  assert.match(post.url, /issues\/7\/comments$/);
-  assert.match(calls.find((c) => c.method === 'DELETE').url, /issues\/comments\/5$/);
-  const body = JSON.parse(post.body).body;
-  assert.match(body, /jiaze-review-source-comment:77/);
-  assert.equal(parseSessionComment(body).status, 'READY');
+  // the decision is a closed handoff on the PR, with a visible receipt for the command
+  assert.equal(pr.session().status, 'READY');
+  assert.match(pr.issue.map((c) => c.body).join('\n'), /Handled: comment 77 \(version created\)/);
+  // READY is a new result for the PR: the summary is posted as the newest comment, and the old one removed
+  assert.equal(pr.issue.some((c) => c.id === '5'), false);
+  assert.match(pr.issue.at(-1).body, /Status: \*\*READY\*\*/);
 });
 
 test('apply-override refuses when the PR HEAD moved', async () => {
@@ -269,7 +271,9 @@ test('UNCERTAIN P2 from targeted validation persists, blocks READY and is not su
   const body=renderSessionComment(pending);
   assert.match(body,/Unresolved material candidates: \*\*1\*\*/);
   assert.match(body,/F001 \*\*P2 · UNCERTAIN \(not confirmed\)\*\*/);
-  assert.deepEqual(parseSessionComment(body),pending);
+  const pr=createFakePr();
+  pr.seed(pending);
+  assert.deepEqual(pr.session(),pending);
   assert.equal(sessionCommitStatus({...pending,status:'READY'},A).state,'error');
 });
 
@@ -327,7 +331,7 @@ test('a manual explicit waiver of an uncertain candidate is recorded as human ov
 test('manual scoped dismissal planner can select an UNCERTAIN finding without pretending it was confirmed',async()=>{
   const pending=recordUncertainFindings(session(),[uncertainCandidate()],A);
   const result=await planSession({env:planEnv({HEAD_SHA:A,REQUESTED_MODE:'dismiss',SOURCE_KIND:'comment'}),
-    fetchImpl:listFetch([{id:5,user:{login:author},body:renderSessionComment(pending)}])});
+    fetchImpl:listFetch([pending])});
   assert.equal(result.decision.mode,'dismiss');
 });
 

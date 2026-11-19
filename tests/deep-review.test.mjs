@@ -6,13 +6,17 @@ import path from 'node:path';
 import {
   DEEP_REVIEW_PR_BUDGET_USD, DEEP_REVIEW_STALE_MS, applyDiscoveryResult, beginDeepReview, completeDeepReview,
   deepReviewBudgetLeft, failDeepReview, isDeepReviewStale, planReviewSession, renderSessionComment,
-  parseSessionComment, sessionCommitStatus, stopUnavailableReviewSession,
+  sessionCommitStatus, stopUnavailableReviewSession,
 } from '../scripts/review-session-core.mjs';
+import { createFakePr } from './helpers/fake-pr.mjs';
 import { runDeepReviewCommand } from '../scripts/deep-review.mjs';
 import { syncCommitStatus } from '../scripts/sync-commit-status.mjs';
 import { planSession } from '../scripts/plan-review-session.mjs';
 import { closeStaleDeepReview, findStaleDeepReviews } from '../scripts/sweep-stale-deep-reviews.mjs';
 
+const BOT_LOGIN = 'jiaze-claude-review-bot[bot]';
+// durable-state records written by a run (receipts, handoffs, run starts) versus its readable summary comment
+const isRecord = (body) => /^### Review (Receipt|Handoff|Run Start|Pending Handoff)/.test(String(body ?? ''));
 const BASE = 'b'.repeat(40), A = 'a'.repeat(40), C = 'c'.repeat(40);
 const T0 = '2026-10-16T08:00:00.000Z';
 const LATER = new Date(Date.parse(T0) + DEEP_REVIEW_STALE_MS + 60_000).toISOString();
@@ -117,26 +121,37 @@ test('a second deep review cannot start over a fresh in-progress one but can rep
 
 test('the in-progress session survives the comment round trip', () => {
   const s = beginDeepReview({ session: readySession(), baseSha: BASE, headSha: A, now: T0 });
-  const back = parseSessionComment(renderSessionComment(s));
+  const pr = createFakePr();
+  pr.seed(s);
+  const back = pr.session();
   assert.equal(back.status, 'REVIEW_IN_PROGRESS');
   assert.equal(back.deepReview.head, A);
 });
 
 // ---- workflow-facing commands with a fake GitHub ----
-function fakeGitHub({ head = A, base = BASE } = {}) {
-  const writes = [];
-  const fetchImpl = async (url, init = {}) => {
+function fakeGitHub({ head = A, base = BASE, pr = createFakePr({ author: BOT_LOGIN, number: 7 }), session = null } = {}) {
+  const writes = []; // writes of the readable summary comment
+  const records = []; // writes of durable records
+  if (!pr.issue.some((c) => c.id === '300')) {
+    // a PR that already has a session: its durable records, then the readable summary comment 300 posted after them
+    const existing = session ?? readySession();
+    pr.seed(existing);
+    pr.addIssue(renderSessionComment(existing), { id: 300 });
+  }
+  const layered = pr.layer(async (url) => {
     if (/\/pulls\/7$/.test(url)) return Response.json({ base: { sha: base }, head: { sha: head } });
     if (/\/compare\//.test(url)) return Response.json({ ahead_by: 2 });
-    if (init.method === 'DELETE') { writes.push({ url, method: 'DELETE', body: null }); return new Response(null, { status: 204 }); }
-    if (init.method === 'POST' || init.method === 'PATCH') {
-      writes.push({ url, method: init.method, body: JSON.parse(init.body) });
-      const patched = String(url).match(/comments\/(\d+)$/);
-      return Response.json({ id: patched ? Number(patched[1]) : 901 });
-    }
     assert.fail('unexpected ' + url);
+  });
+  const fetchImpl = async (url, init = {}) => {
+    const method = init.method || 'GET';
+    if (method !== 'GET' && /\/issues\/(\d+\/comments|comments\/\d+)$/.test(url)) {
+      const body = init.body ? JSON.parse(init.body) : null;
+      (body && isRecord(body.body) ? records : writes).push({ url, method, body });
+    }
+    return layered(url, init);
   };
-  return { fetchImpl, writes };
+  return { fetchImpl, writes, records, pr };
 }
 function ctxDir(plan, usage) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'deep-'));
@@ -146,7 +161,7 @@ function ctxDir(plan, usage) {
 }
 const cenv = (dir, extra = {}) => ({
   TARGET_REPO: 'acme/project', PR_NUMBER: '7', BASE_SHA: BASE, HEAD_SHA: A, SOURCE_COMMENT_ID: '55',
-  GH_TOKEN: 't', REVIEW_CONTEXT_DIR: dir, ...extra,
+  GH_TOKEN: 't', EXPECTED_REVIEW_AUTHOR: BOT_LOGIN, REVIEW_CONTEXT_DIR: dir, ...extra,
 });
 
 test('begin -> finalize writes IN_PROGRESS then READY into the same comment', async () => {
@@ -157,13 +172,15 @@ test('begin -> finalize writes IN_PROGRESS then READY into the same comment', as
   assert.equal(begun.status, 'REVIEW_IN_PROGRESS');
   assert.match(gh.writes[0].body.body, /Status: \*\*REVIEW_IN_PROGRESS\*\*/);
   assert.match(fs.readFileSync(path.join(dir, 'out'), 'utf8'), /run=true/);
-  assert.doesNotMatch(gh.writes[0].body.body, /jiaze-review-source-comment/);
+  assert.doesNotMatch(gh.writes[0].body.body, /Handled: comment/);
+  assert.equal(gh.pr.session().status, 'REVIEW_IN_PROGRESS'); // the run start carries the in-progress state
   fs.writeFileSync(path.join(dir, 'review.json'), JSON.stringify({ summary: 'fine', findings: [] }));
   const done = await runDeepReviewCommand('finalize', { env: { ...env, REVIEW_PATH: path.join(dir, 'review.json') }, fetchImpl: gh.fetchImpl, now: T0 });
   assert.equal(done.status, 'READY');
   assert.equal(done.deepSpendUsd, 0.5);
   assert.equal(gh.writes[1].url.endsWith('/issues/comments/300'), true);
-  assert.match(gh.writes[1].body.body, /jiaze-review-source-comment:55/);
+  assert.match(gh.pr.issue.map((c) => c.body).join('\n'), /Handled: comment 55 \(version created\)/);
+  assert.equal(gh.pr.session().status, 'READY'); // rebuilt from the PR records alone
 });
 
 test('a review that ends in a different status than it started posts the result as a new comment and removes the old one', async () => {
@@ -179,7 +196,7 @@ test('a review that ends in a different status than it started posts the result 
   assert.equal(gh.writes[2].method, 'DELETE');
   assert.match(gh.writes[2].url, /comments\/300$/);
   // the next step of the same job finds the new comment
-  assert.equal(JSON.parse(fs.readFileSync(path.join(dir, 'deep-review-state.json'), 'utf8')).sessionCommentId, '901');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dir, 'deep-review-state.json'), 'utf8')).sessionCommentId, gh.pr.issue.at(-1).id);
 });
 
 test('manual @claude review runs with $5 limit even after exhausting the automatic PR cap', async () => {
@@ -243,7 +260,7 @@ test('if the PR moved, begin refuses; fail keeps the interrupted run but marks i
   assert.equal(r, null);
   assert.equal(moved.writes.length, 1);
   const body = moved.writes[0].body.body;
-  const saved = parseSessionComment(body);
+  const saved = moved.pr.session();
   assert.equal(saved.status, 'REVIEW_IN_PROGRESS');
   assert.equal(saved.deepReview.resumeStatus, stale.deepReview.resumeStatus);
   assert.equal(saved.staleFor, A);
@@ -260,10 +277,10 @@ async function finalizeWhilePrMoves(review) {
   const dir = ctxDir({ requestedMode: 'claude', decision: { mode: 'claude' }, session: readySession(), sessionCommentId: '300' }, { total_cost_usd: 0.5 });
   const env = cenv(dir, { GITHUB_OUTPUT: path.join(dir, 'out') });
   await runDeepReviewCommand('begin', { env, fetchImpl: gh.fetchImpl, now: T0 });
-  const moved = fakeGitHub({ head: C });
+  const moved = fakeGitHub({ head: C, pr: gh.pr });
   fs.writeFileSync(path.join(dir, 'review.json'), JSON.stringify(review));
   const done = await runDeepReviewCommand('finalize', { env: { ...env, REVIEW_PATH: path.join(dir, 'review.json') }, fetchImpl: moved.fetchImpl, now: T0 });
-  return { done, moved, saved: parseSessionComment(moved.writes.find((w) => w.body?.body)?.body.body) };
+  return { done, moved, saved: gh.pr.session() };
 }
 
 test('a push during the review still records its findings for the reviewed commit, marked out of date', async () => {
@@ -323,13 +340,12 @@ test('if only the base branch moved, nothing newer will replace the marker, so t
 
 // ---- required status check ----
 function statusFetch(session, posted) {
-  return async (url, init = {}) => {
-    if (/issues\/7\/comments/.test(url)) {
-      return Response.json(session ? [{ id: 1, user: { login: 'bot[bot]' }, body: renderSessionComment(session) }] : []);
-    }
+  const pr = createFakePr({ author: 'bot[bot]', number: 7 });
+  if (session) pr.seed(session);
+  return pr.layer(async (url, init = {}) => {
     if (/statuses\//.test(url)) { posted.push({ url, body: JSON.parse(init.body) }); return Response.json({}); }
     assert.fail('unexpected ' + url);
-  };
+  });
 }
 const senv = (extra = {}) => ({ TARGET_REPO: 'acme/project', PR_NUMBER: '7', HEAD_SHA: A, GH_TOKEN: 't', STATUS_TOKEN: 's', EXPECTED_REVIEW_AUTHOR: 'bot[bot]', ...extra });
 
@@ -343,6 +359,42 @@ test('READY on this HEAD posts success; a different HEAD stays pending', async (
   assert.equal(other[0].body.state, 'pending');
 });
 
+test('a ledger that cannot be trusted turns the check red instead of leaving an old green or a pending one', async () => {
+  const pr = createFakePr({ author: 'bot[bot]', number: 7 });
+  pr.seed(readySession(A));
+  pr.issue.at(-1).lastEditedAt = '2026-11-18T12:00:00Z'; // somebody edited a bot record
+  const posted = [];
+  const fetchImpl = pr.layer(async (url, init = {}) => {
+    if (/statuses\//.test(url)) { posted.push({ url, body: JSON.parse(init.body) }); return Response.json({}); }
+    assert.fail('unexpected ' + url);
+  });
+  await syncCommitStatus({ env: senv(), fetchImpl });
+  assert.equal(posted.length, 1);
+  assert.equal(posted[0].body.state, 'error');
+  assert.match(posted[0].body.description, /could not be read in full/);
+});
+
+test('the stale sweep refuses to write when the review moved after it read the PR (no lost update)', async () => {
+  const stale = beginDeepReview({ session: readySession(), baseSha: BASE, headSha: A, reserveUsd: 2, now: '2020-01-01T00:00:00.000Z' });
+  const pr = createFakePr({ author: 'bot[bot]', number: 7 });
+  pr.seed(stale);
+  const fetchImpl = pr.layer(async (url) => {
+    if (/\/pulls\/7$/.test(url)) return Response.json({ number: 7, head: { sha: A }, base: { sha: BASE } });
+    if (/statuses\//.test(url)) return Response.json({});
+    assert.fail('unexpected ' + url);
+  });
+  let reads = 0;
+  const racing = async (url, init = {}) => {
+    const response = await fetchImpl(url, init);
+    // after the ledger has been read once (the sweep's snapshot), a newer handoff lands before the sweep writes
+    if (String(url).endsWith('/graphql') && JSON.parse(init.body ?? '{}').query?.includes('reviewThreads(') && ++reads === 1) {
+      pr.seed({ ...readySession(A), updatedAt: 'newer' }, { stage: 'verification' });
+    }
+    return response;
+  };
+  await assert.rejects(() => closeStaleDeepReview({ repo: 'acme/project', prNumber: 7, env: { EXPECTED_REVIEW_AUTHOR: 'bot[bot]', GH_TOKEN: 't', STATUS_TOKEN: 's' }, fetchImpl: racing }), /moved while this run was working/);
+});
+
 test('a failed run with no session for the HEAD reports error instead of pending forever', async () => {
   const posted = [];
   await syncCommitStatus({ env: senv({ JOB_FAILED: 'true' }), fetchImpl: statusFetch(null, posted) });
@@ -353,7 +405,7 @@ test('strict mode refuses to continue when the required status cannot be posted'
   await assert.rejects(() => syncCommitStatus({ env: senv({ STATUS_TOKEN: '', STATUS_STRICT: 'true' }), fetchImpl: async () => assert.fail('no calls') }), /permission/);
   await assert.rejects(() => syncCommitStatus({
     env: senv({ STATUS_STRICT: 'true' }),
-    fetchImpl: async (url) => /comments/.test(url) ? Response.json([]) : new Response('no', { status: 403 }),
+    fetchImpl: createFakePr({ author: 'bot[bot]', number: 7 }).layer(async () => new Response('no', { status: 403 })),
   }), /not posted/);
 });
 
@@ -366,9 +418,7 @@ test('auto stale marker is planned as deep_review_stale from the comment', async
   const stale = beginDeepReview({ session: readySession(), baseSha: BASE, headSha: A, now: '2020-01-01T00:00:00.000Z' });
   const plan = await planSession({
     env: { GH_TOKEN: 't', TARGET_REPO: 'acme/project', PR_NUMBER: '7', BASE_SHA: BASE, HEAD_SHA: A, REQUESTED_MODE: 'auto', EXPECTED_REVIEW_AUTHOR: 'bot[bot]' },
-    fetchImpl: async (url) => /comments/.test(url)
-      ? Response.json([{ id: 4, user: { login: 'bot[bot]' }, body: renderSessionComment(stale) }])
-      : Response.json([]),
+    fetchImpl: (() => { const pr = createFakePr({ author: 'bot[bot]', number: 7 }); pr.seed(stale); return pr.fetchImpl; })(),
   });
   assert.equal(plan.decision.mode, 'deep_review_stale');
 });
@@ -378,7 +428,7 @@ test('the run budget is reserved at begin so an interrupted run still counts aga
   const dir = ctxDir({ requestedMode: 'claude', decision: { mode: 'claude' }, session: { ...readySession(), deepSpendUsd: 3 }, sessionCommentId: '300' });
   const s = await runDeepReviewCommand('begin', { env: cenv(dir, { GITHUB_OUTPUT: path.join(dir, 'out') }), fetchImpl: gh.fetchImpl, now: T0 });
   assert.equal(s.deepSpendUsd, 8); // 3 already spent + 5 reserved
-  assert.equal(parseSessionComment(gh.writes[0].body.body).deepSpendUsd, 8);
+  assert.equal(gh.pr.session().deepSpendUsd, 8);
 });
 
 test('reservation is reconciled to actual spend on success and kept when actual is unknown', () => {
@@ -400,11 +450,11 @@ test('completeDeepReview suppresses a finding already covered by matchesKnownDis
 
 test('begin posts the pending status BEFORE the durable write, so a failed write cannot leave an old green', async () => {
   const order = [];
+  const inner = fakeGitHub().fetchImpl;
   const fetchImpl = async (url, init = {}) => {
-    if (/\/pulls\/7$/.test(url)) return Response.json({ base: { sha: BASE }, head: { sha: A } });
     if (/statuses\//.test(url)) { order.push('status:' + JSON.parse(init.body).state); return Response.json({}); }
-    if (init.method === 'PATCH') { order.push('write'); return new Response('boom', { status: 500 }); }
-    assert.fail('unexpected ' + url);
+    if (init.method === 'POST' && /\/issues\/7\/comments$/.test(url)) { order.push('write'); return new Response('boom', { status: 500 }); }
+    return inner(url, init);
   };
   const dir = ctxDir({ requestedMode: 'claude', decision: { mode: 'claude' }, session: readySession(), sessionCommentId: '300' });
   await assert.rejects(() => runDeepReviewCommand('begin', { env: cenv(dir, { STATUS_TOKEN: 's' }), fetchImpl, now: T0 }), /HTTP 500/);
@@ -415,7 +465,7 @@ test('strict mode: begin refuses to start when the pending status cannot be post
   const gh = fakeGitHub();
   const dir = ctxDir({ requestedMode: 'claude', decision: { mode: 'claude' }, session: readySession(), sessionCommentId: '300' });
   await assert.rejects(() => runDeepReviewCommand('begin', { env: cenv(dir, { STATUS_STRICT: 'true' }), fetchImpl: gh.fetchImpl, now: T0 }), /permission/);
-  assert.equal(gh.writes.length, 0);
+  assert.equal(gh.writes.length + gh.records.length, 0);
 });
 
 test('final mirror turns a stale READY into error when the attempted deep review job failed', async () => {
@@ -428,17 +478,44 @@ test('final mirror turns a stale READY into error when the attempted deep review
 });
 
 function sweepFetch({ repos, prs, comments, onWrite, liveHead = {} }) {
+  // each PR's conversation is a fake PR holding the bot's own records (the session) plus its readable summary comment
+  const fakes = new Map();
+  for (const [key, list] of Object.entries(comments)) {
+    const [repo, n] = key.split('#');
+    const pr = createFakePr({ author: 'bot[bot]', number: Number(n) });
+    for (const c of list) { pr.seed(c.session); pr.addIssue(renderSessionComment(c.session), { id: c.id }); }
+    fakes.set(key, pr);
+  }
+  const blank = createFakePr({ author: 'bot[bot]', number: 0 });
+  const notify = (url, method, init) => {
+    const body = init.body ? JSON.parse(init.body) : null;
+    if (!(body && isRecord(body.body))) onWrite({ url, method, body });
+  };
   return async (url, init = {}) => {
+    const method = init.method || 'GET';
     if (/installation\/repositories/.test(url)) return Response.json({ repositories: repos });
     const pull = String(url).match(/repos\/([^/]+\/[^/]+)\/pulls\?state=open/);
     if (pull) return Response.json(prs[pull[1]] ?? []);
     const live = String(url).match(/repos\/([^/]+\/[^/]+)\/pulls\/(\d+)$/);
     if (live) return Response.json({ head: { sha: liveHead[`${live[1]}#${live[2]}`] ?? prs[live[1]].find((p) => String(p.number) === live[2]).head.sha } });
+    if (String(url).endsWith('/graphql')) {
+      const v = JSON.parse(init.body).variables ?? {};
+      return (fakes.get(`${v.owner}/${v.repo}#${v.number}`) ?? blank).handle(url, init);
+    }
     const one = String(url).match(/repos\/([^/]+\/[^/]+)\/issues\/comments\/(\d+)$/);
-    if (one && !init.method) return Response.json(Object.values(comments).flat().find((c) => String(c.id) === one[2]));
+    if (one) {
+      const pr = [...fakes.values()].find((p) => p.issue.some((c) => c.id === one[2]));
+      if (!pr) return new Response('missing', { status: 404 });
+      if (method !== 'GET') notify(url, method, init);
+      return pr.handle(url, init);
+    }
     const list = String(url).match(/repos\/([^/]+\/[^/]+)\/issues\/(\d+)\/comments/);
-    if (list && !init.method) return Response.json(comments[`${list[1]}#${list[2]}`] ?? []);
-    if (init.method) { onWrite({ url, method: init.method, body: init.body ? JSON.parse(init.body) : null }); return init.method === 'DELETE' ? new Response(null, { status: 204 }) : Response.json({ id: 999 }); }
+    if (list) {
+      const pr = fakes.get(`${list[1]}#${list[2]}`) ?? blank;
+      if (method !== 'GET') notify(url, method, init);
+      return pr.handle(url, init) ?? Response.json([]);
+    }
+    if (method !== 'GET') { onWrite({ url, method, body: init.body ? JSON.parse(init.body) : null }); return method === 'DELETE' ? new Response(null, { status: 204 }) : Response.json({ id: 999 }); }
     assert.fail('unexpected ' + url);
   };
 }
@@ -453,10 +530,10 @@ test('sweeper finds stale deep reviews across installed repositories without any
       'acme/second': [{ number: 3, head: { sha: A } }],
     },
     comments: {
-      'acme/project#7': [{ id: 70, user: { login: 'bot[bot]' }, body: renderSessionComment(stale) }],
-      'acme/project#8': [{ id: 80, user: { login: 'bot[bot]' }, body: renderSessionComment(fresh) }],
-      'acme/project#9': [{ id: 90, user: { login: 'bot[bot]' }, body: renderSessionComment(stale) }],
-      'acme/second#3': [{ id: 30, user: { login: 'bot[bot]' }, body: renderSessionComment(stale) }],
+      'acme/project#7': [{ id: 70, session: stale }],
+      'acme/project#8': [{ id: 80, session: fresh }],
+      'acme/project#9': [{ id: 90, session: stale }],
+      'acme/second#3': [{ id: 30, session: stale }],
     },
     onWrite: () => assert.fail('find must never write'),
   });
@@ -469,7 +546,7 @@ test('close fails a stale review closed and posts an error status', async () => 
   const writes = [];
   const fetchImpl = sweepFetch({
     repos: [], prs: { 'acme/project': [{ number: 7, head: { sha: A } }] },
-    comments: { 'acme/project#7': [{ id: 70, user: { login: 'bot[bot]' }, body: renderSessionComment(stale) }] },
+    comments: { 'acme/project#7': [{ id: 70, session: stale }] },
     onWrite: (w) => writes.push(w),
   });
   const ok = await closeStaleDeepReview({ repo: 'acme/project', prNumber: 7, env: { EXPECTED_REVIEW_AUTHOR: 'bot[bot]', GH_TOKEN: 't', STATUS_TOKEN: 's' }, fetchImpl });
@@ -485,11 +562,11 @@ test('close fails a stale review closed and posts an error status', async () => 
 test('close inside the lock leaves alone a review that was restarted or moved since the scan', async () => {
   const stale = beginDeepReview({ session: readySession(), baseSha: BASE, headSha: A, reserveUsd: 2, now: '2020-01-01T00:00:00.000Z' });
   const restarted = beginDeepReview({ session: readySession(), baseSha: BASE, headSha: A, reserveUsd: 2, now: new Date().toISOString() });
-  for (const [label, body, liveHead] of [['restarted', renderSessionComment(restarted), A], ['moved', renderSessionComment(stale), C]]) {
+  for (const [label, session, liveHead] of [['restarted', restarted, A], ['moved', stale, C]]) {
     const writes = [];
     const fetchImpl = sweepFetch({
       repos: [], prs: { 'acme/project': [{ number: 7, head: { sha: A } }] },
-      comments: { 'acme/project#7': [{ id: 70, user: { login: 'bot[bot]' }, body }] },
+      comments: { 'acme/project#7': [{ id: 70, session }] },
       liveHead: { 'acme/project#7': liveHead },
       onWrite: (w) => writes.push(w),
     });
@@ -750,7 +827,7 @@ test('the final full review is owed once: findings it adds are verified and no s
   assert.equal(done.auditCompleted, true);
 });
 
-test('V5: non-reset cross-commit keeps closed findings (<=32) and dismissed (<=20), deduplicates known dismissals, and FIFO-evicts closed items past 64', () => {
+test('V5: non-reset cross-commit keeps closed findings (<=32) and dismissed (<=20), deduplicates known dismissals, and FIFO-evicts closed items only past the 400-finding bound (the 64 limit went away with the single-comment size limit)', () => {
   const closed = Array.from({ length: 35 }, (_, i) => ({
     id: `F${String(i + 1).padStart(3, '0')}`,
     severity: 'P2',
@@ -796,7 +873,7 @@ test('V5: non-reset cross-commit keeps closed findings (<=32) and dismissed (<=2
   assert.equal(dupResult.findings.filter((f) => f.status === 'OPEN').length, 1);
 
   // Fill to 64+ with closed findings and verify FIFO eviction never drops OPEN
-  const manyClosed = Array.from({ length: 63 }, (_, i) => ({
+  const manyClosed = Array.from({ length: 399 }, (_, i) => ({
     id: `F${String(i + 100).padStart(3, '0')}`,
     severity: 'P2',
     title: `Old ${i + 1}`,
@@ -811,7 +888,7 @@ test('V5: non-reset cross-commit keeps closed findings (<=32) and dismissed (<=2
     resolutionReason: 'done',
   }));
   const fullBegun = beginDeepReview({ session: { ...readySession(), findings: manyClosed, nextFindingNumber: 200 }, baseSha: BASE, headSha: C, now: T0 });
-  // 32 kept + 2 new <= 64, so test direct completeDeepReview on 63 closed + 2 new = 65 -> capped at 64, earliest closed F100 evicted
+  // test completeDeepReview directly: 399 closed + 2 new = 401 -> capped at 400, earliest closed F100 evicted
   const nearCap = {
     ...fullBegun,
     findings: [...manyClosed],
@@ -829,7 +906,7 @@ test('V5: non-reset cross-commit keeps closed findings (<=32) and dismissed (<=2
       coverage: { complete: true, unreviewedPaths: [] },
     },
   });
-  assert.equal(capped.findings.length, 64);
+  assert.equal(capped.findings.length, 400);
   assert.equal(capped.findings.some((f) => f.id === 'F100'), false);
   assert.equal(capped.findings.filter((f) => f.status === 'OPEN').length, 2);
 });

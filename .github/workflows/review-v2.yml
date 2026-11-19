@@ -174,6 +174,8 @@ jobs:
           set -euo pipefail
           marker_new="<!-- jiaze-review-source-comment:${SOURCE_COMMENT_ID} -->"
           marker_old="<!-- claude-review-source-comment:${SOURCE_COMMENT_ID} -->"
+          # The visible receipt the bot writes once a command has been handled (the hidden marker is only read for older PRs).
+          marker_receipt="Handled: comment ${SOURCE_COMMENT_ID} (version"
 
           for page in $(seq 1 100); do
             reviews="$(gh api "repos/${TARGET_REPO}/pulls/${PR_NUMBER}/reviews?per_page=100&page=${page}")"
@@ -195,8 +197,8 @@ jobs:
 
           for page in $(seq 1 100); do
             comments="$(gh api "repos/${TARGET_REPO}/issues/${PR_NUMBER}/comments?per_page=100&page=${page}")"
-            if jq -e --arg m1 "$marker_new" --arg m2 "$marker_old" --arg author "$EXPECTED_REVIEW_AUTHOR" \
-              'any(.[]; (.user.login == $author) and (((.body // "") | contains($m1)) or ((.body // "") | contains($m2))))' \
+            if jq -e --arg m1 "$marker_new" --arg m2 "$marker_old" --arg m3 "$marker_receipt" --arg author "$EXPECTED_REVIEW_AUTHOR" \
+              'any(.[]; (.user.login == $author) and (((.body // "") | contains($m1)) or ((.body // "") | contains($m2)) or ((.body // "") | contains($m3))))' \
               <<<"$comments" >/dev/null; then
               echo "duplicate=true" >> "$GITHUB_OUTPUT"
               exit 0

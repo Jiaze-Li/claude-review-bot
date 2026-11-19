@@ -1,7 +1,7 @@
 // The bot's review threads, read and changed through GitHub's GraphQL API, and how they map to findings.
 import { appendFileSync } from 'node:fs';
 import { findingKey, markerKey } from './review-anchors.mjs';
-import { isBlockingFinding } from './review-session-core.mjs';
+import { MAX_SESSION_FINDINGS, isBlockingFinding } from './review-session-core.mjs';
 
 const THREADS_QUERY = `query($owner:String!,$repo:String!,$number:Int!,$after:String){
   repository(owner:$owner,name:$repo){pullRequest(number:$number){
@@ -130,7 +130,6 @@ export function reportThreadProblem({ env, log, heading, counts, errors = [], pe
   }
 }
 
-const MAX_SESSION_FINDINGS = 64;
 const MAX_OPEN_VERIFICATIONS = 16;
 
 function compactOrphanText(value, max) {
@@ -143,6 +142,20 @@ export function parseBotThreadBody(rawBody) {
   if (typeof rawBody !== 'string') return null;
   let text = rawBody.replace(/\s*<!--\s*jiaze-finding:[0-9a-f]{10}\s*-->\s*$/i, '').trimEnd();
   text = text.replace(/\n\n_Pinned to the nearest changed line:[^\n]*_\s*$/, '').trimEnd();
+  // A Finding Record (the readable first comment of a thread): header line, then the full fields in the details block.
+  const record = text.match(/^### Finding ([A-Za-z0-9_-]+) · (P[0-3]) · ([^\r\n]+)\r?\n/);
+  if (record) {
+    const field = (name) => {
+      const hit = text.match(new RegExp('^finding\\.' + name + ': (.+)$', 'm'));
+      if (!hit) return null;
+      try { return JSON.parse(hit[1]); } catch { return null; }
+    };
+    const title = record[3].trim();
+    const quoted = text.match(/^> (.+)$/m);
+    const body = String(field('body') ?? quoted?.[1] ?? '').trim() || title;
+    const risk = String(field('riskClass') ?? '').trim();
+    return { severity: record[2], title, body, riskClass: risk || 'uncategorized' };
+  }
   let riskClass = 'uncategorized';
   const riskMatch = text.match(/\n\nRisk class:\s*([^\r\n]+)\s*$/);
   if (riskMatch) {

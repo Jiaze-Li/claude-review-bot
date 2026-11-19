@@ -17,7 +17,7 @@ function recorder({ failDelete = false } = {}) {
   };
   return { calls, fetchImpl };
 }
-const save = (rec, previous, session, existingId = '5') => saveSessionComment({ target: 'acme/p', prNumber: 7, token: 't', fetchImpl: rec.fetchImpl, existingId, previous, session, body: 'x' });
+const save = (rec, previous, session, existingId = '5') => saveSessionComment({ target: 'acme/p', prNumber: 7, token: 't', fetchImpl: rec.fetchImpl, existingId, previous, session, body: 'x', projectionOnly: true });
 
 test('a changed status is posted as the newest comment and the old one removed; an unchanged one is edited in place', async () => {
   const changed = recorder();
@@ -68,4 +68,71 @@ test('marking a result out of date is a visible change, and a later review clear
   assert.equal(isMarkedStale(marked), true);
   const reviewedLater = { ...marked, lastReviewedHead: C };
   assert.equal(isMarkedStale(reviewedLater), false); // the mark stops applying by itself
+});
+
+// ---- the durable record is written to the PR first, the summary comment second ----------------------------------
+import { createFakePr, BOT } from './helpers/fake-pr.mjs';
+import { buildLedger } from '../scripts/review-ledger.mjs';
+
+const ledgerOf = (pr) => buildLedger({
+  records: [...pr.issue].map((c) => ({ id: c.id, source: 'issue', createdAt: c.createdAt, body: c.body, login: c.user, type: c.type, lastEditedAt: null, minimizedReason: null })),
+  botLogin: BOT, reads: { complete: true },
+});
+
+test('a save appends a Receipt and a closing Handoff to the PR before the summary comment is touched', async () => {
+  const pr = createFakePr();
+  const session = rework(A);
+  const id = await saveSessionComment({
+    target: 'acme/p', prNumber: 7, token: 't', fetchImpl: pr.fetchImpl, existingId: null, previous: null, session,
+    body: '<!-- jiaze-review-session:v1 -->\nsummary', ledger: { botLogin: BOT, sourceCommentIds: ['55'], stage: 'first' },
+  });
+  const order = pr.calls.filter((c) => c.method === 'POST' && /issues\/7\/comments$/.test(c.url));
+  assert.equal(order.length, 3); // receipt, handoff, summary
+  assert.match(pr.issue[0].body, /^### Review Receipt/);
+  assert.match(pr.issue[1].body, /Handoff: COMPLETE/);
+  assert.match(pr.issue[2].body, /summary/);
+  assert.equal(id, pr.issue[2].id);
+  const ledger = ledgerOf(pr);
+  assert.equal(ledger.state, 'ok');
+  assert.equal(ledger.session.status, 'REWORK');
+  assert.ok(ledger.receipts.has('55@created'));
+});
+
+test('the same command is never receipted twice and Seq/Prev chain across saves', async () => {
+  const pr = createFakePr();
+  const save1 = (session, extra = {}) => saveSessionComment({ target: 'acme/p', prNumber: 7, token: 't', fetchImpl: pr.fetchImpl, session, body: 'summary', existingId: null, ledger: { botLogin: BOT, sourceCommentIds: ['55'], ...extra } });
+  await save1(rework(A));
+  await save1({ ...rework(A), status: 'READY', auditCompleted: true }, { stage: 'audit' });
+  const receipts = pr.issue.filter((c) => /^### Review Receipt/.test(c.body));
+  assert.equal(receipts.length, 1);
+  const ledger = ledgerOf(pr);
+  assert.equal(ledger.state, 'ok');
+  assert.deepEqual(ledger.handoffs.map((h) => h.seq), [1, 2]);
+});
+
+test('an unreadable ledger stops the save: nothing is written, not even the summary', async () => {
+  const pr = createFakePr();
+  pr.addIssue('### Review Handoff · Seq 1 · first\nHandoff: COMPLETE\nSeq: 1', {});
+  await assert.rejects(() => saveSessionComment({ target: 'acme/p', prNumber: 7, token: 't', fetchImpl: pr.fetchImpl, session: rework(A), body: 'summary', existingId: null, ledger: { botLogin: BOT } }), /stopped safely/);
+  assert.equal(pr.calls.filter((c) => (c.method === 'POST' || c.method === 'PATCH') && !c.url.endsWith('/graphql')).length, 0);
+});
+
+test('a plan made at an older handoff is refused instead of overwriting newer work', async () => {
+  const pr = createFakePr();
+  pr.seed(rework(A));
+  await assert.rejects(() => saveSessionComment({ target: 'acme/p', prNumber: 7, token: 't', fetchImpl: pr.fetchImpl, session: { ...rework(A), status: 'READY', auditCompleted: true }, body: 'summary', existingId: null, ledger: { botLogin: BOT, expectedSeq: 0 } }), /moved while this run was working/);
+  assert.equal(pr.issue.length, 1);
+});
+
+test('an in-progress review is written as a Run Start that carries the state, never as a closed handoff', async () => {
+  const pr = createFakePr();
+  const running = beginDeepReview({ session: { ...clean(A), status: 'READY', auditCompleted: true }, baseSha: BASE, headSha: A, reserveUsd: 2, runId: '9' });
+  await saveSessionComment({ target: 'acme/p', prNumber: 7, token: 't', fetchImpl: pr.fetchImpl, session: running, body: 'summary', existingId: null, ledger: { botLogin: BOT } });
+  assert.match(pr.issue[0].body, /^### Review Run Start/);
+  assert.doesNotMatch(pr.issue[0].body, /Handoff: COMPLETE/);
+  const ledger = ledgerOf(pr);
+  assert.equal(ledger.state, 'ok');
+  assert.equal(ledger.session.status, 'REVIEW_IN_PROGRESS');
+  assert.equal(ledger.inProgress, true);
+  assert.equal(ledger.session.deepReview.reservedUsd, 2);
 });

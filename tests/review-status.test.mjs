@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { publishRunStatus } from '../scripts/review-status.mjs';
-import { renderSessionComment } from '../scripts/review-session-core.mjs';
+import { createFakePr } from './helpers/fake-pr.mjs';
 
 const baseEnv = {
   GITHUB_ACTIONS: 'true',
@@ -152,203 +152,59 @@ test('human_required final status posts human prompt containing idempotency mark
   assert.match(fake.calls[0].body, /jiaze-review-source-comment:99/);
 });
 
-test('bounded no-op with session comment silently attaches dedupe marker without conversational noise', async () => {
-  const dummySession = {
-    version: 1,
-    status: 'READY',
-    findings: [],
-    verificationRound: 0,
-    maxVerificationRounds: 3,
-    auditCompleted: true,
-    lastReviewedHead: baseEnv.HEAD_SHA,
-    baseSha: baseEnv.HEAD_SHA,
-    fullAuditHead: baseEnv.HEAD_SHA,
-    deepSpendUsd: 0,
-  };
-  const dummyPlan = {
-    sessionCommentId: '5678',
-    session: dummySession,
-  };
-  const calls = [];
-  const fetchImpl = async (url, options = {}) => {
-    calls.push({ url, method: options.method || 'GET', body: options.body ? JSON.parse(options.body).body : undefined });
-    if (!options.method || options.method === 'GET') {
-      return Response.json({
-        id: 5678,
-        body: renderSessionComment(dummySession),
-      });
-    }
-    return Response.json({ id: 5678 });
-  };
+const BOT_LOGIN = 'jiaze-claude-review-bot[bot]';
+const noopEnv = { ...baseEnv, EXPECTED_REVIEW_AUTHOR: BOT_LOGIN, REVIEW_MODE: 'noop_ready', REVIEW_REASON: 'review clear on this HEAD', STATUS_STAGE: 'finished' };
 
-  const res = await publishRunStatus({
-    env: {
-      ...baseEnv,
-      REVIEW_MODE: 'noop_ready',
-      REVIEW_REASON: 'review clear on this HEAD',
-      STATUS_STAGE: 'finished',
-    },
-    fetchImpl,
-    plan: dummyPlan,
-  });
+test('bounded no-op with a session silently writes the visible receipt, without conversational noise', async () => {
+  const pr = createFakePr({ author: BOT_LOGIN });
+  pr.seed(defaultSession);
+  const before = pr.issue.length;
+  const res = await publishRunStatus({ env: noopEnv, fetchImpl: pr.fetchImpl, plan: { sessionCommentId: '5678', session: defaultSession } });
   assert.equal(res, null);
-  assert.equal(calls.length, 2);
-  assert.equal(calls[0].method, 'GET');
-  assert.equal(calls[1].method, 'PATCH');
-  assert.match(calls[1].body, /jiaze-review-source-comment:99/);
-  assert.match(calls[1].body, /Independent Review Session/);
-  assert.doesNotMatch(calls[1].body, /### Independent review\n/);
+  const added = pr.issue.slice(before);
+  assert.equal(added.length, 1);
+  assert.match(added[0].body, /^### Review Receipt\nHandled: comment 99 \(version created\)/);
+  assert.doesNotMatch(added[0].body, /### Independent review\n/);
+  // handled once means handled: a repeat adds nothing
+  await publishRunStatus({ env: noopEnv, fetchImpl: pr.fetchImpl, plan: { sessionCommentId: '5678', session: defaultSession } });
+  assert.equal(pr.issue.length, before + 1);
 });
 
-test('recordSessionMarker preserves live session state from GitHub rather than stale pre-run plan', async () => {
-  const staleSession = {
-    version: 1,
-    status: 'REWORK',
-    findings: [],
-    verificationRound: 1,
-    maxVerificationRounds: 3,
-    auditCompleted: false,
-    lastReviewedHead: baseEnv.HEAD_SHA,
-    baseSha: baseEnv.HEAD_SHA,
-    fullAuditHead: baseEnv.HEAD_SHA,
-    deepSpendUsd: 0,
-  };
-  const liveSession = {
-    version: 1,
-    status: 'READY',
-    findings: [],
-    verificationRound: 2,
-    maxVerificationRounds: 3,
-    auditCompleted: true,
-    lastReviewedHead: baseEnv.HEAD_SHA,
-    baseSha: baseEnv.HEAD_SHA,
-    fullAuditHead: baseEnv.HEAD_SHA,
-    deepSpendUsd: 0,
-  };
-  const calls = [];
-  const fetchImpl = async (url, options = {}) => {
-    calls.push({ url, method: options.method || 'GET', body: options.body });
-    if (!options.method || options.method === 'GET') {
-      return Response.json({
-        id: 5678,
-        body: renderSessionComment(liveSession, { sourceCommentIds: ['11'] }),
-      });
-    }
-    return Response.json({ id: 5678 });
-  };
-
-  await publishRunStatus({
-    env: {
-      ...baseEnv,
-      REVIEW_MODE: 'noop_ready',
-      REVIEW_REASON: 'review clear on this HEAD',
-      STATUS_STAGE: 'finished',
-    },
-    fetchImpl,
-    plan: { sessionCommentId: '5678', session: staleSession },
-  });
-
-  assert.equal(calls.length, 2);
-  assert.equal(calls[1].method, 'PATCH');
-  // Patched body must preserve the live session status READY (not stale REWORK) and include both markers
-  assert.match(calls[1].body, /Status: \*\*READY\*\*/);
-  assert.match(calls[1].body, /jiaze-review-source-comment:11/);
-  assert.match(calls[1].body, /jiaze-review-source-comment:99/);
+test('the receipt never changes the stored session, whatever the pre-run plan said', async () => {
+  const staleSession = { ...defaultSession, status: 'REWORK', verificationRound: 1, auditCompleted: false };
+  const pr = createFakePr({ author: BOT_LOGIN });
+  pr.seed(defaultSession); // the live, newer state on the PR
+  await publishRunStatus({ env: noopEnv, fetchImpl: pr.fetchImpl, plan: { sessionCommentId: '5678', session: staleSession } });
+  assert.equal(pr.session().status, 'READY');
+  assert.equal(pr.session().verificationRound, 0);
 });
 
-test("recordSessionMarker fails closed on corrupted session comment and refuses to PATCH", async () => {
-  const staleSession = {
-    version: 1,
-    status: "READY",
-    findings: [],
-    verificationRound: 0,
-    maxVerificationRounds: 3,
-    auditCompleted: true,
-    lastReviewedHead: baseEnv.HEAD_SHA,
-    baseSha: baseEnv.HEAD_SHA,
-    fullAuditHead: baseEnv.HEAD_SHA,
-    deepSpendUsd: 0,
-  };
-  const calls = [];
+test('recording the receipt fails closed on an untrustworthy ledger and writes nothing', async () => {
+  const pr = createFakePr({ author: BOT_LOGIN });
+  pr.addIssue('### Review Handoff · Seq 1 · first\nHandoff: COMPLETE\nSeq: 1');
   const warnings = [];
-  const log = { warn: (msg) => warnings.push(msg) };
-  const fetchImpl = async (url, options = {}) => {
-    calls.push({ url, method: options.method || "GET", body: options.body });
-    if (!options.method || options.method === "GET") {
-      return Response.json({
-        id: 5678,
-        body: "<!-- jiaze-review-session:v1 -->\nCorrupted body without state comment",
-      });
-    }
-    return Response.json({ id: 5678 });
-  };
-
-  const res = await publishRunStatus({
-    env: {
-      ...baseEnv,
-      REVIEW_MODE: "noop_ready",
-      REVIEW_REASON: "review clear on this HEAD",
-      STATUS_STAGE: "finished",
-    },
-    fetchImpl,
-    log,
-    plan: { sessionCommentId: "5678", session: staleSession },
-  });
-
+  const res = await publishRunStatus({ env: noopEnv, fetchImpl: pr.fetchImpl, log: { warn: (m) => warnings.push(m) }, plan: { sessionCommentId: '5678', session: defaultSession } });
   assert.equal(res, null);
-  assert.equal(calls.length, 1);
-  assert.equal(calls[0].method, "GET");
-  assert.equal(warnings.length, 1);
-  assert.match(warnings[0], /corrupted or unparseable state/);
+  assert.equal(pr.issue.length, 1);
 });
 
-test("recordSessionMarker fails closed on HTTP error and refuses to PATCH", async () => {
-  const calls = [];
+test('recording the receipt fails closed on an HTTP error and warns', async () => {
   const warnings = [];
-  const log = { warn: (msg) => warnings.push(msg) };
-  const fetchImpl = async (url, options = {}) => {
-    calls.push({ url, method: options.method || "GET", body: options.body });
-    return new Response("Not found", { status: 404 });
-  };
-
   const res = await publishRunStatus({
-    env: {
-      ...baseEnv,
-      REVIEW_MODE: "noop_ready",
-      REVIEW_REASON: "review clear on this HEAD",
-      STATUS_STAGE: "finished",
-    },
-    fetchImpl,
-    log,
-    plan: { sessionCommentId: "5678", session: defaultSession },
+    env: noopEnv, fetchImpl: async () => new Response('Not found', { status: 404 }), log: { warn: (m) => warnings.push(m) },
+    plan: { sessionCommentId: '5678', session: defaultSession },
   });
-
   assert.equal(res, null);
-  assert.equal(calls.length, 1);
-  assert.equal(calls[0].method, "GET");
   assert.equal(warnings.length, 1);
   assert.match(warnings[0], /HTTP 404/);
 });
 
-test("recordSessionMarker fails closed on network exception and refuses to PATCH", async () => {
+test('recording the receipt fails closed on a network exception and warns', async () => {
   const warnings = [];
-  const log = { warn: (msg) => warnings.push(msg) };
-  const fetchImpl = async () => {
-    throw new Error("Network timeout");
-  };
-
   const res = await publishRunStatus({
-    env: {
-      ...baseEnv,
-      REVIEW_MODE: "noop_ready",
-      REVIEW_REASON: "review clear on this HEAD",
-      STATUS_STAGE: "finished",
-    },
-    fetchImpl,
-    log,
-    plan: { sessionCommentId: "5678", session: defaultSession },
+    env: noopEnv, fetchImpl: async () => { throw new Error('Network timeout'); }, log: { warn: (m) => warnings.push(m) },
+    plan: { sessionCommentId: '5678', session: defaultSession },
   });
-
   assert.equal(res, null);
   assert.equal(warnings.length, 1);
   assert.match(warnings[0], /Network timeout/);
@@ -514,45 +370,34 @@ test("recover finished status reports outcome: success is silent, failure posts 
   assert.match(sent[1], /Session recovery was not confirmed/);
 });
 
-test("deep_review_stale finished status reports outcome: success records marker, failure posts error", async () => {
+test("deep_review_stale finished status reports outcome: success records receipt, failure posts error", async () => {
+  const pr = createFakePr({ author: BOT_LOGIN });
+  pr.seed(defaultSession);
   const sent = [];
-  const calls = [];
-  const fetchImpl = async (url, init = {}) => {
-    calls.push({ url, method: init.method || "GET" });
-    if (!init.method || init.method === "GET") {
-      return Response.json({
-        id: 5678,
-        body: renderSessionComment(defaultSession),
-      });
-    }
+  const fetchImpl = pr.layer(async (url, init = {}) => {
     sent.push(JSON.parse(init.body).body);
     return Response.json({ id: 5678 });
-  };
-  const base = { ...baseEnv, REVIEW_MODE: "deep_review_stale", REVIEW_REASON: "stale deep review" };
+  });
+  const base = { ...baseEnv, EXPECTED_REVIEW_AUTHOR: BOT_LOGIN, REVIEW_MODE: "deep_review_stale", REVIEW_REASON: "stale deep review" };
 
-  // Success records marker silently
+  // Success records the receipt silently
+  const before = pr.issue.length;
   const r1 = await publishRunStatus({
     env: { ...base, STATUS_STAGE: "finished", FAIL_DEEP_OUTCOME: "success" },
     fetchImpl,
     plan: { sessionCommentId: "5678", session: defaultSession },
   });
   assert.equal(r1, null);
-  // GET existing comment + PATCH session comment with marker
-  assert.equal(calls.length, 2);
-  assert.equal(calls[0].method, "GET");
-  assert.equal(calls[1].method, "PATCH");
-  assert.match(sent[0], /Independent Review Session/);
+  assert.equal(pr.issue.length, before + 1);
+  assert.match(pr.issue.at(-1).body, /Handled: comment 99/);
 
   // Failure posts error comment
-  calls.length = 0;
-  sent.length = 0;
   const r2 = await publishRunStatus({
     env: { ...base, STATUS_STAGE: "finished", FAIL_DEEP_OUTCOME: "failure" },
-    fetchImpl,
+    fetchImpl: async (url, init = {}) => { sent.push(JSON.parse(init.body).body); return Response.json({ id: 5678 }); },
   });
   assert.equal(r2, "5678");
-  assert.equal(sent.length, 1);
-  assert.match(sent[0], /Stale deep review cleanup was not confirmed/);
-  assert.match(sent[0], /actions\/runs\/1234\/attempts\/2/);
-  assert.match(sent[0], /<!-- jiaze-review-source-comment:99 -->/);
+  assert.match(sent.at(-1), /Stale deep review cleanup was not confirmed/);
+  assert.match(sent.at(-1), /actions\/runs\/1234\/attempts\/2/);
+  assert.match(sent.at(-1), /<!-- jiaze-review-source-comment:99 -->/);
 });

@@ -3,13 +3,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { saveSessionComment } from './session-comment.mjs';
+import { ledgerOptions, loadSession } from './session-store.mjs';
 import { finalReviewOutlook } from './continue-review.mjs';
 import {
   applyFindingDismissal,
   chargeClaudeFallback,
   checkDismissEligibility,
   isBlockingFinding,
-  parseSessionComment,
   recordDismissAttempt,
   renderSessionComment,
 } from './review-session-core.mjs';
@@ -19,6 +19,11 @@ import { parseDismissalRequest } from '../worker/src/review-trigger.js';
 
 // Independent model verification for @gemini dismiss F001. All user-origin
 // facts are re-fetched from GitHub rather than trusted from workflow_dispatch.
+// Two copies of a session are the same session whatever order their keys were written in.
+const canonical = (value) => JSON.stringify(value, (key, v) => (v && typeof v === 'object' && !Array.isArray(v)
+  ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, v[k]])) : v));
+const sameSession = (a, b) => canonical(a) === canonical(b);
+
 export async function applyManualDismissal({
   env = process.env,
   fetchImpl = fetch,
@@ -83,12 +88,12 @@ export async function applyManualDismissal({
     return plan.session;
   }
 
-  const loadCurrentDurable = async () => {
-    const current = await github(root + '/issues/comments/' + plan.sessionCommentId, env.GH_TOKEN, fetchImpl);
-    return String(current.user?.login || '') === expectedAuthor ? parseSessionComment(current.body) : null;
-  };
+  // The session is read from the PR's own records every time (never from a cached or hidden copy).
+  const loadCurrentDurable = async () => (await loadSession({
+    target: repo, prNumber, token: env.GH_TOKEN, fetchImpl, botLogin: expectedAuthor, importLegacy: false,
+  })).session;
   const durable = await loadCurrentDurable();
-  if (!durable || JSON.stringify(durable) !== JSON.stringify(plan.session)) {
+  if (!durable || !sameSession(durable, plan.session)) {
     throw new Error('Durable review session changed since planning; refusing stale dismissal');
   }
 
@@ -154,6 +159,7 @@ export async function applyManualDismissal({
     const savedId = await saveSessionComment({
       target: repo, prNumber, token: env.GH_TOKEN, fetchImpl,
       existingId: plan.sessionCommentId, previous: durable, session: recorded, body,
+      ledger: ledgerOptions(env, { sourceCommentIds: [sourceId], stage: 'closing', expectedSeq: plan.ledgerSeq ?? null }),
     });
     await postDismissalOutcomeReply({
       repo, prNumber, expectedAuthor, session: recorded, findingId: decision.findingId,
@@ -192,7 +198,7 @@ export async function applyManualDismissal({
   try {
     await proveHead();
     const latestDurable = await loadCurrentDurable();
-    if (!latestDurable || JSON.stringify(latestDurable) !== JSON.stringify(durable)) {
+    if (!latestDurable || !sameSession(latestDurable, durable)) {
       throw new Error('Durable review session changed during dismissal verification; refusing stale verdict');
     }
   } catch (staleError) {
@@ -205,6 +211,8 @@ export async function applyManualDismissal({
           await saveSessionComment({
             target: repo, prNumber, token: env.GH_TOKEN, fetchImpl,
             existingId: plan.sessionCommentId, previous: latestForSpend, session: charged, body: chargedBody,
+            // the ledger was just read again (that is why it moved); the plan's Seq is already out of date
+            ledger: ledgerOptions(env, { sourceCommentIds: [sourceId], stage: 'closing' }),
           });
         }
       } catch {
@@ -233,6 +241,7 @@ export async function applyManualDismissal({
     const savedId = await saveSessionComment({
       target: repo, prNumber, token: env.GH_TOKEN, fetchImpl,
       existingId: plan.sessionCommentId, previous: durable, session, body,
+      ledger: ledgerOptions(env, { sourceCommentIds: [sourceId], stage: 'closing', expectedSeq: plan.ledgerSeq ?? null }),
     });
     writePublishedSession(contextRoot, { mode: 'dismiss', verdict: 'DISMISSED', session, sessionCommentId: savedId });
     console.log(`Verified dismissal recorded (${verdict.provider}): ${decision.findingId}; status ${session.status}.`);
@@ -257,6 +266,7 @@ export async function applyManualDismissal({
   const savedId = await saveSessionComment({
     target: repo, prNumber, token: env.GH_TOKEN, fetchImpl,
     existingId: plan.sessionCommentId, previous: durable, session, body,
+    ledger: ledgerOptions(env, { sourceCommentIds: [sourceId], stage: 'closing', expectedSeq: plan.ledgerSeq ?? null }),
   });
 
   const isRejected = verdict.verdict === 'REJECTED';
@@ -281,20 +291,18 @@ export async function applyManualDismissal({
 
 const DISMISSAL_FORMAT_EXAMPLE = [
   '```text',
-  '@gemini dismiss F001',
-  'Reason: <30-1200 characters explaining why this finding is a false positive or already addressed>',
-  'Evidence: <https://... or path/to/file.ext#L10>',
+  '@gemini dismiss F001 <say in your own words why this is not a problem; mention the file or line if it helps>',
   '```',
 ].join('\n');
 
 async function postInvalidDismissalReply({ repo, prNumber, sourceId, heading, reason, env, fetchImpl }) {
   const body = [
-    `<!-- jiaze-review-source-comment:${sourceId} -->`,
+    `Handled: comment ${sourceId} (version created) → guidance posted, no review was run`,
     heading,
     '',
     reason,
     '',
-    'Expected format:',
+    'How to ask:',
     DISMISSAL_FORMAT_EXAMPLE,
   ].join('\n');
   await github(`https://api.github.com/repos/${repo}/issues/${prNumber}/comments`, env.GH_TOKEN, fetchImpl, {

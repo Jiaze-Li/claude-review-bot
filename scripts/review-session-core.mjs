@@ -28,9 +28,10 @@ function stripTransientState(session, headSha, { clearAllCoverageDeepReview = fa
   return next;
 }
 export const SESSION_VERSION = 1;
-export const MAX_VERIFICATION_ROUNDS = 2;
-export const MAX_DISMISS_ATTEMPTS_PER_HEAD = 2;
-export const MAX_DISMISS_LEDGER = 48;
+// Verification has no fixed number of rounds: a finding is checked again every time a new HEAD is pushed and asked for.
+// `verificationRound` is only a count of the passes made so far.
+// A safety bound on the attempt records kept per session, not a limit on how many claims are read.
+export const MAX_DISMISS_LEDGER = 400;
 // A P0-P2 finding must carry a concrete failure path (trigger state -> wrong
 // result). Without one it is demoted to non-blocking P3 instead of blocking.
 export const MIN_FAILURE_PATH_CHARS = 30;
@@ -49,7 +50,8 @@ const MAX_UNREVIEWED_PATHS = 20;
 const MAX_REVIEWED_KEYS = 400;
 const CLOSED_FINDING_STATUSES = new Set(['FIXED', 'DISMISSED', 'WAIVED', 'DEFERRED']);
 const MAX_CARRIED_CLOSED_FINDINGS = 32;
-const MAX_SESSION_FINDINGS = 64;
+// The ledger has no 24 KB state block any more; this only bounds how many findings one render carries.
+export const MAX_SESSION_FINDINGS = 400;
 
 function pruneFindingsToCap(findings, max = MAX_SESSION_FINDINGS) {
   const next = [...findings];
@@ -128,9 +130,6 @@ export function planReviewSession({ session = null, baseSha, headSha, reset = fa
   if (session.status === 'REWORK') {
     if (session.lastReviewedHead === headSha) {
       return { mode: 'noop_waiting', previousHead: session.lastReviewedHead, reason: 'push a repair before verification' };
-    }
-    if ((session.verificationRound ?? 0) >= MAX_VERIFICATION_ROUNDS) {
-      return { mode: 'human_required', previousHead: session.lastReviewedHead, reason: 'verification budget exhausted' };
     }
     return { mode: 'verification', previousHead: session.lastReviewedHead, reason: 'verify the repair against open findings' };
   }
@@ -218,7 +217,6 @@ export function applyDiscoveryResult({
     status: open.length ? 'REWORK' : 'AUDIT_PENDING',
     auditCompleted: false,
     verificationRound: 0,
-    maxVerificationRounds: MAX_VERIFICATION_ROUNDS,
     nextFindingNumber,
     findings,
     acceptedRiskClasses: [],
@@ -333,16 +331,13 @@ export function applyVerificationResult({
   const status = open.length === 0
     ? unresolvedMaterialFindings(session).length > 0 ? 'HUMAN_REQUIRED'
       : session.auditCompleted === true ? 'READY' : 'AUDIT_PENDING'
-    : verificationRound >= MAX_VERIFICATION_ROUNDS
-      ? 'HUMAN_REQUIRED'
-      : 'REWORK';
+    : 'REWORK';
 
   return {
     ...stripTransientState(session, headSha),
     lastReviewedHead: headSha,
     status,
     verificationRound,
-    maxVerificationRounds: MAX_VERIFICATION_ROUNDS,
     nextFindingNumber,
     findings,
     lastSummary: compactText(normalized.summary, 800),
@@ -567,7 +562,7 @@ export function completeDeepReview({
     && session.reviewFailure?.head === headSha;
   const coverage = normalizeCoverage(result.coverage);
   const status = open.length > 0
-    ? verificationRound >= MAX_VERIFICATION_ROUNDS ? 'HUMAN_REQUIRED' : 'REWORK'
+    ? 'REWORK'
     : unresolvedMaterialFindings(session).length > 0 ? 'HUMAN_REQUIRED'
       : coverage && !coverage.complete ? 'PARTIAL'
       : resume === 'HUMAN_REQUIRED' && !providerRecovery ? 'HUMAN_REQUIRED'
@@ -801,12 +796,8 @@ export function checkDismissEligibility({ session, findingId, headSha, sourceCom
   if (duplicateRebuttal) {
     return { eligible: false, kind: 'duplicate_rebuttal', entry: duplicateRebuttal };
   }
-  const adjudicated = sameHeadFinding.filter(
-    (entry) => !entry?.unavailable && ['DISMISSED', 'REJECTED', 'INCONCLUSIVE'].includes(entry?.verdict),
-  );
-  if (adjudicated.length >= MAX_DISMISS_ATTEMPTS_PER_HEAD) {
-    return { eligible: false, kind: 'attempt_limit', entries: adjudicated };
-  }
+  // There is no fixed number of attempts: a different claim is always read; only an identical claim on the same
+  // HEAD is not paid for twice (above), and the budget limits the spend.
   const sameHeadAll = ledger.filter((entry) => entry?.head === headSha);
   if (sameHeadAll.length >= MAX_DISMISS_LEDGER) {
     return { eligible: false, kind: 'attempt_limit', entries: sameHeadAll };
@@ -903,11 +894,12 @@ export function applyFindingDismissal({
     throw new Error('invalid dismissal actor');
   }
   if (!/^[1-9]\d*$/.test(String(sourceCommentId ?? ''))) throw new Error('invalid dismissal source comment id');
-  const explanation = checkedText(reason, 1200, 'dismissal reason');
-  if (explanation.length < 30) throw new Error('dismissal reason must be at least 30 characters');
-  if (!Array.isArray(evidence) || evidence.length < 1 || evidence.length > 3) {
-    throw new Error('dismissal needs 1-3 cited evidence items');
+  // The claim is free text of any length (clipped, never rejected for being short); citations are optional.
+  const explanation = compactText(String(reason ?? '').trim(), 1200) || 'No explanation was given.';
+  if (evidence != null && (!Array.isArray(evidence) || evidence.length > 3)) {
+    throw new Error('dismissal may cite at most 3 evidence items');
   }
+  evidence = evidence ?? [];
   for (const link of evidence) {
     validateDismissalEvidence(link);
   }
@@ -1062,7 +1054,7 @@ export function recordUncertainFindings(session, validations, headSha) {
     entry?.verdict === 'UNCERTAIN' && MATERIAL_SEVERITIES.has(entry.severity));
   const count = uncertain.length;
   if (!count) return session;
-  if (session.findings.length + count > 64) {
+  if (session.findings.length + count > MAX_SESSION_FINDINGS) {
     throw new Error('too many unresolved material candidates to persist safely');
   }
   const findings = [...session.findings];
@@ -1085,8 +1077,7 @@ export function recordUncertainFindings(session, validations, headSha) {
     });
   }
   const confirmedOpen = findings.some(f => f.status === 'OPEN' && isBlocking(f));
-  const status = confirmedOpen && (session.verificationRound ?? 0) < MAX_VERIFICATION_ROUNDS
-    ? 'REWORK' : 'HUMAN_REQUIRED';
+  const status = confirmedOpen ? 'REWORK' : 'HUMAN_REQUIRED';
   return {
     ...session,
     findings,
@@ -1103,7 +1094,7 @@ export function renderSessionComment(session, { sourceCommentIds = [], finalRevi
   validateSession(session);
   const open = openMaterialFindings(session);
   const unresolved = unresolvedMaterialFindings(session);
-  const verification = `${session.verificationRound ?? 0}/${session.maxVerificationRounds ?? MAX_VERIFICATION_ROUNDS}`;
+  const verification = `${session.verificationRound ?? 0} pass${(session.verificationRound ?? 0) === 1 ? '' : 'es'} so far`;
   const audit = session.auditCompleted === true ? 'complete' : session.status === 'AUDIT_PENDING' ? 'pending' : 'not run';
   const stale = Boolean(session.staleFor) && session.staleFor === session.lastReviewedHead;
   const newer = Number.isInteger(session.staleCommits) && session.staleCommits > 0
@@ -1115,7 +1106,7 @@ export function renderSessionComment(session, { sourceCommentIds = [], finalRevi
     : session.reviewFailure?.code === 'REVIEWER_UNAVAILABLE'
     ? 'Provider review did not complete. Comment `@gemini review` to retry the latest HEAD, or `@claude review` for an existing exact-HEAD session. A manual request bypasses the automatic $6 cap but not provider quota or the $5 per-call ceiling.'
     : unresolved.length > 0
-    ? 'Inconclusive material candidate(s): inspect the cited code. If disproven, use `@gemini dismiss F001` with Reason and Evidence links; otherwise fix and push for a fresh review. Manual override explicitly accepts risk.'
+    ? 'Inconclusive material candidate(s): inspect the cited code. If disproven, use `@gemini dismiss F001` and say in your own words why; otherwise fix and push for a fresh review. Manual override explicitly accepts risk.'
     : session.status === 'PARTIAL'
     ? 'Some changed files were NOT reviewed (listed above), so this HEAD is not READY. Comment `@claude review` to cover them, or split the PR.'
     : session.status === 'READY'
@@ -1129,7 +1120,7 @@ export function renderSessionComment(session, { sourceCommentIds = [], finalRevi
           ? `The final full review is NOT running right now: ${cleanInline(finalReview.reason || 'it did not start')}. Comment \`@gemini review\` to start it.`
           : 'The final full review is the next step, but it may not be running right now. If no new run appears on this PR, comment `@gemini review` to start it.')
       : session.status === 'REWORK'
-        ? 'Push a repair for real bugs; for a disproven finding post `@gemini dismiss F001` with Reason and Evidence lines. Dismissal does not change product code.'
+        ? 'Push a repair for real bugs; for a disproven finding post `@gemini dismiss F001` and say in your own words why. Dismissal does not change product code.'
         : 'Automatic review budget is exhausted. Use human judgment or a targeted Codex/Claude review; do not restart full discovery automatically.';
   const dismissed = session.findings.filter((finding) => finding.status === 'DISMISSED').slice(-4);
   const hasVerifiedDismissal = dismissed.some((finding) => Boolean(finding.dismissal?.verifiedBy));
@@ -1155,14 +1146,16 @@ export function renderSessionComment(session, { sourceCommentIds = [], finalRevi
   ];
   if (!findingLines.length) findingLines.push('- none');
   const orphanLine = formatOrphanReconcileLine(session, orphanReconcile);
-  const state = encodeSessionState(session);
   const processedMarkers = [...new Set(sourceCommentIds.map(String).filter((id) => /^[1-9]\d*$/.test(id)))]
     .slice(-8)
     .map((id) => `<!-- jiaze-review-source-comment:${id} -->`);
+  const handledLines = [...new Set(sourceCommentIds.map(String).filter((id) => /^[1-9]\d*$/.test(id)))].slice(-8)
+    .map((id) => `Handled: comment ${id} (version created)`);
   return [
     '<!-- jiaze-review-session:v1 -->',
     ...processedMarkers,
     '### Independent Review Session',
+    ...handledLines,
     `Status: **${stale ? `${session.status} on an earlier commit (NOT current)` : session.status}**${session.override ? ` (manually overridden by @${cleanInline(session.override.by)})` : ''}`,
     `Default reviewer: **Gemini Flash (latest) / medium thinking**`,
     `Discovery: **complete** · Final audit: **${audit}** · Verification: **${verification}**`,
@@ -1187,7 +1180,7 @@ export function renderSessionComment(session, { sourceCommentIds = [], finalRevi
     `Next: ${next}`,
     '',
     '<sub>Every reported finding, P3 included, stays open until it is fixed. Verification covers open findings and new delta regressions. Audited unchanged code is reused after safe incremental reviews; high-risk deltas receive full review.</sub>',
-    `<!-- jiaze-review-state:${state} -->`,
+    '<sub>This comment is only a summary. The durable record is the bot\'s own "Review Handoff" comments on this PR, which it never edits.</sub>',
   ].join('\n');
 }
 
@@ -1297,7 +1290,7 @@ function validateSession(session) {
   checkedSha(session.lastReviewedHead, 'session.lastReviewedHead');
   if (!['AUDIT_PENDING', 'READY', 'REWORK', 'HUMAN_REQUIRED', 'REVIEW_IN_PROGRESS', 'PARTIAL'].includes(session.status)) throw new Error('invalid review session status');
   if (session.auditCompleted != null && typeof session.auditCompleted !== 'boolean') throw new Error('invalid final audit state');
-  if (!Array.isArray(session.findings) || session.findings.length > 64) throw new Error('invalid review session findings');
+  if (!Array.isArray(session.findings) || session.findings.length > MAX_SESSION_FINDINGS) throw new Error('invalid review session findings');
 }
 
 function compactFinding(finding) {
@@ -1332,30 +1325,4 @@ function checkedText(value, max, name) {
 
 function cleanInline(value) {
   return String(value).replace(/[\r\n]+/g, ' ').replace(/<!--|-->/g, '').slice(0, 300);
-}
-
-export function encodeSessionState(session) {
-  validateSession(session);
-  const json = JSON.stringify(session);
-  if (Buffer.byteLength(json, 'utf8') > 24_000) throw new Error('review session state exceeds 24KB');
-  return Buffer.from(json, 'utf8').toString('base64url');
-}
-
-export function pendingSessionMarker(session, sourceCommentId) {
-  const id = String(sourceCommentId ?? '');
-  if (!/^[1-9]\d*$/.test(id)) throw new Error('invalid pending source comment id');
-  return `<!-- jiaze-review-pending-session:v1:${id}:${encodeSessionState(session)} -->`;
-}
-
-export function parsePendingSessionReview(body) {
-  if (typeof body !== 'string') return null;
-  const match = body.match(/<!-- jiaze-review-pending-session:v1:([1-9]\d*):([A-Za-z0-9_-]+) -->/);
-  if (!match) return null;
-  try {
-    const session = JSON.parse(Buffer.from(match[2], 'base64url').toString('utf8'));
-    validateSession(session);
-    return { sourceCommentId: match[1], session };
-  } catch {
-    return null;
-  }
 }

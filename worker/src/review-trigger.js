@@ -20,7 +20,8 @@ export function parseReviewTrigger(body) {
   }
   // The workflow re-fetches the original issue comment for a reason and citations. (Resolving a review
   // thread is a separate path: see parseReviewThreadTrigger.)
-  if (/^ {0,3}@(gemini|jiaze-claude-review-bot)[ \t]+dismiss[ \t]+F[0-9]{3,}[ \t]*$/i.test(firstLine)) {
+  // `dismiss F001` may be followed by any free-text explanation: layout never decides whether a claim is read.
+  if (/^ {0,3}@(gemini|jiaze-claude-review-bot)[ \t]+dismiss[ \t]+F[0-9]{3,}(?:[ \t]+\S.*)?[ \t]*$/i.test(firstLine)) {
     return { requestedMode: 'dismiss' };
   }
   // Short forms: `@gemini review` (same as the bare bot command) and `@claude review`.
@@ -125,8 +126,27 @@ export function validateDismissalEvidence(raw) {
   return { kind: 'path', value: raw, relPath };
 }
 
-// A human-attested decision, NOT an automatically verified external fact.
-// Parse a strict small format and prevent unrelated prose from being evidence.
+// A person's claim about a finding, in their own words. It is an unverified claim, never a fact: the bot checks it
+// against the code. Anything after `dismiss F001` is the claim (no Reason:/Evidence: layout, no minimum length).
+// Evidence is whatever the text points at: credential-free HTTPS URLs and repository-relative paths (optionally
+// with :line). A pointer that is unsafe or malformed is not trusted and is simply not used.
+const ANCHOR = '(?::\\d+(?:-\\d+)?|#L\\d+(?:-L\\d+)?)';
+const EVIDENCE_CANDIDATE_RE = new RegExp(
+  'https?:\\/\\/[^\\s<>()\\[\\]"\'`]+'                                         // a link
+  + '|(?:[A-Za-z0-9_.-]+\\/)+[A-Za-z0-9_.-]+' + ANCHOR                           // dir/name with a line anchor
+  + '|(?:[A-Za-z0-9_.-]+\\/)+[A-Za-z0-9_-]+\\.[A-Za-z][A-Za-z0-9]{0,7}'           // dir/name.ext
+  + '|\\b[A-Za-z0-9_-]+\\.[A-Za-z]{1,6}' + ANCHOR + '\\b', 'g');
+export function extractEvidenceFromText(text) {
+  const seen = [];
+  for (const raw of String(text ?? '').match(EVIDENCE_CANDIDATE_RE) ?? []) {
+    const candidate = raw.replace(/[.,;:]+$/, '');
+    if (seen.includes(candidate) || seen.length >= 3) continue;
+    try { validateDismissalEvidence(candidate); } catch { continue; }
+    seen.push(candidate);
+  }
+  return seen;
+}
+
 export function parseDismissalRequest(body) {
   if (typeof body !== 'string' || body.length > 3000) throw new Error('Invalid dismissal comment length');
   const lines = body.split(/\r\n|\n|\r/);
@@ -134,27 +154,9 @@ export function parseDismissalRequest(body) {
   if (index < 0 || parseReviewTrigger(body)?.requestedMode !== 'dismiss') {
     throw new Error('Expected a standalone @gemini dismiss F001 command');
   }
-  const match = lines[index].match(/^ {0,3}@(gemini|jiaze-claude-review-bot)[ \t]+dismiss[ \t]+(F[0-9]{3,})[ \t]*$/i);
+  const match = lines[index].match(/^ {0,3}@(gemini|jiaze-claude-review-bot)[ \t]+dismiss[ \t]+(F[0-9]{3,})(?:[ \t]+(\S.*?))?[ \t]*$/i);
   if (!match) throw new Error('Invalid finding dismissal command');
-  let reason = null;
-  const evidence = [];
-  for (const line of lines.slice(index + 1)) {
-    if (!line.trim()) continue;
-    const reasonMatch = line.match(/^Reason:[ \t]*(.+)$/i);
-    const evidenceMatch = line.match(/^Evidence:[ \t]*(\S+)[ \t]*$/i);
-    if (reasonMatch && reason === null) {
-      reason = reasonMatch[1].trim();
-    } else if (evidenceMatch) {
-      const raw = evidenceMatch[1];
-      validateDismissalEvidence(raw);
-      if (evidence.includes(raw)) throw new Error('Duplicate dismissal evidence');
-      evidence.push(raw);
-    } else {
-      throw new Error('Dismissal requires exactly one Reason: line and 1-3 Evidence: lines');
-    }
-  }
-  if (!reason || reason.length < 30 || reason.length > 1200 || evidence.length < 1 || evidence.length > 3) {
-    throw new Error('Dismissal requires a 30-1200 character Reason and 1-3 Evidence items (HTTPS URL or repo-relative path)');
-  }
-  return { findingId: match[2].toUpperCase(), reason, evidence };
+  const claim = [match[3] ?? '', ...lines.slice(index + 1)].join('\n').trim();
+  const reason = claim.replace(/^(?:Reason|Evidence):[ \t]*/gim, '').slice(0, 1200).trim();
+  return { findingId: match[2].toUpperCase(), reason, evidence: extractEvidenceFromText(claim) };
 }

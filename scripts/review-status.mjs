@@ -6,8 +6,7 @@ import {
   decideNotificationAction,
   extractSourceCommentMarkers,
 } from './notification-policy.mjs';
-import { parseSessionComment, renderSessionComment } from './review-session-core.mjs';
-import { saveSessionComment } from './session-comment.mjs';
+import { recordReceipt } from './session-store.mjs';
 
 const repoPattern = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const positiveId = /^[1-9]\d*$/;
@@ -51,70 +50,22 @@ function loadSessionPlan(env) {
   return null;
 }
 
+// A command comment that changed nothing is still "handled": write its visible Receipt so a repeat is recognised.
 export async function recordSessionMarker({
   targetRepo,
   prNumber,
   token,
-  sessionCommentId,
-  session = null,
   sourceCommentId,
   fetchImpl = fetch,
   log = console,
+  botLogin = process.env.EXPECTED_REVIEW_AUTHOR,
+  result = 'no change to the review',
 }) {
-  if (!sessionCommentId || !sourceCommentId) return null;
-  const root = `https://api.github.com/repos/${targetRepo}`;
-  let response;
+  if (!sourceCommentId || !botLogin) return null;
   try {
-    response = await fetchImpl(`${root}/issues/comments/${sessionCommentId}`, {
-      headers: {
-        Accept: 'application/vnd.github+json',
-        Authorization: `Bearer ${token}`,
-        'X-GitHub-Api-Version': '2022-11-28',
-        'User-Agent': 'jiaze-review-bot',
-      },
-      signal: AbortSignal.timeout(15000),
-    });
+    return await recordReceipt({ target: targetRepo, prNumber, token, fetchImpl, botLogin, commentId: sourceCommentId, result });
   } catch (error) {
-    log?.warn?.(`::warning::Failed to fetch session comment ${sessionCommentId} for marker ${sourceCommentId}: ${error?.message || error}`);
-    return null;
-  }
-  if (!response?.ok) {
-    log?.warn?.(`::warning::Failed to fetch session comment ${sessionCommentId} for marker ${sourceCommentId} (HTTP ${response.status})`);
-    return null;
-  }
-  let data;
-  try {
-    data = await response.json();
-  } catch (error) {
-    log?.warn?.(`::warning::Failed to parse session comment ${sessionCommentId} JSON for marker ${sourceCommentId}: ${error?.message || error}`);
-    return null;
-  }
-  const existingMarkers = extractSourceCommentMarkers(data?.body);
-  if (existingMarkers.includes(String(sourceCommentId))) {
-    return String(sessionCommentId);
-  }
-  // Fail closed: if the live session cannot be parsed, refuse to patch to prevent overwriting
-  // findings, READY/REWORK status, cost records, or lastReviewedHead with stale data.
-  const currentSession = parseSessionComment(data?.body);
-  if (!currentSession) {
-    log?.warn?.(`::warning::Session comment ${sessionCommentId} has corrupted or unparseable state; refusing to record marker ${sourceCommentId} to preserve durable state`);
-    return null;
-  }
-  const sourceCommentIds = [...existingMarkers, String(sourceCommentId)];
-  const body = renderSessionComment(currentSession, { sourceCommentIds });
-  try {
-    return await saveSessionComment({
-      target: targetRepo,
-      prNumber,
-      token,
-      fetchImpl,
-      existingId: sessionCommentId,
-      previous: currentSession,
-      session: currentSession,
-      body,
-    });
-  } catch (error) {
-    log?.warn?.(`::warning::Failed to patch session comment ${sessionCommentId} with marker ${sourceCommentId}: ${error?.message || error}`);
+    log?.warn?.(`::warning::Failed to record the receipt for comment ${sourceCommentId}: ${error?.message || error}`);
     return null;
   }
 }
@@ -177,9 +128,8 @@ export async function publishRunStatus({ env = process.env, fetchImpl = fetch, p
         targetRepo: repo,
         prNumber: pr,
         token: env.GH_TOKEN,
-        sessionCommentId: resolvedPlan.sessionCommentId,
-        session: resolvedPlan.session,
         sourceCommentId: env.SOURCE_COMMENT_ID,
+        botLogin: env.EXPECTED_REVIEW_AUTHOR,
         fetchImpl,
         log,
       });

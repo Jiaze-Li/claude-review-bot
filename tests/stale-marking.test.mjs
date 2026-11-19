@@ -5,19 +5,20 @@ import os from 'node:os';
 import path from 'node:path';
 import { planSession } from '../scripts/plan-review-session.mjs';
 import { applyStale } from '../scripts/apply-stale.mjs';
-import { applyDiscoveryResult, parseSessionComment, renderSessionComment } from '../scripts/review-session-core.mjs';
+import { applyDiscoveryResult, renderSessionComment } from '../scripts/review-session-core.mjs';
+import { createFakePr, BOT } from './helpers/fake-pr.mjs';
+import { buildLedger } from '../scripts/review-ledger.mjs';
 import { decideNotificationAction } from '../scripts/notification-policy.mjs';
 
 const BASE = 'b'.repeat(40), A = 'a'.repeat(40), C = 'c'.repeat(40);
-const author = 'jiaze-claude-review-bot[bot]';
+const author = BOT;
 const ready = () => ({ ...applyDiscoveryResult({ result: { summary: 's', findings: [] }, baseSha: BASE, headSha: A, sourceCommentId: '1' }), status: 'READY', auditCompleted: true });
 const env = (extra = {}) => ({ GH_TOKEN: 't', TARGET_REPO: 'acme/p', PR_NUMBER: '7', BASE_SHA: BASE, HEAD_SHA: C, REQUESTED_MODE: 'stale', EXPECTED_REVIEW_AUTHOR: author, ...extra });
-const plan = (session, extra) => planSession({
-  env: env(extra),
-  fetchImpl: async (url) => /issues\/7\/comments/.test(url)
-    ? Response.json(session ? [{ id: 5, user: { login: author }, body: renderSessionComment(session) }] : [])
-    : Response.json([]),
-});
+const plan = (session, extra) => {
+  const pr = createFakePr();
+  if (session) pr.seed(session);
+  return planSession({ env: env(extra), fetchImpl: pr.fetchImpl });
+};
 
 test('a push after READY plans a zero-model stale marking', async () => {
   assert.equal((await plan(ready())).decision.mode, 'stale');
@@ -51,24 +52,33 @@ test('stale marking is silent in the PR conversation unless it failed', () => {
 test('apply-stale changes only the mark: status, findings, spend and reviewed commit stay', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'stale-'));
   const session = ready();
-  fs.writeFileSync(path.join(dir, 'session-plan.json'), JSON.stringify({ decision: { mode: 'stale' }, session, sessionCommentId: '5' }));
-  const writes = [];
-  const fetchImpl = async (url, init = {}) => {
+  const pr = createFakePr();
+  pr.seed(session);
+  const projectionId = pr.seedProjection(session).id;
+  fs.writeFileSync(path.join(dir, 'session-plan.json'), JSON.stringify({ decision: { mode: 'stale' }, session, sessionCommentId: projectionId, ledgerSeq: 1 }));
+  const fetchImpl = pr.layer(async (url) => {
     if (/pulls\/7$/.test(url)) return Response.json({ head: { sha: C } });
     if (/compare\//.test(url)) return Response.json({ ahead_by: 3 });
-    writes.push({ method: init.method || 'GET', url, body: init.body });
-    return init.method === 'DELETE' ? new Response(null, { status: 204 }) : Response.json({ id: 900 });
-  };
+    assert.fail('unexpected ' + url);
+  });
   const result = await applyStale({ env: env({ REVIEW_CONTEXT_DIR: dir, SOURCE_COMMENT_ID: '123' }), fetchImpl });
   assert.equal(result.marked, true);
   assert.deepEqual({ ...result.session, staleFor: undefined, staleHead: undefined, staleCommits: undefined }, { ...session, staleFor: undefined, staleHead: undefined, staleCommits: undefined });
-  const posted = JSON.parse(writes.find((w) => w.method === 'POST').body).body;
-  const stored = parseSessionComment(posted);
+  // the mark is a new closing handoff on the PR; rebuilding from the PR alone yields it
+  const rebuilt = buildLedger({
+    records: pr.issue.map((c) => ({ id: c.id, source: 'issue', createdAt: c.createdAt, body: c.body, login: c.user, type: c.type, lastEditedAt: null, minimizedReason: null })),
+    botLogin: BOT, reads: { complete: true },
+  });
+  assert.equal(rebuilt.state, 'ok', rebuilt.message);
+  const stored = rebuilt.session;
   assert.equal(stored.staleFor, A);
   assert.equal(stored.staleCommits, 3);
   assert.equal(stored.status, 'READY');
   assert.equal(stored.lastReviewedHead, A);
-  assert.ok(writes.some((w) => w.method === 'DELETE')); // old comment replaced, the new one is at the bottom
+  assert.equal(rebuilt.handoff.seq, 2);
+  // the summary comment was replaced by a new one at the bottom and says it is not current
+  assert.equal(pr.issue.some((c) => c.id === projectionId), false);
+  assert.match(pr.issue.at(-1).body, /NOT current/);
 });
 
 test('apply-stale does nothing if the PR already moved on', async () => {

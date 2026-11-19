@@ -1,6 +1,9 @@
+import { renderFindingRecord } from './review-ledger.mjs';
 import { saveSessionComment } from './session-comment.mjs';
+import { ledgerOptions } from './session-store.mjs';
+import { renderPendingHandoff } from './review-ledger.mjs';
 import { finalReviewOutlook } from './continue-review.mjs';
-import { REVIEW_BODY_MAX_BYTES, anchorFindings, assertPrUnmoved, staleMarkerIfMoved, escapeHtml, foldedDetails, githubJson, loadAnchors, pullUrl, requiredEnv as required, splitSummary } from './github-review-api.mjs';
+import { REVIEW_BODY_MAX_BYTES, splitForParts, anchorFindings, assertPrUnmoved, staleMarkerIfMoved, escapeHtml, foldedDetails, githubJson, loadAnchors, pullUrl, requiredEnv as required, splitSummary } from './github-review-api.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -11,7 +14,6 @@ import {
   normalizeReviewResult,
   normalizeVerificationResult,
   openMaterialFindings,
-  pendingSessionMarker,
   recordDismissed,
   recordUncertainFindings,
   renderSessionComment,
@@ -69,13 +71,22 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
       session = chargeClaudeFallback(session, meta.total_cost_usd, meta.cost_source === 'reserve' ? 'reserve' : 'sdk');
   }
 
+  // Every verification answer becomes a readable Verdict record on the PR, written before the handoff that closes the stage.
+  const verdictRecords = mode === 'verification'
+    ? normalized.verifications.map((entry) => ({
+      finding: session.findings.find((f) => f.id === entry.findingId) ?? { id: entry.findingId },
+      verdict: entry.status, head: headSha, kind: 'repair',
+      range: plan.decision?.previousHead ? plan.decision.previousHead + '..' + headSha : null,
+      reason: entry.reason ?? '', run: String(env.GITHUB_RUN_ID ?? ''),
+    })).filter((entry) => ['FIXED', 'STILL_OPEN', 'UNCERTAIN', 'DISMISSED'].includes(entry.verdict))
+    : [];
   let sessionBody = renderSessionComment(session, { sourceCommentIds: [sourceCommentId], finalReview: finalReviewOutlook({ session, headSha, sourceCommentId, planMode: mode }), orphanReconcile: plan.orphanReconcile });
-  const pendingMarker = pendingSessionMarker(session, sourceCommentId);
+  const pendingMarker = renderPendingHandoff({ session, sourceCommentId });
   const anchors = await loadAnchors({ owner, repo, prNumber, token: env.GH_TOKEN, fetchImpl });
   const newFindings = session.findings.slice(plan.session.findings.length);
-  const { inline, unanchored } = anchorFindings(anchors, newFindings, (finding) =>
-    '**[' + finding.id + ' · ' + finding.severity + '] ' + finding.title + '**\n\n'
-      + finding.body + '\n\nRisk class: ' + finding.riskClass);
+  // The first comment of each thread is the readable Finding Record: location, failure condition, blocking flag and
+  // the full fields, so the thread alone says what was found.
+  const { inline, unanchored } = anchorFindings(anchors, newFindings, (finding) => renderFindingRecord(finding, { headSha }));
 
   const open = openMaterialFindings(session);
   const reviewKind = mode === 'incremental' ? 'Incremental' : 'Verification';
@@ -124,18 +135,19 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
       + ' but gave no concrete failure path, so it is recorded as non-blocking P3._';
   }
   if (newFindings.length === 0) body += '\n\nNo new material finding was reported.';
+  let unanchoredSection = '';
   if (unanchored.length) {
-    body += '\n\n### Findings without an inline anchor';
+    unanchoredSection = '### Findings without an inline anchor';
     for (const finding of unanchored) {
       const location = finding.path + (finding.line ? ':' + finding.line : '');
-      body += '\n- **[' + finding.id + ' · ' + finding.severity + '] ' + finding.title + '** — <code>'
+      unanchoredSection += '\n- **[' + finding.id + ' · ' + finding.severity + '] ' + finding.title + '** — <code>'
         + escapeHtml(location) + '</code>: ' + finding.body;
     }
   }
   const unresolved = unresolvedMaterialFindings(session);
   body += '\n\n### Session result\n**' + session.status + '** · confirmed open material findings: **' + open.length
     + '** · unresolved material candidates: **' + unresolved.length
-    + '** · verification: **' + session.verificationRound + '/' + session.maxVerificationRounds + '**';
+    + '** · verification passes so far: **' + session.verificationRound + '**';
   if (unresolved.length) {
     body += '\n\n**Not merge-ready:** targeted validation could not settle ' + unresolved.length
       + ' P0–P2 candidate(s). Inspect and adjudicate the F-numbered candidates with code evidence; they are not confirmed defects.';
@@ -144,8 +156,20 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
   }
   detail += formatRuntime(raw._meta, mode === 'verification' ? 'Verification runtime' : 'Incremental runtime');
   detail += formatRuntime(raw._validation?._meta, 'Validation runtime');
+  // The details are the one part that can grow without bound. If everything does not fit in the review itself, the
+  // review keeps its summary and the details continue in numbered comments right after it: nothing is cut.
+  const reportParts = [];
   const folded = foldedDetails('Review details (for AI)', detail);
-  if (folded) body += '\n\n' + folded;
+  const reserveBytes = Buffer.byteLength('\n\n' + pendingMarker + '\n\n_The rest of this report continues in 99 comments right below (Part 1/99 onward)._', 'utf8');
+  const whole = [unanchoredSection, folded].filter(Boolean).join('\n\n');
+  if (!whole || Buffer.byteLength(body + '\n\n' + whole, 'utf8') + reserveBytes <= REVIEW_BODY_MAX_BYTES) {
+    if (whole) body += '\n\n' + whole;
+  } else {
+    // Only the part that does not fit moves: the verdict, the session result and the headline stay in the review.
+    const pieces = splitForParts([unanchoredSection, detail].filter(Boolean).join('\n\n'), 50_000);
+    pieces.forEach((piece, index) => reportParts.push(foldedDetails(`Report · Part ${index + 1}/${pieces.length}`, piece)));
+    body += `\n\n_The rest of this report (${[unanchoredSection && 'findings without an inline anchor', detail && 'review details'].filter(Boolean).join(' and ')}) continues in ${reportParts.length} comment${reportParts.length === 1 ? '' : 's'} right below (Part 1/${reportParts.length} onward)._`;
+  }
   // This is intentionally NOT the processed-source marker. If durable session
   // persistence fails after the review POST, a retry remains eligible and can
   // recover this exact already-paid result without another Gemini call.
@@ -157,6 +181,13 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
       method: 'POST',
       body: JSON.stringify({ commit_id: headSha, event: 'COMMENT', body, comments: inline }),
     });
+
+  for (const [index, part] of reportParts.entries()) {
+    await githubJson(`https://api.github.com/repos/${owner}/${repo}/issues/${prNumber}/comments`, env.GH_TOKEN, fetchImpl, {
+      method: 'POST',
+      body: JSON.stringify({ body: `### Review Report · Part ${index + 1}/${reportParts.length} · review ${review.id}\n\n${part}` }),
+    });
+  }
 
   // The review is already posted as threads on the reviewed commit. A push that arrived meanwhile must not make its
   // result vanish: record it for the reviewed commit, marked out of date for the newer one (that commit then plans
@@ -170,6 +201,7 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
 
   const sessionCommentId = await saveSessionComment({
     target: owner + '/' + repo, prNumber, existingId: plan.sessionCommentId, previous: plan.session, session, body: sessionBody, token: env.GH_TOKEN, fetchImpl,
+    ledger: ledgerOptions(env, { sourceCommentIds: [sourceCommentId], expectedSeq: plan.ledgerSeq, spendThisRun: spentThisRun(raw), verdicts: verdictRecords }),
   });
   const publishedStatePath = path.join(contextRoot, 'published-session.json');
   fs.writeFileSync(publishedStatePath, JSON.stringify({
@@ -178,6 +210,11 @@ export async function publishGeminiReview({ env = process.env, fetchImpl = fetch
   console.log('Published Gemini ' + mode + ' review ' + (review.html_url || review.id)
     + '; session comment ' + sessionCommentId + '; status ' + session.status + '.');
   return { session, sessionCommentId, reviewId: review.id };
+}
+
+// What this run cost, from the usage the provider reported (zero for a provider that reports none).
+function spentThisRun(raw) {
+  return [raw?._meta, raw?._validation?._meta].reduce((sum, meta) => sum + (meta?.provider === 'claude' && Number.isFinite(meta.total_cost_usd) ? meta.total_cost_usd : 0), 0);
 }
 
 // Findings the session filter removed. Identity is path + title: two findings
