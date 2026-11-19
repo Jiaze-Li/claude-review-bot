@@ -148,7 +148,7 @@ export async function publishRunStatus({ env = process.env, fetchImpl = fetch, p
   } else if (mode === 'dismiss') {
     state = env.DISMISS_OUTCOME !== 'success'
       ? 'Finding dismissal was not confirmed; durable session did not acknowledge it.'
-      : 'Finding dismissal recorded. No model quota was spent by dismissal.';
+      : 'Finding dismissal recorded.';
   } else if (mode === 'override') {
     state = env.OVERRIDE_OUTCOME !== 'success'
       ? 'Manual override was not confirmed. Check the workflow run.'

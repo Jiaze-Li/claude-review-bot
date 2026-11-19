@@ -770,3 +770,77 @@ test('accept: dismiss on the same PR still works exactly as before (kind dismiss
   assert.equal(out.dismissLedger[0].kind, undefined);
   assert.equal(out.findings[0].dismissal.verifiedBy, 'gemini');
 });
+
+test('AC-06: accepted P3 with both failurePath values empty or missing does not suppress a new P3 finding', () => {
+  const baseP3 = p3Session();
+  for (const emptyPath of ['', undefined, null]) {
+    const withoutPath = {
+      ...baseP3,
+      findings: [{ ...baseP3.findings[0], failurePath: emptyPath }],
+    };
+    const closed = applyFindingAcceptance({
+      session: withoutPath,
+      findingId: 'F001',
+      headSha: A,
+      by: 'maintainer',
+      statement: 'Accepted P3 risk without failurePath.',
+      sourceCommentId: '99',
+      now: '2026-11-19T00:00:00Z',
+    });
+    const candidate = { path: 'scripts/ref.mjs', title: 'Duplicate notification', severity: 'P3' };
+    assert.equal(matchesKnownDismissal(candidate, closed), false);
+    assert.equal(matchesKnownDismissal({ ...candidate, failurePath: '' }, closed), false);
+    assert.equal(matchesKnownDismissal({ ...candidate, failurePath: null }, closed), false);
+    assert.equal(matchesKnownDismissal({ ...candidate, failurePath: 'some path' }, closed), false);
+  }
+});
+
+test('AC-01/AC-03/AC-04: shared closure kernel enforces P3-only acceptance and consistent status/spend transitions', () => {
+  for (const severity of ['P0', 'P1', 'P2']) {
+    const nonP3 = {
+      ...p3Session(),
+      findings: [{ ...p3Session().findings[0], severity }],
+    };
+    assert.throws(
+      () => applyFindingAcceptance({
+        session: nonP3, findingId: 'F001', headSha: A, by: 'maintainer',
+        statement: 'Trying to accept non-P3', sourceCommentId: '99',
+      }),
+      /blocking P3/,
+    );
+  }
+
+  // Remaining = 0 with auditCompleted=true & same head -> READY (for both dismissal and acceptance)
+  const audited = { ...p3Session(), auditCompleted: true, lastReviewedHead: A };
+  const readyAccept = applyFindingAcceptance({
+    session: audited, findingId: 'F001', headSha: A, by: 'maintainer',
+    statement: 'Accepted P3 risk with audit already complete.', sourceCommentId: '99',
+    verification: { provider: 'claude', claudeCharge: { amount: 0.25, source: 'sdk' } },
+  });
+  assert.equal(readyAccept.status, 'READY');
+  assert.equal(readyAccept.claudeSdkSpendUsd, 0.25);
+  assert.equal(readyAccept.dismissLedger.at(-1).kind, 'accepted');
+
+  const readyDismiss = applyFindingDismissal({
+    session: audited, findingId: 'F001', headSha: A, by: 'dev',
+    reason: 'Already handled', sourceCommentId: '100',
+    verification: { provider: 'claude', claudeCharge: { amount: 0.25, source: 'sdk' } },
+  });
+  assert.equal(readyDismiss.status, 'READY');
+  assert.equal(readyDismiss.claudeSdkSpendUsd, 0.25);
+  assert.equal(readyDismiss.dismissLedger.at(-1).kind, undefined);
+
+  // Remaining UNCERTAIN blocking finding -> HUMAN_REQUIRED
+  const twoFindings = {
+    ...p3Session(),
+    findings: [
+      p3Session().findings[0],
+      { ...issue(), id: 'F002', status: 'UNCERTAIN', severity: 'P2' },
+    ],
+  };
+  const humanReq = applyFindingAcceptance({
+    session: twoFindings, findingId: 'F001', headSha: A, by: 'maintainer',
+    statement: 'Accept F001 while F002 remains uncertain.', sourceCommentId: '101',
+  });
+  assert.equal(humanReq.status, 'HUMAN_REQUIRED');
+});

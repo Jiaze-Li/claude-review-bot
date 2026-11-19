@@ -790,9 +790,12 @@ export function matchesKnownDismissal(finding, session) {
     if (item.status === 'DISMISSED' && item.dismissal?.kind === 'accepted') {
       // An accepted risk was a P3 with one specific failure path. A worse severity, a different path, or a missing
       // path (which would match anything) is a materially different finding and must block again.
+      const acceptedPath = String(item.failurePath ?? '').trim();
+      const candidatePath = String(finding.failurePath ?? '').trim();
       return item.title.trim().toLowerCase() === String(finding.title).trim().toLowerCase()
         && finding.severity === 'P3'
-        && String(item.failurePath ?? '').trim() === String(finding.failurePath ?? '').trim();
+        && Boolean(acceptedPath)
+        && acceptedPath === candidatePath;
     }
     if (item.status === 'DISMISSED') {
       return item.title.trim().toLowerCase() === String(finding.title).trim().toLowerCase()
@@ -913,32 +916,96 @@ function validateDismissalEvidence(raw) {
   }
 }
 
-export function applyFindingDismissal({
-  session, findingId, headSha, by, reason, evidence, sourceCommentId,
-  verification = null, inputHash = '', now = new Date().toISOString(),
+function applyFindingClosure({
+  noun,
+  session,
+  findingId,
+  headSha,
+  by,
+  sourceCommentId,
+  verification = null,
+  inputHash = '',
+  now = new Date().toISOString(),
+  requireSeverity = null,
+  invalidFindingMessage,
+  buildClosure,
 } = {}) {
   validateSession(session);
   checkedSha(headSha, 'headSha');
   if (!['REWORK', 'HUMAN_REQUIRED'].includes(session.status)) {
-    throw new Error('dismissal requires REWORK or HUMAN_REQUIRED');
+    throw new Error(`${noun} requires REWORK or HUMAN_REQUIRED`);
   }
-  if (!/^F[0-9]{3,}$/.test(String(findingId ?? ''))) throw new Error('invalid dismissal finding id');
+  if (!/^F[0-9]{3,}$/.test(String(findingId ?? ''))) throw new Error(`invalid ${noun} finding id`);
   if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})(?:\[bot\])?$/.test(String(by ?? ''))) {
-    throw new Error('invalid dismissal actor');
+    throw new Error(`invalid ${noun} actor`);
   }
-  if (!/^[1-9]\d*$/.test(String(sourceCommentId ?? ''))) throw new Error('invalid dismissal source comment id');
+  if (!/^[1-9]\d*$/.test(String(sourceCommentId ?? ''))) throw new Error(`invalid ${noun} source comment id`);
+  const item = session.findings.find((finding) => finding.id === findingId);
+  if (!item || !['OPEN', 'UNCERTAIN'].includes(item.status) || !isBlocking(item)
+    || (requireSeverity && item.severity !== requireSeverity)) {
+    throw new Error(invalidFindingMessage);
+  }
+  const {
+    resolutionReason,
+    dismissal,
+    recordAttempt = false,
+    attemptReason,
+    attemptKind,
+    buildSummary,
+  } = buildClosure();
+  const findings = session.findings.map((finding) => finding.id === findingId
+    ? {
+      ...finding,
+      status: 'DISMISSED',
+      lastCheckedHead: headSha,
+      resolutionReason,
+      dismissal,
+    }
+    : { ...finding });
+  const remaining = findings.filter((finding) =>
+    ['OPEN', 'UNCERTAIN'].includes(finding.status) && isBlocking(finding)).length;
+  const status = remaining
+    ? findings.some((f) => f.status === 'OPEN') ? 'REWORK' : 'HUMAN_REQUIRED'
+    : session.auditCompleted === true && session.lastReviewedHead === headSha ? 'READY' : 'AUDIT_PENDING';
+  let next = session;
+  if (verification?.claudeCharge && Number.isFinite(verification.claudeCharge.amount) && verification.claudeCharge.amount > 0) {
+    next = chargeClaudeFallback(next, verification.claudeCharge.amount, verification.claudeCharge.source || 'sdk');
+  }
+  if (recordAttempt) {
+    next = recordDismissAttempt({
+      session: next,
+      findingId,
+      headSha,
+      sourceCommentId,
+      inputHash,
+      verdict: 'DISMISSED',
+      reason: attemptReason,
+      ...(attemptKind ? { kind: attemptKind } : {}),
+      now,
+    });
+  }
+  const base = remaining === 0 ? stripTransientState(next, headSha) : next;
+  return {
+    ...base,
+    findings,
+    status,
+    lastSummary: compactText(buildSummary(remaining), 800),
+    updatedAt: now,
+  };
+}
+
+export function applyFindingDismissal({
+  session, findingId, headSha, by, reason, evidence, sourceCommentId,
+  verification = null, inputHash = '', now = new Date().toISOString(),
+} = {}) {
   // The claim is free text of any length (clipped, never rejected for being short); citations are optional.
   const explanation = compactText(String(reason ?? '').trim(), 1200) || 'No explanation was given.';
   if (evidence != null && (!Array.isArray(evidence) || evidence.length > 3)) {
     throw new Error('dismissal may cite at most 3 evidence items');
   }
-  evidence = evidence ?? [];
-  for (const link of evidence) {
+  const normalizedEvidence = evidence ?? [];
+  for (const link of normalizedEvidence) {
     validateDismissalEvidence(link);
-  }
-  const item = session.findings.find((finding) => finding.id === findingId);
-  if (!item || !['OPEN', 'UNCERTAIN'].includes(item.status) || !isBlocking(item)) {
-    throw new Error('dismissal finding must be an OPEN or UNCERTAIN material candidate');
   }
   const verificationMeta = verification && typeof verification === 'object' ? {
     verifiedBy: compactText(verification.provider || 'gemini', 24),
@@ -953,9 +1020,18 @@ export function applyFindingDismissal({
       }
       : {}),
   } : {};
-  const findings = session.findings.map((finding) => finding.id === findingId
-    ? {
-      ...finding, status: 'DISMISSED', lastCheckedHead: headSha,
+  return applyFindingClosure({
+    noun: 'dismissal',
+    session,
+    findingId,
+    headSha,
+    by,
+    sourceCommentId,
+    verification,
+    inputHash,
+    now,
+    invalidFindingMessage: 'dismissal finding must be an OPEN or UNCERTAIN material candidate',
+    buildClosure: () => ({
       resolutionReason: compactText(
         verificationMeta.verifiedBy
           ? `Verified dismissed (${verificationMeta.verifiedBy}) for @${by}: ${verificationMeta.verdictReason || explanation}`
@@ -963,42 +1039,21 @@ export function applyFindingDismissal({
         300,
       ),
       dismissal: {
-        by, at: now, head: headSha, sourceCommentId: String(sourceCommentId),
-        reason: explanation, evidence: [...evidence], ...verificationMeta,
+        by,
+        at: now,
+        head: headSha,
+        sourceCommentId: String(sourceCommentId),
+        reason: explanation,
+        evidence: [...normalizedEvidence],
+        ...verificationMeta,
       },
-    }
-    : { ...finding });
-  const remaining = findings.filter(finding =>
-    ['OPEN', 'UNCERTAIN'].includes(finding.status) && isBlocking(finding)).length;
-  const status = remaining
-    ? findings.some(f => f.status === 'OPEN') ? 'REWORK' : 'HUMAN_REQUIRED'
-    : session.auditCompleted === true && session.lastReviewedHead === headSha ? 'READY' : 'AUDIT_PENDING';
-  let next = session;
-  if (verification?.claudeCharge && Number.isFinite(verification.claudeCharge.amount) && verification.claudeCharge.amount > 0) {
-    next = chargeClaudeFallback(next, verification.claudeCharge.amount, verification.claudeCharge.source || 'sdk');
-  }
-  if (verificationMeta.verifiedBy || inputHash) {
-    next = recordDismissAttempt({
-      session: next,
-      findingId,
-      headSha,
-      sourceCommentId,
-      inputHash,
-      verdict: 'DISMISSED',
-      reason: verificationMeta.verdictReason || explanation,
-      now,
-    });
-  }
-  const base = remaining === 0 ? stripTransientState(next, headSha) : next;
-  return {
-    ...base, findings, status,
-    lastSummary: compactText(
-      (verificationMeta.verifiedBy ? `Verified dismissal (${verificationMeta.verifiedBy}) of ` : 'Human-dismissed ')
-      + findingId + ' by @' + by + '; remaining material findings: ' + remaining + '.',
-      800,
-    ),
-    updatedAt: now,
-  };
+      recordAttempt: Boolean(verificationMeta.verifiedBy || inputHash),
+      attemptReason: verificationMeta.verdictReason || explanation,
+      buildSummary: (remaining) =>
+        (verificationMeta.verifiedBy ? `Verified dismissal (${verificationMeta.verifiedBy}) of ` : 'Human-dismissed ')
+        + findingId + ' by @' + by + '; remaining material findings: ' + remaining + '.',
+    }),
+  });
 }
 
 // The owner states a blocking P3 finding is real and accepts the risk. Same closure as a verified dismissal
@@ -1009,55 +1064,43 @@ export function applyFindingAcceptance({
   session, findingId, headSha, by, statement, sourceCommentId,
   verification = null, inputHash = '', now = new Date().toISOString(),
 } = {}) {
-  validateSession(session);
-  checkedSha(headSha, 'headSha');
-  if (!['REWORK', 'HUMAN_REQUIRED'].includes(session.status)) {
-    throw new Error('acceptance requires REWORK or HUMAN_REQUIRED');
-  }
-  if (!/^F[0-9]{3,}$/.test(String(findingId ?? ''))) throw new Error('invalid acceptance finding id');
-  if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})(?:\[bot\])?$/.test(String(by ?? ''))) {
-    throw new Error('invalid acceptance actor');
-  }
-  if (!/^[1-9]\d*$/.test(String(sourceCommentId ?? ''))) throw new Error('invalid acceptance source comment id');
   const words = compactText(String(statement ?? '').trim(), 1200);
   if (!words) throw new Error('acceptance needs the owner\'s own words');
-  const item = session.findings.find((finding) => finding.id === findingId);
-  if (!item || !['OPEN', 'UNCERTAIN'].includes(item.status) || !isBlocking(item) || item.severity !== 'P3') {
-    throw new Error('acceptance finding must be an OPEN or UNCERTAIN blocking P3');
-  }
   const verifiedBy = compactText(verification?.provider || 'gemini', 24);
   const verdictReason = verification?.reason ? compactText(verification.reason, 300) : '';
-  const findings = session.findings.map((finding) => finding.id === findingId
-    ? {
-      ...finding, status: 'DISMISSED', lastCheckedHead: headSha,
+  return applyFindingClosure({
+    noun: 'acceptance',
+    session,
+    findingId,
+    headSha,
+    by,
+    sourceCommentId,
+    verification,
+    inputHash,
+    now,
+    requireSeverity: 'P3',
+    invalidFindingMessage: 'acceptance finding must be an OPEN or UNCERTAIN blocking P3',
+    buildClosure: () => ({
       resolutionReason: compactText(`Risk accepted by @${by}: ${words}`, 300),
       dismissal: {
-        kind: 'accepted', by, at: now, head: headSha, sourceCommentId: String(sourceCommentId),
-        reason: words, evidence: [], verifiedBy,
+        kind: 'accepted',
+        by,
+        at: now,
+        head: headSha,
+        sourceCommentId: String(sourceCommentId),
+        reason: words,
+        evidence: [],
+        verifiedBy,
         ...(verification?.model ? { model: compactText(verification.model, 80) } : {}),
         ...(verdictReason ? { verdictReason } : {}),
       },
-    }
-    : { ...finding });
-  const remaining = findings.filter((finding) =>
-    ['OPEN', 'UNCERTAIN'].includes(finding.status) && isBlocking(finding)).length;
-  const status = remaining
-    ? findings.some((f) => f.status === 'OPEN') ? 'REWORK' : 'HUMAN_REQUIRED'
-    : session.auditCompleted === true && session.lastReviewedHead === headSha ? 'READY' : 'AUDIT_PENDING';
-  let next = session;
-  if (verification?.claudeCharge && Number.isFinite(verification.claudeCharge.amount) && verification.claudeCharge.amount > 0) {
-    next = chargeClaudeFallback(next, verification.claudeCharge.amount, verification.claudeCharge.source || 'sdk');
-  }
-  next = recordDismissAttempt({
-    session: next, findingId, headSha, sourceCommentId, inputHash,
-    verdict: 'DISMISSED', reason: verdictReason || words, kind: 'accepted', now,
+      recordAttempt: true,
+      attemptReason: verdictReason || words,
+      attemptKind: 'accepted',
+      buildSummary: (remaining) =>
+        `Risk accepted by @${by} for ${findingId}; remaining material findings: ${remaining}.`,
+    }),
   });
-  const base = remaining === 0 ? stripTransientState(next, headSha) : next;
-  return {
-    ...base, findings, status,
-    lastSummary: compactText(`Risk accepted by @${by} for ${findingId}; remaining material findings: ${remaining}.`, 800),
-    updatedAt: now,
-  };
 }
 
 // ---- Manual override ----------------------------------------------------
