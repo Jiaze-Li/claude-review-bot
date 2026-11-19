@@ -22,7 +22,6 @@ import {
   planReviewSession,
   sessionCommitStatus,
   renderSessionComment,
-  parseSessionComment,
   normalizeReviewResult,
   normalizeVerificationResult,
 } from '../scripts/review-session-core.mjs';

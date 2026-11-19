@@ -401,3 +401,15 @@ test("deep_review_stale finished status reports outcome: success records receipt
   assert.match(sent.at(-1), /actions\/runs\/1234\/attempts\/2/);
   assert.match(sent.at(-1), /<!-- jiaze-review-source-comment:99 -->/);
 });
+
+test('a PR holding only old-format comments reads as "no session" for the commit status, and nothing is posted', async () => {
+  const pr = createFakePr({ author: BOT_LOGIN });
+  const marker = '<!-- jiaze-review-session:v1 -->\n### Independent Review Session';
+  pr.addIssue(`${marker}\n<!-- jiaze-review-state:AAAA -->`);
+  pr.addIssue(`${marker}\nStatus: READY`);
+  pr.addIssue('### Review Handoff · Seq 1 · import\nHandoff: COMPLETE\nStage: import\nSeq: 1');
+  const { latestSession } = await import('../scripts/sync-commit-status.mjs');
+  const session = await latestSession({ target: 'acme/project', prNumber: pr.number, author: BOT_LOGIN, token: 't', fetchImpl: pr.fetchImpl });
+  assert.equal(session, null);
+  assert.equal(pr.calls.filter((c) => c.method === 'POST' && !c.url.endsWith('/graphql')).length, 0);
+});

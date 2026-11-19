@@ -2,11 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   LEDGER_CODES, buildLedger, flattenFields, ledgerIsReady, parseRecord, renderEventRecord, renderFindingRecord,
-  renderHandoffParts, renderImportParts, renderReceipt, renderRunStart, renderVerdictRecord, unflattenFields,
+  renderHandoffParts, renderReceipt, renderRunStart, renderVerdictRecord, unflattenFields,
 } from '../scripts/review-ledger.mjs';
 import { fetchLedgerSources } from '../scripts/review-ledger-fetch.mjs';
 import { applyDiscoveryResult, applyVerificationResult, completeDeepReview, beginDeepReview } from '../scripts/review-session-core.mjs';
-import { legacyStateComment } from './helpers/fake-pr.mjs';
 
 const BASE = 'b'.repeat(40), A = 'a'.repeat(40), C = 'c'.repeat(40);
 const BOT = 'claude-review-bot[bot]';
@@ -202,31 +201,38 @@ test('READY needs the newest handoff to say so for the CURRENT head with nothing
   assert.equal(ledgerIsReady(build(post(handoff(blockingReady))), A), false);
 });
 
-test('an old hidden-state session is imported once, kept as history, and rebuilds equal to the old session', () => {
-  const old = applyVerificationResult({ session: session(), result: { summary: 'v', verifications: [{ findingId: 'F001', status: 'FIXED', reason: 'done' }, { findingId: 'F002', status: 'STILL_OPEN', reason: 'no' }], findings: [] }, headSha: C });
-  const legacy = rec(legacyStateComment(old));
-  assert.match(legacy.body, /jiaze-review-state:/);
-  const before = build([legacy]);
-  assert.equal(before.state, 'needs_import');
-  assert.deepEqual(norm(before.legacy.session), norm(old));
-  const parts = renderImportParts({ legacySession: before.legacy.session, legacyCommentId: before.legacy.commentId, markerByFinding: { F001: 'abc123' } });
-  assert.match(parts.at(-1), /Stage: import/);
-  assert.match(parts.at(-1), /earlier thread marker abc123/);
-  const after = build([legacy, ...post(parts)]);
-  assert.equal(after.state, 'ok', after.message);
-  assert.deepEqual(norm(after.session), norm(old));
-  assert.equal(after.handoff.stage, 'import');
-  // the old comment is untouched history; deleting it does not matter any more
-  assert.equal(build(post(parts)).state, 'ok');
+test('old-format content is ignored: a PR holding only that reads as new', () => {
+  const old = applyVerificationResult({ session: session(), result: { summary: 'v', verifications: [{ findingId: 'F001', status: 'FIXED', reason: 'done' }], findings: [] }, headSha: C });
+  const state = Buffer.from(JSON.stringify(old), 'utf8').toString('base64url');
+  const marker = '<!-- jiaze-review-session:v1 -->\n### Independent Review Session';
+  const inputs = {
+    readable: `${marker}\n<!-- jiaze-review-state:${state} -->`,
+    undecodable: `${marker}\n<!-- jiaze-review-state:AAAA -->`,
+    stateless: `${marker}\nStatus: READY`,
+    importStage: '### Review Handoff · Seq 1 · import\nHandoff: COMPLETE\nStage: import\nSeq: 1',
+    importPart: '### Review Handoff · Seq 1 · import · Part 1/2\nHandoff: PART\nSeq: 1\nPart: 1/2',
+  };
+  for (const [name, body] of Object.entries(inputs)) {
+    const ledger = build([rec(body)]);
+    assert.equal(ledger.state, 'new', `${name}: ${ledger.message ?? ''}`);
+    assert.equal(ledger.session, null, name);
+  }
+  // the marker-bearing summary stays the projection writers edit
+  const withSummary = build([rec(inputs.readable)]);
+  assert.match(withSummary.projection.body, /Independent Review Session/);
 });
 
-test('a damaged old session is never silently discarded', () => {
-  const damaged = rec('<!-- jiaze-review-session:v1 -->\n### Independent Review Session\n<!-- jiaze-review-state:AAAA -->');
-  assert.equal(build([damaged]).code, LEDGER_CODES.RECORD_UNRECOVERABLE);
-  const stateless = rec('<!-- jiaze-review-session:v1 -->\n### Independent Review Session\nStatus: READY');
-  assert.equal(build([stateless]).code, LEDGER_CODES.RECORD_UNRECOVERABLE);
+test('a garbled current-format handoff still stops, also next to an old comment', () => {
   const garbled = rec('### Review Handoff · Seq x · first\nHandoff: COMPLETE\nSeq: x');
   assert.equal(build([garbled]).code, LEDGER_CODES.RECORD_UNRECOVERABLE);
+  const old = rec('<!-- jiaze-review-session:v1 -->\n### Independent Review Session\nStatus: READY');
+  assert.equal(build([old, garbled]).code, LEDGER_CODES.RECORD_UNRECOVERABLE);
+});
+
+test('finding records with no closed stage still stop next to an old comment', () => {
+  const old = rec('<!-- jiaze-review-session:v1 -->\n### Independent Review Session\nStatus: READY');
+  const finding = rec(renderFindingRecord(session().findings[0]));
+  assert.equal(build([old, finding]).code, LEDGER_CODES.STAGE_NOT_CLOSED);
 });
 
 test('no hidden state: nothing a ledger record needs lives in an HTML comment or base64', () => {

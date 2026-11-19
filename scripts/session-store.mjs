@@ -1,11 +1,10 @@
 // The one place the review session is read from, and written to, the PR itself (see review-ledger.mjs).
-// Reading rebuilds the session from the bot's own readable comments; writing appends new comments. The old
-// hidden base64 state comment is only ever READ, once, to import it.
+// Reading rebuilds the session from the bot's own readable comments; writing appends new comments. Old-format
+// comments are ignored (a PR with only those is read as new).
 import { fetchLedgerSources } from './review-ledger-fetch.mjs';
 import {
-  LEDGER_CODES, buildLedger, parsePendingHandoff, renderHandoffParts, renderImportParts, renderEventRecord, renderReceipt, renderRunStart, renderVerdictRecord, repairAttempts,
+  LEDGER_CODES, buildLedger, parsePendingHandoff, renderHandoffParts, renderEventRecord, renderReceipt, renderRunStart, renderVerdictRecord, repairAttempts,
 } from './review-ledger.mjs';
-import { findingKey } from './review-anchors.mjs';
 
 export class LedgerStopped extends Error {
   constructor(ledger) {
@@ -55,14 +54,9 @@ export async function readLedger({ target, prNumber, token, fetchImpl = fetch, b
   return { ledger: buildLedger({ records, botLogin, reads, headSha, closingStage }), records };
 }
 
-// -> a ledger result. `needs_import` is imported first (one visible record), then read again.
-export async function loadLedger({ target, prNumber, token, fetchImpl = fetch, botLogin, headSha = null, closingStage = false, importLegacy = true }) {
-  let { ledger, records } = await readLedger({ target, prNumber, token, fetchImpl, botLogin, headSha, closingStage });
-  if (ledger.state === 'needs_import' && importLegacy) {
-    await importLegacySession({ target, prNumber, token, fetchImpl, legacy: ledger.legacy });
-    ({ ledger, records } = await readLedger({ target, prNumber, token, fetchImpl, botLogin, headSha, closingStage }));
-  }
-  return { ledger, records };
+// -> a ledger result. Old-format comments are ignored: a PR with only those reads as `new`.
+export async function loadLedger(options) {
+  return readLedger(options);
 }
 
 // Same as loadLedger, for callers that cannot continue without a trustworthy read.
@@ -70,14 +64,6 @@ export async function loadSession(options) {
   const { ledger, records } = await loadLedger(options);
   if (ledger.state === 'stopped') throw new LedgerStopped(ledger);
   return { ledger, records, session: ledger.session ?? null, projection: ledger.projection ?? null };
-}
-
-export async function importLegacySession({ target, prNumber, token, fetchImpl, legacy }) {
-  const markerByFinding = Object.fromEntries(legacy.session.findings.map((f) => [f.id, findingKey(f.path, f.title)]));
-  const bodies = renderImportParts({ legacySession: legacy.session, legacyCommentId: legacy.commentId, markerByFinding });
-  const ids = [];
-  for (const body of bodies) ids.push(await postComment({ target, prNumber, token, fetchImpl, body }));
-  return ids;
 }
 
 // The options every writer passes to saveSessionComment so the record lands on the PR.
@@ -88,7 +74,7 @@ export function ledgerOptions(env, extra = {}) {
 // Records that a command comment was handled (the visible, idempotent "Receipt"), without changing the session.
 // -> the receipt's comment id, the existing one's marker 'existing', or null when the ledger cannot be trusted.
 export async function recordReceipt({ target, prNumber, token, fetchImpl = fetch, botLogin, commentId, version = 'created', result }) {
-  const { ledger } = await loadLedger({ target, prNumber, token, fetchImpl, botLogin, importLegacy: false, closingStage: true });
+  const { ledger } = await loadLedger({ target, prNumber, token, fetchImpl, botLogin, closingStage: true });
   if (ledger.state === 'stopped') return null;
   if (ledger.receipts?.has(`${commentId}@${version}`)) return 'existing';
   return postComment({ target, prNumber, token, fetchImpl, body: renderReceipt({ commentId, version, result }) });
