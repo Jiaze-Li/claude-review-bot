@@ -1212,19 +1212,6 @@ function formatOrphanReconcileLine(session, orphanReconcile) {
   return `Old bot threads reconciled: found **${totalFound}**${parts.length ? ` — ${parts.join('; ')}` : ''}`;
 }
 
-export function parseSessionComment(body) {
-  if (typeof body !== 'string' || !body.includes('<!-- jiaze-review-session:v1 -->')) return null;
-  const match = body.match(/<!-- jiaze-review-state:([A-Za-z0-9_-]+) -->/);
-  if (!match) return null;
-  try {
-    const value = JSON.parse(Buffer.from(match[1], 'base64url').toString('utf8'));
-    validateSession(value);
-    return value;
-  } catch {
-    return null;
-  }
-}
-
 export function normalizeReviewResult(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('review result must be an object');
   const summary = checkedText(value.summary, 4000, 'summary');

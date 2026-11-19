@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { applyThreadDecisions, planReviewSession, parseSessionComment, renderSessionComment, sessionCommitStatus, applyDiscoveryResult } from '../scripts/review-session-core.mjs';
+import { applyThreadDecisions, planReviewSession, renderSessionComment, sessionCommitStatus, applyDiscoveryResult } from '../scripts/review-session-core.mjs';
 import { applyThreadResolutions } from '../scripts/apply-thread-resolutions.mjs';
 import { findingMarker } from '../scripts/review-anchors.mjs';
 import { createFakePr } from './helpers/fake-pr.mjs';

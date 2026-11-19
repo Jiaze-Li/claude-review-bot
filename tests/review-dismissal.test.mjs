@@ -8,7 +8,7 @@ import path from 'node:path';
 import {
   applyDiscoveryResult, applyFindingDismissal,
   checkDismissEligibility,
-  matchesKnownDismissal, openMaterialFindings, parseSessionComment,
+  matchesKnownDismissal, openMaterialFindings,
   planReviewSession, recordDismissAttempt, renderSessionComment,
 } from '../scripts/review-session-core.mjs';
 import { parseDismissalRequest, parseReviewTrigger } from '../worker/src/review-trigger.js';

@@ -483,7 +483,10 @@ function sweepFetch({ repos, prs, comments, onWrite, liveHead = {} }) {
   for (const [key, list] of Object.entries(comments)) {
     const [repo, n] = key.split('#');
     const pr = createFakePr({ author: 'bot[bot]', number: Number(n) });
-    for (const c of list) { pr.seed(c.session); pr.addIssue(renderSessionComment(c.session), { id: c.id }); }
+    for (const c of list) {
+      if (c.oldBody) { pr.addIssue(c.oldBody, { id: c.id }); continue; } // an old-format comment only, no records
+      pr.seed(c.session); pr.addIssue(renderSessionComment(c.session), { id: c.id });
+    }
     fakes.set(key, pr);
   }
   const blank = createFakePr({ author: 'bot[bot]', number: 0 });
@@ -539,6 +542,18 @@ test('sweeper finds stale deep reviews across installed repositories without any
   });
   const found = await findStaleDeepReviews({ env: { EXPECTED_REVIEW_AUTHOR: 'bot[bot]', GH_TOKEN: 't' }, fetchImpl });
   assert.deepEqual(found, [{ repo: 'acme/project', pr: 7 }, { repo: 'acme/second', pr: 3 }]);
+});
+
+test('a PR with only an old-format comment is not a stale review: nothing is closed, imported or posted', async () => {
+  const writes = [];
+  const fetchImpl = sweepFetch({
+    repos: [], prs: { 'acme/project': [{ number: 7, head: { sha: A } }] },
+    comments: { 'acme/project#7': [{ id: 70, oldBody: '<!-- jiaze-review-session:v1 -->\n### Independent Review Session\n<!-- jiaze-review-state:AAAA -->' }] },
+    onWrite: (w) => writes.push(w),
+  });
+  const ok = await closeStaleDeepReview({ repo: 'acme/project', prNumber: 7, env: { EXPECTED_REVIEW_AUTHOR: 'bot[bot]', GH_TOKEN: 't', STATUS_TOKEN: 's' }, fetchImpl });
+  assert.equal(ok, false);
+  assert.deepEqual(writes, []);
 });
 
 test('close fails a stale review closed and posts an error status', async () => {

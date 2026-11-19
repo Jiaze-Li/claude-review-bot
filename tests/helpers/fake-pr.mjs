@@ -1,17 +1,11 @@
 // A small in-memory pull request for tests: its conversation comments, reviews and review threads, served through
 // the same REST + GraphQL calls the bot makes. Whatever the code under test POSTs becomes a real record that the next
 // read sees, so write -> read round trips are exercised end to end.
-import { buildLedger, renderHandoffParts, renderImportParts } from '../../scripts/review-ledger.mjs';
+import { buildLedger, renderHandoffParts } from '../../scripts/review-ledger.mjs';
 import { renderSessionComment } from '../../scripts/review-session-core.mjs';
 
 export const BOT = 'jiaze-claude-review-bot[bot]';
 const login = (value) => String(value).replace(/\[bot\]$/i, '');
-
-// The retired hidden-state comment, kept only so tests can build the old format the importer must still read.
-export function legacyStateComment(session) {
-  const state = Buffer.from(JSON.stringify(session), 'utf8').toString('base64url');
-  return `${renderSessionComment(session)}\n<!-- jiaze-review-state:${state} -->`;
-}
 
 export function createFakePr({ author = BOT, number = 7 } = {}) {
   let nextId = 5000;
@@ -39,13 +33,6 @@ export function createFakePr({ author = BOT, number = 7 } = {}) {
       for (const body of bodies) id = api.addIssue(body, { user, type }).id;
       if (user === author) { lastSeq += 1; lastHandoffId = id; }
       return id;
-    },
-    seedLegacy(session, options) { return api.addIssue(legacyStateComment(session), options); },
-    seedImport(session) {
-      const bodies = renderImportParts({ legacySession: session, legacyCommentId: '1' });
-      let id = null;
-      for (const body of bodies) id = api.addIssue(body).id;
-      lastSeq = 1; lastHandoffId = id; return id;
     },
     // The session as a fresh run would rebuild it from this PR's records alone (throws if the ledger would stop).
     ledger() {

@@ -90,7 +90,7 @@ export async function applyManualDismissal({
 
   // The session is read from the PR's own records every time (never from a cached or hidden copy).
   const loadCurrentDurable = async () => (await loadSession({
-    target: repo, prNumber, token: env.GH_TOKEN, fetchImpl, botLogin: expectedAuthor, importLegacy: false,
+    target: repo, prNumber, token: env.GH_TOKEN, fetchImpl, botLogin: expectedAuthor,
   })).session;
   const durable = await loadCurrentDurable();
   if (!durable || !sameSession(durable, plan.session)) {

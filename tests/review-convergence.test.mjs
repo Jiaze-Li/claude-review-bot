@@ -16,7 +16,6 @@ import {
   normalizeReviewResult,
   openMaterialFindings,
   unresolvedMaterialFindings,
-  parseSessionComment,
   planReviewSession,
   recordDismissed,
   recordUncertainFindings,
