@@ -7,5 +7,6 @@ export function lastItems(list, count) {
 
 // Returns a percentage string for done / total.
 export function percentDone(done, total) {
+  if (!total) return '0%';
   return `${Math.round((done / total) * 100)}%`;
 }
