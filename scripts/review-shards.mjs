@@ -193,9 +193,31 @@ export function reconcileCoverage(coverage, assignedFiles) {
   };
 }
 
+export const FAILURE_PATH_SUMMARY_PREFIX = 'Failure-path checks (separate from file coverage; not a proof that every failure path is safe): ';
+
+export function formatFailurePathSummaryLine({ notes = [], unverified = [], deferredCount = 0 } = {}) {
+  const cleanNotes = notes.map((n) => String(n ?? '').replace(/\s+/g, ' ').trim()).filter(Boolean);
+  if (cleanNotes.length === 0) {
+    return `${FAILURE_PATH_SUMMARY_PREFIX}not reported — exception paths were not verified`;
+  }
+  const warningParts = [...unverified.map((u) => String(u ?? '').trim()).filter(Boolean)];
+  if (deferredCount > 0) warningParts.push(`${deferredCount} deferred file(s) not checked`);
+  const suffix = warningParts.length ? ` [Unverified: ${warningParts.join('; ')}]` : '';
+  const maxContent = 300;
+  if (suffix.length >= maxContent) {
+    return `${FAILURE_PATH_SUMMARY_PREFIX}${suffix.trimStart().slice(0, maxContent)}`;
+  }
+  const detailBudget = maxContent - suffix.length;
+  const joined = cleanNotes.join('; ');
+  const detail = joined.length <= detailBudget
+    ? joined
+    : (detailBudget > 1 ? `${joined.slice(0, detailBudget - 1)}…` : '');
+  return `${FAILURE_PATH_SUMMARY_PREFIX}${detail}${suffix}`;
+}
+
 // results[i] is { ok: true, structured } or { ok: false, error } for shards[i]; shards
 // that never started have no entry.
-export function mergeShardResults({ shards, results, deferred = [], allFiles, priorReviewed = [], ignoredCount = 0 }) {
+export function mergeShardResults({ shards, results, deferred = [], allFiles, priorReviewed = [], ignoredCount = 0, failureRecovery = false }) {
   const reviewed = new Set(priorReviewed);
   const notes = [];
   const findings = new Map();
@@ -203,6 +225,8 @@ export function mergeShardResults({ shards, results, deferred = [], allFiles, pr
   let failedShards = 0;
   const shardStats = [];
   const fellBack = [];
+  const failurePathNotes = [];
+  const failurePathUnverified = [];
 
   shards.forEach((shard, index) => {
     const result = results[index];
@@ -211,6 +235,9 @@ export function mergeShardResults({ shards, results, deferred = [], allFiles, pr
       shardStats.push(`${index + 1}: ${result ? 'failed' : 'not run'} 0/${shard.files.length}`);
       if (result?.error) fellBack.push(null);
       notes.push(`shard ${index + 1}/${shards.length} ${result ? `failed (${String(result.error).slice(0, 80)})` : 'did not run'}`);
+      if (failureRecovery) {
+        failurePathUnverified.push(`shard ${index + 1}/${shards.length} ${result ? 'failed' : 'not run'}`);
+      }
       return;
     }
     const coverage = reconcileCoverage(result.structured.coverage, shard.files);
@@ -222,6 +249,14 @@ export function mergeShardResults({ shards, results, deferred = [], allFiles, pr
       const said = coverage.note ? `reviewer said: ${coverage.note.slice(0, 110)}` : '';
       const note = [said, result.facts].filter(Boolean).join(' — ');
       if (note) notes.push(note);
+    }
+    if (failureRecovery) {
+      const fpNote = typeof result.structured.failurePathNote === 'string' ? result.structured.failurePathNote.trim() : '';
+      if (fpNote) {
+        failurePathNotes.push(shards.length > 1 ? `shard ${index + 1}/${shards.length}: ${fpNote}` : fpNote);
+      } else {
+        failurePathUnverified.push(`shard ${index + 1}/${shards.length} not reported`);
+      }
     }
     if (result.structured.summary) summaries.push(String(result.structured.summary).trim());
     for (const finding of result.structured.findings ?? []) {
@@ -247,6 +282,7 @@ export function mergeShardResults({ shards, results, deferred = [], allFiles, pr
     ...(shards.length > 1 || deferred.length || fellBack.some(Boolean) ? [`Shards (reviewed/assigned): ${shardStats.join(' · ')}${deferred.length ? ` · deferred beyond limit: ${deferred.length} file(s)` : ''}.`] : []),
     ...(droppedMaterial ? [`${droppedMaterial} more material finding(s) were omitted to fit the session limit; fix the listed ones and re-review.`] : []),
     ...(complete ? [] : [`Not reviewed: ${unreviewedPaths.slice(0, 15).join(', ')}${unreviewedPaths.length > 15 ? `, … (+${unreviewedPaths.length - 15})` : ''}.`]),
+    ...(failureRecovery ? [formatFailurePathSummaryLine({ notes: failurePathNotes, unverified: failurePathUnverified, deferredCount: deferred.length })] : []),
   ];
   const budget = 3500 - header.length - extra.join(' ').length;
   const perShard = Math.max(120, Math.floor(budget / Math.max(1, summaries.length)));

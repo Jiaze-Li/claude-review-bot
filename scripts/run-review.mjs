@@ -4,7 +4,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { defaultProviderRegistry, getProviderAdapter, parseReviewProviders, PROVIDER_KINDS } from './provider-adapter.mjs';
 import { ReadOnlyToolGateway } from './tool-gateway.mjs';
-import { stateIntegrityProcedure } from './review-prompts.mjs';
+import { failurePathProcedure, stateIntegrityProcedure } from './review-prompts.mjs';
 import { knownIssuesPromptBlock, matchesKnownDismissal, pathKey, providerPolicyOf } from './review-session-core.mjs';
 import { GEMINI_SHARD_MAX_BYTES, GEMINI_SHARD_TIMEOUT_MS, runGeminiShard } from './gemini-shard.mjs';
 import { DEFAULT_IGNORE, assertDiffCoverage, decodeGitPath, matchesIgnore, mergeShardResults, parseIgnorePatterns, planShards, reconcileCoverage, splitDiffByFile } from './review-shards.mjs';
@@ -51,6 +51,7 @@ const schema = {
       },
       required: ['complete', 'reviewedPaths', 'unreviewedPaths', 'note'],
     },
+    failurePathNote: { type: 'string', maxLength: 400 },
   },
   required: ['summary', 'findings', 'coverage'],
 };
@@ -130,7 +131,7 @@ function unitFor(files, chunks) {
   return { files, diff, bytes: Buffer.byteLength(diff, 'utf8') };
 }
 
-function combineUnits(first, firstCoverage, second, notes, restFiles) {
+export function combineUnits(first, firstCoverage, second, notes, restFiles) {
   if (!second.ok) {
     // Keep what the first provider did; the files it left stay unreviewed and the reason is recorded.
     return { ...first, fellBackFrom: [...notes, second.error].join('; ') };
@@ -139,6 +140,11 @@ function combineUnits(first, firstCoverage, second, notes, restFiles) {
   const secondReviewed = (second.structured.coverage?.reviewedPaths ?? []).filter((file) => restFiles.includes(file));
   const reviewedPaths = [...new Set([...firstCoverage.reviewedPaths, ...secondReviewed])];
   const unreviewedPaths = restFiles.filter((file) => !secondReviewed.includes(file));
+  const combinedFailurePathNote = [first.structured?.failurePathNote, second.structured?.failurePathNote]
+    .map((n) => (typeof n === 'string' ? n.trim() : ''))
+    .filter(Boolean)
+    .join('; ')
+    .slice(0, 400);
   return {
     ok: true,
     provider: [...new Set(`${first.provider}+${second.provider}`.split('+'))].join('+'),
@@ -153,6 +159,7 @@ function combineUnits(first, firstCoverage, second, notes, restFiles) {
         unreviewedPaths,
         note: [...new Set([firstCoverage.note, ...String(second.structured.coverage?.note ?? '').split('; ')].filter(Boolean))].join('; ').slice(0, 300),
       },
+      ...(combinedFailurePathNote ? { failurePathNote: combinedFailurePathNote } : {}),
     },
   };
 }
@@ -210,7 +217,8 @@ export async function runReview({ env = process.env, cwd = process.cwd() } = {})
 
   const commonContext = { targetRepo, prNumber, headSha };
   const knownIssues = knownIssuesPromptBlock(session);
-  const riskNotes = stateIntegrityProcedure(readJson(path.join(contextRoot, 'risk-profile.json')));
+  const riskProfile = readJson(path.join(contextRoot, 'risk-profile.json'));
+  const riskNotes = `${stateIntegrityProcedure(riskProfile)}${failurePathProcedure(riskProfile, { mode: 'full' })}`;
   const deadlineTracker = new DeadlineTracker({ totalMs: DEADLINE_MS, minBufferMs: 60_000 });
   let results = [];
   const metas = [];
@@ -484,7 +492,15 @@ export async function runReview({ env = process.env, cwd = process.cwd() } = {})
     throw new Error(message);
   }
 
-  const merged = mergeShardResults({ shards, results, deferred: plan.deferred, allFiles, priorReviewed, ignoredCount: ignoredFiles.size });
+  const merged = mergeShardResults({
+    shards,
+    results,
+    deferred: plan.deferred,
+    allFiles,
+    priorReviewed,
+    ignoredCount: ignoredFiles.size,
+    failureRecovery: riskProfile?.failureRecovery === true,
+  });
   const repeats = merged.findings.filter((finding) => matchesKnownDismissal(finding, session));
   if (repeats.length) {
     merged.findings = merged.findings.filter((finding) => !repeats.includes(finding));
