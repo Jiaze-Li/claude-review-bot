@@ -22,6 +22,15 @@ const SIGNALS = {
     ['concurrency', /\b(?:concurrent|parallel|race|interleav)\w*\b/i],
     ['process-worker', /\b(?:process|worker|thread|actor)\b/i],
   ],
+  recovery: [
+    ['recovery', /\b(?:rollback|roll back|restore\w*|revert\w*|undo|clean ?up|compensat\w*)\b/i],
+  ],
+  externalCall: [
+    ['external-call', /\b(?:execFileSync|execSync|spawnSync|spawn|execFile|child_process|fetch|subprocess|requests)\b|\bexec\(/],
+  ],
+  faultInjection: [
+    ['fault-injection', /\b(?:chmod\w*|chmodSync|EACCES|EPERM)\b/i],
+  ],
 };
 
 export function addedDiffText(diff) {
@@ -41,6 +50,9 @@ export function detectReviewRisk({ diff = '' } = {}) {
   const synchronization = matchedSignals(added, SIGNALS.synchronization);
   const durableState = matchedSignals(added, SIGNALS.durableState);
   const multiActor = matchedSignals(added, SIGNALS.multiActor);
+  const recovery = matchedSignals(added, SIGNALS.recovery);
+  const externalCall = matchedSignals(added, SIGNALS.externalCall);
+  const faultInjection = matchedSignals(added, SIGNALS.faultInjection);
 
   // Keep this deliberately narrow. We only escalate when the changed code
   // combines synchronization/transaction primitives with durable/shared state,
@@ -50,14 +62,21 @@ export function detectReviewRisk({ diff = '' } = {}) {
   ) || (
     durableState.length >= 2 && multiActor.length > 0
   );
+  const failureRecovery = (
+    recovery.length > 0 && externalCall.length > 0
+  ) || faultInjection.length > 0;
 
   return {
     version: 1,
     stateIntegrity,
+    failureRecovery,
     signals: {
       synchronization,
       durableState,
       multiActor,
+      recovery,
+      externalCall,
+      faultInjection,
     },
   };
 }
@@ -80,9 +99,13 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     fs.writeFileSync(output, JSON.stringify(result, null, 2) + '\n', { mode: 0o600 });
     console.log(
       'Deterministic review risk: stateIntegrity=' + String(result.stateIntegrity)
+      + ' failureRecovery=' + String(result.failureRecovery)
       + ' synchronization=' + result.signals.synchronization.join(',')
       + ' durableState=' + result.signals.durableState.join(',')
-      + ' multiActor=' + result.signals.multiActor.join(','),
+      + ' multiActor=' + result.signals.multiActor.join(',')
+      + ' recovery=' + result.signals.recovery.join(',')
+      + ' externalCall=' + result.signals.externalCall.join(',')
+      + ' faultInjection=' + result.signals.faultInjection.join(','),
     );
   } catch (error) {
     console.error(error.message);

@@ -27,6 +27,24 @@ Deterministic signals: ${JSON.stringify(riskProfile.signals || {})}
 `;
 }
 
+// A PR the deterministic risk classifier marks as touching failure-recovery or permission fault-injection
+// gets an explicit 3-state semantics + bounded horizontal sibling-sweep procedure. Empty otherwise.
+export function failurePathProcedure(riskProfile, { mode = 'full' } = {}) {
+  if (riskProfile?.failureRecovery !== true) return '';
+  const verificationClause = mode === 'verification'
+    ? '\n5. Horizontal sibling checks for the SAME failure family as a confirmed defect are explicitly in scope and are NOT "unrelated pre-existing issues".'
+    : '';
+  return `
+
+This PR is deterministically classified as FAILURE-RECOVERY RISK.
+In addition to the ordinary bug audit, perform a 3-state failure-semantics and bounded horizontal sibling check:
+1. External queries & recovery paths: For each external query/command (non-zero exit, timeout, crash, empty output, permission error, unexpected format), classify outcomes into present / confirmed-absent / unknown. Trace whether unknown flows into deletion, overwrite, rollback, or a "success" verdict. Treat as confirmed-absent ONLY when actual tool output/semantics prove absence; otherwise treat as unknown (unverified) — never guess safe and never emit a finding without a concrete failurePath.
+2. Fault-injection tests (chmod/EACCES/EPERM): Check whether the test still holds under root or non-enforcing filesystems (e.g., getuid() === 0 guard).
+3. Bounded horizontal sibling check: Once a concrete defect is confirmed, use Grep/Read within existing turn/tool budgets to check shared helpers, callers, and sibling tests in this PR using the same pattern. Report siblings in your assigned files as findings; record siblings in other shards/files in failurePathNote as candidates (do not report findings outside your assigned files).
+4. In failurePathNote (<=400 chars), state which external calls/siblings were checked and what remained unverified due to turn, tool, or shard limits.${verificationClause}
+`;
+}
+
 export function readOnlyToolGuidance({ hasTools = false, mode = 'review' } = {}) {
   if (!hasTools) return '';
   const lines = [
