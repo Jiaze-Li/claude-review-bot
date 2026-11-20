@@ -23,15 +23,21 @@ const SIGNALS = {
     ['process-worker', /\b(?:process|worker|thread|actor)\b/i],
   ],
   recovery: [
-    ['recovery', /\b(?:rollback|roll back|restore\w*|revert\w*|undo|clean ?up|compensat\w*)\b/i],
+    ['recovery', /\b(?:rollback|roll[-_ ]?back|compensat\w*|reconcile\w*)\b/i],
   ],
   externalCall: [
-    ['external-call', /\b(?:execFileSync|execSync|spawnSync|spawn|execFile|child_process|fetch|subprocess|requests)\b|\bexec\(/],
+    ['external-call', /\b(?:execFileSync|execSync|spawnSync|spawn|execFile|child_process|subprocess)\b/],
   ],
   faultInjection: [
     ['fault-injection', /\b(?:chmod\w*|chmodSync|EACCES|EPERM)\b/i],
   ],
 };
+
+function addedDiffByFile(diff) {
+  const chunks = String(diff ?? '').split(/^diff --git /m).filter(Boolean);
+  if (!chunks.length) return [addedDiffText(diff)];
+  return chunks.map((chunk) => addedDiffText(chunk));
+}
 
 export function addedDiffText(diff) {
   return String(diff ?? '')
@@ -62,8 +68,8 @@ export function detectReviewRisk({ diff = '' } = {}) {
   ) || (
     durableState.length >= 2 && multiActor.length > 0
   );
-  const failureRecovery = (
-    recovery.length > 0 && externalCall.length > 0
+  const failureRecovery = addedDiffByFile(diff).some(
+    (fileAdded) => matchedSignals(fileAdded, SIGNALS.recovery).length > 0 && matchedSignals(fileAdded, SIGNALS.externalCall).length > 0,
   ) || faultInjection.length > 0;
 
   return {

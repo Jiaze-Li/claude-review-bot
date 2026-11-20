@@ -41,6 +41,19 @@ test('L1: negative controls do not trigger failureRecovery and stateIntegrity re
     assert.equal(risk.failureRecovery, false, `${name} should not trigger failureRecovery`);
     assert.equal(risk.stateIntegrity, false, `${name} should not trigger stateIntegrity`);
   }
+  const crossFileSplit = [
+    'diff --git a/a.js b/a.js',
+    '--- a/a.js',
+    '+++ b/a.js',
+    '@@ -1 +1 @@',
+    '+rollback();',
+    'diff --git a/b.js b/b.js',
+    '--- a/b.js',
+    '+++ b/b.js',
+    '@@ -1 +1 @@',
+    '+execFileSync("git", ["status"]);',
+  ].join('\n');
+  assert.equal(detectReviewRisk({ diff: crossFileSplit }).failureRecovery, false);
 });
 
 // ---- L2: Prompt assembly & byte-for-byte invariance ----

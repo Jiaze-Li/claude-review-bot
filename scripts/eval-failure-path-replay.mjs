@@ -142,7 +142,7 @@ const VECTORS = [
   },
 ];
 
-async function runSingleVector(vector, enableFailureRecovery, runIndex) {
+async function runSingleVector(vector, enableFailureRecovery, runIndex, maxBudgetUsd) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), `l4-${vector.id}-${enableFailureRecovery ? 'new' : 'base'}-`));
   const ctxDir = path.join(tmpDir, '.review-context');
   const safeDir = path.join(tmpDir, 'safe-target');
@@ -190,7 +190,7 @@ async function runSingleVector(vector, enableFailureRecovery, runIndex) {
         PR_NUMBER: '60',
         HEAD_SHA: String(runIndex).padStart(40, '0'),
         DEEP_REVIEW_SHARD_TURNS: '10',
-        DEEP_REVIEW_MAX_BUDGET_USD: '0.50',
+        DEEP_REVIEW_MAX_BUDGET_USD: String(Math.min(0.5, maxBudgetUsd).toFixed(4)),
       },
     });
     const matched = (doc.findings ?? []).some((f) => vector.match(f));
@@ -203,6 +203,24 @@ async function runSingleVector(vector, enableFailureRecovery, runIndex) {
       turns: doc._meta?.num_turns ?? 0,
       model: doc._meta?.resolved_model ?? doc._meta?.requested_model ?? 'claude',
     };
+  } catch (error) {
+    let costUsd = 0;
+    try {
+      const usage = JSON.parse(fs.readFileSync(path.join(ctxDir, 'claude-usage.json'), 'utf8'));
+      if (Number.isFinite(usage?.total_cost_usd)) costUsd = usage.total_cost_usd;
+    } catch {
+      // ignore missing usage file on early failure
+    }
+    return {
+      ok: false,
+      error: error.message,
+      matched: false,
+      findingsCount: 0,
+      findingTitles: [],
+      costUsd,
+      turns: 0,
+      model: 'claude',
+    };
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
@@ -210,17 +228,21 @@ async function runSingleVector(vector, enableFailureRecovery, runIndex) {
 
 export async function runReplay({ runsPerVariant = 2 } = {}) {
   let totalSpend = 0;
+  let stoppedByCap = false;
   const rows = [];
-  for (const vector of VECTORS) {
+  outer: for (const vector of VECTORS) {
     for (const variant of [false, true]) {
       for (let i = 1; i <= runsPerVariant; i += 1) {
-        if (totalSpend >= MAX_TOTAL_SPEND_USD) {
-          throw new Error(`Aborted L4 replay: cumulative spend $${totalSpend.toFixed(4)} reached cap $${MAX_TOTAL_SPEND_USD.toFixed(2)}`);
+        const remainingUsd = MAX_TOTAL_SPEND_USD - totalSpend;
+        if (remainingUsd < 0.05) {
+          stoppedByCap = true;
+          console.error(`[L4] Stopping early: remaining budget $${remainingUsd.toFixed(4)} below minimum run allowance`);
+          break outer;
         }
-        const res = await runSingleVector(vector, variant, i);
+        const res = await runSingleVector(vector, variant, i, remainingUsd);
         totalSpend += res.costUsd;
         rows.push({ vector: vector.id, expectDefect: vector.expectDefect, improved: variant, run: i, ...res });
-        console.error(`[L4] ${vector.id} (${variant ? 'improved' : 'baseline'}) #${i}: matched=${res.matched} findings=${res.findingsCount} cost=$${res.costUsd.toFixed(4)} total=$${totalSpend.toFixed(4)}`);
+        console.error(`[L4] ${vector.id} (${variant ? 'improved' : 'baseline'}) #${i}: ok=${res.ok} matched=${res.matched} findings=${res.findingsCount} cost=$${res.costUsd.toFixed(4)} total=$${totalSpend.toFixed(4)}`);
       }
     }
   }
@@ -238,6 +260,7 @@ export async function runReplay({ runsPerVariant = 2 } = {}) {
   return {
     model: rows.find((r) => r.model)?.model ?? 'claude',
     runsPerVariant,
+    stoppedByCap,
     totalSpendUsd: Number(totalSpend.toFixed(4)),
     baseline: summarize(false),
     improved: summarize(true),
