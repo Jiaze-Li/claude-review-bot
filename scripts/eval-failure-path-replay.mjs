@@ -48,7 +48,7 @@ const VECTORS = [
     id: 'V2',
     name: 'PR #60 tri-state MCP query + rollback (35279dd, fixed)',
     expectDefect: false,
-    match: (f) => /unknown|absent|mcpState|boolean|fail.*absent|query.*fail/i.test(`${f.title} ${f.body} ${f.failurePath}`),
+    match: (f) => /treat(?:s|ed|ing)?\s+(?:fail|error).*absent|boolean.*mcp|missing\s+tri-state/i.test(`${f.title} ${f.body} ${f.failurePath}`),
     files: ['bin/install-plugin.js'],
     diff: [
       'diff --git a/bin/install-plugin.js b/bin/install-plugin.js',
@@ -109,18 +109,20 @@ const VECTORS = [
     id: 'V4',
     name: 'Chmod sibling pair both guarded with isRoot (fixed)',
     expectDefect: false,
-    match: (f) => /root|getuid|chmod|0o555|permission/i.test(`${f.title} ${f.body} ${f.failurePath}`),
+    match: (f) => /(?:lack|missing|without|no)\s+(?:a\s+)?(?:root|getuid|SKIP_ROOT)/i.test(`${f.title} ${f.body} ${f.failurePath}`),
     files: ['tests/installRollbackSafety.test.js', 'tests/cliLink.test.js'],
     diff: [
       'diff --git a/tests/installRollbackSafety.test.js b/tests/installRollbackSafety.test.js',
       '--- a/tests/installRollbackSafety.test.js',
       '+++ b/tests/installRollbackSafety.test.js',
-      '@@ -1,4 +1,11 @@',
+      '@@ -1,4 +1,13 @@',
       '+const isRoot = typeof process.getuid === "function" && process.getuid() === 0;',
       '+const SKIP_ROOT = isRoot ? "permission-bit fault injection does not apply to root" : false;',
       '+test("rollback when target is read-only", { skip: SKIP_ROOT }, async () => {',
-      '+  await chmod(agents, 0o444);',
-      '+  await assert.rejects(() => installGlobal());',
+      '+  try {',
+      '+    await chmod(agents, 0o444);',
+      '+    await assert.rejects(() => installGlobal());',
+      '+  } finally { await chmod(agents, 0o644).catch(() => {}); }',
       '+});',
       'diff --git a/tests/cliLink.test.js b/tests/cliLink.test.js',
       '--- a/tests/cliLink.test.js',
@@ -164,6 +166,17 @@ async function runSingleVector(vector, enableFailureRecovery, runIndex) {
   fs.writeFileSync(path.join(ctxDir, 'risk-profile.json'), JSON.stringify(risk, null, 2));
   fs.writeFileSync(path.join(ctxDir, 'session-plan.json'), JSON.stringify({ session: null }));
 
+  // Populate safe-target/ with the vector's file contents so Read/Grep tools see real code.
+  for (const chunk of vector.diff.split(/^diff --git /m).filter(Boolean)) {
+    const m = chunk.match(/^a\/(\S+) b\/\S+/);
+    if (!m) continue;
+    const rel = m[1];
+    const body = chunk.split('\n').filter((l) => l.startsWith('+') && !l.startsWith('+++')).map((l) => l.slice(1)).join('\n');
+    const targetPath = path.join(safeDir, rel);
+    fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+    fs.writeFileSync(targetPath, `${body}\n`);
+  }
+
   try {
     const doc = await runReview({
       cwd: tmpDir,
@@ -176,7 +189,7 @@ async function runSingleVector(vector, enableFailureRecovery, runIndex) {
         TARGET_REPO: 'Jiaze-Li/reviewloop',
         PR_NUMBER: '60',
         HEAD_SHA: String(runIndex).padStart(40, '0'),
-        DEEP_REVIEW_SHARD_TURNS: '6',
+        DEEP_REVIEW_SHARD_TURNS: '10',
         DEEP_REVIEW_MAX_BUDGET_USD: '0.50',
       },
     });
@@ -185,6 +198,7 @@ async function runSingleVector(vector, enableFailureRecovery, runIndex) {
       ok: true,
       matched,
       findingsCount: (doc.findings ?? []).length,
+      findingTitles: (doc.findings ?? []).map((f) => `[${f.severity}] ${f.title}`),
       costUsd: doc._meta?.total_cost_usd ?? 0,
       turns: doc._meta?.num_turns ?? 0,
       model: doc._meta?.resolved_model ?? doc._meta?.requested_model ?? 'claude',

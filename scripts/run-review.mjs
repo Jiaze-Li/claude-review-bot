@@ -131,7 +131,7 @@ function unitFor(files, chunks) {
   return { files, diff, bytes: Buffer.byteLength(diff, 'utf8') };
 }
 
-function combineUnits(first, firstCoverage, second, notes, restFiles) {
+export function combineUnits(first, firstCoverage, second, notes, restFiles) {
   if (!second.ok) {
     // Keep what the first provider did; the files it left stay unreviewed and the reason is recorded.
     return { ...first, fellBackFrom: [...notes, second.error].join('; ') };
@@ -140,6 +140,11 @@ function combineUnits(first, firstCoverage, second, notes, restFiles) {
   const secondReviewed = (second.structured.coverage?.reviewedPaths ?? []).filter((file) => restFiles.includes(file));
   const reviewedPaths = [...new Set([...firstCoverage.reviewedPaths, ...secondReviewed])];
   const unreviewedPaths = restFiles.filter((file) => !secondReviewed.includes(file));
+  const combinedFailurePathNote = [first.structured?.failurePathNote, second.structured?.failurePathNote]
+    .map((n) => (typeof n === 'string' ? n.trim() : ''))
+    .filter(Boolean)
+    .join('; ')
+    .slice(0, 400);
   return {
     ok: true,
     provider: [...new Set(`${first.provider}+${second.provider}`.split('+'))].join('+'),
@@ -154,6 +159,7 @@ function combineUnits(first, firstCoverage, second, notes, restFiles) {
         unreviewedPaths,
         note: [...new Set([firstCoverage.note, ...String(second.structured.coverage?.note ?? '').split('; ')].filter(Boolean))].join('; ').slice(0, 300),
       },
+      ...(combinedFailurePathNote ? { failurePathNote: combinedFailurePathNote } : {}),
     },
   };
 }

@@ -187,7 +187,7 @@ export async function runGeminiReview({env=process.env,fetchImpl=fetch,logImpl=c
   const shared={circuitBreaker,budgetManager,providerBudgetManagers};
 
   const capacity=stagedReviewCapacity({diff,fixedBytes:stagedFixedBytes({prJson,session,riskProfile})});
-  if(capacity.kind==='single') return reviewPart(ctx,diff,shared);
+  if(capacity.kind==='single') return reviewPart(ctx,diff,shared,{appendFailurePathLine:true});
 
   const {chunks,parts,deferred}=capacity;
   if(capacity.kind==='too_large') throw new Error(`The ${mode} diff spans too many parts (${parts.length+(deferred.length?'+':'')}) for one staged review even after skipping ignored files; add generated or bulk files to .reviewbotignore, or ask for a sharded review`);
@@ -201,7 +201,7 @@ export async function runGeminiReview({env=process.env,fetchImpl=fetch,logImpl=c
       concurrency:PART_CONCURRENCY,
       deadlineTracker,
       minTimeBufferMs:0,
-      workerFn:async(part)=>reviewPart(ctx,part.diff,shared),
+      workerFn:async(part)=>reviewPart(ctx,part.diff,shared,{appendFailurePathLine:false}),
       onStop:()=>{},
     });
   }catch(error){
@@ -231,7 +231,7 @@ function recordParts(ctx,shared,reason){
 
 // One model request for one diff: Gemini, then Claude when Gemini cannot do it. `shared` carries what an
 // earlier part learned (Gemini unavailable) and what Claude has already cost.
-async function reviewPart(ctx,diff,shared){
+async function reviewPart(ctx,diff,shared,{appendFailurePathLine=true}={}){
   const {claudeOnly,env,fetchImpl,logImpl,queryImpl,apiKey,repo,prNumber,headSha,contextRoot,plan,mode,prJson,session,riskProfile,diffName,providers}=ctx;
   const contextBytes=Buffer.byteLength(diff,'utf8')+Buffer.byteLength(prJson,'utf8')+Buffer.byteLength(JSON.stringify(session??{}),'utf8')+Buffer.byteLength(JSON.stringify(riskProfile),'utf8');
   if(contextBytes>MAX_CONTEXT_BYTES) throw new Error(`Gemini review context exceeds ${MAX_CONTEXT_BYTES} bytes; use targeted human/Codex review rather than silently truncating`);
@@ -501,7 +501,7 @@ async function reviewPart(ctx,diff,shared){
   }
 
   const structured = { ...outcome.structured };
-  if (riskProfile?.failureRecovery === true) {
+  if (appendFailurePathLine && riskProfile?.failureRecovery === true) {
     const fpNote = typeof structured.failurePathNote === 'string' ? structured.failurePathNote.trim() : '';
     const line = formatFailurePathSummaryLine({ notes: fpNote ? [fpNote] : [] });
     structured.summary = [String(structured.summary ?? '').trim(), line].filter(Boolean).join('\n\n').slice(0, 3900);

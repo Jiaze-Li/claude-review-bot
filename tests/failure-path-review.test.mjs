@@ -7,6 +7,7 @@ import { detectReviewRisk } from '../scripts/detect-review-risk.mjs';
 import { failurePathProcedure, stateIntegrityProcedure } from '../scripts/review-prompts.mjs';
 import { FAILURE_PATH_SUMMARY_PREFIX, formatFailurePathSummaryLine, mergeShardResults } from '../scripts/review-shards.mjs';
 import { STAGED_REVIEW_MAX_TURNS, buildGeminiRequest, runGeminiReview } from '../scripts/run-gemini-review.mjs';
+import { combineUnits } from '../scripts/run-review.mjs';
 import { parseRecord, renderHandoffParts, runSpendFromCharges } from '../scripts/review-ledger.mjs';
 import {
   NEGATIVE_CONTROL_DIFFS,
@@ -259,4 +260,74 @@ test('L3: adding Failure-path checks line to handoff intro does not alter parsed
   const parsedBase = parseRecord(baseBody);
   const parsedWithLine = parseRecord(withLineBody);
   assert.deepEqual(parsedWithLine.session, parsedBase.session);
+});
+
+test('L3: combineUnits preserves failurePathNote from partial-shard providers', () => {
+  const first = {
+    ok: true,
+    provider: 'gemini',
+    structured: {
+      summary: 'Part 1',
+      findings: [],
+      coverage: { complete: false, reviewedPaths: ['a.js'], unreviewedPaths: ['b.js'], note: 'partial' },
+      failurePathNote: 'Checked a.js mcpState',
+    },
+  };
+  const second = {
+    ok: true,
+    provider: 'claude',
+    structured: {
+      summary: 'Part 2',
+      findings: [],
+      coverage: { complete: true, reviewedPaths: ['b.js'], unreviewedPaths: [], note: '' },
+      failurePathNote: 'Checked b.js chmod guard',
+    },
+  };
+  const combined = combineUnits(first, first.structured.coverage, second, ['gemini partial'], ['b.js']);
+  assert.equal(combined.structured.failurePathNote, 'Checked a.js mcpState; Checked b.js chmod guard');
+});
+
+test('L3: multi-part runGeminiReview emits exactly one aggregated Failure-path checks line', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fp-multipart-'));
+  const ctxDir = path.join(tmpDir, '.review-context');
+  fs.mkdirSync(ctxDir, { recursive: true });
+  const bigFile = (name) => [
+    `diff --git a/${name} b/${name}`,
+    `--- a/${name}`,
+    `+++ b/${name}`,
+    '@@ -1,1 +1,1 @@',
+    `+${'x'.repeat(28000)}`,
+    '',
+  ].join('\n');
+  fs.writeFileSync(path.join(ctxDir, 'session-plan.json'), JSON.stringify({
+    decision: { mode: 'incremental' },
+    requestedMode: 'auto',
+    session: { version: 1, threadId: 't', status: 'OPEN', findings: [] },
+  }));
+  fs.writeFileSync(path.join(ctxDir, 'pr.json'), JSON.stringify({ number: 10, title: 'T', base: { ref: 'main' } }));
+  fs.writeFileSync(path.join(ctxDir, 'repair.diff'), bigFile('p1.js') + bigFile('p2.js'));
+  fs.writeFileSync(path.join(ctxDir, 'risk-profile.json'), JSON.stringify({
+    version: 1,
+    stateIntegrity: false,
+    failureRecovery: true,
+    signals: { synchronization: [], durableState: [], multiActor: [], recovery: [], externalCall: [], faultInjection: [] },
+  }));
+  try {
+    const res = await runGeminiReview({
+      env: {
+        REVIEW_PROVIDERS: 'mock-runner-provider',
+        PROVIDER_MOCK_RUNNER_PROVIDER_BUDGET_USD: '5.00',
+        TARGET_REPO: 'test/repo',
+        PR_NUMBER: '10',
+        HEAD_SHA: 'a'.repeat(40),
+        REVIEW_CONTEXT_DIR: ctxDir,
+      },
+      fetchImpl: null,
+      logImpl: () => {},
+    });
+    const matches = res.summary.match(/Failure-path checks \(separate from file coverage; not a proof that every failure path is safe\):/g) ?? [];
+    assert.equal(matches.length, 1);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 });
