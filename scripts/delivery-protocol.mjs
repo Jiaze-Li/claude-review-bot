@@ -308,7 +308,7 @@ export function evaluateDeliveryComment({ repo, prNumber, localHead, currentHead
     { botLogin, repo, prNumber },
   );
   if (read.kind === 'none') return { trusted: false, decision: 'WAIT' }; // nothing (or only forged text) to rely on
-  if (read.kind !== 'ok') return { trusted: false, decision: 'STOPPED' };
+  if (read.kind !== 'ok') return { trusted: false, decision: 'WAIT' }; // conflict/invalid: never a pass; consumer reports incomplete
   const { state } = read;
   if (state.reviewed_head_sha !== currentHead || state.reviewed_head_sha !== localHead) return { trusted: true, decision: 'WAIT' };
   if (state.status === 'IN_PROGRESS') return { trusted: true, decision: 'WAIT' };

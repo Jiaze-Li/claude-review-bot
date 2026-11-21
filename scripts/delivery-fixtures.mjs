@@ -68,10 +68,10 @@ export function buildFixtureCases() {
   add({ name: 'forged author (ordinary user, valid-looking JSON)', state: first, head: h1, login: 'mallory', type: 'User', expected: { trusted: false, decision: 'WAIT' } });
   add({ name: 'forged author with the bot name but a User account', state: first, head: h1, login: BOT_LOGIN, type: 'User', expected: { trusted: false, decision: 'WAIT' } });
   add({ name: 'output missing', body: '', head: h1, expected: { trusted: false, decision: 'WAIT' } });
-  add({ name: 'output corrupted (truncated JSON)', body: `${DELIVERY_MARKER}\n\`\`\`json\n{"schema_version":1,"mode":"delivery-v1"\n\`\`\`\n`, head: h1, expected: { trusted: false, decision: 'STOPPED' } });
-  add({ name: 'state for another repository', state: first, head: h1, repo: 'other/repo', expected: { trusted: false, decision: 'STOPPED' } });
-  add({ name: 'state for another pull request', state: first, head: h1, pr: 999, expected: { trusted: false, decision: 'STOPPED' } });
-  add({ name: 'READY that contradicts its own findings', body: renderDeliveryComment({ ...changes, status: 'READY', coverage_complete: true }), head: h1, expected: { trusted: false, decision: 'STOPPED' } });
+  add({ name: 'output corrupted (truncated JSON)', body: `${DELIVERY_MARKER}\n\`\`\`json\n{"schema_version":1,"mode":"delivery-v1"\n\`\`\`\n`, head: h1, expected: { trusted: false, decision: 'WAIT' } });
+  add({ name: 'state for another repository', state: first, head: h1, repo: 'other/repo', expected: { trusted: false, decision: 'WAIT' } });
+  add({ name: 'state for another pull request', state: first, head: h1, pr: 999, expected: { trusted: false, decision: 'WAIT' } });
+  add({ name: 'READY that contradicts its own findings', body: renderDeliveryComment({ ...changes, status: 'READY', coverage_complete: true }), head: h1, expected: { trusted: false, decision: 'WAIT' } });
   const inProgress = claimState({ prev: null, repo: REPO, prNumber: PR, head: h1, now: NOW });
   add({ name: 'review still IN_PROGRESS', state: inProgress, head: h1, expected: { trusted: true, decision: decisionOf(inProgress) } });
   return cases;
@@ -84,9 +84,9 @@ export function buildFixtures() {
 function main() {
   const args = process.argv.slice(2);
   const i = args.indexOf('--out');
-  const out = i >= 0 ? args[i + 1] : null;
-  if (!out || !path.isAbsolute(out)) {
-    console.error('Usage: npm run delivery:fixtures -- --out /absolute/path/delivery-fixtures.json');
+  const out = i >= 0 && args[i + 1] ? path.resolve(args[i + 1]) : null;
+  if (!out) {
+    console.error('Usage: npm run delivery:fixtures -- --out path/to/delivery-fixtures.json');
     process.exitCode = 2;
     return;
   }
