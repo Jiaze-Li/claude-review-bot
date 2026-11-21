@@ -98,10 +98,10 @@ export function createStateStore({ github, botLogin, repo, prNumber, commentId =
       for (let tryNo = 1; tryNo <= 3; tryNo += 1) {
         try {
           if (id) {
-            if (tryNo === 1) {
-              const current = stateOf(await github.getComment(id));
-              if (!same(current, last)) throw new StateWriteError('the review state comment was changed by another writer; stopping without overwriting');
-            }
+            // Recheck on EVERY retry: a failed PATCH may have allowed another writer to change the record.
+            // Workflow concurrency is the primary serialization; this check prevents retry clobbering.
+            const current = stateOf(await github.getComment(id));
+            if (!same(current, last)) throw new StateWriteError('the review state comment was changed by another writer; stopping without overwriting');
             await github.patchComment(id, body);
           } else {
             id = await github.createComment(body);
