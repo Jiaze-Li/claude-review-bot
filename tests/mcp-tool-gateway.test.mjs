@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { ReadOnlyToolGateway, createGatewayMcpServer } from '../scripts/tool-gateway.mjs';
-import { getProviderAdapter, PROVIDER_KINDS } from '../scripts/provider-adapter.mjs';
+import { runClaude } from '../scripts/claude-provider.mjs';
 
 const [eq, deq, pj] = [assert.equal, assert.deepEqual, path.join];
 
@@ -281,14 +281,14 @@ test('Req 5: Concurrent calls share gateway quota safely without race condition 
   eq(gw.getDiagnostics().quotaExhausted, true);
 }));
 
-test('AC1 & AC8: Claude provider adapter mounts MCP Gateway with tools: [], strictMcpConfig, and dontAsk mode', () => withFixture(async (f) => {
+test('AC1 & AC8: Claude provider mounts MCP Gateway with tools: [], strictMcpConfig, and dontAsk mode', () => withFixture(async (f) => {
   const gw = new ReadOnlyToolGateway({ safeRoot: f.safeRoot, contextRoot: f.contextRoot, cwd: f.tmpDir });
   let capturedOptions = null;
 
-  const outcome = await getProviderAdapter(PROVIDER_KINDS.CLAUDE).execute({
-    prompt: 'review this PR',
+  const outcome = await runClaude({
+    prompt: 'review this PR', maxTurns: 3, maxBudgetUsd: 0.5, timeoutMs: 5000,
     schema: { type: 'object', properties: { summary: { type: 'string' } }, required: ['summary'] },
-    env: { CLAUDE_CODE_OAUTH_TOKEN: 'token-val' },
+    env: { CLAUDE_CODE_OAUTH_TOKEN: 'token-val', GH_TOKEN: 'ghs_secret', PATH: '/usr/bin' },
     toolGateway: gw,
     queryImpl: async function* ({ options }) {
       capturedOptions = options;
@@ -332,6 +332,14 @@ test('AC1 & AC8: Claude provider adapter mounts MCP Gateway with tools: [], stri
   eq(capturedOptions.permissionMode, 'dontAsk');
   eq(capturedOptions.strictMcpConfig, true);
   assert.deepEqual(capturedOptions.settingSources, []);
+
+  // The model's environment carries no GitHub credential, and native tools are denied by the permission callback.
+  assert.equal(capturedOptions.env.GH_TOKEN, undefined);
+  assert.equal(capturedOptions.env.CLAUDE_CODE_OAUTH_TOKEN, 'token-val');
+  eq((await capturedOptions.canUseTool('Bash', { command: 'env' })).behavior, 'deny');
+  eq((await capturedOptions.canUseTool('mcp__gateway__Read', { file_path: 'a' })).behavior, 'allow');
+  eq(capturedOptions.maxTurns, 3);
+  eq(capturedOptions.maxBudgetUsd, 0.5);
 }));
 test('F001: explicit single-file paths work for Grep and Glob without ENOTDIR', () => withFixture(async (f) => {
   const gw = new ReadOnlyToolGateway({ safeRoot: f.safeRoot, cwd: f.tmpDir });

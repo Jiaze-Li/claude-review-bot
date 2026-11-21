@@ -1,10 +1,4 @@
-import {
-  automaticSourceId,
-  parseAutomaticPullRequestTrigger,
-  parseReviewThreadTrigger,
-  parseReviewTrigger,
-} from './review-trigger.js';
-import { hasDeliveryStateComment, parseDeliveryLabelTrigger, routeDelivery } from './delivery.js';
+import { automaticSourceId, parseAutomaticPullRequestTrigger, parseReviewTrigger } from './review-trigger.js';
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -59,38 +53,22 @@ export default {
     if (event === 'issue_comment') {
       if (payload.action !== 'created') return json({ ignored: true, reason: 'not a created comment' });
       if (!payload.issue?.pull_request) return json({ ignored: true, reason: 'comment is not on a pull request' });
-      const reviewCommand = parseReviewTrigger(payload.comment?.body);
-      if (!reviewCommand) {
+      if (!parseReviewTrigger(payload.comment?.body)) {
         return json({ ignored: true, reason: 'first nonblank line is not a review command' });
       }
       trigger = {
-        requestedMode: reviewCommand.requestedMode,
         sourceKind: 'comment',
         prNumber: payload.issue?.number,
         triggerUser: payload.comment?.user?.login,
         sourceId: payload.comment?.id ? String(payload.comment.id) : null,
         requireWritePermission: true,
       };
-    } else if (event === 'pull_request_review_thread') {
-      const thread = parseReviewThreadTrigger(event, payload);
-      if (!thread) return json({ ignored: true, reason: 'review thread event needs no decision' });
-      const deliveryId = request.headers.get('x-github-delivery');
-      if (!deliveryId) return new Response('Missing GitHub webhook delivery id', { status: 400 });
-      trigger = {
-        requestedMode: thread.requestedMode,
-        sourceKind: thread.sourceKind,
-        prNumber: payload.pull_request.number,
-        triggerUser: payload.sender.login,
-        sourceId: automaticSourceId(deliveryId),
-        requireWritePermission: true,
-      };
     } else {
-      const automatic = parseAutomaticPullRequestTrigger(event, payload) ?? parseDeliveryLabelTrigger(event, payload);
+      const automatic = parseAutomaticPullRequestTrigger(event, payload);
       if (!automatic) return json({ ignored: true, reason: 'event does not trigger review' });
       const deliveryId = request.headers.get('x-github-delivery');
       if (!deliveryId) return new Response('Missing GitHub webhook delivery id', { status: 400 });
       trigger = {
-        requestedMode: automatic.requestedMode,
         sourceKind: automatic.sourceKind,
         prNumber: payload.pull_request?.number ?? payload.number,
         triggerUser: payload.sender?.login ?? payload.pull_request?.user?.login ?? 'github',
@@ -111,10 +89,6 @@ export default {
     const appId = requireEnv(env, 'GITHUB_APP_ID');
     const privateKey = requireEnv(env, 'GITHUB_PRIVATE_KEY');
     const appJwt = await createAppJwt(appId, privateKey);
-    const app = await githubApi('/app', { token: appJwt });
-    if (!app?.slug) throw new Error('GitHub did not return the App slug');
-    const expectedReviewAuthor = `${app.slug}[bot]`;
-
     const targetToken = await createInstallationToken(installationId, appJwt);
 
     if (trigger.requireWritePermission) {
@@ -129,37 +103,12 @@ export default {
 
     const pr = await githubApi(`/repos/${targetRepo}/pulls/${prNumber}`, { token: targetToken });
     if (pr.state !== 'open') return json({ ignored: true, reason: 'pull request is not open' });
-    if (trigger.sourceKind === 'pull_request' && pr.draft === true) {
-      return json({ ignored: true, reason: 'draft pull request is not ready for automatic review' });
-    }
+    if (pr.draft === true) return json({ ignored: true, reason: 'draft pull request: no review until it is marked ready' });
 
-    const sourceId = trigger.sourceId;
-
-    // Delivery v1 (opt-in). An existing delivery state or the label fixes the mode for this PR; otherwise the
-    // legacy path below is untouched.
-    const delivery = await routeDelivery({
-      trigger,
-      pr,
-      hasState: () => hasDeliveryStateComment({
-        expectedReviewAuthor,
-        listComments: (page) => githubApi(`/repos/${targetRepo}/issues/${prNumber}/comments?per_page=100&page=${page}`, { token: targetToken }),
-      }),
-    });
-    if (delivery.route === 'ignore') return json({ ignored: true, reason: delivery.reason });
-    const deliveryRoute = delivery.route === 'delivery';
-    if (deliveryRoute) trigger.requestedMode = delivery.requestedMode;
-
-    // Fast path for webhook redeliveries. Review generation/HEAD state is handled
-    // by the durable session planner, so a later return to an old HEAD is not
-    // suppressed by historical trigger markers.
-    // Only markers published by this exact App identity count as processed.
-    // Delivery runs are idempotent by HEAD inside the runner, so they skip the legacy receipt lookup.
-    if (!deliveryRoute && await hasProcessedSourceComment(targetRepo, prNumber, sourceId, expectedReviewAuthor, targetToken)) {
-      return json({ ignored: true, reason: 'review trigger already processed for this HEAD' });
-    }
-
+    // Idempotency lives in the review state comment (a complete result for this HEAD is reused, an attempt in
+    // flight is waited for), so redelivered or repeated events need no receipt lookup here.
     const controlRepo = env.CONTROL_REPO || 'Jiaze-Li/pr-bot';
-    const controlWorkflow = deliveryRoute ? (env.DELIVERY_WORKFLOW || 'delivery-review.yml') : (env.CONTROL_WORKFLOW || 'review-v2.yml');
+    const controlWorkflow = env.CONTROL_WORKFLOW || 'review.yml';
     const controlRef = env.CONTROL_REF || 'main';
 
     const controlInstallation = await githubApi(`/repos/${controlRepo}/installation`, { token: appJwt });
@@ -182,9 +131,8 @@ export default {
           base_sha: pr.base.sha,
           head_sha: pr.head.sha,
           trigger_user: triggerUser,
-          source_comment_id: sourceId,
+          source_comment_id: trigger.sourceId,
           source_kind: trigger.sourceKind,
-          requested_mode: trigger.requestedMode,
         },
       },
       expectNoContent: true,
@@ -194,9 +142,7 @@ export default {
       accepted: true,
       target: `${targetRepo}#${prNumber}`,
       head_sha: pr.head.sha,
-      requested_mode: trigger.requestedMode,
       source_kind: trigger.sourceKind,
-      ...(deliveryRoute ? { mode: 'delivery-v1' } : {}),
     }, 202);
   },
 };
@@ -246,45 +192,6 @@ async function createInstallationToken(installationId, appJwt) {
   });
   if (!result.token) throw new Error('GitHub did not return an installation token');
   return result.token;
-}
-
-async function hasProcessedSourceComment(targetRepo, prNumber, commentId, expectedReviewAuthor, token) {
-  const markers = sourceCommentMarkers(commentId);
-  for (let page = 1; page <= 100; page += 1) {
-    const reviews = await githubApi(`/repos/${targetRepo}/pulls/${prNumber}/reviews?per_page=100&page=${page}`, { token });
-    if (!Array.isArray(reviews)) throw new Error('GitHub pull request reviews response was not an array');
-    if (reviews.some((review) =>
-      review?.user?.login === expectedReviewAuthor &&
-      typeof review.body === 'string' &&
-      markers.some((marker) => review.body.includes(marker)))) {
-      return true;
-    }
-    if (reviews.length < 100) break;
-  }
-
-  // Model-backed runs are marked by their PR review. No-model terminal paths
-  // (READY-on-same-HEAD, waiting-for-repair, HUMAN_REQUIRED) are marked only
-  // when the final status comment is successfully updated.
-  for (let page = 1; page <= 100; page += 1) {
-    const comments = await githubApi(`/repos/${targetRepo}/issues/${prNumber}/comments?per_page=100&page=${page}`, { token });
-    if (!Array.isArray(comments)) throw new Error('GitHub issue comments response was not an array');
-    if (comments.some((comment) =>
-      comment?.user?.login === expectedReviewAuthor &&
-      typeof comment.body === 'string' &&
-      markers.some((marker) => comment.body.includes(marker)))) {
-      return true;
-    }
-    if (comments.length < 100) return false;
-  }
-  throw new Error('Pull request review/comment pagination exceeded safety limit');
-}
-
-function sourceCommentMarkers(commentId) {
-  const id = String(commentId);
-  return [
-    `<!-- jiaze-review-source-comment:${id} -->`,
-    `<!-- claude-review-source-comment:${id} -->`,
-  ];
 }
 
 async function githubApi(path, { method = 'GET', token, body, expectNoContent = false } = {}) {
