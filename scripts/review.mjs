@@ -15,7 +15,7 @@ import {
   BOT_LOGIN, MAX_ATTEMPTS, MAX_ROUNDS, MAX_SCOPE_FILES, STALL_LIMIT, commitStatusFor, isBlocking, parseComment, readState, renderComment,
 } from './review-contract.mjs';
 import {
-  BATCH_LIMITS, applyBatch, claimAttempt, concludeRound, discardAttempt, failAttempt, isCovered, makeScope, maxReadCalls, nextBatch, overflowState,
+  BATCH_LIMITS, applyBatch, claimAttempt, concludeRound, discardAttempt, failAttempt, isCovered, makeScope, maxReadCalls, countBatches, nextBatch, overflowState,
   parseBatchOutput, planRun, readCallsFor, stopRun, stoppedState,
 } from './review-engine.mjs';
 import { DEFAULT_IGNORE, assertDiffCoverage, decodeGitPath, matchesIgnore, parseIgnorePatterns, splitDiffByFile } from './review-shards.mjs';
@@ -319,7 +319,8 @@ export async function runReview({ env = process.env, github, provider, loadCtx =
   const read = readState(await github.readRecords(), { botLogin, repo: target, prNumber });
   const baseSha = env.BASE_SHA || pr.base_sha; // the base the workflow builds the review context from
   let plan = planRun({ pr, requestedHead: env.HEAD_SHA, read, now: now() });
-  if ((plan.action === 'reuse' || plan.action === 'hold') && baseSha) {
+  const st = read.kind === 'ok' ? read.state : null;
+  if (st && baseSha && ['reuse', 'hold', 'budget_stop', 'run'].includes(plan.action) && (st.completed_head_sha === pr.head_sha || st.head_sha === pr.head_sha)) {
     // Same HEAD is only the same review if the diff is the same: look up the merge-base the context would use now.
     plan = planRun({ pr, requestedHead: env.HEAD_SHA, read, now: now(), mergeBase: await github.getMergeBase(baseSha, pr.head_sha) });
   }
@@ -337,7 +338,9 @@ export async function runReview({ env = process.env, github, provider, loadCtx =
       await project(github, plan.state, log); // heals a missing status; never changes the result
       return result({ status: plan.state.status });
     case 'budget_stop': {
-      const stopped = stoppedState({ prev: plan.state, repo: target, prNumber, head: pr.head_sha, reason: plan.reason, now: now() });
+      // After base drift the STOPPED document names the CURRENT baseline, so a consumer can tell it is about this diff.
+      const stopped = stoppedState({ prev: plan.state, repo: target, prNumber, head: pr.head_sha, reason: plan.reason, now: now(),
+        scope: plan.rebase ? { ...plan.state.scope, merge_base_sha: plan.rebase } : undefined });
       await store.write(stopped);
       await project(github, stopped, log);
       return result({ status: 'STOPPED' });
@@ -375,6 +378,22 @@ export async function runReview({ env = process.env, github, provider, loadCtx =
     await store.write(stopped);
     await project(github, stopped, log);
     return result({ status: 'STOPPED' });
+  }
+
+  // The whole PR must fit the attempts that are left, or no attempt is spent on it.
+  {
+    const keep = plan.state && plan.state.head_sha === head && plan.state.scope.files_sha256 === scope.files_sha256 && plan.state.scope.merge_base_sha === scope.merge_base_sha;
+    const done = new Set(keep ? plan.state.reviewed_files : []);
+    const todo = scopeFiles.filter((file) => !done.has(file));
+    const left = MAX_ATTEMPTS - (plan.state?.attempts_used ?? 0);
+    const need = countBatches({ files: todo, bytesOf: (file) => byPath.get(file).bytes, readsOf, maxReads: turnReads });
+    if (need > left) {
+      const stopped = stoppedState({ prev: plan.state, repo: target, prNumber, head, scope, stalled: true, now: now(),
+        reason: `${todo.length} file(s) still to review need at least ${need} model executions (a batch is at most ${BATCH_LIMITS.maxFiles} files or about ${Math.round(BATCH_LIMITS.targetBytes / 1000)} KB of diff), but only ${left} of ${MAX_ATTEMPTS} remain for this pull request. Split the pull request or review it manually.` });
+      await store.write(stopped);
+      await project(github, stopped, log);
+      return result({ status: 'STOPPED' });
+    }
   }
 
   const limits = provider.limits;

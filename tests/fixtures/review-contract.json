@@ -268,6 +268,96 @@
       }
     },
     {
+      "name": "same HEAD, merge-base moved: the old READY is not current",
+      "repo": "owner/repo",
+      "pr_number": 123,
+      "local_head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "current_head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "comment_author_login": "jiaze-claude-review-bot[bot]",
+      "comment_author_type": "Bot",
+      "current_merge_base_sha": "9999999999999999999999999999999999999999",
+      "comment_body": "<!-- agent-delivery:v1 -->\n```json\n{\n  \"schema_version\": 2,\n  \"repo\": \"owner/repo\",\n  \"pr_number\": 123,\n  \"head_sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\n  \"status\": \"READY\",\n  \"reason\": \"Round 1 complete: all 2 reviewable file(s) were covered and there is no unresolved P0-P2 finding (P3 items are suggestions).\",\n  \"completed_rounds\": 1,\n  \"completed_head_sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\n  \"attempts_used\": 1,\n  \"stalled_attempts\": 0,\n  \"scope\": {\n    \"merge_base_sha\": \"0000000000000000000000000000000000000000\",\n    \"files_sha256\": \"7a343a74709108f89fca9626a0ceffb80141d64de8a58f617b93cc81ed0d33ce\",\n    \"total_files\": 2,\n    \"skipped_files\": 0\n  },\n  \"reviewed_files\": [],\n  \"findings\": [],\n  \"updated_at\": \"2026-11-21T08:00:00.000Z\"\n}\n```\n\n**Review: READY** (rounds 1/2, attempts 1/10, HEAD `aaaaaaaaaaaa`)\n\nRound 1 complete: all 2 reviewable file(s) were covered and there is no unresolved P0-P2 finding (P3 items are suggestions).\n",
+      "expected": {
+        "trusted": true,
+        "decision": "WAIT"
+      }
+    },
+    {
+      "name": "same HEAD, merge-base unchanged: the READY stands",
+      "repo": "owner/repo",
+      "pr_number": 123,
+      "local_head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "current_head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "comment_author_login": "jiaze-claude-review-bot[bot]",
+      "comment_author_type": "Bot",
+      "current_merge_base_sha": "0000000000000000000000000000000000000000",
+      "comment_body": "<!-- agent-delivery:v1 -->\n```json\n{\n  \"schema_version\": 2,\n  \"repo\": \"owner/repo\",\n  \"pr_number\": 123,\n  \"head_sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\n  \"status\": \"READY\",\n  \"reason\": \"Round 1 complete: all 2 reviewable file(s) were covered and there is no unresolved P0-P2 finding (P3 items are suggestions).\",\n  \"completed_rounds\": 1,\n  \"completed_head_sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\n  \"attempts_used\": 1,\n  \"stalled_attempts\": 0,\n  \"scope\": {\n    \"merge_base_sha\": \"0000000000000000000000000000000000000000\",\n    \"files_sha256\": \"7a343a74709108f89fca9626a0ceffb80141d64de8a58f617b93cc81ed0d33ce\",\n    \"total_files\": 2,\n    \"skipped_files\": 0\n  },\n  \"reviewed_files\": [],\n  \"findings\": [],\n  \"updated_at\": \"2026-11-21T08:00:00.000Z\"\n}\n```\n\n**Review: READY** (rounds 1/2, attempts 1/10, HEAD `aaaaaaaaaaaa`)\n\nRound 1 complete: all 2 reviewable file(s) were covered and there is no unresolved P0-P2 finding (P3 items are suggestions).\n",
+      "expected": {
+        "trusted": true,
+        "decision": "READY"
+      }
+    },
+    {
+      "name": "same HEAD, merge-base moved, partial redo is a valid IN_PROGRESS (not a phantom round)",
+      "repo": "owner/repo",
+      "pr_number": 123,
+      "local_head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "current_head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "comment_author_login": "jiaze-claude-review-bot[bot]",
+      "comment_author_type": "Bot",
+      "current_merge_base_sha": "9999999999999999999999999999999999999999",
+      "comment_body": "<!-- agent-delivery:v1 -->\n```json\n{\n  \"schema_version\": 2,\n  \"repo\": \"owner/repo\",\n  \"pr_number\": 123,\n  \"head_sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\n  \"status\": \"IN_PROGRESS\",\n  \"reason\": \"Review round 1 of 2 in progress: attempt 2/10, 1/2 file(s) reviewed.\",\n  \"completed_rounds\": 0,\n  \"completed_head_sha\": null,\n  \"attempts_used\": 2,\n  \"stalled_attempts\": 0,\n  \"scope\": {\n    \"merge_base_sha\": \"9999999999999999999999999999999999999999\",\n    \"files_sha256\": \"7a343a74709108f89fca9626a0ceffb80141d64de8a58f617b93cc81ed0d33ce\",\n    \"total_files\": 2,\n    \"skipped_files\": 0\n  },\n  \"reviewed_files\": [\n    \"src/a.js\"\n  ],\n  \"findings\": [],\n  \"updated_at\": \"2026-11-21T08:00:00.000Z\",\n  \"claimed_at\": \"2026-11-21T08:00:00.000Z\"\n}\n```\n\n**Review: IN_PROGRESS** (rounds 0/2, attempts 2/10, HEAD `aaaaaaaaaaaa`)\n\nReview round 1 of 2 in progress: attempt 2/10, 1/2 file(s) reviewed.\n\nCoverage in progress: 1/2 file(s) reviewed, 1 remaining.\n",
+      "expected": {
+        "trusted": true,
+        "decision": "WAIT"
+      }
+    },
+    {
+      "name": "same HEAD, merge-base moved, redo complete: READY for the current scope, still one round",
+      "repo": "owner/repo",
+      "pr_number": 123,
+      "local_head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "current_head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "comment_author_login": "jiaze-claude-review-bot[bot]",
+      "comment_author_type": "Bot",
+      "current_merge_base_sha": "9999999999999999999999999999999999999999",
+      "comment_body": "<!-- agent-delivery:v1 -->\n```json\n{\n  \"schema_version\": 2,\n  \"repo\": \"owner/repo\",\n  \"pr_number\": 123,\n  \"head_sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\n  \"status\": \"READY\",\n  \"reason\": \"Round 1 complete: all 2 reviewable file(s) were covered and there is no unresolved P0-P2 finding (P3 items are suggestions).\",\n  \"completed_rounds\": 1,\n  \"completed_head_sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\n  \"attempts_used\": 2,\n  \"stalled_attempts\": 0,\n  \"scope\": {\n    \"merge_base_sha\": \"9999999999999999999999999999999999999999\",\n    \"files_sha256\": \"7a343a74709108f89fca9626a0ceffb80141d64de8a58f617b93cc81ed0d33ce\",\n    \"total_files\": 2,\n    \"skipped_files\": 0\n  },\n  \"reviewed_files\": [],\n  \"findings\": [],\n  \"updated_at\": \"2026-11-21T08:00:00.000Z\"\n}\n```\n\n**Review: READY** (rounds 1/2, attempts 2/10, HEAD `aaaaaaaaaaaa`)\n\nRound 1 complete: all 2 reviewable file(s) were covered and there is no unresolved P0-P2 finding (P3 items are suggestions).\n",
+      "expected": {
+        "trusted": true,
+        "decision": "READY"
+      }
+    },
+    {
+      "name": "budget exhausted after merge-base drift: STOPPED for the current HEAD is reported, never an endless WAIT",
+      "repo": "owner/repo",
+      "pr_number": 123,
+      "local_head_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "current_head_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "comment_author_login": "jiaze-claude-review-bot[bot]",
+      "comment_author_type": "Bot",
+      "current_merge_base_sha": "9999999999999999999999999999999999999999",
+      "comment_body": "<!-- agent-delivery:v1 -->\n```json\n{\n  \"schema_version\": 2,\n  \"repo\": \"owner/repo\",\n  \"pr_number\": 123,\n  \"head_sha\": \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\n  \"status\": \"STOPPED\",\n  \"reason\": \"Model execution budget used up (10/10); HEAD bbbbbbbbbbbb cannot be reviewed automatically.\",\n  \"completed_rounds\": 1,\n  \"completed_head_sha\": null,\n  \"attempts_used\": 10,\n  \"stalled_attempts\": 0,\n  \"scope\": {\n    \"merge_base_sha\": \"9999999999999999999999999999999999999999\",\n    \"files_sha256\": \"7a343a74709108f89fca9626a0ceffb80141d64de8a58f617b93cc81ed0d33ce\",\n    \"total_files\": 2,\n    \"skipped_files\": 0\n  },\n  \"reviewed_files\": [],\n  \"findings\": [\n    {\n      \"id\": \"F001\",\n      \"severity\": \"P1\",\n      \"title\": \"Upload retry drops the last chunk\",\n      \"path\": \"src/a.js\",\n      \"failure_path\": \"When the second attempt starts, the final chunk is skipped so the file is truncated.\",\n      \"verification\": \"FIXED\",\n      \"checked_head_sha\": \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"\n    }\n  ],\n  \"updated_at\": \"2026-11-21T08:00:00.000Z\"\n}\n```\n\n**Review: STOPPED** (rounds 1/2, attempts 10/10, HEAD `bbbbbbbbbbbb`)\n\nModel execution budget used up (10/10); HEAD bbbbbbbbbbbb cannot be reviewed automatically.\n\n| ID | Severity | State | Path | Failure path |\n| --- | --- | --- | --- | --- |\n| F001 | P1 | FIXED | `src/a.js` | When the second attempt starts, the final chunk is skipped so the file is truncated. |\n\nP3 items are suggestions and never block. This comment is generated from the JSON above.\n",
+      "expected": {
+        "trusted": true,
+        "decision": "STOPPED"
+      }
+    },
+    {
+      "name": "a STOPPED whose last reviewed merge-base is stale is still reported",
+      "repo": "owner/repo",
+      "pr_number": 123,
+      "local_head_sha": "cccccccccccccccccccccccccccccccccccccccc",
+      "current_head_sha": "cccccccccccccccccccccccccccccccccccccccc",
+      "comment_author_login": "jiaze-claude-review-bot[bot]",
+      "comment_author_type": "Bot",
+      "current_merge_base_sha": "9999999999999999999999999999999999999999",
+      "comment_body": "<!-- agent-delivery:v1 -->\n```json\n{\n  \"schema_version\": 2,\n  \"repo\": \"owner/repo\",\n  \"pr_number\": 123,\n  \"head_sha\": \"cccccccccccccccccccccccccccccccccccccccc\",\n  \"status\": \"STOPPED\",\n  \"reason\": \"Both review rounds are used (2/2); HEAD cccccccccccc was not reviewed and no further automatic round starts.\",\n  \"completed_rounds\": 2,\n  \"completed_head_sha\": \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\n  \"attempts_used\": 2,\n  \"stalled_attempts\": 0,\n  \"scope\": {\n    \"merge_base_sha\": \"0000000000000000000000000000000000000000\",\n    \"files_sha256\": \"7a343a74709108f89fca9626a0ceffb80141d64de8a58f617b93cc81ed0d33ce\",\n    \"total_files\": 2,\n    \"skipped_files\": 0\n  },\n  \"reviewed_files\": [],\n  \"findings\": [\n    {\n      \"id\": \"F001\",\n      \"severity\": \"P1\",\n      \"title\": \"Upload retry drops the last chunk\",\n      \"path\": \"src/a.js\",\n      \"failure_path\": \"When the second attempt starts, the final chunk is skipped so the file is truncated.\",\n      \"verification\": \"FIXED\",\n      \"checked_head_sha\": \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"\n    }\n  ],\n  \"updated_at\": \"2026-11-21T08:00:00.000Z\"\n}\n```\n\n**Review: STOPPED** (rounds 2/2, attempts 2/10, HEAD `cccccccccccc`)\n\nBoth review rounds are used (2/2); HEAD cccccccccccc was not reviewed and no further automatic round starts.\n\n| ID | Severity | State | Path | Failure path |\n| --- | --- | --- | --- | --- |\n| F001 | P1 | FIXED | `src/a.js` | When the second attempt starts, the final chunk is skipped so the file is truncated. |\n\nP3 items are suggestions and never block. This comment is generated from the JSON above.\n",
+      "expected": {
+        "trusted": true,
+        "decision": "STOPPED"
+      }
+    },
+    {
       "name": "review still IN_PROGRESS",
       "repo": "owner/repo",
       "pr_number": 123,

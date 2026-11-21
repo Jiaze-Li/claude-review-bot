@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { BOT_LOGIN, readState, renderComment } from '../scripts/review-contract.mjs';
 import { createProvider, loadContext, runReview } from '../scripts/review.mjs';
 import { nextBatch, readCallsFor, maxReadCalls } from '../scripts/review-engine.mjs';
 import { splitDiffByFile } from '../scripts/review-shards.mjs';
@@ -153,38 +154,121 @@ test('a file too large to read through in one attempt stops the PR before any mo
   assert.match(stateOf(gh).reason, /too large to read through/);
 });
 
-test('same HEAD, different merge-base: a finished review is not reused; same merge-base still is', async () => {
+const names = (n) => Array.from({ length: n }, (_, i) => `src/f${String(i).padStart(2, '0')}.js`);
+const ok = (c) => model.ok({ assigned: c.assigned });
+const reread = (gh) => readState(gh.comments, { botLogin: BOT_LOGIN, repo: REPO, prNumber: PR });
+
+test('same HEAD, different merge-base: the old READY is not reused, and the redo is the CURRENT phase, not a new one', async () => {
   const gh = fakeGithub();
-  const names = ['src/a.js', 'src/b.js'];
-  const first = scriptedProvider((c) => model.ok({ assigned: c.assigned }));
-  await review({ gh, provider: first, ctx: makeContext(names) });
+  await review({ gh, provider: scriptedProvider(ok), ctx: makeContext(names(2)) });
   assert.equal(stateOf(gh).status, 'READY');
   assert.equal(stateOf(gh).completed_rounds, 1);
 
-  const same = scriptedProvider((c) => model.ok({ assigned: c.assigned }));
-  const reused = await review({ gh, provider: same, ctx: makeContext(names) });
-  assert.equal(reused.action, 'reuse');
+  const same = scriptedProvider(ok);
+  assert.equal((await review({ gh, provider: same, ctx: makeContext(names(2)) })).action, 'reuse');
   assert.equal(same.calls.length, 0);
 
-  gh.mergeBase = sha('9'); // the base moved under the same HEAD: the diff is different
-  const moved = scriptedProvider((c) => model.ok({ assigned: c.assigned }));
-  const again = await review({ gh, provider: moved, ctx: makeContext(names, { mergeBase: sha('9') }) });
+  gh.mergeBase = sha('9');
+  const moved = scriptedProvider(ok);
+  const again = await review({ gh, provider: moved, ctx: makeContext(names(2), { mergeBase: sha('9') }) });
   assert.equal(again.action, 'run');
   assert.ok(moved.calls.length > 0, 'the new diff is reviewed');
-  assert.equal(stateOf(gh).scope.merge_base_sha, sha('9'));
-  assert.equal(stateOf(gh).completed_rounds, 2, 'a review of a different diff is a new round, never a free reuse');
-  assert.notEqual(MERGE_BASE, sha('9'));
+  const s = stateOf(gh);
+  assert.equal(s.scope.merge_base_sha, sha('9'));
+  assert.equal(s.completed_rounds, 1, 'no phantom round: the one-and-only fix/verification opportunity is untouched');
+  assert.equal(s.status, 'READY');
+  assert.equal(s.attempts_used, 2, 'but the model attempt is really spent');
 });
 
-test('same HEAD, merge-base changed mid-way: partial progress from the old diff is dropped, not resumed', async () => {
+test('same HEAD, new merge-base, >10 files: a partial batch is a VALID state, survives a technical stop, and resumes to a completed round', async () => {
   const gh = fakeGithub();
-  const names = Array.from({ length: 14 }, (_, i) => `src/f${String(i).padStart(2, '0')}.js`);
-  const crash = scriptedProvider((c) => (c.n === 1 ? model.ok({ assigned: c.assigned }) : model.fail('boom')));
-  await review({ gh, provider: crash, ctx: makeContext(names) });
-  assert.equal(stateOf(gh).reviewed_files.length, 10);
+  const files = names(14);
+  await review({ gh, provider: scriptedProvider(ok), ctx: makeContext(files) });
+  assert.equal(stateOf(gh).status, 'READY');
 
   gh.mergeBase = sha('8');
-  const next = scriptedProvider((c) => model.ok({ assigned: c.assigned }));
-  await review({ gh, provider: next, ctx: makeContext(names, { mergeBase: sha('8') }) });
-  assert.equal(new Set(next.calls.flatMap((c) => c.assigned)).size, 14, 'every file is reviewed again against the new merge-base');
+  const ctx = makeContext(files, { mergeBase: sha('8') });
+  const crash = scriptedProvider((c) => (c.n === 1 ? ok(c) : model.fail('boom')));
+  await review({ gh, provider: crash, ctx });
+  let read = reread(gh);
+  assert.equal(read.kind, 'ok', `a persisted partial state must be readable: ${read.reason}`);
+  assert.equal(read.state.reviewed_files.length, 10);
+  assert.equal(read.state.completed_rounds, 0, 'the reopened round is not counted while it is being redone');
+  assert.equal(read.state.completed_head_sha, null);
+  assert.equal(read.state.status, 'STOPPED');
+
+  const spent = read.state.attempts_used;
+  const resume = scriptedProvider(ok);
+  const r = await review({ gh, provider: resume, ctx });
+  assert.equal(r.action, 'run', 'a partial redo is never mistaken for a complete review');
+  assert.equal(resume.calls.flatMap((c) => c.assigned).length, 4, 'only the remaining files');
+  read = reread(gh);
+  assert.equal(read.kind, 'ok');
+  assert.equal(read.state.status, 'READY');
+  assert.equal(read.state.completed_rounds, 1);
+  assert.equal(read.state.attempts_used, spent + resume.calls.length, 'every real attempt is counted, none refunded');
+});
+
+test('base drift after BOTH rounds: the final phase is redone under the remaining attempts; with none left it is an authoritative STOPPED naming the current baseline', async () => {
+  const gh = fakeGithub({ head: sha('a') });
+  await review({ gh, provider: scriptedProvider((c) => model.ok({ assigned: c.assigned, findings: [{ severity: 'P2', title: 'Bug', path: 'src/f00.js', failure_path: 'trigger then wrong result' }] })), ctx: makeContext(names(2)) });
+  gh.head = sha('b');
+  await review({ gh, provider: scriptedProvider((c) => model.ok({ assigned: c.assigned, prior: [{ id: 'F001', verification: 'FIXED', evidence: 'fixed at f00:3' }] })), ctx: makeContext(names(2)) });
+  assert.equal(stateOf(gh).completed_rounds, 2);
+  assert.equal(stateOf(gh).status, 'READY');
+
+  const exhausted = JSON.parse(JSON.stringify(stateOf(gh)));
+  gh.mergeBase = sha('7');
+  const redo = scriptedProvider(ok);
+  await review({ gh, provider: redo, ctx: makeContext(names(2), { mergeBase: sha('7') }) });
+  assert.equal(redo.calls.length, 1, 'no third phase, no budget_stop: the second phase is redone');
+  assert.equal(stateOf(gh).completed_rounds, 2);
+  assert.equal(stateOf(gh).scope.merge_base_sha, sha('7'));
+
+  // no attempts left
+  gh.comments[0].body = renderComment({ ...exhausted, attempts_used: 10 });
+  gh.mergeBase = sha('6');
+  const none = scriptedProvider(ok);
+  const r = await review({ gh, provider: none, ctx: makeContext(names(2), { mergeBase: sha('6') }) });
+  assert.equal(none.calls.length, 0);
+  assert.equal(r.status, 'STOPPED');
+  const s = reread(gh);
+  assert.equal(s.kind, 'ok', s.reason);
+  assert.equal(s.state.status, 'STOPPED');
+  assert.equal(s.state.scope.merge_base_sha, sha('6'), 'the STOPPED names the current baseline');
+  assert.notEqual(s.state.completed_head_sha, s.state.head_sha, 'and does not pose as a completed review of it');
+  assert.match(s.state.reason, /budget used up/);
+});
+
+test('whole-PR preflight: 26 files fit; 60 files fit; a PR that cannot finish within 10 executions stops before any model call', async () => {
+  for (const n of [26, 60]) {
+    const gh = fakeGithub();
+    const p = scriptedProvider(ok);
+    const r = await review({ gh, provider: p, ctx: makeContext(names(n)) });
+    assert.equal(r.status, 'READY', `${n} files`);
+    assert.equal(p.calls.length, Math.ceil(n / 10));
+  }
+  for (const n of [101, 156]) {
+    const gh = fakeGithub();
+    const p = scriptedProvider(ok);
+    const r = await review({ gh, provider: p, ctx: makeContext(names(n).concat(Array.from({ length: Math.max(0, n - 100) }, (_, i) => `docs/x${i}.md`)).slice(0, n)) });
+    assert.equal(r.status, 'STOPPED', `${n} files`);
+    assert.equal(p.calls.length, 0, 'no attempt is spent');
+    assert.equal(stateOf(gh).attempts_used, 0);
+    assert.equal(stateOf(gh).completed_rounds, 0);
+    assert.match(stateOf(gh).reason, new RegExp(`need at least ${Math.ceil(n / 10)} model executions.*only 10 of 10 remain`));
+  }
+});
+
+test('preflight counts what is left: progress already credited and attempts already spent are taken into account', async () => {
+  const gh = fakeGithub();
+  const files = names(30);
+  // two batches done, then the run stops; 3 batches in total are needed, 8 attempts remain
+  const crash = scriptedProvider((c) => (c.n <= 2 ? ok(c) : model.fail('boom')));
+  await review({ gh, provider: crash, ctx: makeContext(files) });
+  assert.equal(stateOf(gh).reviewed_files.length, 20);
+  const fin = scriptedProvider(ok);
+  const r = await review({ gh, provider: fin, ctx: makeContext(files) });
+  assert.equal(r.status, 'READY');
+  assert.equal(fin.calls.length, 1);
 });

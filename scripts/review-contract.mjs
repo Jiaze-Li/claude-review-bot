@@ -57,7 +57,7 @@ export function validateState(state, expected = {}) {
   if (!Number.isInteger(state.completed_rounds) || state.completed_rounds < 0 || state.completed_rounds > MAX_ROUNDS) errors.push('completed_rounds out of range');
   if (state.completed_head_sha !== null && !(typeof state.completed_head_sha === 'string' && SHA_RE.test(state.completed_head_sha))) errors.push('completed_head_sha must be a SHA or null');
   if (state.completed_rounds === 0 && state.completed_head_sha !== null) errors.push('completed_head_sha without a completed round');
-  if (state.completed_rounds > 0 && state.completed_head_sha === null) errors.push('completed round without completed_head_sha');
+  // completed_rounds > 0 with a null completed_head_sha is valid: the last concluded round is being redone because its diff changed.
   if (!Number.isInteger(state.attempts_used) || state.attempts_used < 0 || state.attempts_used > MAX_ATTEMPTS) errors.push('attempts_used out of range');
   if (!Number.isInteger(state.stalled_attempts) || state.stalled_attempts < 0) errors.push('stalled_attempts must be a non-negative integer');
   const scope = state.scope;
@@ -158,12 +158,16 @@ export function commitStatusFor(state) {
 }
 
 // What a consumer concludes from one comment, given context obtained independently of it: repo, PR number, its local
-// HEAD and the remote's current HEAD. Nothing absent, stale, forged or inconsistent is ever READY.
-export function evaluateComment({ repo, prNumber, localHead, currentHead, authorLogin, authorType, body, botLogin = BOT_LOGIN }) {
+// HEAD and the remote's current HEAD (and, when it knows it, the PR's current merge-base). Nothing absent, stale, forged
+// or inconsistent is ever READY. A READY/CHANGES_REQUESTED describes one scope: if its merge-base is not the current one
+// it is WAIT. A trusted STOPPED for the current HEAD is always reported, whatever scope it last reviewed: the bot has
+// stopped and said why, and waiting for it would never end.
+export function evaluateComment({ repo, prNumber, localHead, currentHead, currentMergeBase, authorLogin, authorType, body, botLogin = BOT_LOGIN }) {
   const read = readState(body ? [{ source: 'issue', id: '0', login: authorLogin, type: authorType, body }] : [], { botLogin, repo, prNumber });
   if (read.kind !== 'ok') return { trusted: false, decision: 'WAIT' };
   const { state } = read;
   if (state.head_sha !== currentHead || state.head_sha !== localHead) return { trusted: true, decision: 'WAIT' };
   if (state.status === 'IN_PROGRESS') return { trusted: true, decision: 'WAIT' };
+  if (state.status !== 'STOPPED' && currentMergeBase && state.scope.merge_base_sha !== currentMergeBase) return { trusted: true, decision: 'WAIT' };
   return { trusted: true, decision: state.status };
 }

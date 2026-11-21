@@ -27,8 +27,8 @@ const P1 = { severity: 'P1', title: 'Upload retry drops the last chunk', path: '
 const P2 = { severity: 'P2', title: 'Cache never expires', path: 'src/b.js', failure_path: 'A stale entry is served forever after the source changes.' };
 
 // One real attempt: record it, fold the model output in, conclude the round if coverage is complete.
-export function attempt({ prev = null, head, output, assigned = FILES }) {
-  const claimed = claimAttempt({ prev, repo: REPO, prNumber: PR, head, scope: SCOPE, now: NOW });
+export function attempt({ prev = null, head, output, assigned = FILES, scope = SCOPE }) {
+  const claimed = claimAttempt({ prev, repo: REPO, prNumber: PR, head, scope, now: NOW });
   const applied = applyBatch({ state: claimed, assigned, output, needsRead: new Map(), reads: new Map(), now: NOW });
   return applied.state.reviewed_files.length === FILES.length ? concludeRound(applied.state, NOW) : applied.state;
 }
@@ -36,10 +36,11 @@ const decisionOf = (state) => (state.status === 'IN_PROGRESS' ? 'WAIT' : state.s
 
 export function buildFixtureCases() {
   const cases = [];
-  const add = ({ name, state = null, body = null, head, current = head, local = head, login = BOT_LOGIN, type = 'Bot', repo = REPO, pr = PR, expected }) => {
+  const add = ({ name, state = null, body = null, head, current = head, local = head, base = null, login = BOT_LOGIN, type = 'Bot', repo = REPO, pr = PR, expected }) => {
     cases.push({
       name, repo, pr_number: pr, local_head_sha: local, current_head_sha: current,
-      comment_author_login: login, comment_author_type: type, comment_body: body ?? (state ? renderComment(state) : ''), expected,
+      comment_author_login: login, comment_author_type: type, ...(base ? { current_merge_base_sha: base } : {}),
+      comment_body: body ?? (state ? renderComment(state) : ''), expected,
     });
   };
   const h1 = sha('a'); const h2 = sha('b'); const h3 = sha('c');
@@ -75,6 +76,24 @@ export function buildFixtureCases() {
   add({ name: 'state for another pull request', state: ready1, head: h1, pr: 999, expected: { trusted: false, decision: 'WAIT' } });
   add({ name: 'READY that contradicts its own findings', body: renderComment({ ...changes, status: 'READY' }), head: h1, expected: { trusted: false, decision: 'WAIT' } });
   add({ name: 'READY on a HEAD no round has completed', body: renderComment({ ...ready1, completed_head_sha: h2 }), head: h1, expected: { trusted: false, decision: 'WAIT' } });
+  // Same HEAD, the merge-base moved: the old conclusion describes another diff.
+  const moved = sha('9');
+  const movedScope = makeScope({ mergeBase: moved, files: FILES });
+  add({ name: 'same HEAD, merge-base moved: the old READY is not current', state: ready1, head: h1, base: moved, expected: { trusted: true, decision: 'WAIT' } });
+  add({ name: 'same HEAD, merge-base unchanged: the READY stands', state: ready1, head: h1, base: SCOPE.merge_base_sha, expected: { trusted: true, decision: 'READY' } });
+  const redo = planRun({ pr: { state: 'open', draft: false, head_sha: h1 }, requestedHead: h1, read: { kind: 'ok', state: ready1 }, now: NOW, mergeBase: moved });
+  if (redo.action !== 'run' || redo.state.completed_rounds !== 0) throw new Error(`policy no longer reopens the round on base drift: ${redo.action}`);
+  const redoing = attempt({ prev: redo.state, head: h1, scope: movedScope, output: modelOutput({ reviewed: ['src/a.js'], unreviewed: ['src/b.js'], complete: false }) });
+  add({ name: 'same HEAD, merge-base moved, partial redo is a valid IN_PROGRESS (not a phantom round)', state: redoing, head: h1, base: moved, expected: { trusted: true, decision: 'WAIT' } });
+  const redone = attempt({ prev: redo.state, head: h1, scope: movedScope, output: modelOutput() });
+  add({ name: 'same HEAD, merge-base moved, redo complete: READY for the current scope, still one round', state: redone, head: h1, base: moved, expected: { trusted: true, decision: 'READY' } });
+  const spent = { ...fixed, attempts_used: 10 };
+  const drift = planRun({ pr: { state: 'open', draft: false, head_sha: h2 }, requestedHead: h2, read: { kind: 'ok', state: spent }, now: NOW, mergeBase: moved });
+  if (drift.action !== 'budget_stop' || !drift.rebase) throw new Error(`policy no longer stops an exhausted base drift: ${drift.action}`);
+  const driftStop = stoppedState({ prev: drift.state, repo: REPO, prNumber: PR, head: h2, reason: drift.reason, now: NOW, scope: { ...drift.state.scope, merge_base_sha: drift.rebase } });
+  add({ name: 'budget exhausted after merge-base drift: STOPPED for the current HEAD is reported, never an endless WAIT', state: driftStop, head: h2, base: moved, expected: { trusted: true, decision: 'STOPPED' } });
+  add({ name: 'a STOPPED whose last reviewed merge-base is stale is still reported', state: budget, head: h3, base: moved, expected: { trusted: true, decision: 'STOPPED' } });
+
   const running = claimAttempt({ prev: null, repo: REPO, prNumber: PR, head: h1, scope: SCOPE, now: NOW });
   add({ name: 'review still IN_PROGRESS', state: running, head: h1, expected: { trusted: true, decision: decisionOf(running) } });
   return cases;
@@ -105,7 +124,7 @@ export function checkFixtures(fixtures) {
   const failures = [];
   if (fixtures?.schema_version !== SCHEMA_VERSION || !Array.isArray(fixtures.cases)) return ['fixtures file has the wrong shape'];
   for (const c of fixtures.cases) {
-    const actual = evaluateComment({ repo: c.repo, prNumber: c.pr_number, localHead: c.local_head_sha, currentHead: c.current_head_sha, authorLogin: c.comment_author_login, authorType: c.comment_author_type, body: c.comment_body });
+    const actual = evaluateComment({ repo: c.repo, prNumber: c.pr_number, localHead: c.local_head_sha, currentHead: c.current_head_sha, currentMergeBase: c.current_merge_base_sha, authorLogin: c.comment_author_login, authorType: c.comment_author_type, body: c.comment_body });
     if (actual.trusted !== c.expected.trusted || actual.decision !== c.expected.decision) failures.push(`${c.name}: expected ${JSON.stringify(c.expected)} but got ${JSON.stringify(actual)}`);
   }
   for (const t of fixtures.transitions ?? []) {

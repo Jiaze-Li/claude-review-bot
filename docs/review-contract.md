@@ -14,7 +14,7 @@ One conversation comment per PR, authored by the review App (`jiaze-claude-revie
   "status": "IN_PROGRESS | CHANGES_REQUESTED | READY | STOPPED",
   "reason": "human readable",
   "completed_rounds": 0,             // 0..2 complete review conclusions published for this PR
-  "completed_head_sha": null,        // HEAD of the latest completed round, else null
+  "completed_head_sha": null,        // HEAD of the latest completed round on the CURRENT diff, else null (also null while a concluded round is being redone after the merge-base moved)
   "attempts_used": 1,                // 0..10 model executions started (recorded BEFORE the call; failures are not refunded)
   "stalled_attempts": 0,             // consecutive attempts on this HEAD that credited no new file
   "scope": { "merge_base_sha": "...", "files_sha256": "...", "total_files": 26, "skipped_files": 0 },
@@ -31,7 +31,7 @@ A blocking finding is `severity in P0..P2` and `verification != FIXED`. P3 never
 Decision is one of `READY | CHANGES_REQUESTED | STOPPED | WAIT`. `WAIT` is a display result ("no usable final state yet"), never a remote status.
 
 1. The comment must be by the bot identity with type `Bot`, carry the marker and a parseable, valid `schema_version: 2` JSON for this repo and PR. Otherwise: not trusted, `WAIT`. A `schema_version: 1` document is never a pass.
-2. `head_sha` must equal both the consumer's local HEAD and the remote's current HEAD. Otherwise `WAIT`.
+2. `head_sha` must equal both the consumer's local HEAD and the remote's current HEAD. Otherwise `WAIT`. For `READY` and `CHANGES_REQUESTED`, `scope.merge_base_sha` must also equal the PR's current merge-base (a conclusion describes one scope); otherwise `WAIT`. A trusted `STOPPED` for the current HEAD is reported as `STOPPED` whatever scope it last reviewed: the bot has stopped and said why, so waiting would never end.
 3. `IN_PROGRESS` is `WAIT`. Otherwise the decision is the status.
 4. A `READY` that contradicts its own JSON (blocking finding, or `completed_head_sha != head_sha`) is invalid, hence `WAIT`.
 
@@ -44,7 +44,8 @@ Decision is one of `READY | CHANGES_REQUESTED | STOPPED | WAIT`. `WAIT` is a dis
 - Round 1 complete: no blocker -> `READY`; blocker -> `CHANGES_REQUESTED`. Round 2 complete: no blocker -> `READY`; blocker or `UNCERTAIN` -> `STOPPED`. There is no third round; later HEADs are `STOPPED` unreviewed. Incomplete coverage never publishes `CHANGES_REQUESTED`, even with a P2 in hand.
 - Earlier blockers are re-verified on the new HEAD (`FIXED` needs evidence). A blocker nobody verified is `UNCERTAIN`, never fixed. Findings are only added or escalated: IDs are stable, a repeated issue never loses to an old P3/FIXED, nothing is truncated to reach `READY`. More than 40 findings is `STOPPED`.
 - The round count and its conclusion are written in the same single comment PATCH. Before every write the comment must still be what the run last wrote; a write whose response is lost is verified by re-reading.
-- Same HEAD, complete, same merge-base: reuse (no call, no count); a different merge-base is a different diff and is reviewed (and counted) again. Same HEAD, incomplete: resume while budget remains. New HEAD while incomplete: coverage restarts, attempts and findings carry over. HEAD change during an attempt: the attempt stays spent and its result is discarded.
+- Same HEAD, complete, same merge-base: reuse (no call, no count). Same HEAD, different merge-base: the diff is new, so the old conclusion is void and the round that concluded on it is **reopened** (`completed_rounds - 1`, `completed_head_sha = null`) and redone as the current phase: it does not use up the one fix/verification opportunity, but every model attempt it takes is counted. With no attempts left the bot publishes `STOPPED` for the current HEAD with `scope.merge_base_sha` set to the current baseline. Same HEAD, incomplete: resume while budget remains. New HEAD while incomplete: coverage restarts, attempts and findings carry over. HEAD change during an attempt: the attempt stays spent and its result is discarded.
+- Whole-PR preflight: before any attempt is spent, the files still to review are batched (at most 10 files, ~70 KB of diff and the Read calls the attempt's turns allow per batch); if that needs more executions than remain of the 10, the PR is `STOPPED` with the numbers, no model call, no attempt used. Finite capacity is deliberate: about 100 small files per PR; split larger ones or review them manually.
 - Budget per PR (never reset by rerun, HEAD change or tooling): 10 model executions, each at most 14 turns, 8 minutes and USD 0.50 (SDK nominal estimate, not a bill) -> worst case 140 turns, 80 minutes, USD 5.00 nominal (the previous delivery-v1 worst case was 2 x USD 2.50 = USD 5.00, 40 turns). One workflow run also stops after 6 attempts or 30 minutes; 4 consecutive attempts on one HEAD without progress stop that HEAD.
 
 ## One-time migration from schema_version 1

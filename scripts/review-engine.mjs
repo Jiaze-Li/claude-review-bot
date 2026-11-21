@@ -47,21 +47,28 @@ export function planRun({ pr, requestedHead, read, now = Date.now(), mergeBase }
     if (!Number.isFinite(startedAt) || now - startedAt < IN_PROGRESS_TIMEOUT_MS) return { action: 'wait_in_progress', reason: 'a review attempt is still running', state };
     state = interrupted(state, now); // the attempt stays spent; nothing is credited
   }
-  const sameBase = mergeBase === undefined || state.scope.merge_base_sha === mergeBase;
-  if (state.completed_head_sha === pr.head_sha && sameBase) return { action: 'reuse', reason: 'a complete review already exists for this HEAD', state };
+  // Same HEAD, other merge-base: the diff is a different one. The round that concluded on the old diff is not a verdict on
+  // this one and is not a third phase either: it is reopened (redone as the CURRENT phase, under the remaining attempts).
+  const rebased = mergeBase !== undefined && state.scope.merge_base_sha !== mergeBase;
+  if (rebased && state.completed_head_sha === pr.head_sha) state = reopened(state);
+  if (state.completed_head_sha === pr.head_sha) return { action: 'reuse', reason: 'a complete review already exists for this HEAD', state };
   if (state.completed_rounds >= MAX_ROUNDS) {
-    return { action: 'budget_stop', reason: `Both review rounds are used (${MAX_ROUNDS}/${MAX_ROUNDS}); HEAD ${pr.head_sha.slice(0, 12)} was not reviewed and no further automatic round starts.`, state };
+    return { action: 'budget_stop', reason: `Both review rounds are used (${MAX_ROUNDS}/${MAX_ROUNDS}); HEAD ${pr.head_sha.slice(0, 12)} was not reviewed and no further automatic round starts.`, state, ...(rebased ? { rebase: mergeBase } : {}) };
   }
   if (state.attempts_used >= MAX_ATTEMPTS) {
-    return { action: 'budget_stop', reason: `Model execution budget used up (${MAX_ATTEMPTS}/${MAX_ATTEMPTS}); HEAD ${pr.head_sha.slice(0, 12)} cannot be reviewed automatically.`, state };
+    return { action: 'budget_stop', reason: `Model execution budget used up (${MAX_ATTEMPTS}/${MAX_ATTEMPTS}); HEAD ${pr.head_sha.slice(0, 12)} cannot be reviewed automatically.`, state, ...(rebased ? { rebase: mergeBase } : {}) };
   }
-  if (state.head_sha === pr.head_sha && sameBase && state.stalled_attempts >= STALL_LIMIT) {
+  if (state.head_sha === pr.head_sha && !rebased && state.stalled_attempts >= STALL_LIMIT) {
     return { action: 'hold', reason: 'repeated attempts on this HEAD made no progress; push a new commit to continue', state };
   }
-  return { action: 'run', reason: `review round ${state.completed_rounds + 1} for this HEAD`, state };
+  return { action: 'run', reason: `review round ${state.completed_rounds + 1} for this HEAD`, state, ...(rebased ? { rebase: mergeBase } : {}) };
 }
 
 // ---------------------------------------------------------------- state transitions
+
+// A concluded round whose diff has since changed (same HEAD, other merge-base) is reopened: its count goes back by one and
+// it no longer names a concluding HEAD, so it can neither be reused nor be mistaken for progress on the current scope.
+const reopened = (state) => ({ ...state, completed_rounds: state.completed_rounds - 1, completed_head_sha: null });
 
 const baseFrom = (prev) => ({
   completed_rounds: prev?.completed_rounds ?? 0, completed_head_sha: prev?.completed_head_sha ?? null,
@@ -275,6 +282,19 @@ export function nextBatch({ remaining, bytesOf, readsOf = () => 0, maxReads = In
     reads += needed;
   }
   return batch;
+}
+
+// How many model executions the given files need at the very least (full-size batches). The whole PR is checked against the
+// remaining attempts BEFORE the first one is spent: a PR that cannot finish within the cap stops without any model call.
+export function countBatches({ files, bytesOf, readsOf = () => 0, maxReads = Infinity, limits = BATCH_LIMITS }) {
+  let left = [...files];
+  let count = 0;
+  while (left.length) {
+    const batch = new Set(nextBatch({ remaining: left, bytesOf, readsOf, maxReads, limits }));
+    left = left.filter((file) => !batch.has(file));
+    count += 1;
+  }
+  return count;
 }
 
 // ---------------------------------------------------------------- one-time migration of the retired v1 document
