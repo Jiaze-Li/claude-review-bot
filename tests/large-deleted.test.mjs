@@ -1,13 +1,13 @@
-// Large files that cannot be inlined need real, logged reads before they are credited. A file the PR deletes is not in
-// the HEAD snapshot, so its content is read from its block of the full diff. These tests drive the REAL gateway.
+// Diffs beyond the shared prompt budget need real, logged reads of the entire changed diff block.
+// This proof is independent of file status and never requires reading an entire HEAD source file.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { BOT_LOGIN, readState, renderComment } from '../scripts/review-contract.mjs';
-import { createProvider, loadContext, runReview } from '../scripts/review.mjs';
-import { nextBatch, readCallsFor, maxReadCalls } from '../scripts/review-engine.mjs';
+import { createProvider, loadContext, readNeed, runReview } from '../scripts/review.mjs';
+import { BATCH_LIMITS, nextBatch, readCallsFor, maxReadCalls } from '../scripts/review-engine.mjs';
 import { splitDiffByFile } from '../scripts/review-shards.mjs';
 import { DELETED_LINES, MERGE_BASE, PR, REPO, contextFiles, fakeGithub, makeContext, model, review, scriptedProvider, sha } from './helpers/harness.mjs';
 
@@ -65,11 +65,78 @@ test('diff status distinguishes added, modified, deleted and renamed files, with
   }
 });
 
+test('all file statuses require the diff block, not a full HEAD read, only when the shared budget is exceeded', () => {
+  const blocks = splitDiffByFile([
+    'diff --git a/n.js b/n.js\nnew file mode 100644\n--- /dev/null\n+++ b/n.js\n@@ -0,0 +1 @@\n+a\n',
+    'diff --git a/d.js b/d.js\ndeleted file mode 100644\n--- a/d.js\n+++ /dev/null\n@@ -1 +0,0 @@\n-a\n',
+    'diff --git a/m.js b/m.js\n--- a/m.js\n+++ b/m.js\n@@ -1 +1 @@\n-a\n+b\n',
+    'diff --git a/old.js b/new.js\nsimilarity index 90%\nrename from old.js\nrename to new.js\n@@ -1 +1 @@\n-a\n+b\n',
+  ].join(''));
+  for (const block of blocks) {
+    assert.equal(readNeed(block.path, block), null, 'all small diffs are already delivered in the prompt');
+    assert.deepEqual(readNeed(block.path, block, 1), { key: 'ctx:pr.diff', from: block.startLine, to: block.endLine });
+  }
+});
+
+test('a 60 KB generated-style fixture is fully inlined and a 14-file review completes without tool reads', async () => {
+  const jsonPath = 'test/fixtures/pr-bot-review-contract.json';
+  const files = [...Array.from({ length: 13 }, (_, i) => 'src/f' + i + '.js'), jsonPath];
+  const gh = fakeGithub();
+  const provider = scriptedProvider((call) => {
+    if (call.assigned.includes(jsonPath)) {
+      assert.ok(call.prompt.includes('x'.repeat(60_000)), 'the WHOLE changed fixture is present in the prompt');
+      assert.doesNotMatch(call.prompt, /diff too large to inline|complete .* diff .* exceeds/);
+    }
+    return model.ok({ assigned: call.assigned });
+  });
+  const result = await review({ gh, provider, ctx: makeContext(files, { bigDiff: [jsonPath] }) });
+  assert.equal(result.status, 'READY');
+  assert.equal(stateOf(gh).completed_rounds, 1);
+  assert.equal(stateOf(gh).attempts_used, provider.calls.length);
+  assert.ok(provider.calls.length <= 3, 'batching did not waste a special read attempt on the fixture');
+  assert.equal(BATCH_LIMITS.targetBytes, 70_000);
+});
+
+function modifiedFixture() {
+  const fx = fixture();
+  const diffPath = path.join(fx.ctxDir, 'pr.diff');
+  const changed = fs.readFileSync(diffPath, 'utf8')
+    .replace('deleted file mode 100644\n', '')
+    .replace('+++ /dev/null', '+++ b/' + GONE)
+    .replace('@@ -1,' + DELETED_LINES + ' +0,0 @@', '@@ -1,' + DELETED_LINES + ' +1,0 @@');
+  fs.writeFileSync(diffPath, changed);
+  const headPath = path.join(fx.root, 'safe-target', GONE);
+  fs.mkdirSync(path.dirname(headPath), { recursive: true });
+  fs.writeFileSync(headPath, '// HEAD exists; reading it alone must NOT prove diff coverage.\n');
+  const block = splitDiffByFile(changed)[0];
+  assert.equal(block.status, 'modified');
+  return { ...fx, span: { from: block.startLine, to: block.endLine } };
+}
+
+test('a large MODIFIED file gains credit by reading the changed diff, never by reading HEAD alone', async () => {
+  const fx = modifiedFixture();
+  const denied = await run(fx, async ({ toolGateway }) => {
+    const headRead = await toolGateway.executeRead({ file_path: 'safe-target/' + GONE });
+    assert.equal(headRead.ok, true);
+    return { ok: true, structured: coverage([GONE]) };
+  });
+  assert.notEqual(denied.result.status, 'READY');
+  assert.equal(stateOf(denied.gh).reviewed_files.length, 0);
+
+  const good = await run(fx, async ({ prompt, toolGateway }) => {
+    assert.match(prompt, /diff too large to inline: Read \.review-context\/pr\.diff lines/);
+    await readSpan(toolGateway, fx.span.from, fx.span.to);
+    return { ok: true, structured: coverage([GONE]) };
+  });
+  assert.equal(good.result.status, 'READY');
+  assert.equal(stateOf(good.gh).completed_rounds, 1);
+});
+
 test('a large deleted file completes review from segmented reads of its diff block; HEAD is never asked for it', async () => {
   const fx = fixture();
   const { gh, result, prompts } = await run(fx, async ({ prompt, toolGateway }) => {
     const assigned = [GONE];
-    assert.match(prompt, new RegExp(`${GONE}  \\(diff truncated below: this file is deleted; Read \\.review-context/pr\\.diff lines ${fx.span.from}-${fx.span.to}`));
+    assert.match(prompt, new RegExp(`diff too large to inline: Read \\.review-context/pr\\.diff lines ${fx.span.from}-${fx.span.to}`));
     assert.doesNotMatch(prompt, /you must Read this whole file from safe-target/);
     await readSpan(toolGateway, fx.span.from, fx.span.to);
     return { ok: true, structured: coverage(assigned) };
