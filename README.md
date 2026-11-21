@@ -58,6 +58,13 @@ A full review is used for: a PR's first review, the review after a big or risky 
   a full refresh); anything else gets a full review.
 * If the PR's history was rewritten since the last review (rebase, force-push, the target branch merged in, a changed base), the verification uses the whole current PR diff instead of the old-HEAD-to-new-HEAD diff; if that is too large for one staged review it is reviewed in shards and the old open findings are carried as "needs confirmation" until a person dismisses them (see `docs/rewritten-history-review.md`).
 
+## Delivery v1 (opt-in, two-run review)
+
+Personal projects can opt in with the `delivery-v1` label (Draft, label, Ready): one review, one batched fix, one
+verifying review, then stop. One bot comment holds the whole state. PRs without the label are unaffected. See
+[docs/delivery-v1.md](docs/delivery-v1.md) for the trigger order, real budget limits, permissions, compatibility
+checks, limitations and how to pause it.
+
 ## What you do
 
 1. Open (or mark ready) a PR. A full review starts by itself. **Pushes do not trigger a review.**

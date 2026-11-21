@@ -4,6 +4,7 @@ import {
   parseReviewThreadTrigger,
   parseReviewTrigger,
 } from './review-trigger.js';
+import { hasDeliveryStateComment, parseDeliveryLabelTrigger, routeDelivery } from './delivery.js';
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -84,7 +85,7 @@ export default {
         requireWritePermission: true,
       };
     } else {
-      const automatic = parseAutomaticPullRequestTrigger(event, payload);
+      const automatic = parseAutomaticPullRequestTrigger(event, payload) ?? parseDeliveryLabelTrigger(event, payload);
       if (!automatic) return json({ ignored: true, reason: 'event does not trigger review' });
       const deliveryId = request.headers.get('x-github-delivery');
       if (!deliveryId) return new Response('Missing GitHub webhook delivery id', { status: 400 });
@@ -134,16 +135,31 @@ export default {
 
     const sourceId = trigger.sourceId;
 
+    // Delivery v1 (opt-in). An existing delivery state or the label fixes the mode for this PR; otherwise the
+    // legacy path below is untouched.
+    const delivery = await routeDelivery({
+      trigger,
+      pr,
+      hasState: () => hasDeliveryStateComment({
+        expectedReviewAuthor,
+        listComments: (page) => githubApi(`/repos/${targetRepo}/issues/${prNumber}/comments?per_page=100&page=${page}`, { token: targetToken }),
+      }),
+    });
+    if (delivery.route === 'ignore') return json({ ignored: true, reason: delivery.reason });
+    const deliveryRoute = delivery.route === 'delivery';
+    if (deliveryRoute) trigger.requestedMode = delivery.requestedMode;
+
     // Fast path for webhook redeliveries. Review generation/HEAD state is handled
     // by the durable session planner, so a later return to an old HEAD is not
     // suppressed by historical trigger markers.
     // Only markers published by this exact App identity count as processed.
-    if (await hasProcessedSourceComment(targetRepo, prNumber, sourceId, expectedReviewAuthor, targetToken)) {
+    // Delivery runs are idempotent by HEAD inside the runner, so they skip the legacy receipt lookup.
+    if (!deliveryRoute && await hasProcessedSourceComment(targetRepo, prNumber, sourceId, expectedReviewAuthor, targetToken)) {
       return json({ ignored: true, reason: 'review trigger already processed for this HEAD' });
     }
 
     const controlRepo = env.CONTROL_REPO || 'Jiaze-Li/pr-bot';
-    const controlWorkflow = env.CONTROL_WORKFLOW || 'review-v2.yml';
+    const controlWorkflow = deliveryRoute ? (env.DELIVERY_WORKFLOW || 'delivery-review.yml') : (env.CONTROL_WORKFLOW || 'review-v2.yml');
     const controlRef = env.CONTROL_REF || 'main';
 
     const controlInstallation = await githubApi(`/repos/${controlRepo}/installation`, { token: appJwt });
@@ -180,6 +196,7 @@ export default {
       head_sha: pr.head.sha,
       requested_mode: trigger.requestedMode,
       source_kind: trigger.sourceKind,
+      ...(deliveryRoute ? { mode: 'delivery-v1' } : {}),
     }, 202);
   },
 };

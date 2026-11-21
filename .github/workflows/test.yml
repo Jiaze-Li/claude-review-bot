@@ -23,6 +23,7 @@ jobs:
       # dependencies; no Claude credentials or paid model calls are used.
       - run: npm ci --legacy-peer-deps --ignore-scripts --no-audit --no-fund
       - run: npm test
+      - run: npm run test:compat
       - name: Syntax-check review service scripts
         run: |
           node --check worker/src/index.js
@@ -41,3 +42,9 @@ jobs:
           node --check scripts/publish-review.mjs
           node --check scripts/github-review-api.mjs
           node --check scripts/apply-override.mjs
+          node --check worker/src/delivery.js
+          node --check scripts/delivery-protocol.mjs
+          node --check scripts/delivery-review.mjs
+          node --check scripts/delivery-mode-check.mjs
+          node --check scripts/delivery-fixtures.mjs
+          node --check scripts/delivery-compat.mjs

@@ -100,6 +100,10 @@ jobs:
     env:
       REVIEW_PROVIDERS: ${{ inputs.review_providers || vars.REVIEW_PROVIDERS || '' }}
       PROVIDER_BUDGETS: ${{ inputs.provider_budgets || vars.PROVIDER_BUDGETS || '' }}
+    # A delivery-v1 PR belongs to delivery-review.yml: when the gate says so (or cannot tell), this whole job is
+    # skipped, including every always() step, so the legacy path can never overwrite a delivery result.
+    needs: mode-gate
+    if: needs.mode-gate.outputs.delivery != 'true'
     # Room for the sharded review (16 minutes) plus validation and publication.
     timeout-minutes: 30
 
@@ -668,3 +672,45 @@ jobs:
           JOB_FAILED: ${{ job.status == 'failure' || job.status == 'cancelled' }}
           FINAL_REVIEW_DISPATCHED: ${{ steps.continue.outputs.dispatched }}
         run: node scripts/sync-commit-status.mjs
+
+  # Decides whether this PR is on delivery-v1 (label or delivery state comment); see the `review` job's `if`.
+  mode-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      delivery: ${{ steps.check.outputs.delivery }}
+    steps:
+      - name: Checkout trusted control repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Parse target repository
+        id: target
+        shell: bash
+        env:
+          TARGET_REPO: ${{ inputs.target_repo }}
+        run: |
+          set -euo pipefail
+          echo "owner=${TARGET_REPO%%/*}" >> "$GITHUB_OUTPUT"
+          echo "repo=${TARGET_REPO#*/}" >> "$GITHUB_OUTPUT"
+
+      - name: Create read-only GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ steps.target.outputs.owner }}
+          repositories: ${{ steps.target.outputs.repo }}
+          permission-pull-requests: read
+          permission-issues: read
+
+      - name: Detect delivery-v1 pull request
+        id: check
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          EXPECTED_REVIEW_AUTHOR: ${{ steps.app-token.outputs.app-slug }}[bot]
+        run: node scripts/delivery-mode-check.mjs
