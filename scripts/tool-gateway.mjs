@@ -233,14 +233,14 @@ export class ReadOnlyToolGateway {
     if (this.logImpl) this.logImpl(`[ToolGateway] REJECT ${toolName}: ${reason}`);
   }
 
-  recordSuccess(toolName, input, bytes, truncated = false, { incrementCalls = true } = {}) {
+  recordSuccess(toolName, input, bytes, truncated = false, { incrementCalls = true, read = null } = {}) {
     if (incrementCalls) {
       this.callCount += 1;
       if (this.callCount >= this.maxCalls) this.quotaExhausted = true;
     }
     this.totalReadBytes += bytes;
     if (this.totalReadBytes >= this.maxTotalReadBytes) this.quotaExhausted = true;
-    this.history.push({ toolName, input, bytes, truncated, timestamp: Date.now(), status: 'success' });
+    this.history.push({ toolName, input, bytes, truncated, timestamp: Date.now(), status: 'success', ...(read ? { read } : {}) });
     if (this.logImpl) this.logImpl(`[ToolGateway] ALLOW ${toolName}: ${bytes} bytes`);
   }
 
@@ -459,6 +459,8 @@ export class ReadOnlyToolGateway {
       }
 
       const hasMore = nextColumn > 1 || nextOffset <= all.length;
+      let partialTail = nextColumn > 1; // the last delivered line was cut inside the line
+      let delivered = entries.length;
       let footer = hasMore
         ? (nextColumn > 1 ? `\n[more offset=${nextOffset} col=${nextColumn}]` : `\n[next offset=${nextOffset}]`)
         : '\n[EOF]';
@@ -468,11 +470,19 @@ export class ReadOnlyToolGateway {
         footer = nextColumn > 1 ? `\n[more offset=${nextOffset} col=${nextColumn}]` : `\n[next offset=${nextOffset}]`;
         const room = budget - Buffer.byteLength(header + footer, 'utf8');
         if (room < 0) return this.denyAndRecord(TOOL_NAMES.READ, rawInput, 'Read byte budget too small for continuation cursor.');
-        text = header + clipUtf8(entries.join('\n'), room) + footer;
+        const kept = clipUtf8(entries.join('\n'), room);
+        text = header + kept + footer;
         truncated = true;
+        delivered = kept.split('\n').length; // only what survived the clip counts as delivered
+        partialTail = true;
       }
       const bytesRead = Buffer.byteLength(text, 'utf8');
-      this.recordSuccess(TOOL_NAMES.READ, rawInput, bytesRead, truncated || hasMore, { incrementCalls: false });
+      // Evidence for coverage: the real file and the 1-based lines delivered whole in this call (a line cut at either
+      // end is never counted). A consumer needs the union of these spans to cover what it requires.
+      const firstWhole = startColumn > 1 ? 1 : 0;
+      const lastWhole = partialTail ? delivered - 2 : delivered - 1;
+      const read = { file: filePath, totalLines: all.length, from: lastWhole >= firstWhole ? startIndex + 1 + firstWhole : null, to: lastWhole >= firstWhole ? startIndex + 1 + lastWhole : null };
+      this.recordSuccess(TOOL_NAMES.READ, rawInput, bytesRead, truncated || hasMore, { incrementCalls: false, read });
       return { ok: true, content: text, lines: entries.length, totalLines: all.length,
         offset, limit, nextOffset: hasMore ? nextOffset : null, nextColumn: hasMore ? nextColumn : null,
         truncated: truncated || hasMore, bytesRead };

@@ -93,24 +93,33 @@ function parseDiffHeaderPath(line, followingLines = []) {
   throw new Error(`Cannot disambiguate Git diff header: ${line.slice(0, 300)}`);
 }
 
-// One entry per `diff --git` block: { path, text, bytes }.
+// One entry per `diff --git` block: { path, text, bytes, status, startLine, endLine }.
+// status comes from the Git header (added | deleted | renamed | modified); startLine/endLine are the 1-based line span of
+// the block inside the full diff, so a Read of that span is checkable evidence of having seen the whole block.
 // Parse after collecting metadata, and fail closed on unknown headers.
 export function splitDiffByFile(diffText) {
   const chunks = [];
   let current = null;
-  for (const line of String(diffText ?? '').split('\n')) {
+  const all = String(diffText ?? '').split('\n');
+  if (all.at(-1) === '') all.pop(); // the trailing newline is not a line
+  all.forEach((line, index) => {
     if (line.startsWith('diff --git ')) {
-      current = { lines: [line] };
+      current = { lines: [line], startLine: index + 1 };
       chunks.push(current);
     } else if (current) {
       current.lines.push(line);
     }
-  }
+  });
   return chunks.map((c) => {
     const path = parseDiffHeaderPath(c.lines[0], c.lines.slice(1));
     const joined = c.lines.join('\n');
-    const text = joined.endsWith('\n') ? joined : `${joined}\n`;
-    return { path, text, bytes: Buffer.byteLength(text, 'utf8') };
+    const text = `${joined}\n`;
+    const hunk = c.lines.findIndex((l, i) => i > 0 && l.startsWith('@@'));
+    const header = c.lines.slice(1, hunk < 0 ? c.lines.length : hunk);
+    const status = header.some((l) => l.startsWith('deleted file mode')) ? 'deleted'
+      : header.some((l) => l.startsWith('new file mode')) ? 'added'
+        : header.some((l) => l.startsWith('rename from ')) ? 'renamed' : 'modified';
+    return { path, text, bytes: Buffer.byteLength(text, 'utf8'), status, startLine: c.startLine, endLine: c.startLine + c.lines.length - 1 };
   });
 }
 

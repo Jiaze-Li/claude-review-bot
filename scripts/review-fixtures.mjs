@@ -29,7 +29,7 @@ const P2 = { severity: 'P2', title: 'Cache never expires', path: 'src/b.js', fai
 // One real attempt: record it, fold the model output in, conclude the round if coverage is complete.
 export function attempt({ prev = null, head, output, assigned = FILES }) {
   const claimed = claimAttempt({ prev, repo: REPO, prNumber: PR, head, scope: SCOPE, now: NOW });
-  const applied = applyBatch({ state: claimed, assigned, output, needsRead: new Set(), readPaths: new Set(), now: NOW });
+  const applied = applyBatch({ state: claimed, assigned, output, needsRead: new Map(), reads: new Map(), now: NOW });
   return applied.state.reviewed_files.length === FILES.length ? concludeRound(applied.state, NOW) : applied.state;
 }
 const decisionOf = (state) => (state.status === 'IN_PROGRESS' ? 'WAIT' : state.status);
@@ -87,7 +87,7 @@ export function buildTransitions() {
   const start = attempt({ head: h1, output: modelOutput({ findings: [P2], reviewed: ['src/a.js'], unreviewed: ['src/b.js'], complete: false }) });
   const step = (name, output, assigned, expectedBlocking) => {
     const claimed = claimAttempt({ prev: start, repo: REPO, prNumber: PR, head: h1, scope: SCOPE, now: NOW });
-    const applied = applyBatch({ state: claimed, assigned, output, needsRead: new Set(), readPaths: new Set(), now: NOW });
+    const applied = applyBatch({ state: claimed, assigned, output, needsRead: new Map(), reads: new Map(), now: NOW });
     const result = applied.state.reviewed_files.length === FILES.length ? concludeRound(applied.state, NOW) : applied.state;
     return { name, prev_state: start, assigned, result_state: result, expected: { blocking_ids: expectedBlocking, blocking_ids_actual: result.findings.filter(isBlocking).map((f) => f.id) } };
   };

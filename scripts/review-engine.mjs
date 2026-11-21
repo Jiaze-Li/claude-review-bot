@@ -8,7 +8,14 @@ import {
 
 // A claimed attempt with no result for this long is a crashed or killed run. Above the workflow's job timeout.
 export const IN_PROGRESS_TIMEOUT_MS = 50 * 60 * 1000;
-export const BATCH_LIMITS = Object.freeze({ maxFiles: 10, targetBytes: 70_000, maxInlineFileBytes: 40_000 });
+export const BATCH_LIMITS = Object.freeze({
+  maxFiles: 10, targetBytes: 70_000, maxInlineFileBytes: 40_000,
+  // Capacity must match the call budget: one Read yields at most ~200 KB of a source (the gateway caps a call at 256 KB
+  // including line numbers), and a model attempt keeps `reservedTurns` for orientation and writing the result.
+  readChunkBytes: 200_000, reservedTurns: 4,
+});
+export const readCallsFor = (bytes) => Math.ceil(bytes / BATCH_LIMITS.readChunkBytes);
+export const maxReadCalls = (maxTurns) => Math.max(1, maxTurns - BATCH_LIMITS.reservedTurns);
 
 const SEVERITY_RANK = { P0: 0, P1: 1, P2: 2, P3: 3 };
 const VERDICT_RANK = { OPEN: 0, FIXED: 1, UNCERTAIN: 2, STILL_OPEN: 3 }; // a blocking verdict always beats FIXED
@@ -24,8 +31,10 @@ const sameScope = (a, b) => a.merge_base_sha === b.merge_base_sha && a.files_sha
 // ---------------------------------------------------------------- the "should a model run?" decision
 
 // pr: { state, draft, head_sha }; read: readState() result; requestedHead: HEAD the queued event captured.
+// mergeBase: the merge-base the diff would be taken against now. A review (or its progress) done against another
+// merge-base covered a different diff, so the same HEAD is not reused (undefined = not looked up).
 // -> { action, reason, state? }  actions: skip | wait_draft | stop_untrusted | wait_in_progress | reuse | hold | budget_stop | run
-export function planRun({ pr, requestedHead, read, now = Date.now() }) {
+export function planRun({ pr, requestedHead, read, now = Date.now(), mergeBase }) {
   if (pr.state !== 'open') return { action: 'skip', reason: 'pull request is not open' };
   if (read.kind === 'conflict' || read.kind === 'invalid' || read.kind === 'legacy') return { action: 'stop_untrusted', reason: read.reason };
   if (pr.draft) return { action: 'wait_draft', reason: 'draft pull request: no review until it is marked ready' };
@@ -38,14 +47,15 @@ export function planRun({ pr, requestedHead, read, now = Date.now() }) {
     if (!Number.isFinite(startedAt) || now - startedAt < IN_PROGRESS_TIMEOUT_MS) return { action: 'wait_in_progress', reason: 'a review attempt is still running', state };
     state = interrupted(state, now); // the attempt stays spent; nothing is credited
   }
-  if (state.completed_head_sha === pr.head_sha) return { action: 'reuse', reason: 'a complete review already exists for this HEAD', state };
+  const sameBase = mergeBase === undefined || state.scope.merge_base_sha === mergeBase;
+  if (state.completed_head_sha === pr.head_sha && sameBase) return { action: 'reuse', reason: 'a complete review already exists for this HEAD', state };
   if (state.completed_rounds >= MAX_ROUNDS) {
     return { action: 'budget_stop', reason: `Both review rounds are used (${MAX_ROUNDS}/${MAX_ROUNDS}); HEAD ${pr.head_sha.slice(0, 12)} was not reviewed and no further automatic round starts.`, state };
   }
   if (state.attempts_used >= MAX_ATTEMPTS) {
     return { action: 'budget_stop', reason: `Model execution budget used up (${MAX_ATTEMPTS}/${MAX_ATTEMPTS}); HEAD ${pr.head_sha.slice(0, 12)} cannot be reviewed automatically.`, state };
   }
-  if (state.head_sha === pr.head_sha && state.stalled_attempts >= STALL_LIMIT) {
+  if (state.head_sha === pr.head_sha && sameBase && state.stalled_attempts >= STALL_LIMIT) {
     return { action: 'hold', reason: 'repeated attempts on this HEAD made no progress; push a new commit to continue', state };
   }
   return { action: 'run', reason: `review round ${state.completed_rounds + 1} for this HEAD`, state };
@@ -144,19 +154,39 @@ export function parseBatchOutput(raw) {
 const sameIssue = (a, b) => a.path === b.path && a.title.trim().toLowerCase() === b.title.trim().toLowerCase();
 const nextId = (findings) => `F${String(findings.reduce((max, f) => Math.max(max, Number(f.id.slice(1)) || 0), 0) + 1).padStart(3, '0')}`;
 
+// ---------------------------------------------------------------- read evidence
+
+// reads: Map<key, { total, spans: [[from, to], ...] }> built by the executor from the gateway's own Read log: the lines a
+// Read really delivered whole. A need is { key, from, to }: `to: null` means "to the end of that file".
+export function spansCover(spans, from, to) {
+  let next = from;
+  for (const [a, b] of [...spans].sort((x, y) => x[0] - y[0])) {
+    if (a > next) break;
+    next = Math.max(next, b + 1);
+    if (next > to) return true;
+  }
+  return next > to;
+}
+export function readCovers(reads, need) {
+  const entry = reads.get(need.key);
+  if (!entry) return false;
+  return spansCover(entry.spans, need.from, need.to ?? entry.total);
+}
+
 // Files the program credits for one batch. The model's report is checked against the assignment and the tool log:
 // a path outside the batch counts for nothing, a path the model itself marks unreviewed is never credited, a model
 // that says it is incomplete without naming what is missing gets no credit at all, and a file whose diff was not
-// fully inlined needs a real Read of that file.
-export function creditedFiles({ assigned, coverage, needsRead = new Set(), readPaths = new Set() }) {
+// fully inlined needs real Reads, recorded by the gateway, that together cover all of it (a file that is deleted in the
+// PR is read from its block of the full diff instead, since HEAD no longer has it). needsRead: Map<file, need>.
+export function creditedFiles({ assigned, coverage, needsRead = new Map(), reads = new Map() }) {
   if (!coverage.complete && coverage.unreviewed.size === 0) return [];
   const assignedSet = new Set(assigned);
-  return [...coverage.reviewed].filter((p) => assignedSet.has(p) && !coverage.unreviewed.has(p) && (!needsRead.has(p) || readPaths.has(p))).sort();
+  return [...coverage.reviewed].filter((p) => assignedSet.has(p) && !coverage.unreviewed.has(p) && (!needsRead.has(p) || readCovers(reads, needsRead.get(p)))).sort();
 }
 
 // Folds one valid batch result into the state. Findings are only ever added or escalated; nothing a batch omits is
 // removed or downgraded. -> { state, credited, overflow }
-export function applyBatch({ state, assigned, output, needsRead, readPaths, now }) {
+export function applyBatch({ state, assigned, output, needsRead, reads, now }) {
   const head = state.head_sha;
   const findings = state.findings.map((f) => ({ ...f }));
   for (const f of findings) {
@@ -185,7 +215,7 @@ export function applyBatch({ state, assigned, output, needsRead, readPaths, now 
     }
     findings.push(entry);
   }
-  const credited = creditedFiles({ assigned, coverage: output.coverage, needsRead, readPaths });
+  const credited = creditedFiles({ assigned, coverage: output.coverage, needsRead, reads });
   const reviewed = [...new Set([...state.reviewed_files, ...credited])].sort();
   const next = {
     ...state, findings, reviewed_files: reviewed, stalled_attempts: credited.some((p) => !state.reviewed_files.includes(p)) ? 0 : state.stalled_attempts + 1,
@@ -226,19 +256,23 @@ export function concludeRound(state, now) {
 
 // ---------------------------------------------------------------- batch planning
 
-// chunks: [{ path, bytes }] for the files still to review. Source files go before docs, tests and lockfiles. Both the
-// number of files and the diff size bound a batch, so dozens of small files never land in one model session.
-export function nextBatch({ remaining, bytesOf, limits = BATCH_LIMITS, shrink = 0 }) {
+// Source files go before docs, tests and lockfiles. The number of files, the diff size and the Read calls the batch
+// will need (`readsOf`, against `maxReads`) all bound a batch, so it always fits one attempt's turn budget.
+export function nextBatch({ remaining, bytesOf, readsOf = () => 0, maxReads = Infinity, limits = BATCH_LIMITS, shrink = 0 }) {
   const maxFiles = Math.max(1, Math.floor(limits.maxFiles / 2 ** shrink));
   const targetBytes = Math.max(1, Math.floor(limits.targetBytes / 2 ** shrink));
+  const readBudget = Math.max(1, Math.floor(maxReads / 2 ** shrink));
   const ordered = [...remaining].sort((a, b) => filePriority(b) - filePriority(a) || (a < b ? -1 : 1));
   const batch = [];
   let bytes = 0;
+  let reads = 0;
   for (const file of ordered) {
     const size = Math.min(bytesOf(file), limits.maxInlineFileBytes);
-    if (batch.length && (batch.length >= maxFiles || bytes + size > targetBytes)) break;
+    const needed = readsOf(file);
+    if (batch.length && (batch.length >= maxFiles || bytes + size > targetBytes || reads + needed > readBudget)) break;
     batch.push(file);
     bytes += size;
+    reads += needed;
   }
   return batch;
 }
