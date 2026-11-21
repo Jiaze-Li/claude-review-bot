@@ -305,7 +305,7 @@ test('coverage is checked by the program: outside paths, complete=false with eve
   const unread = scriptedProvider((c) => model.ok({ assigned: c.assigned }));
   await review({ gh: gh2, provider: unread, ctx: big });
   assert.notEqual(stateOf(gh2).status, 'READY', 'the truncated file was never read');
-  assert.match(unread.calls[0].prompt, /truncated at/);
+  assert.match(unread.calls[0].prompt, /diff too large to inline: Read \.review-context\/pr\.diff/);
   const gh3 = fakeGithub();
   const read = scriptedProvider((c) => model.ok({ assigned: c.assigned, reads: [{ key: 'ctx:pr.diff', total: 1e9, spans: [[1, 1e9]] }] }));
   await review({ gh: gh3, provider: read, ctx: big });
