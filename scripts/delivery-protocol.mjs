@@ -25,9 +25,9 @@ export const VERIFICATIONS = Object.freeze(['OPEN', 'FIXED', 'STILL_OPEN', 'UNCE
 export const DECISIONS = Object.freeze(['READY', 'CHANGES_REQUESTED', 'STOPPED', 'WAIT']);
 
 const SHA_RE = /^[0-9a-f]{40}$/;
-const MIN_FAILURE_PATH = 30;
 const MAX_FINDINGS = 40;
 
+const BLOCKING = ['P0', 'P1', 'P2'];
 export const isBlocking = (finding) => ['P0', 'P1', 'P2'].includes(finding?.severity) && finding?.verification !== 'FIXED';
 export const normalizeLogin = (login) => String(login ?? '').replace(/\[bot\]$/i, '').toLowerCase();
 export const sameRepo = (a, b) => String(a ?? '').toLowerCase() === String(b ?? '').toLowerCase();
@@ -41,8 +41,8 @@ export function validateFinding(f) {
   if (!SEVERITIES.includes(f.severity)) errors.push(`finding ${f.id}: bad severity`);
   if (typeof f.path !== 'string' || !f.path) errors.push(`finding ${f.id}: path required`);
   if (typeof f.failure_path !== 'string') errors.push(`finding ${f.id}: failure_path required`);
-  else if (['P0', 'P1', 'P2'].includes(f.severity) && f.failure_path.trim().length < MIN_FAILURE_PATH) {
-    errors.push(`finding ${f.id}: P0-P2 needs a concrete failure_path`);
+  else if (['P0', 'P1', 'P2'].includes(f.severity) && !f.failure_path.trim()) {
+    errors.push(`finding ${f.id}: P0-P2 needs a non-empty failure_path`);
   }
   if (!VERIFICATIONS.includes(f.verification)) errors.push(`finding ${f.id}: bad verification`);
   return errors;
@@ -231,6 +231,10 @@ export function parseModelOutput(raw) {
     if (!f || !SEVERITIES.includes(f.severity) || typeof f.path !== 'string' || !f.path || typeof f.title !== 'string') {
       return { ok: false, error: 'model output contains a malformed finding' };
     }
+    // A blocking finding with no stated failure path is an unusable result (run stops), never a silent downgrade.
+    if (f.severity !== 'P3' && (typeof f.failure_path !== 'string' || !f.failure_path.trim())) {
+      return { ok: false, error: 'model output has a P0-P2 finding without a failure_path' };
+    }
     findings.push({ severity: f.severity, title: f.title, path: f.path, failure_path: typeof f.failure_path === 'string' ? f.failure_path : '' });
   }
   const prior = Array.isArray(raw.prior_findings) ? raw.prior_findings.filter((p) => p && typeof p.id === 'string') : [];
@@ -258,10 +262,19 @@ export function finalizeRun({ claimed, output, changedFiles, now }) {
   });
   const findings = [...carried];
   for (const f of output.findings.slice(0, MAX_FINDINGS)) {
-    if (findings.some((existing) => sameIssue(existing, f))) continue;
-    const concrete = f.failure_path.trim().length >= MIN_FAILURE_PATH;
-    const severity = !concrete && f.severity !== 'P3' ? 'P3' : f.severity; // no concrete failure path: a suggestion only
-    findings.push({ id: nextId(findings), severity, title: f.title.slice(0, 200), path: f.path, failure_path: f.failure_path.trim().slice(0, 600), verification: 'OPEN' });
+    const index = findings.findIndex((existing) => sameIssue(existing, f));
+    if (index === -1) {
+      findings.push({ id: nextId(findings), severity: f.severity, title: f.title.slice(0, 200), path: f.path, failure_path: f.failure_path.trim().slice(0, 600), verification: 'OPEN' });
+      continue;
+    }
+    // The same issue was reported again this round: this round's report counts. An older FIXED or P3 never hides a
+    // current P0-P2; the stable id stays, severity only goes up, and a contradiction stays open.
+    const existing = findings[index];
+    if (!BLOCKING.includes(f.severity)) continue;
+    const wasBlocking = BLOCKING.includes(existing.severity);
+    const severity = wasBlocking && SEVERITIES.indexOf(existing.severity) < SEVERITIES.indexOf(f.severity) ? existing.severity : f.severity;
+    const verification = existing.verification === 'FIXED' ? 'STILL_OPEN' : wasBlocking ? existing.verification : 'OPEN';
+    findings[index] = { ...existing, severity, verification, failure_path: f.failure_path.trim().slice(0, 600) || existing.failure_path };
   }
   const missing = changedFiles.filter((file) => !output.coverage.reviewed.has(file));
   const coverageComplete = output.coverage.complete && missing.length === 0;

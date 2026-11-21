@@ -71,7 +71,7 @@ no signature, database or append-only ledger to prevent that.
 * Run 2: every run-1 P0/P1/P2 is verified individually (`FIXED`, `STILL_OPEN`, `UNCERTAIN`) and the fix is checked
   for substantive regressions. An omitted blocker counts as `UNCERTAIN`, never `FIXED`. Any remaining or new
   P0/P1/P2, any `UNCERTAIN`, or incomplete coverage -> `STOPPED`; otherwise `READY`.
-* P3 is advice and never blocks. A P0-P2 without a concrete failure path (>= 30 characters) is demoted to P3.
+* P3 is advice and never blocks. A P0-P2 must state a failure path; a short one ("On null, deletes all rows.") is enough and still blocks. A P0-P2 with an empty failure path makes the run unusable (STOPPED), never a pass and never a silent downgrade.
 * The reviewer gets the exact-HEAD safe source snapshot with read-only Read/Glob/Grep, plus the PR title and
   description (goal, constraints, observable acceptance, local acceptance notes) as untrusted requirement text.
   It does **not** run tests and the bot never says it did; local testing stays with the author.
@@ -128,3 +128,9 @@ corrupt, foreign-repo/PR or self-contradicting state also to `trusted:false, WAI
 * A very large PR will report incomplete coverage rather than shard (this mode has one bounded run, no sharding).
 * The first real model run and the Worker deployment have not been exercised by this change; they happen only after
   merge and deploy.
+
+## Run diagnostics
+
+Each model run writes one Actions log line: `DELIVERY_DIAGNOSTICS {json}` with repo, PR, full HEAD, run number, provider, requested/resolved model, turns, input/output tokens, nominal cost and its source, duration, timeout and failure kind/message. Unknown values are `null`/`"unknown"`, never 0. No environment, token, prompt or model conversation is logged, and a diagnostics failure never changes the review result.
+
+`cost_usd_nominal` is the Claude SDK's own estimate, not an actual bill. Only the Claude adapter enforces the USD cap; the Gemini adapter has no USD cap (its cost is reported as unknown).

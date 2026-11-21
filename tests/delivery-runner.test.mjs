@@ -290,3 +290,40 @@ test('state comments are read across pages', async () => {
   const result = await runDelivery({ env: { TARGET_REPO: 'acme/project', PR_NUMBER: '7', HEAD_SHA: H1, EXPECTED_REVIEW_AUTHOR: BOT }, github, provider: h.provider, log: () => {} });
   assert.deepEqual([result.action, result.modelCalls, h.providerCalls.length], ['reuse', 0, 1]);
 });
+
+test('diagnostics: one allow-listed line per run, unknown stays null, failures and crashes still report, results unchanged', async () => {
+  const { buildProviderDiagnostics, emitDiagnostics } = await import('../scripts/delivery-review.mjs');
+  const claude = buildProviderDiagnostics({ provider: 'claude', durationMs: 1200, limits: { maxTurns: 20, maxBudgetUsd: 2.5 }, outcome: { ok: true, meta: { requested_model: 'sonnet', resolved_model: 'claude-sonnet-x', num_turns: 4, total_cost_usd: 0.31, cost_source: 'sdk', usage: { input_tokens: 900, output_tokens: 50 } } } });
+  assert.deepEqual([claude.cost_usd_nominal, claude.usd_cap, claude.turns, claude.input_tokens, claude.failure], [0.31, 2.5, 4, 900, null]);
+  const gemini = buildProviderDiagnostics({ provider: 'gemini', durationMs: 5, limits: { maxTurns: 20, maxBudgetUsd: 2.5 }, outcome: { ok: false, errorKind: 'timeout', error: 'Gemini request timed out', meta: { total_cost_usd: 0, cost_source: 'zero', usage: { input_tokens: 0, output_tokens: 0 } } } });
+  assert.equal(gemini.cost_usd_nominal, null); // Gemini zero is "not measured", never a real 0
+  assert.equal(gemini.usd_cap, null);
+  assert.equal(gemini.timed_out, true);
+  assert.equal(gemini.failure.kind, 'timeout');
+  assert.equal(buildProviderDiagnostics({ provider: 'claude', outcome: {}, limits: {} }).resolved_model, 'unknown');
+
+  const h = createHarness();
+  const lines = [];
+  const secretish = { ok: true, structured: modelOutput(), diagnostics: { ...claude, resolved_model: 'm' } };
+  h.script(secretish);
+  const { runDelivery } = await import('../scripts/delivery-review.mjs');
+  const res = await runDelivery({ env: { TARGET_REPO: 'acme/project', PR_NUMBER: '7', HEAD_SHA: sha('a'), EXPECTED_REVIEW_AUTHOR: BOT }, github: h.github, provider: h.provider, now: () => h.world.now, log: (l) => lines.push(l) });
+  assert.equal(lines.filter((l) => l.startsWith('DELIVERY_DIAGNOSTICS ')).length, 1);
+  // a provider that throws still yields its (limited) diagnostics line and the same STOPPED result as before
+  const h2 = createHarness();
+  const crash = Object.assign(new Error('boom'), { diagnostics: gemini });
+  h2.script(() => { throw crash; });
+  const l2 = [];
+  const r2 = await runDelivery({ env: { TARGET_REPO: 'acme/project', PR_NUMBER: '7', HEAD_SHA: sha('a'), EXPECTED_REVIEW_AUTHOR: BOT }, github: h2.github, provider: h2.provider, now: () => h2.world.now, log: (l) => l2.push(l) });
+  assert.equal(r2.status, 'STOPPED');
+  assert.equal(l2.filter((l) => l.startsWith('DELIVERY_DIAGNOSTICS ')).length, 1);
+  assert.equal(res.status, 'READY');
+  const emitted = [];
+  emitDiagnostics((l) => emitted.push(l), { repo: 'a/b', prNumber: 7, head: sha('a'), round: 1, diagnostics: claude });
+  assert.match(emitted[0], /^DELIVERY_DIAGNOSTICS \{/);
+  const parsed = JSON.parse(emitted[0].slice('DELIVERY_DIAGNOSTICS '.length));
+  assert.deepEqual([parsed.repo, parsed.pr, parsed.head, parsed.run], ['a/b', 7, sha('a'), 1]);
+  assert.doesNotMatch(emitted[0], /OAUTH|API_KEY|PRIVATE|ghp_|Bearer/i);
+  // a logger that throws must not change anything
+  assert.doesNotThrow(() => emitDiagnostics(() => { throw new Error('log broke'); }, { repo: 'a/b', prNumber: 7, head: 'x', round: 1, diagnostics: claude }));
+});

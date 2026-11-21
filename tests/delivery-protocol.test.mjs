@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import {
   BOT_LOGIN, DELIVERY_LABEL, DELIVERY_MARKER, IN_PROGRESS_TIMEOUT_MS, claimState, commitStatusFor, evaluateDeliveryComment, finalizeRun,
-  parseModelOutput, planDelivery, readDeliveryState, renderDeliveryComment, validateState,
+  parseModelOutput, planDelivery, readDeliveryState, renderDeliveryComment, validateFinding, validateState,
 } from '../scripts/delivery-protocol.mjs';
 import { DELIVERY_LABEL as WORKER_LABEL, DELIVERY_MARKER as WORKER_MARKER } from '../worker/src/delivery.js';
 import { buildFixtures } from '../scripts/delivery-fixtures.mjs';
@@ -45,11 +45,36 @@ test('marker-looking text inside a finding cannot break or duplicate the state',
   assert.equal(read.state.findings.length, 1);
 });
 
-test('severity rules: P3 never blocks; P0-P2 need a concrete failure path or are demoted to suggestions', () => {
+test('severity rules: P3 never blocks; short but explicit P0-P2 evidence still blocks; empty evidence is unusable', () => {
   assert.equal(run(null, sha('a'), out({ findings: [{ severity: 'P3', title: 'nit', path: 'a.js', failure_path: '' }] })).status, 'READY');
-  const vague = run(null, sha('a'), out({ findings: [{ severity: 'P1', title: 'maybe', path: 'a.js', failure_path: 'could break' }] }));
-  assert.equal(vague.status, 'READY');
-  assert.equal(vague.findings[0].severity, 'P3');
+  for (const [severity, failure_path] of [['P0', '空筛选条件导致全部样品被删除。'], ['P0', 'On null, deletes all rows.'], ['P1', 'could break']]) {
+    const s = run(null, sha('a'), out({ findings: [{ severity, title: 'bad', path: 'a.js', failure_path }] }));
+    assert.equal(s.status, 'CHANGES_REQUESTED', failure_path);
+    assert.equal(s.findings[0].severity, severity);
+    assert.equal(validateState(s, { repo: REPO, prNumber: PR }).ok, true);
+  }
+  for (const failure_path of ['', '   ', undefined]) {
+    assert.equal(parseModelOutput({ findings: [{ severity: 'P2', title: 't', path: 'a.js', failure_path }], coverage: { complete: true, reviewedPaths: ['a.js'] } }).ok, false);
+  }
+  assert.equal(validateFinding({ id: 'F001', severity: 'P1', path: 'a.js', failure_path: ' ', verification: 'OPEN' }).length, 1);
+});
+
+test('a repeated issue never lets an older FIXED or P3 hide this round\'s P0-P2', () => {
+  const first = run(null, sha('a'), out({ findings: [P1] }));
+  const id = first.findings[0].id;
+  const again = run(first, sha('b'), out({ prior: [{ id, verification: 'FIXED', evidence: 'looks fixed' }], findings: [P1] }));
+  assert.equal(again.findings.length, 1);
+  assert.equal(again.findings[0].id, id);
+  assert.equal(again.findings[0].verification, 'STILL_OPEN');
+  assert.equal(again.status, 'STOPPED'); // final run with a blocking finding: never READY
+  const p3 = run(null, sha('a'), out({ findings: [{ ...P1, severity: 'P3' }] }));
+  assert.equal(p3.status, 'READY');
+  const up = run(p3, sha('b'), out({ findings: [P1] }));
+  assert.equal(up.findings.length, 1);
+  assert.equal(up.findings[0].id, p3.findings[0].id);
+  assert.equal(up.findings[0].severity, 'P1');
+  assert.notEqual(up.status, 'READY');
+  assert.equal(run(first, sha('b'), out({ prior: [{ id, verification: 'FIXED' }] })).status, 'READY');
 });
 
 test('READY needs full coverage: partial coverage and unreported changed files never pass', () => {
