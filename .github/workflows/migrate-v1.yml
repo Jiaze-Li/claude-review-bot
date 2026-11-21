@@ -45,7 +45,7 @@ jobs:
           repositories: ${{ steps.target.outputs.repo }}
           permission-contents: read
           permission-pull-requests: write
-          permission-issues: write
+          permission-issues: read
       - name: Install dependencies
         run: npm ci --legacy-peer-deps --ignore-scripts --no-audit --no-fund --omit=dev
       - name: Migrate
