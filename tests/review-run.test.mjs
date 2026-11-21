@@ -123,6 +123,43 @@ test('another writer changing the state comment stops the run without overwritin
   assert.equal(provider.calls.length, 1, 'no second model call after the conflict');
 });
 
+test('a transient PATCH failure retries only if the authoritative state is still unchanged', async () => {
+  const gh = fakeGithub();
+  const patch = gh.patchComment.bind(gh);
+  let patches = 0;
+  gh.patchComment = async (id, body) => {
+    patches += 1;
+    if (patches === 1) throw new Error('HTTP 502 before the PATCH was applied');
+    return patch(id, body);
+  };
+  const result = await review({ gh, provider: scriptedProvider(all), ctx: makeContext(files(2)) });
+  assert.equal(result.status, 'READY');
+  assert.equal(patches, 2);
+  assert.equal(stateOf(gh).completed_rounds, 1);
+  assert.equal(stateOf(gh).attempts_used, 1);
+});
+
+test('a failed PATCH followed by another writer is never retried over their new state', async () => {
+  const gh = fakeGithub();
+  let patches = 0;
+  gh.patchComment = async () => {
+    patches += 1;
+    if (patches === 1) {
+      // Simulate a concurrent writer after the first PATCH request fails, before retry.
+      gh.comments[0].body = gh.comments[0].body.replace('"stalled_attempts": 0', '"stalled_attempts": 3');
+      throw new Error('HTTP 502; meanwhile another writer updated the state');
+    }
+    throw new Error('MUST NOT WRITE: stale retry would overwrite another writer');
+  };
+  await assert.rejects(
+    review({ gh, provider: scriptedProvider(all), ctx: makeContext(files(2)) }),
+    /changed by another writer/,
+  );
+  assert.equal(patches, 1, 'no second PATCH may overwrite the other writer');
+  assert.equal(gh.writes.length, 1, 'the only successful write is the initial attempt claim');
+  assert.match(gh.comments[0].body, /"stalled_attempts": 3/);
+});
+
 test('round 1 -> batch fix -> round 2 verifies every earlier blocker; omission is not a fix and no third round starts', async () => {
   const gh = fakeGithub({ head: sha('a') });
   const ctx = makeContext(files(3));
