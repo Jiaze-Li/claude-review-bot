@@ -34,7 +34,7 @@ test('a batch is bounded by diff size as well as file count', async () => {
   const names = files(6);
   const provider = scriptedProvider((call) => model.ok({ assigned: call.assigned, readPaths: call.assigned }));
   await review({ gh, provider, ctx: makeContext(names, { bigDiff: names }) });
-  assert.ok(provider.calls.every((c) => c.assigned.length === 1), `40KB-capped diffs exceed the 70KB batch target together, got ${provider.calls.map((c) => c.assigned.length)}`);
+  assert.ok(provider.calls.every((c) => c.assigned.length === 1), `complete 60KB diffs exceed the 70KB batch target together, got ${provider.calls.map((c) => c.assigned.length)}`);
   assert.equal(stateOf(gh).completed_rounds, 1);
 });
 
@@ -301,13 +301,13 @@ test('coverage is checked by the program: outside paths, complete=false with eve
   assert.deepEqual(stateOf(gh).reviewed_files, [], 'complete=false is never overridden by a list of paths');
 
   const gh2 = fakeGithub();
-  const big = makeContext(['src/big.js', 'src/small.js'], { bigDiff: ['src/big.js'] });
+  const big = makeContext(['src/big.js', 'src/small.js'], { bigDiff: ['src/big.js'], bigDiffBytes: 120_000 });
   const unread = scriptedProvider((c) => model.ok({ assigned: c.assigned }));
   await review({ gh: gh2, provider: unread, ctx: big });
   assert.notEqual(stateOf(gh2).status, 'READY', 'the truncated file was never read');
-  assert.match(unread.calls[0].prompt, /truncated at/);
+  assert.match(unread.calls[0].prompt, /diff too large to inline: Read \.review-context\/pr\.diff/);
   const gh3 = fakeGithub();
-  const read = scriptedProvider((c) => model.ok({ assigned: c.assigned, readPaths: ['src/big.js'] }));
+  const read = scriptedProvider((c) => model.ok({ assigned: c.assigned, reads: [{ key: 'ctx:pr.diff', total: 1e9, spans: [[1, 1e9]] }] }));
   await review({ gh: gh3, provider: read, ctx: big });
   assert.equal(stateOf(gh3).status, 'READY');
 });

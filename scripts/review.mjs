@@ -187,31 +187,30 @@ export const RESULT_SCHEMA = {
   required: ['summary', 'findings', 'prior_findings', 'coverage'],
 };
 
-// What a file needs before it may be credited, when its diff is too big to inline: real Reads covering all of it.
-// A file that still exists at HEAD is read from the snapshot. A file the PR deletes is not in the snapshot: its content
-// is the block of the full diff (every line of it is a removed line), read from the trusted context in segments.
-export function readNeed(file, chunk, limit = BATCH_LIMITS.maxInlineFileBytes) {
+// A complete per-file diff that fits the batch budget is included in the model's prompt. Otherwise the only
+// acceptable reading evidence is the whole corresponding block of the trusted Git diff, for EVERY file status.
+// Reading all of HEAD is useful for context but never substitutes for reviewing a truncated diff.
+export function readNeed(_file, chunk, limit = BATCH_LIMITS.targetBytes) {
   if (chunk.bytes <= limit) return null;
-  return chunk.status === 'deleted' ? { key: 'ctx:pr.diff', from: chunk.startLine, to: chunk.endLine } : { key: `safe:${file}`, from: 1, to: null };
+  return { key: 'ctx:pr.diff', from: chunk.startLine, to: chunk.endLine };
 }
 
-// The diff of one assigned file, cut at the inline cap. A cut file is named in `needsRead` (file -> need): the program
-// only credits it if the gateway's Read log shows the whole of it was actually read.
-export function inlineDiffs({ assigned, byPath, limit = BATCH_LIMITS.maxInlineFileBytes }) {
+// The single batch diff-byte budget is also the per-file inline boundary. Oversized diffs are assigned alone;
+// they get a small orientation preview, then must be read entirely from the allowlisted Git diff.
+export function inlineDiffs({ assigned, byPath, limit = BATCH_LIMITS.targetBytes }) {
   const needsRead = new Map();
   const text = assigned.map((file) => {
     const chunk = byPath.get(file);
     const need = readNeed(file, chunk, limit);
     if (!need) return chunk.text;
     needsRead.set(file, need);
-    return `${Buffer.from(chunk.text).subarray(0, limit).toString('utf8')}\n[... diff for ${file} truncated at ${limit} bytes: ${need.key === 'ctx:pr.diff' ? `read lines ${need.from}-${need.to} of .review-context/pr.diff` : `read the file from safe-target/`} to review the rest ...]\n`;
+    return `${chunk.text.slice(0, 1500)}\n[... complete ${chunk.bytes}-byte diff for ${file} exceeds the ${limit}-byte batch prompt budget. Read ALL lines ${need.from}-${need.to} from .review-context/pr.diff using offset/limit; do not rely on the preview or a HEAD-file read ...]\n`;
   }).join('\n');
   return { text, needsRead };
 }
 
 const needLabel = (need) => (!need ? ''
-  : need.key === 'ctx:pr.diff' ? `  (diff truncated below: this file is deleted; Read .review-context/pr.diff lines ${need.from}-${need.to}, in segments with offset and limit; the whole span must be read)`
-    : '  (diff truncated below: you must Read this whole file from safe-target/, in segments with offset and limit if it is long)');
+  : `  (diff too large to inline: Read .review-context/pr.diff lines ${need.from}-${need.to}, in segments if needed; every line must be delivered by the tool before credit)`);
 
 export function buildPrompt({ repo, prNumber, head, round, pr, assigned, diffText, needsRead, otherFiles, deleted = [], pendingBlockers, batchNo, maxTurns }) {
   const boundary = `REQ-${randomUUID()}`;
