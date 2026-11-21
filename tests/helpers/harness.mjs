@@ -43,7 +43,7 @@ export function fakeGithub({ head = sha('a'), draft = false, state = 'open', com
 
 export const assignedFrom = (prompt) => {
   const block = /FILES ASSIGNED TO THIS BATCH[^\n]*\n([\s\S]*?)\n\nTheir diffs/.exec(prompt)[1];
-  return block.split('\n').map((l) => l.replace(/^- /, '').replace(/ {2}\(diff truncated.*$/, ''));
+  return block.split('\n').map((l) => l.replace(/^- /, '').replace(/ {2}\(diff (?:truncated|too large).*$/, ''));
 };
 
 // script: (call: { n, assigned, prompt }) => outcome   (outcome from `model.*`)
