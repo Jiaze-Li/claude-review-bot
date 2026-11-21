@@ -1,292 +1,40 @@
 # pr-bot
 
-> **Name note.** This repository was renamed from `review-bot` (originally `claude-review-bot`) to `pr-bot` (GitHub keeps the old URLs
-> redirecting). Three identifiers deliberately keep the old name, because other repositories and users depend on them:
-> the GitHub App and its `@jiaze-claude-review-bot` command/author name, the Cloudflare Worker service name and
-> webhook URL, and the commit-status context `claude-review-bot/review`.
+Independent, static pull-request review for Jiaze-Li's repositories. One path for every non-draft PR.
 
-Account-wide bounded PR review service for GitHub: Gemini first, Claude where Gemini cannot, one session per PR.
+## Use
 
-## How a review works (the whole picture)
+Nothing to configure per PR. A review starts when a non-draft PR is opened, marked ready, reopened or pushed to. To make sure the current commit has a result (also to resume a stopped review), comment on the PR:
 
-There is one session per PR, stored in a bot-authored **Independent Review Session** comment, and one rule for
-every model and every PR size.
-
-**Two kinds of review**
-
-| Kind | What it looks at | Who runs it |
-| --- | --- | --- |
-| **Full review** | every file of the PR | the sharded engine: the diff is split by file into shards (~100 KB each, at most 20 per run, 3 at a time); each shard goes to Gemini first, and to Claude for whatever Gemini cannot finish |
-| **Delta review** | only what changed since a reviewed state | the staged pipeline: *verification* (a repair against the open findings) and *incremental* (a small, low-risk change on a READY PR) |
-
-A full review is used for: a PR's first review, the review after a big or risky change, `reset review`, and the
-**final full review** (below). `@claude review` is the same review with Claude as the only model.
-
-**The session status**
-
-```text
- (new PR / @gemini review)
-          |
-   FULL REVIEW ---- nothing blocking, every file covered ------> READY
-          |
-          +--- P0/P1/P2 found ----> REWORK --- you fix, resolve threads --->  VERIFICATION (max 2 rounds)
-          |                                                                      |        |
-          |                                          findings fixed, none left   |        +-- still open: back to REWORK
-          |                                                                      v           (after 2 rounds: HUMAN_REQUIRED)
-          |                                                              AUDIT_PENDING
-          |                                                                      |
-          |                                                  FINAL FULL REVIEW (runs by itself, once)
-          |                                                                      |
-          +--- some files not reached ----> PARTIAL ---- continues by itself ----+--> READY (or REWORK for what it adds;
-                                                                                        those are verified, no second full review)
+```
+@jiaze-claude-review-bot review
 ```
 
-* **READY** needs a complete pass over every changed file with no open P0/P1/P2 and nothing uncertain. It is the
-  *review's* clearance; CI, approvals and branch protection still decide whether the PR can merge.
-* **PARTIAL** means some files were not reached (time, budget). It is never READY. It continues by itself, up to
-  3 more runs, and `@gemini review` continues it by hand; an unrelated event (a reopened PR) does not.
-* **HUMAN_REQUIRED** means a person must decide: verification budget spent, an UNCERTAIN material candidate, or
-  both providers unavailable. Use `@gemini dismiss F001` (with evidence) or `override review`.
-* **READY on an earlier commit (NOT current)**: pushes do not start a review, but a push after a result does mark that
-  result out of date at once (no model call, no cost): the status comment is re-posted saying which commit was reviewed
-  and how many newer commits no review has covered. It is not a new status of the review itself, only a warning on
-  the old one; the next review (`@gemini review` / `@claude review`) moves the reviewed commit and the warning goes
-  away on its own. That review covers only the new part when the change is small and low-risk (below), otherwise
-  everything.
-* A new commit never inherits an old READY. A READY PR with a small, low-risk new commit gets an *incremental*
-  review (at most 50 changed lines in at most 3 files; no workflow/security/schema/dependency paths; every 15th is
-  a full refresh); anything else gets a full review.
-* If the PR's history was rewritten since the last review (rebase, force-push, the target branch merged in, a changed base), the verification uses the whole current PR diff instead of the old-HEAD-to-new-HEAD diff; if that is too large for one staged review it is reviewed in shards and the old open findings are carried as "needs confirmation" until a person dismisses them (see `docs/rewritten-history-review.md`).
+You get one bot comment (the only record) and the `claude-review-bot/review` commit status:
 
-## Delivery v1 (opt-in, two-run review)
+| Status | Meaning |
+| --- | --- |
+| IN_PROGRESS | the current round is being reviewed (sequential batches, with resumption) |
+| CHANGES_REQUESTED | round 1 is complete and found P0/P1/P2: fix them together, push once |
+| READY | the current commit is completely reviewed and has no unresolved P0/P1/P2 |
+| STOPPED | automatic review cannot continue; the comment says why and what is unreviewed |
 
-Personal projects can opt in with the `delivery-v1` label (Draft, label, Ready): one review, one batched fix, one
-verifying review, then stop. One bot comment holds the whole state. PRs without the label are unaffected. See
-[docs/delivery-v1.md](docs/delivery-v1.md) for the trigger order, real budget limits, permissions, compatibility
-checks, limitations and how to pause it.
+Two complete rounds per PR, P3 never blocks, and a hard cap on model executions per PR. Details: [docs/review-contract.md](docs/review-contract.md).
 
-## What you do
+## Layout
 
-1. Open (or mark ready) a PR. A full review starts by itself. **Pushes do not trigger a review.**
-2. Read the findings. Each one is a review thread pinned to a line.
-3. Fix a problem, push, and click **Resolve** on its thread. Once *every* blocking thread is resolved and there is a
-   new commit, the verification starts by itself and only its result decides READY; a finding that is not really
-   fixed gets its thread reopened with the reason. P3 is treated like P0-P2: it stays open, blocks READY, and is checked on re-review; the bot resolves its thread once it is verified fixed. Only an unproven claim that was demoted to P3 (no concrete failure path) is non-blocking, and Resolve closes that one for good, no model run.
-4. When everything is settled, the final full review runs by itself, and the session turns READY.
-5. The newest comment at the bottom of the PR is always the session status: **when the status changes (or a new
-   HEAD gets its result) it is posted as a new comment and the old one is removed**, so you do not have to look
-   for it. If nothing visible changed it is edited in place.
+- `worker/` Cloudflare Worker: verifies the webhook signature and trigger permission, ignores drafts, dispatches `review.yml`.
+- `.github/workflows/review.yml` the one review workflow (plan -> exact-HEAD checkout and safe snapshot -> run).
+- `scripts/review.mjs` the executor; `review-engine.mjs` pure decisions and transitions; `review-contract.mjs` the shared contract; `claude-provider.mjs` the single model call; `tool-gateway.mjs` read-only tools; `materialize-safe-tree.mjs` the sanitized snapshot.
+- `scripts/migrate-v1.mjs` + `migrate-v1.yml`: one-time v1 -> v2 migration (delete after the cut-over).
 
-**Commands** (the first non-blank line must be exactly one of these):
+## Configuration
 
-```text
-@gemini review                          # review the latest HEAD: whatever the session calls for, Gemini first
-@claude review                          # the same review, Claude only (no Gemini key needed)
-@jiaze-claude-review-bot reset review   # discard the session and review from scratch
-@jiaze-claude-review-bot override review  # a writer accepts the risk: waives open findings, READY (marked as manual)
-@gemini dismiss F001                    # + Reason:/Evidence: lines, see below
-@gemini accept F001 <risk and consequence>  # the owner accepts a real minor (P3) finding, see below
+Secrets: `APP_PRIVATE_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, `CLOUDFLARE_*` (Worker deploy). Variables: `APP_ID`, optional `REQUIRE_STATUS_CHECK=true`, optional `REVIEW_MAX_TURNS` (14), `REVIEW_MAX_BUDGET_USD` (0.5), `REVIEW_TIMEOUT_MS` (480000) per model execution. A repository can skip files with a `.reviewbotignore` read from the PR's base commit.
+
+## Develop
+
 ```
-
-`@gemini review` / `@claude review` are the same review; only the model differs. On a HEAD that is already READY
-they do nothing. An unchanged HEAD never spends model quota.
-
-## Money and models
-
-* **Gemini** (`gemini-flash-latest`, its own API key) is tried first for every full-review shard and every delta.
-  It is switched off for the rest of a run after a credit/rate-limit/outage/key error (HTTP 402/429/5xx/400/401/403/404)
-  or two shard-level failures; the review says how much Claude took over and why.
-* **Claude** (subscription OAuth token) takes what Gemini cannot. Its spend is a per-PR ledger:
-  automatic reviews share a **$6 per-PR allowance** (a call does not start below $0.50); a person's command
-  (`@gemini review`, `@claude review`, `reset review`, or resolving threads) may exceed it, each Claude call being
-  capped at **$5**. Gemini is billed to its own key and never to this ledger. A dismissal or override is not a
-  request for more review: what follows it obeys the automatic allowance.
-* If neither provider can run, the session records **HUMAN_REQUIRED / reviewer unavailable** for that HEAD;
-  `@gemini review` retries.
-* The review of a very large PR is split over several runs: each run reviews up to 20 shards within a 16-minute
-  deadline and remembers which files it covered; the next run (automatic, up to 3 more) takes the rest. The review
-  lists reviewed/assigned files per shard.
-* Binary assets are skipped. A repository can skip more (lockfiles, generated code) with a `.reviewbotignore` at its
-  root (gitignore-style patterns); it is read from the PR's **base** commit, so a PR cannot exempt its own files.
-
-## Findings
-
-* Every finding is an inline review thread, pinned to its own line when that line is part of the diff, else to the
-  nearest changed line (with a note). Only a finding about a file the PR does not touch, or a file that is deleted
-  entirely, stays in the review body ("Findings without an inline anchor") and cannot be resolved by a click.
-* At the end of every run the bot resolves the threads of findings that are now FIXED, DISMISSED or WAIVED. It only
-  touches threads it opened, and never undoes a person's own resolve or unresolve. If GitHub refuses (see below) the
-  run still succeeds; the refusal shows as a warning and in the Job Summary, and the review result is not affected.
-
-### One-time App setup for resolving/reopening threads
-
-GitHub rejects `resolveReviewThread`/`unresolveReviewThread` ("Resource not accessible by integration") for an App
-token that has Pull requests: write but only Contents: read, while reading threads still works. This is reported by
-several users but not documented by GitHub, so the first run after the change is the verification. To enable it:
-
-1. GitHub → Settings → Developer settings → GitHub Apps → this App → Permissions & events → Repository permissions →
-   **Contents: Read and write** (leave everything else as is) → Save.
-2. For the installation on the reviewed account/org, open the App's installation page and **Accept new permissions**
-   (until accepted, tokens cannot get the permission).
-3. Make the thread steps request it. The workflow does **not** do this by itself, so nothing widens until you decide.
-   Narrowest change: add a token step right after "Create best-effort commit-status token" in `review-v2.yml`
-   (`id: thread-token`, `continue-on-error: true`, same inputs as that step but `permission-contents: write` and
-   `permission-pull-requests: write`), then set `GH_TOKEN: ${{ steps.thread-token.outputs.token || steps.app-token.outputs.token }}`
-   on the two steps "Apply review-thread decisions" and "Resolve review threads for closed findings" only.
-4. Verify with a real change, not just an empty summary. On a test PR with a bot thread whose finding is closed
-   (FIXED/DISMISSED/WAIVED), trigger a review and confirm **both**: (a) the run's log says `Review threads: N resolved`
-   with N ≥ 1 and the thread now shows as resolved on the PR; and (b) a thread a person resolved while its finding is
-   still open (run a verification) is reopened with the bot's "Reopened:" reply. No "did not fully complete" section in
-   the Job Summary is necessary but not sufficient: a run that had nothing to change also has none.
-
-* Convergence: only 2 verification rounds; each finding needs a concrete `failurePath` (trigger state → wrong result)
-  or it is demoted to non-blocking P3; concerns already dismissed or settled are shown to every reviewer and an exact
-  repeat is not reported again; a delta's P0-P2 candidates get one targeted validation pass that can confirm, reject
-  or mark them UNCERTAIN (UNCERTAIN blocks READY; silence from a later review never clears it).
-* A PR the deterministic classifier marks as touching shared durable state gets an explicit concurrency procedure
-  (stale snapshots, lost updates, TOCTOU, two-actor interleavings) in every full-review prompt.
-
-### Dismiss a disproven finding
-
-An authorized writer can dismiss **one** open or UNCERTAIN P0/P1/P2 finding on the exact reviewed HEAD:
-
-```text
-@gemini dismiss F001
-Reason: The report mixes exact Git reference lookups with matching-refs; the exact endpoint does not return arrays.
-Evidence: https://docs.github.com/en/rest/git/refs
+npm ci --legacy-peer-deps && npm test && npm run test:compat
+npm run review:fixtures   # regenerate tests/fixtures/review-contract.json
 ```
-
-`Reason:` 30-400 characters and 1-3 credential-free HTTPS `Evidence:` lines. The evidence is attributed to the
-person, not certified by the bot. The other findings stay blocking; when none is left the session goes to
-AUDIT_PENDING and the final full review runs by itself. Resolving a thread alone is not a dismissal.
-
-### Accept a real minor finding as a known risk
-
-When a P3 finding is real but the owner decides to live with it, `dismiss` cannot help (it needs proof the finding is
-wrong). The repository owner (GitHub permission `admin`) can accept it instead:
-
-```text
-@gemini accept F001 The retry can double-send one notification if two pushes land together; the cost is one duplicate message.
-```
-
-The statement must say what the risk is and what happens if it occurs. The bot checks once, with a model, that it
-describes the same risk the finding reports; it does not judge whether the risk is worth accepting. Anyone but the
-owner changes nothing, P0-P2 findings are refused, and a wrong, vague or unverifiable statement leaves the finding
-blocking with a reply saying why. An acceptance is shown in the review summary as `[risk accepted]` with who, the
-owner's words and the commit, and later reviewers are told it is settled. It stays accepted on later pushes only
-while the same finding comes back (same file, title and failure path, and still P3). The final full review still runs.
-
-## Security and execution model
-
-The GitHub comment is only a trigger. The central workflow pins the exact PR HEAD, builds trusted diff context,
-runs the reviewer without a GitHub write token, and re-checks HEAD before publishing. A review published against
-a HEAD that moved is refused. Gemini gets no tools; Claude has Read/Glob/Grep over a sanitized snapshot only
-(no symlinks, submodules, `CLAUDE.md`, `.claude/`, `.mcp.json`) under host-enforced tool policy. The bot only trusts
-session comments authored by its own GitHub App identity. Only commands from users with write access count, in
-the first non-blank line (quoted, fenced, edited or mid-prose mentions do not).
-
-Concurrency: the workflow is serialized per PR. A run that ends with work left starts the next run of the same
-workflow itself (the `actions: write` permission is used only for that).
-
-### Deploying a trigger change
-
-Merging to `main` deploys the Worker automatically whenever anything under `worker/`
-changes (`deploy-worker.yml`). It needs two repository secrets, `CLOUDFLARE_API_TOKEN`
-(an API token with the "Edit Cloudflare Workers" permission) and `CLOUDFLARE_ACCOUNT_ID`;
-if either is missing the run fails with a clear error instead of skipping. Check the
-run's result in the Actions tab after merging.
-
-A GitHub commit alone does not update the Cloudflare webhook Worker. To deploy by hand
-instead (preserving its existing secrets):
-
-```bash
-npm test
-cd worker
-npm ci
-npm run deploy
-```
-
-After deployment, verify one fresh PR lifecycle event (open a non-draft PR or move
-a draft to Ready) and confirm that the matching automatic trigger reaches the
-central run and its bot-authored status. The manual `@gemini review` command should still
-work as a fallback. The `test.yml` workflow runs deterministic trigger/status
-tests without Claude calls or Cloudflare deployment.
-
-Repository code cannot change the GitHub App event subscription or deploy the
-Cloudflare Worker by itself: after merging a trigger change, subscribe the App to
-**Pull request** events and redeploy the Worker from the merged checkout.
-
-## One-time setup
-
-There are two pieces that cannot be created from repository code alone: your GitHub App registration and secrets. Everything else lives in this repository.
-
-### 1. Create a GitHub App
-
-GitHub -> Settings -> Developer settings -> GitHub Apps -> New GitHub App.
-
-Suggested permissions:
-
-- Actions: **Read and write** (to dispatch the central workflow)
-- Contents: **Read-only**
-- Issues: **Read-only** (to receive PR conversation comments)
-- Pull requests: **Read and write** (to receive PR lifecycle events and publish PR reviews)
-- Metadata: read is implicit
-
-Subscribe to both **Issue comment** and **Pull request** events.
-
-Install the App on your account and choose **All repositories** if you want Codex-like account-wide behavior.
-
-Generate one private key for the App. Never commit it to this repository.
-
-### 2. Deploy the webhook Worker
-
-```bash
-cd worker
-npm install
-npx wrangler login
-npx wrangler secret put GITHUB_APP_ID
-npx wrangler secret put GITHUB_PRIVATE_KEY
-npx wrangler secret put GITHUB_WEBHOOK_SECRET
-npm run deploy
-```
-
-Use the deployed Worker URL as the GitHub App Webhook URL. Set the same random value as both the GitHub App webhook secret and `GITHUB_WEBHOOK_SECRET` in the Worker.
-
-### 3. Add central-repo secrets/variable
-
-In this repository -> Settings -> Secrets and variables -> Actions:
-
-Repository variable:
-
-- `APP_ID`: numeric GitHub App ID
-
-Repository secrets:
-
-- `APP_PRIVATE_KEY`: complete GitHub App private-key PEM
-- `GEMINI_API_KEY`: Google AI Studio / Gemini API key used by the default bounded reviewer
-- `CLAUDE_CODE_OAUTH_TOKEN`: Claude Code OAuth token used only by an explicit `@claude review`
-
-The OAuth token can be generated locally with Claude Code using `claude setup-token` if that authentication mode is available to your account.
-
-### 4. Merge the review-service branch into `main`
-
-The Worker dispatches `.github/workflows/review-v2.yml` on `main`, so the workflow must exist on `main` before end-to-end testing.
-
-### 5. Test
-
-Open a non-draft PR in any repository covered by the GitHub App, or move a draft
-PR to **Ready for review**.
-
-Expected behavior: the PR event automatically runs a full review and posts an **Independent Review Session**
-comment. If it finds problems, fix them and resolve their threads; the review that checks the repair starts by
-itself once every blocking thread is resolved (or comment `@gemini review`). Pushes do not trigger a review.
-
-The manual command remains useful for retrying a stopped/no-op path:
-
-```text
-@gemini review
-```
-
-## Security model
-
-The GitHub App is intentionally review-only. V1 does not grant Claude code-write, push, merge, or approval permissions. The webhook verifies GitHub's signature and checks that the triggering user has write/admin-level repository access before spending Claude quota.

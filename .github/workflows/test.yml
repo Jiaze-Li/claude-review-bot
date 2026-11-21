@@ -28,23 +28,4 @@ jobs:
         run: |
           node --check worker/src/index.js
           node --check worker/src/review-trigger.js
-          node --check scripts/review-status.mjs
-          node --check scripts/review-session-core.mjs
-          node --check scripts/plan-review-session.mjs
-          node --check scripts/recover-review-session.mjs
-          node --check scripts/detect-review-risk.mjs
-          node --check scripts/run-gemini-review.mjs
-          node --check scripts/run-review.mjs
-          node --check scripts/provider-adapter.mjs
-          node --check scripts/tool-gateway.mjs
-          node --check scripts/validate-gemini-findings.mjs
-          node --check scripts/publish-gemini-review.mjs
-          node --check scripts/publish-review.mjs
-          node --check scripts/github-review-api.mjs
-          node --check scripts/apply-override.mjs
-          node --check worker/src/delivery.js
-          node --check scripts/delivery-protocol.mjs
-          node --check scripts/delivery-review.mjs
-          node --check scripts/delivery-mode-check.mjs
-          node --check scripts/delivery-fixtures.mjs
-          node --check scripts/delivery-compat.mjs
+          for f in scripts/*.mjs; do node --check "$f"; done

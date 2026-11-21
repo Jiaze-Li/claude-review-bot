@@ -4,13 +4,11 @@
   "type": "module",
   "scripts": {
     "test": "node --test tests/*.test.mjs",
-    "delivery:fixtures": "node scripts/delivery-fixtures.mjs",
-    "test:compat": "node scripts/delivery-compat.mjs"
+    "review:fixtures": "node scripts/review-fixtures.mjs",
+    "test:compat": "node scripts/review-fixtures.mjs --check"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "0.3.325",
-    "@anthropic-ai/sdk": "0.133.0",
-    "@modelcontextprotocol/sdk": "1.32.1",
     "zod": "4.6.6"
   }
 }
