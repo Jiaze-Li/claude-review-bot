@@ -9,8 +9,9 @@ import {
 // A claimed attempt with no result for this long is a crashed or killed run. Above the workflow's job timeout.
 export const IN_PROGRESS_TIMEOUT_MS = 50 * 60 * 1000;
 export const BATCH_LIMITS = Object.freeze({
-  maxFiles: 10, targetBytes: 70_000, maxInlineFileBytes: 40_000,
-  // Capacity must match the call budget: one Read yields at most ~200 KB of a source (the gateway caps a call at 256 KB
+  // One unified per-batch diff budget. There is no smaller per-file threshold that forces a HEAD-file read.
+  maxFiles: 10, targetBytes: 70_000,
+  // Capacity must match the call budget: one Read yields at most ~200 KB of a diff (the gateway caps a call at 256 KB
   // including line numbers), and a model attempt keeps `reservedTurns` for orientation and writing the result.
   readChunkBytes: 200_000, reservedTurns: 4,
 });
@@ -182,9 +183,10 @@ export function readCovers(reads, need) {
 
 // Files the program credits for one batch. The model's report is checked against the assignment and the tool log:
 // a path outside the batch counts for nothing, a path the model itself marks unreviewed is never credited, a model
-// that says it is incomplete without naming what is missing gets no credit at all, and a file whose diff was not
-// fully inlined needs real Reads, recorded by the gateway, that together cover all of it (a file that is deleted in the
-// PR is read from its block of the full diff instead, since HEAD no longer has it). needsRead: Map<file, need>.
+// that says it is incomplete without naming what is missing gets no credit at all. For a diff too large for the
+// batch prompt, the gateway must confirm that the COMPLETE per-file diff block (not the HEAD source) was delivered
+// through bounded Read calls. This applies equally to added, modified, renamed and deleted paths.
+// needsRead: Map<file, need>.
 export function creditedFiles({ assigned, coverage, needsRead = new Map(), reads = new Map() }) {
   if (!coverage.complete && coverage.unreviewed.size === 0) return [];
   const assignedSet = new Set(assigned);
@@ -274,7 +276,9 @@ export function nextBatch({ remaining, bytesOf, readsOf = () => 0, maxReads = In
   let bytes = 0;
   let reads = 0;
   for (const file of ordered) {
-    const size = Math.min(bytesOf(file), limits.maxInlineFileBytes);
+    // What is actually inserted into the prompt: the full diff up to the one batch budget.
+    // An oversized file is the only file in its batch and is reviewed through a diff Read.
+    const size = Math.min(bytesOf(file), limits.targetBytes);
     const needed = readsOf(file);
     if (batch.length && (batch.length >= maxFiles || bytes + size > targetBytes || reads + needed > readBudget)) break;
     batch.push(file);
