@@ -8,11 +8,11 @@ export const sha = (c) => c.repeat(40);
 export const MERGE_BASE = sha('0');
 
 export const DELETED_LINES = 1500; // 1500 x 100 bytes: far over the 40 KB inline cap
-export function contextFiles(files, { ignore = '', binary = [], bigDiff = [], deleted = [], bigDeleted = [], mergeBase = MERGE_BASE } = {}) {
+export function contextFiles(files, { ignore = '', binary = [], bigDiff = [], bigDiffBytes = 60_000, deleted = [], bigDeleted = [], mergeBase = MERGE_BASE } = {}) {
   const deletedDiff = (f, lines) => `diff --git a/${f} b/${f}\ndeleted file mode 100644\nindex 1111111..0000000\n--- a/${f}\n+++ /dev/null\n@@ -1,${lines} +0,0 @@\n${Array.from({ length: lines }, (_, i) => `-${String(i).padStart(4, '0')} ${'d'.repeat(94)}`).join('\n')}\n`;
   const diffOf = (f) => (bigDeleted.includes(f) ? deletedDiff(f, DELETED_LINES) : deleted.includes(f) ? deletedDiff(f, 3) : binary.includes(f)
     ? `diff --git a/${f} b/${f}\nBinary files a/${f} and b/${f} differ\n`
-    : `diff --git a/${f} b/${f}\n--- a/${f}\n+++ b/${f}\n@@ -1 +1 @@\n+${bigDiff.includes(f) ? 'x'.repeat(60000) : 'changed'}\n`);
+    : `diff --git a/${f} b/${f}\n--- a/${f}\n+++ b/${f}\n@@ -1 +1 @@\n+${bigDiff.includes(f) ? 'x'.repeat(bigDiffBytes) : 'changed'}\n`);
   const store = { 'merge-base.txt': `${mergeBase}\n`, 'ignore-patterns.txt': ignore, 'changed-files.txt': `${files.join('\n')}\n`, 'pr.diff': files.map(diffOf).join('') };
   return store;
 }
